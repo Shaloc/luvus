@@ -15,6 +15,8 @@ export const THEMES: { id: string; label: string; note: string }[] = [
   { id: 'dracula', label: 'dracula', note: 'indigo dark, violet accent' },
   { id: 'nord', label: 'nord', note: 'cool arctic blue-grey' },
   { id: 'tokyo-night', label: 'tokyo night', note: 'deep night blue, clear blue accent' },
+  { id: 'one-dark', label: 'one dark', note: 'Atom charcoal, blue accent' },
+  { id: 'one-light', label: 'one light', note: 'Atom paper, blue accent' },
   { id: 'sky', label: 'sky', note: 'light paper, sky-blue accent' },
   { id: 'catppuccin-mocha', label: 'catppuccin mocha', note: 'darkest Catppuccin, mauve' },
   { id: 'catppuccin-macchiato', label: 'catppuccin macchiato', note: 'softer dark Catppuccin' },
@@ -47,6 +49,7 @@ export const DEFAULT_THEME = 'quattro-rally';
 export const LIGHT_THEMES = [
   'catppuccin-latte',
   'gruvbox-light',
+  'one-light',
   'paper',
   'papercolor',
   'rose-pine-dawn',

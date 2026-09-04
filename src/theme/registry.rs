@@ -270,7 +270,7 @@ impl ThemeRegistry {
                 appearance: bundled.map(|file| file.appearance).unwrap_or_else(|| {
                     if virtual_theme {
                         Appearance::Terminal
-                    } else if matches!(*id, "sky" | "catppuccin-latte" | "gruvbox-light") {
+                    } else if matches!(*id, "sky" | "one-light" | "catppuccin-latte" | "gruvbox-light") {
                         Appearance::Light
                     } else {
                         Appearance::Dark
@@ -572,6 +572,15 @@ accent = "#222222"
         assert_eq!(
             registry.index_of("mocha"),
             registry.index_of("catppuccin-mocha")
+        );
+        assert_eq!(registry.index_of("onedark"), registry.index_of("one-dark"));
+        assert_eq!(
+            registry.index_of("onelight"),
+            registry.index_of("one-light")
+        );
+        assert_eq!(
+            registry.get("one-light").map(|entry| entry.appearance),
+            Some(Appearance::Light)
         );
     }
 

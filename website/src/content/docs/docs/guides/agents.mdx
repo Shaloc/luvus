@@ -10,7 +10,7 @@ back after a restart, all without wrapping or modifying the agents themselves.
 ## The AGENTS sidebar
 
 Every pane running a recognized agent (Claude Code, Copilot, Codex, opencode,
-Kimi, Grok, Hermes CLI, Muse Code, Pi, Oh My Pi (OMP), Cursor, Gemini, Qwen,
+Kimi, Qoder CLI, Grok, Hermes CLI, Muse Code, Pi, Oh My Pi (OMP), Cursor, Gemini, Qwen,
 Kilo Code, Kiro, Aider, Amp, Droid, or fx) appears in the sidebar with a live state:
 
 | State | Meaning | How it's detected |
@@ -77,7 +77,7 @@ Click a session row to select it and update the Selected Agent panel. Use
 | Gemini and Qwen | project chat records |
 | fx | session usage snapshot |
 
-Aider, Kilo Code, Kiro, Cursor, Amp, Droid, Muse, and manifest-defined agents still receive live
+Aider, Kilo Code, Qoder CLI, Kiro, Cursor, Amp, Droid, Muse, and manifest-defined agents still receive live
 identity and state detection, but show `—` for usage until they expose a stable
 per-session counter or report one through an integration. Luvus never estimates
 tokens from transcript text.
@@ -134,6 +134,7 @@ not sufficient, and Luvus runs the agent's own resume command:
 | Antigravity CLI | its workspace conversation cache (`~/.gemini/antigravity-cli/cache/last_conversations.json`) |
 | opencode | its session storage, plus exact live ownership from the optional integration |
 | Kimi | its session index (`~/.kimi-code/session_index.jsonl`) |
+| Qoder CLI | its exact session id from the optional integration |
 | Grok | its session directory (`~/.grok/sessions`) |
 | Hermes CLI | its exact session report from the optional integration |
 | Pi | its session store (`~/.pi/agent/sessions`) |
@@ -213,7 +214,7 @@ Screen-based detection needs no setup and works for everything. The optional
 where its hook contract supports them safely, lifecycle events into luvus:
 
 ```sh
-luvus integration install claude    # or: copilot · codex · antigravity · opencode · kimi · grok · hermes · omp
+luvus integration install claude    # or: copilot · codex · antigravity · opencode · kimi · qodercli · grok · hermes · omp
 ```
 
 or toggle it in **Settings → Integrations**. What it does per agent:
@@ -232,6 +233,12 @@ or toggle it in **Settings → Integrations**. What it does per agent:
   update and no agent database is opened.
 - **kimi**: adds a `[[hooks]]` entry to `~/.kimi-code/config.toml`, edited in
   place so your API keys, comments, and own hooks are left untouched.
+- **qodercli**: adds one Luvus-owned `SessionStart` command to
+  `~/.qoder/settings.json`, or the configuration selected by
+  `QODER_CONFIG_DIR`. It reports only the exact session id used by
+  `qodercli --resume <id>`; screen detection remains responsible for state.
+  The Qoder config directory must already exist, and unrelated settings and
+  hooks are preserved.
 - **grok**: installs its own hook file without editing Grok's authentication
   configuration.
 - **hermes**: installs an opt-in plugin under the active `HERMES_HOME`. It
