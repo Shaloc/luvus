@@ -11,6 +11,7 @@ description: What luvus supports per agent, covering live status, session resume
 | Antigravity CLI (`agy`) | ✓ | ✓ | no | session only |
 | opencode | ✓ | ✓ | no | ✓ |
 | Kimi Code CLI | ✓ | ✓ | no | ✓ |
+| Qoder CLI | ✓ | ✓ with integration | no | session only |
 | Grok Build | ✓ | ✓ | ✓ | ✓ |
 | Hermes CLI | ✓ | ✓ with integration | no | session only |
 | Pi | ✓ | ✓ | ✓ | no |
@@ -69,6 +70,14 @@ description: What luvus supports per agent, covering live status, session resume
   child-session events cannot claim the pane. Without the integration,
   OpenCode detection and legacy JSON session discovery still work while usage
   remains unavailable.
+
+  Qoder CLI uses screen evidence for live state, so detection works without an
+  integration. `luvus integration install qodercli` adds one Luvus-owned
+  `SessionStart` command under `~/.qoder/settings.json` (or
+  `$QODER_CONFIG_DIR/settings.json`) and records only the exact session id.
+  Luvus then restores that session with `qodercli --resume <id>`. The Qoder
+  config directory must already exist; install and uninstall preserve every
+  unrelated setting and hook.
 
   Hermes installs `~/.hermes/plugins/luvus-agent-state`, or the equivalent
   directory under `HERMES_HOME`, and enables only that plugin in

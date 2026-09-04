@@ -14,6 +14,8 @@ export const THEMES: { id: string; label: string; note: string }[] = [
   { id: 'ocean', label: 'ocean', note: 'deep cmd-blue, cyan accent' },
   { id: 'dracula', label: 'dracula', note: 'indigo dark, violet accent' },
   { id: 'nord', label: 'nord', note: 'cool arctic blue-grey' },
+  { id: 'one-dark', label: 'one dark', note: 'Atom charcoal, blue accent' },
+  { id: 'one-light', label: 'one light', note: 'Atom paper, blue accent' },
   { id: 'sky', label: 'sky', note: 'light paper, sky-blue accent' },
   { id: 'catppuccin-mocha', label: 'catppuccin mocha', note: 'darkest Catppuccin, mauve' },
   { id: 'catppuccin-macchiato', label: 'catppuccin macchiato', note: 'softer dark Catppuccin' },
@@ -37,7 +39,7 @@ export const DEFAULT_THEME = 'quattro-rally';
  * own rules (and Expressive Code's syntax theme) off `data-theme`, so the docs
  * have to say which side of the line each palette falls on.
  */
-export const LIGHT_THEMES = ['catppuccin-latte', 'gruvbox-light', 'sky'];
+export const LIGHT_THEMES = ['catppuccin-latte', 'gruvbox-light', 'one-light', 'sky'];
 
 /** `data-theme` for a palette: what Starlight's own light/dark rules key off. */
 export const modeOf = (id: string) => (LIGHT_THEMES.includes(id) ? 'light' : 'dark');

@@ -9,6 +9,7 @@ pub(crate) static BUILTINS: &[&AgentDescriptor] = &[
     &super::opencode::DESCRIPTOR,
     &super::copilot::DESCRIPTOR,
     &super::kimi::DESCRIPTOR,
+    &super::qodercli::DESCRIPTOR,
     &super::qwen::DESCRIPTOR,
     &super::kiro::DESCRIPTOR,
     &super::cursor::DESCRIPTOR,
@@ -31,6 +32,7 @@ static INTEGRATIONS: &[&AgentDescriptor] = &[
     &super::antigravity::DESCRIPTOR,
     &super::opencode::DESCRIPTOR,
     &super::kimi::DESCRIPTOR,
+    &super::qodercli::DESCRIPTOR,
     &super::grok::DESCRIPTOR,
     &super::hermes::DESCRIPTOR,
     &super::omp::DESCRIPTOR,
@@ -186,6 +188,8 @@ mod tests {
             find("ANTIGRAVITY-CLI").map(|agent| agent.id),
             Some("antigravity")
         );
+        assert_eq!(find("QODER").map(|agent| agent.id), Some("qodercli"));
+        assert_eq!(find("qodercn").map(|agent| agent.id), Some("qodercli"));
         assert!(find("not-an-agent").is_none());
     }
 
@@ -210,6 +214,11 @@ mod tests {
             ("opencode", &["opencode"][..], &[][..]),
             ("copilot", &["copilot"][..], &[][..]),
             ("kimi", &["kimi"][..], &[][..]),
+            (
+                "qodercli",
+                &["qodercli", "qoderclicn", "qodercn"][..],
+                &["qoder"][..],
+            ),
             ("qwen", &["qwen"][..], &[][..]),
             ("kiro", &["kiro"][..], &[][..]),
             ("cursor", &["cursor-agent"][..], &["cursor"][..]),
@@ -255,6 +264,7 @@ mod tests {
                 "opencode",
                 "copilot",
                 "kimi",
+                "qodercli",
                 "qwen",
                 "cursor",
                 "grok",
@@ -321,6 +331,7 @@ mod tests {
                 "antigravity",
                 "opencode",
                 "kimi",
+                "qodercli",
                 "grok",
                 "hermes",
                 "omp",

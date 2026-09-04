@@ -401,6 +401,56 @@ impl Theme {
         }
     }
 
+    /// Atom One Dark — charcoal surfaces with its familiar blue accent.
+    pub fn one_dark() -> Self {
+        let rgb = |r, g, b| Color::Rgb(r, g, b);
+        Theme {
+            crust: rgb(0x21, 0x25, 0x2b),
+            mantle: rgb(0x28, 0x2c, 0x34),
+            base: rgb(0x2c, 0x31, 0x3a),
+            surface0: rgb(0x31, 0x36, 0x40),
+            surface1: rgb(0x3e, 0x44, 0x51),
+            overlay0: rgb(0x5c, 0x63, 0x70),
+            overlay1: rgb(0x73, 0x7a, 0x87),
+            subtext0: rgb(0x96, 0x9c, 0xa8),
+            subtext1: rgb(0xa3, 0xaa, 0xb7),
+            text: rgb(0xab, 0xb2, 0xbf),
+            accent: rgb(0x61, 0xaf, 0xef),
+            sel_bg: rgb(0x33, 0x46, 0x59),
+            border: rgb(0x3e, 0x44, 0x51),
+            border_focus: rgb(0x73, 0x7a, 0x87),
+            green: rgb(0x98, 0xc3, 0x79),
+            mint: rgb(0x56, 0xb6, 0xc2),
+            amber: rgb(0xe5, 0xc0, 0x7b),
+            coral: rgb(0xe0, 0x6c, 0x75),
+        }
+    }
+
+    /// Atom One Light — neutral paper surfaces with the matching blue accent.
+    pub fn one_light() -> Self {
+        let rgb = |r, g, b| Color::Rgb(r, g, b);
+        Theme {
+            crust: rgb(0xfa, 0xfa, 0xfa),
+            mantle: rgb(0xf5, 0xf5, 0xf6),
+            base: rgb(0xf0, 0xf0, 0xf1),
+            surface0: rgb(0xe5, 0xe5, 0xe6),
+            surface1: rgb(0xd8, 0xdb, 0xe2),
+            overlay0: rgb(0xa0, 0xa1, 0xa7),
+            overlay1: rgb(0x81, 0x83, 0x8c),
+            subtext0: rgb(0x68, 0x6b, 0x77),
+            subtext1: rgb(0x56, 0x58, 0x61),
+            text: rgb(0x38, 0x3a, 0x42),
+            accent: rgb(0x40, 0x78, 0xf2),
+            sel_bg: rgb(0xcd, 0xdb, 0xf8),
+            border: rgb(0xd8, 0xdb, 0xe2),
+            border_focus: rgb(0xa0, 0xa1, 0xa7),
+            green: rgb(0x50, 0xa1, 0x4f),
+            mint: rgb(0x01, 0x84, 0xbc),
+            amber: rgb(0xc1, 0x84, 0x01),
+            coral: rgb(0xe4, 0x56, 0x49),
+        }
+    }
+
     /// A warm light palette (Catppuccin-Latte-ish) for light terminals.
     pub fn latte() -> Self {
         let rgb = |r, g, b| Color::Rgb(r, g, b);
@@ -663,6 +713,8 @@ pub const THEMES: &[&str] = &[
     "ocean",
     "dracula",
     "nord",
+    "one-dark",
+    "one-light",
     "sky",
     "catppuccin-mocha",
     "catppuccin-macchiato",
@@ -690,6 +742,8 @@ pub fn canonical(name: &str) -> &str {
         "macchiato" => "catppuccin-macchiato",
         "frappe" => "catppuccin-frappe",
         "gruvboxlight" => "gruvbox-light",
+        "onedark" => "one-dark",
+        "onelight" => "one-light",
         other => other,
     }
 }
@@ -705,6 +759,8 @@ pub fn by_name(name: &str) -> Theme {
         "grass" => Theme::grass(),
         "dracula" => Theme::dracula(),
         "nord" => Theme::nord(),
+        "one-dark" | "onedark" => Theme::one_dark(),
+        "one-light" | "onelight" => Theme::one_light(),
         "catppuccin-mocha" | "mocha" => Theme::mocha(),
         "catppuccin-macchiato" | "macchiato" => Theme::macchiato(),
         "catppuccin-frappe" | "frappe" => Theme::frappe(),
@@ -730,6 +786,8 @@ pub fn describe(name: &str) -> &'static str {
         "grass" => "green field, pale-yellow text",
         "dracula" => "indigo dark, violet accent",
         "nord" => "cool arctic blue-grey",
+        "one-dark" | "onedark" => "Atom charcoal, blue accent",
+        "one-light" | "onelight" => "Atom paper, blue accent",
         "catppuccin-mocha" | "mocha" => "darkest Catppuccin, mauve",
         "catppuccin-macchiato" | "macchiato" => "softer dark Catppuccin",
         "catppuccin-frappe" | "frappe" => "lightest dark Catppuccin",
@@ -856,6 +914,8 @@ mod tests {
             ("mocha", "catppuccin-mocha"),
             ("latte", "catppuccin-latte"),
             ("gruvboxlight", "gruvbox-light"),
+            ("onedark", "one-dark"),
+            ("onelight", "one-light"),
         ] {
             assert_eq!(canonical(old), new, "{old} should map to {new}");
             assert_eq!(

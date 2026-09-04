@@ -33,6 +33,7 @@ pub(crate) mod muse;
 pub(crate) mod omp;
 pub(crate) mod opencode;
 pub(crate) mod pi;
+pub(crate) mod qodercli;
 pub(crate) mod qwen;
 pub(crate) mod registry;
 pub(crate) mod shared;
@@ -381,6 +382,11 @@ mod tests {
             .unwrap()
             .contains("kimi --resume"));
         assert!(is_resumable("kimi"));
+        assert_eq!(
+            resume_command("qoder", "qoder-session-1").as_deref(),
+            Some("qodercli --resume 'qoder-session-1'\r")
+        );
+        assert!(is_resumable("qodercli"));
         assert!(resume_command("grok", "20250921_143022")
             .unwrap()
             .contains("grok --resume"));

@@ -94,6 +94,7 @@ Keyboard → Keyboard Shortcuts → Input Sources** to free `Ctrl+Space`.
 | Antigravity CLI | ✓ | ✓ | session only |
 | opencode | ✓ | ✓ | ✓ |
 | Kimi | ✓ | ✓ | ✓ |
+| Qoder CLI | ✓ | ✓ with integration | session only |
 | Grok | ✓ | ✓ | ✓ |
 | Hermes CLI | ✓ | ✓ with integration | session only |
 | Pi | ✓ | ✓ | No |

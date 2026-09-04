@@ -564,6 +564,49 @@ fn builtin_rules() -> Vec<Rule> {
             Region::Screen,
             vec![all(&["select", "choose", "confirm"])],
         ),
+        // Qoder CLI keeps these explicit input/approval labels visible while
+        // waiting. Scope the shorter phrases to Qoder so transcript prose in
+        // other agents cannot become a generic blocker.
+        per(
+            "qodercli",
+            State::Blocked,
+            315,
+            Region::Screen,
+            vec![any(&[
+                "permission required",
+                "allow once or always?",
+                "asking user",
+                "enter your response",
+                "review your answers:",
+                "shell awaiting input",
+            ])],
+        ),
+        // `waiting for user confirmation` is already a global blocker. The
+        // Qoder-specific `awaiting approval` copy also occurs in transcript
+        // prose, so require one of its visible decision labels beside it.
+        per(
+            "qodercli",
+            State::Blocked,
+            316,
+            Region::Screen,
+            vec![all(&["awaiting approval", "allow"])],
+        ),
+        per(
+            "qodercli",
+            State::Blocked,
+            316,
+            Region::Screen,
+            vec![all(&["awaiting approval", "reject"])],
+        ),
+        // Qoder's working footer includes a comma after the generic cancel
+        // phrase. Keep the exact product form as positive working evidence.
+        per(
+            "qodercli",
+            State::Working,
+            105,
+            Region::Screen,
+            vec![any(&["(esc to cancel,"])],
+        ),
         // Grok Build's permission card (docs/35) always shows the two persistent
         // option labels "Always allow" + "Never allow" together, for every tool
         // (command, edit, MCP call). That pair is unmistakable and catches an
@@ -1603,6 +1646,78 @@ Would you like to proceed?
             incidental.agent, "zsh",
             "the ordinary proper name must not identify a shell as Hermes CLI"
         );
+    }
+
+    #[test]
+    fn qodercli_identity_covers_aliases_and_versioned_binaries_without_trusting_prose() {
+        let manifests = Manifests::builtin();
+        for command in [
+            "/home/me/.local/bin/qodercli --resume abc123",
+            "/home/me/.qoder/bin/qodercli/qodercli-1.1.42",
+            r"C:\Users\me\.qoder\bin\qodercli\qodercli-1.1.42.exe",
+            "env QODER_CONFIG_DIR=/home/me/.qoder qoderclicn",
+            r"C:\Users\me\bin\qodercn.exe",
+        ] {
+            assert_eq!(
+                manifests.agent_in_processes(&[command.to_string()]),
+                Some("qodercli".to_string()),
+                "failed to recognize {command}"
+            );
+        }
+        assert_eq!(
+            manifests.agent_in_processes(&["/usr/local/bin/qodercli-helper".into()]),
+            None
+        );
+
+        let incidental = classify(
+            Some("zsh"),
+            "The README compares Qoder with another editor",
+            true,
+            false,
+            "zsh",
+            "",
+            &[],
+            &manifests,
+        );
+        assert_eq!(incidental.agent, "zsh");
+    }
+
+    #[test]
+    fn qodercli_screen_rules_work_without_the_optional_integration() {
+        let manifests = Manifests::builtin();
+        let running = vec!["/home/me/.local/bin/qodercli".to_string()];
+        let detect = |screen: &str| {
+            classify(
+                Some("Qoder CLI"),
+                screen,
+                false,
+                false,
+                "zsh",
+                "",
+                &running,
+                &manifests,
+            )
+        };
+
+        let working = detect("Generating answer (esc to cancel, 12s)");
+        assert_eq!(working.agent, "qodercli");
+        assert_eq!(working.identity_source, "process_tree");
+        assert_eq!(working.state, State::Working);
+        assert_eq!(
+            detect("Permission required for shell").state,
+            State::Blocked
+        );
+        assert_eq!(
+            detect("Waiting for user confirmation\nYes  No").state,
+            State::Blocked
+        );
+        assert_eq!(
+            detect("Previous output: awaiting approval from the reviewer").state,
+            State::Idle,
+            "generic transcript prose is not a live approval card"
+        );
+        assert_eq!(detect("Enter your response").state, State::Blocked);
+        assert_eq!(detect("Ready for your next task").state, State::Idle);
     }
 
     #[test]

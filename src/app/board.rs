@@ -3306,6 +3306,7 @@ mod tests {
             ("omp", "omp"),
             ("opencode", "opencode --prompt"),
             ("pi", "pi"),
+            ("qodercli", "qodercli --prompt-interactive"),
             ("qwen", "qwen --prompt-interactive"),
         ];
         assert_eq!(expected.len(), crate::agent::registry::descriptors().len());
