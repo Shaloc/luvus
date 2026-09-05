@@ -188,6 +188,29 @@ pub(super) fn draw_sidebar(
     app: &mut App,
     t: &Theme,
 ) -> SidebarHits {
+    draw_sidebar_mode(f, side, area, app, t, false)
+}
+
+/// Owner extensions remain usable in a workspace projection, without a second
+/// copy of whole-session workspace/agent navigation.
+pub(super) fn draw_workspace_sidebar(
+    f: &mut RenderTarget,
+    side: Side,
+    area: Rect,
+    app: &mut App,
+    t: &Theme,
+) {
+    draw_sidebar_mode(f, side, area, app, t, true);
+}
+
+fn draw_sidebar_mode(
+    f: &mut RenderTarget,
+    side: Side,
+    area: Rect,
+    app: &mut App,
+    t: &Theme,
+    workspace_only: bool,
+) -> SidebarHits {
     f.render_widget(Block::new().style(Style::new().bg(t.base)), area);
     {
         // Edge separator (standard vertical rule): the left sidebar carries it on
@@ -217,16 +240,22 @@ pub(super) fn draw_sidebar(
 
     // Chrome (brand + Menu on the left; a lone collapse chevron on the right),
     // then the dock body below it.
-    match side {
-        Side::Left => draw_left_chrome(f, area, app, t),
-        Side::Right => draw_right_chrome(f, area, app, t),
+    if !workspace_only {
+        match side {
+            Side::Left => draw_left_chrome(f, area, app, t),
+            Side::Right => draw_right_chrome(f, area, app, t),
+        }
     }
 
     // The dock stack fills the sidebar below the chrome (a single top row + one
     // blank separator row). The body is inset by one column on the separator side
     // so a dock never paints over the edge rule; the dock draw fns stay
     // side-agnostic.
-    let body_top = area.y.saturating_add(SIDEBAR_CHROME_ROWS);
+    let body_top = area.y.saturating_add(if workspace_only {
+        0
+    } else {
+        SIDEBAR_CHROME_ROWS
+    });
     let (body_x, body_w) = match side {
         Side::Left => (area.x, area.width),
         Side::Right => (area.x + 1, area.width.saturating_sub(1)),
@@ -237,14 +266,30 @@ pub(super) fn draw_sidebar(
         body_w,
         area.bottom().saturating_sub(body_top),
     );
-    let docks = app.sidebars.get(side).docks.clone();
-    let (slots, dividers) = dock_slots(body, &app.sidebars.get(side).dock_weights());
+    let (docks, weights): (Vec<_>, Vec<_>) = app
+        .sidebars
+        .get(side)
+        .docks
+        .iter()
+        .cloned()
+        .zip(app.sidebars.get(side).dock_weights())
+        .filter(|(dock, _)| {
+            !workspace_only
+                || matches!(dock, DockKind::Module(_))
+                || (*dock == DockKind::Files && app.files_focused)
+        })
+        .unzip();
+    let (slots, dividers) = dock_slots(body, &weights);
     // Publish the rules so a press can grab one. Recomputed every frame, so a
     // sidebar that stops being drawn leaves no stale drag target behind.
     app.dock_dividers.retain(|(s, _, _)| *s != side);
     for (i, &dy) in dividers.iter().enumerate() {
         draw_dock_divider(f, body, dy, t);
-        app.dock_dividers.push((side, i, dy));
+        // Filtered slots no longer share the full sidebar's positional indices.
+        // Owner Layout settings still control their stored height and order.
+        if !workspace_only {
+            app.dock_dividers.push((side, i, dy));
+        }
     }
 
     let mut ws_rects = Vec::new();
@@ -677,9 +722,12 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     // rest in workspace/tab order. Skipped entirely when nothing is pinned, which
     // is the common case: the sort itself is cheap, but it does a hash lookup per
     // comparison and this runs on every frame the dock is drawn.
-    if !app.pinned_agents.is_empty() {
+    if !app.pinned_agents.is_empty() || live.iter().any(|row| matches!(row, AgentDockRow::Remote(wi, ai) if app.remote_workspace_view(*wi).is_some_and(|view| view.agents[*ai].pinned))) {
         live.sort_by_key(
-            |row| !matches!(row, AgentDockRow::Local(id, _) if app.pinned_agents.contains(id)),
+            |row| match row {
+                AgentDockRow::Local(id, _) => !app.pinned_agents.contains(id),
+                AgentDockRow::Remote(wi, ai) => !app.remote_workspace_view(*wi).is_some_and(|view| view.agents[*ai].pinned),
+            },
         );
     }
     // Armed definitions appear in Active as lightweight placeholders. Their
@@ -693,61 +741,60 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         u64,
         bool,
         Option<crate::automation::ActiveTargetState>,
+        Option<PaneId>,
     )> = app
-        .automation
-        .automations
-        .iter()
-        .filter_map(|automation| {
-            if !automation.enabled {
-                return None;
-            }
-            let (workspace_index, workspace) = app
+        .scheduled_agent_rows()
+        .into_iter()
+        .filter_map(|row| {
+            let (index, workspace) = app
                 .workspaces
                 .iter()
                 .enumerate()
-                .find(|(_, workspace)| workspace.id == automation.task.workspace_id)?;
-            if scoped && workspace_index != app.active_ws {
+                .find(|(_, workspace)| workspace.id == row.workspace_id)?;
+            if scoped && index != app.active_ws {
                 return None;
             }
-            let live_run = app
-                .automation
-                .runs
-                .iter()
-                .rev()
-                .find(|run| run.automation_id == automation.id && run.status.is_live());
-            let pane_backed = live_run
-                .and_then(|run| run.task_id.as_deref())
-                .and_then(|task| app.orch.task(task))
-                .and_then(|task| task.assignee)
-                .is_some_and(|pane| app.panes.contains_key(&PaneId(pane)));
-            if pane_backed
-                || live_run.is_some_and(|run| {
-                    matches!(
-                        run.status,
-                        crate::automation::RunStatus::Running
-                            | crate::automation::RunStatus::Review
-                    )
-                })
-            {
-                return None;
-            }
-            let starting = live_run.is_some();
-            let deadline = live_run
-                .map(|run| run.scheduled_at)
-                .or(automation.next_run_at)?;
             Some((
-                automation.id.clone(),
-                automation.task.agent_id.clone(),
+                row.id,
+                row.agent,
                 workspace.name.clone(),
-                deadline,
-                starting,
-                app.automation
-                    .active_target_states
-                    .get(&automation.id)
-                    .copied(),
+                row.deadline,
+                row.starting,
+                row.target_state,
+                None,
             ))
         })
         .collect();
+    let mut remote_history = Vec::new();
+    for (index, workspace) in app.workspaces.iter().enumerate() {
+        if scoped && index != app.active_ws {
+            continue;
+        }
+        let Some(view) = app.remote_workspace_view(index) else {
+            continue;
+        };
+        let pane = workspace.tabs[0].layout.focus;
+        for row in &view.scheduled {
+            scheduled.push((
+                row.id.clone(),
+                if paths_visible {
+                    row.agent.clone()
+                } else {
+                    format!("[{}] {}", view.target.host, row.agent)
+                },
+                format!("[{}] {}", view.target.host, workspace.name),
+                row.deadline,
+                row.starting,
+                row.target_state,
+                Some(pane),
+            ));
+        }
+        if !active_only {
+            for row in &view.history {
+                remote_history.push((pane, row.clone(), view.target.host.clone()));
+            }
+        }
+    }
     scheduled.sort_by_key(|item| item.3);
     // Scope resumable history by workspace ownership too. Longest matching root
     // wins, matching pane-home semantics when workspaces are nested. Keep the
@@ -780,7 +827,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     } else {
         app.resumable.len()
     };
-    let atotal = live.len() + scheduled.len() + resumable_total;
+    let atotal = live.len() + scheduled.len() + resumable_total + remote_history.len();
     // The overflow line is always visible while attention is hidden, even if no
     // local rows exist. Reserve exactly one terminal row for it.
     let blocked_count = blocked_elsewhere.len() + remote_blocked_elsewhere.len();
@@ -856,7 +903,12 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                             target.host,
                             agent.name.as_deref().unwrap_or(&agent.pane)
                         );
-                        let presentation = (agent.state, agent.agent.clone(), focused, meta);
+                        let name = if paths_visible {
+                            agent.agent.clone()
+                        } else {
+                            format!("[{}] {}", target.host, agent.agent)
+                        };
+                        let presentation = (agent.state, name, focused, meta);
                         let hit = (target.clone(), agent.pane.clone(), rect);
                         app.remote_agent_rects.push(hit);
                         presentation
@@ -900,13 +952,16 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         }
                     }
                 }
-            } else if let Some((automation, agent, workspace, deadline, starting, target_state)) =
+            } else if let Some((automation, agent, workspace, deadline, starting, target_state, owner)) =
                 scheduled.get(k.saturating_sub(live.len()))
             {
-                automation_rects.push((
-                    automation.clone(),
-                    Rect::new(area.x, y, area.width, row_stride),
-                ));
+                let rect = Rect::new(area.x, y, area.width, row_stride);
+                if let Some(view) = owner {
+                    app.remote_automation_rects
+                        .push((*view, automation.clone(), rect));
+                } else {
+                    automation_rects.push((automation.clone(), rect));
+                }
                 let (status, status_color) = match target_state {
                     Some(crate::automation::ActiveTargetState::Restoring) => {
                         (cat.automation_restoring, t.amber)
@@ -947,17 +1002,41 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             } else {
                 // A resumable session discovered on disk — click to reopen.
                 let visible_index = k - live.len() - scheduled.len();
-                let si = if scoped {
-                    resumable_scoped[visible_index]
-                } else {
-                    visible_index
-                };
-                let s = &app.resumable[si];
                 let row = Rect::new(area.x, y, area.width, row_stride);
-                session_rects.push((si, row));
+                let (agent, proj) = if visible_index >= resumable_total {
+                    let (view, session, host) = &remote_history[visible_index - resumable_total];
+                    app.remote_history_rects.push((*view, session.key, row));
+                    let project = std::path::Path::new(&session.cwd)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("project");
+                    let agent = if paths_visible {
+                        session.agent.clone()
+                    } else {
+                        format!("[{host}] {}", session.agent)
+                    };
+                    (agent, format!("[{host}] {project}"))
+                } else {
+                    let si = if scoped {
+                        resumable_scoped[visible_index]
+                    } else {
+                        visible_index
+                    };
+                    let session = &app.resumable[si];
+                    session_rects.push((si, row));
+                    (
+                        session.agent.clone(),
+                        session
+                            .cwd
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("project")
+                            .to_string(),
+                    )
+                };
                 let label = " resume  ";
                 let prefix_w = 1 + crate::ui::display_width(label);
-                let name = crate::ui::truncate(&s.agent, (cw as usize).saturating_sub(prefix_w));
+                let name = crate::ui::truncate(&agent, (cw as usize).saturating_sub(prefix_w));
                 line_at(
                     f,
                     y,
@@ -968,11 +1047,6 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     ]),
                 );
                 if paths_visible {
-                    let proj = s
-                        .cwd
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("project");
                     line_at(
                         f,
                         y + 1,

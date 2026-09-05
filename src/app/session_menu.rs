@@ -70,6 +70,8 @@ impl NamedSessionPrompt {
 
 #[derive(Debug)]
 pub struct NamedSessionMenu {
+    /// Ephemeral display-client origin for generation-fenced async navigation.
+    pub client_id: Option<u64>,
     pub generation: u64,
     pub rows: Vec<NamedSessionRow>,
     pub hosts: Vec<String>,
@@ -178,6 +180,7 @@ impl App {
         self.named_session_generation = self.named_session_generation.wrapping_add(1);
         let generation = self.named_session_generation;
         self.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             generation,
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -569,7 +572,7 @@ impl App {
         });
     }
 
-    fn prepare_remote_session(
+    pub(super) fn prepare_remote_session(
         &mut self,
         target: crate::session::remote::RemoteSession,
         merge: bool,
@@ -595,10 +598,12 @@ impl App {
                     {
                         return Err(NamedSessionOpenError::Exists);
                     }
-                    // Connecting the control bridge creates the selected remote
-                    // server through its normal lifecycle. No binary is copied.
-                    crate::session::remote::ensure_session(&target)
-                        .map_err(NamedSessionOpenError::Failed)?;
+                }
+                // Only this explicit open/create action has startup authority;
+                // discovery, CLI controls and frame subscriptions never do.
+                crate::session::remote::ensure_session(&target)
+                    .map_err(NamedSessionOpenError::Failed)?;
+                if register {
                     crate::session::remote::add_session(target.clone(), merge)
                         .map_err(NamedSessionOpenError::Failed)?;
                 }
@@ -814,6 +819,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             generation: 7,
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -842,6 +848,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             generation: 1,
             rows: vec![
                 NamedSessionRow {
@@ -890,6 +897,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             generation: 1,
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -920,6 +928,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             generation: 4,
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -978,6 +987,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             generation: 1,
             rows: Vec::new(),
             hosts: vec!["build-box".into(), "dev-207".into()],
@@ -1018,6 +1028,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             hosts: Vec::new(),
             generation: 8,
             rows: vec![NamedSessionRow {
@@ -1051,6 +1062,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             hosts: Vec::new(),
             generation: 5,
             rows: vec![NamedSessionRow {
@@ -1080,6 +1092,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             hosts: Vec::new(),
             generation: 3,
             rows: vec![NamedSessionRow {
@@ -1105,11 +1118,59 @@ mod tests {
     }
 
     #[test]
+    fn session_context_menu_accounts_for_both_new_session_rows() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("named-session-context-row-offset");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
+            hosts: Vec::new(),
+            generation: 1,
+            rows: vec![NamedSessionRow {
+                name: "other".into(),
+                running: true,
+                current: false,
+                remote: None,
+                merged: false,
+            }],
+            cursor: 0,
+            scroll: 0,
+            loading: false,
+            prompt: None,
+            error: None,
+            preparing: false,
+        });
+        app.named_session_row_rects = (0..3)
+            .map(|index| {
+                (
+                    index,
+                    ratatui::layout::Rect::new(5, 5 + index as u16, 20, 1),
+                )
+            })
+            .collect();
+        for index in [0, 1, 2] {
+            app.handle_event(crate::event::AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: 6,
+                row: 5 + index,
+                modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+            }));
+            if index < super::NEW_SESSION_ROWS as u16 {
+                assert!(app.session_menu.is_none());
+            } else {
+                assert_eq!(app.session_menu.as_ref().unwrap().name, "other");
+            }
+        }
+    }
+
+    #[test]
     fn open_session_menu_creating_flag_blocks_stop_until_ready() {
         let _env = crate::persist::test_env("named-session-menu-preparing-guard");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
             hosts: Vec::new(),
             generation: 1,
             rows: vec![NamedSessionRow {

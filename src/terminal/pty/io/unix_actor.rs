@@ -231,6 +231,8 @@ fn actor_loop(
                 &mut read_buffer,
                 &engine,
                 &content_revision,
+                id,
+                &app_tx,
             ) {
                 Ok(ReadState::Data) => {
                     let now = Instant::now();
@@ -409,6 +411,8 @@ fn read_available(
     buffer: &mut [u8],
     engine: &Arc<Mutex<dyn VtEngine>>,
     content_revision: &AtomicU64,
+    id: PaneId,
+    app_tx: &mpsc::Sender<AppEvent>,
 ) -> io::Result<ReadState> {
     let mut budget = IO_BUDGET;
     let mut read_any = false;
@@ -457,6 +461,11 @@ fn read_available(
     if advanced_any {
         content_revision.fetch_add(1, Ordering::Release);
     }
+    let clipboard = terminal.as_deref_mut().and_then(VtEngine::take_clipboard);
+    drop(terminal);
+    if let Some(text) = clipboard {
+        let _ = app_tx.send(AppEvent::PtyClipboard { pane: id, text });
+    }
     Ok(state)
 }
 
@@ -504,6 +513,74 @@ mod tests {
         );
         pending.clear(); // Same RAII release used by write completion/cancellation.
         tx.send(InputAction::Bytes(vec![1])).unwrap();
+    }
+
+    #[test]
+    fn osc52_socket_capture_uses_real_unix_output_reader() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        use crate::terminal::appearance::PaneAppearance;
+        use crate::terminal::vt::{create_engine, VtEngineKind};
+
+        // An anonymous socket pair exercises the production read path without
+        // starting a shell/server, attaching a client, or touching a clipboard.
+        let (reader, mut writer) = UnixStream::pair().expect("anonymous byte source");
+        reader.set_nonblocking(true).unwrap();
+        let (input_tx, input_rx) = mpsc::channel();
+        let (app_tx, app_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::default(),
+            20,
+            3,
+            input_tx,
+            64 * 1024,
+            PaneAppearance::default(),
+        );
+        let revision = AtomicU64::new(0);
+        let pane = PaneId(42);
+        writer
+            .write_all(b"\x1b]52;c;Zmlyc3Q=\x07\x1b]52;c;bnZpbSB5YW5r\x1b\\")
+            .unwrap();
+        assert!(matches!(
+            read_available(
+                reader.as_raw_fd(),
+                &mut [0; 7],
+                &engine,
+                &revision,
+                pane,
+                &app_tx,
+            ),
+            Ok(ReadState::Data)
+        ));
+        match app_rx.try_recv().expect("copy propagated from byte source") {
+            AppEvent::PtyClipboard { pane: owner, text } => {
+                assert_eq!(owner, pane);
+                assert_eq!(text, "nvim yank");
+            }
+            _ => panic!("expected the child clipboard effect"),
+        }
+        assert!(app_rx.try_recv().is_err());
+        assert!(input_rx.try_recv().is_err());
+        assert!(engine.lock().unwrap().take_clipboard().is_none());
+        assert_eq!(
+            revision.load(Ordering::Acquire),
+            1,
+            "split kernel reads retain one revision update per bounded drain"
+        );
+        assert!(matches!(
+            read_available(
+                reader.as_raw_fd(),
+                &mut [0; 7],
+                &engine,
+                &revision,
+                pane,
+                &app_tx,
+            ),
+            Ok(ReadState::WouldBlock)
+        ));
+        assert!(app_rx.try_recv().is_err(), "a copy is forwarded only once");
+        assert_eq!(revision.load(Ordering::Acquire), 1);
     }
 
     #[test]

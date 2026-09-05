@@ -121,7 +121,8 @@ impl App {
         workspace_cwd: &std::path::Path,
         leaves: &[PaneId],
     ) -> Option<usize> {
-        if self.workspaces.get(workspace)?.cwd != workspace_cwd {
+        let owner = self.workspaces.get(workspace)?;
+        if owner.remote.is_some() || owner.cwd != workspace_cwd {
             return None;
         }
         self.resolve_tab_menu_target(&super::TabMenuTarget {
@@ -136,10 +137,9 @@ impl App {
         self.recent_files
             .iter()
             .filter_map(|(workspace_cwd, path)| {
-                let ws = self
-                    .workspaces
-                    .iter()
-                    .position(|workspace| workspace.cwd == *workspace_cwd)?;
+                let ws = self.workspaces.iter().position(|workspace| {
+                    workspace.remote.is_none() && workspace.cwd == *workspace_cwd
+                })?;
                 let workspace = &self.workspaces[ws];
                 let relative = path
                     .strip_prefix(workspace_cwd)
@@ -175,11 +175,25 @@ impl App {
             for info in sessions {
                 let current = info.name == session;
                 let state = if info.running { "running" } else { "stopped" };
+                let remote = self
+                    .workspaces
+                    .iter()
+                    .filter_map(|workspace| workspace.remote.as_ref())
+                    .map(|owner| (&owner.host, &owner.session))
+                    .find(|(host, name)| format!("remote-{host}-{name}") == info.name)
+                    .or_else(|| {
+                        crate::session::remote::view_target()
+                            .filter(|owner| owner.canonical_name() == info.name)
+                            .map(|owner| (&owner.host, &owner.session))
+                    });
                 out.push(SearchEntry::new(
                     format!("session:{}", info.name),
                     SearchKind::Session,
-                    info.name.clone(),
-                    state.into(),
+                    remote.map_or_else(|| info.name.clone(), |(_, name)| name.clone()),
+                    remote.map_or_else(
+                        || state.into(),
+                        |(host, _)| format!("[remote · {host}] {state}"),
+                    ),
                     [],
                     SearchTarget::Session {
                         name: info.name,
@@ -192,6 +206,11 @@ impl App {
         }
 
         for (wi, ws) in self.workspaces.iter().enumerate() {
+            // A projection's single native view is not an owner tab or pane.
+            // Its actual navigation metadata comes from that owner's catalog.
+            if ws.remote.is_some() {
+                continue;
+            }
             out.push(SearchEntry::new(
                 format!("workspace:{wi}"),
                 SearchKind::Workspace,
@@ -276,6 +295,23 @@ impl App {
         out
     }
 
+    fn search_file_roots(&self) -> Vec<(usize, String, std::path::PathBuf)> {
+        self.workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| workspace.remote.is_none())
+            .map(|(ws, workspace)| (ws, workspace.name.clone(), workspace.cwd.clone()))
+            .collect()
+    }
+
+    fn search_remote_owners(&self) -> Vec<String> {
+        self.workspaces
+            .iter()
+            .filter_map(|workspace| workspace.remote.as_ref())
+            .map(|owner| format!("remote-{}-{}", owner.host, owner.session))
+            .collect()
+    }
+
     /// Start a public fuzzy query without blocking the single-writer app loop.
     /// The connection's reply channel is fulfilled by this bounded worker.
     pub fn start_search_api(&self, request: crate::ipc::api::ApiRequest) {
@@ -328,12 +364,8 @@ impl App {
             .unwrap_or(false);
         let metadata = self.search_metadata();
         let output_targets = self.search_output_targets();
-        let roots: Vec<_> = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .map(|(ws, workspace)| (ws, workspace.name.clone(), workspace.cwd.clone()))
-            .collect();
+        let roots = self.search_file_roots();
+        let remote_owners = self.search_remote_owners();
         std::thread::spawn(move || {
             let fuzzy = FuzzyQuery::new(&query, false);
             let (mut matches, mut total) = rank_entries(&metadata, &fuzzy, scope, RESULT_CAP);
@@ -354,7 +386,8 @@ impl App {
                 capped |= partial;
             }
             if all_sessions {
-                let (sessions, session_cap) = crate::search::federation::running_sessions();
+                let (sessions, session_cap) =
+                    crate::search::federation::sessions_with_owners(remote_owners);
                 capped |= session_cap;
                 for session in sessions {
                     if !crate::search::federation::session_supports_search(&session) {
@@ -401,7 +434,11 @@ impl App {
     fn search_output_targets(&self) -> Vec<OutputTarget> {
         let session = crate::session::display_name();
         let mut targets = Vec::new();
-        for ws in &self.workspaces {
+        for ws in self
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.remote.is_none())
+        {
             for (ti, tab) in ws.tabs.iter().enumerate() {
                 for id in tab.layout.leaves() {
                     let Some(pane) = self.panes.get(&id) else {
@@ -430,12 +467,7 @@ impl App {
         let recent_files = self.search_recent_files();
         let metadata = self.search_metadata();
         let output_targets = self.search_output_targets();
-        let roots: Vec<_> = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .map(|(ws, workspace)| (ws, workspace.name.clone(), workspace.cwd.clone()))
-            .collect();
+        let roots = self.search_file_roots();
         let (tx, rx) = mpsc::channel::<SearchRequest>();
         let app_tx = self.app_tx.clone();
         std::thread::spawn(move || {
@@ -481,7 +513,8 @@ impl App {
             }
         });
 
-        let (session_names, session_list_partial) = crate::search::federation::running_sessions();
+        let (session_names, session_list_partial) =
+            crate::search::federation::sessions_with_owners(self.search_remote_owners());
         let federation = if session_names.is_empty() {
             None
         } else {
@@ -810,11 +843,9 @@ impl App {
                 path,
                 workspace_cwd,
             } => {
-                if self
-                    .workspaces
-                    .get(ws)
-                    .is_some_and(|workspace| workspace.cwd == workspace_cwd)
-                {
+                if self.workspaces.get(ws).is_some_and(|workspace| {
+                    workspace.remote.is_none() && workspace.cwd == workspace_cwd
+                }) {
                     self.active_ws = ws;
                     self.open_file_search_result(path);
                 }
@@ -839,6 +870,31 @@ impl App {
                 });
             }
         }
+    }
+
+    pub(super) fn finish_search_handoff(
+        &mut self,
+        session: String,
+        activation: crate::search::federation::SearchActivation,
+    ) {
+        let Some(owner) = activation.remote else {
+            self.pending_session_switch = Some(session);
+            return;
+        };
+        if let Some(index) = self.workspaces.iter().position(|workspace| {
+            workspace.remote.as_ref().is_some_and(|remote| {
+                remote.host == owner.host
+                    && remote.session == owner.session
+                    && Some(remote.workspace_id.as_str()) == activation.workspace_id.as_deref()
+            })
+        }) {
+            self.active_ws = index;
+            return;
+        }
+        // An owner may have gained a workspace after the catalog was queried.
+        // Reuse session preparation; never interpret its file path locally.
+        self.open_named_session_menu();
+        self.prepare_remote_session(owner, self.remote_merge_enabled, false);
     }
 
     /// Revalidate and activate one structured result returned by this session's
@@ -868,7 +924,7 @@ impl App {
                     .ok_or_else(|| "target.workspace_path is required".to_string())?;
                 self.workspaces
                     .get(ws)
-                    .filter(|workspace| workspace.cwd == expected)
+                    .filter(|workspace| workspace.remote.is_none() && workspace.cwd == expected)
                     .map(|_| ws)
                     .ok_or_else(|| "target workspace no longer exists".to_string())
             };
@@ -968,7 +1024,8 @@ impl App {
         match result {
             Ok(()) => serde_json::json!({
                 "id": request.id,
-                "result": { "type": "search_activation", "activated": true }
+                "result": { "type": "search_activation", "activated": true,
+                    "workspace_id": self.workspaces.get(self.active_ws).map(|workspace| workspace.id.clone()) }
             })
             .to_string(),
             Err(message) => api_error(&request.id, &message),
@@ -1411,14 +1468,22 @@ fn search_match_json(found: &SearchMatch) -> serde_json::Value {
         }),
         SearchTarget::Remote { target, .. } => target.clone(),
     };
-    serde_json::json!({
+    let mut value = serde_json::json!({
         "id": found.entry.id,
         "kind": found.entry.kind.label(),
         "label": found.entry.label,
         "detail": found.entry.detail,
         "score": found.score,
         "target": target,
-    })
+    });
+    if let SearchTarget::Remote { session, .. } = &found.entry.target {
+        value["owner_session"] = serde_json::json!(session);
+        if let Ok(Some(owner)) = crate::session::remote::resolve_canonical(session) {
+            value["owner_session"] = serde_json::json!(owner.session);
+            value["host"] = serde_json::json!(owner.host);
+        }
+    }
+    value
 }
 
 fn sort_and_cap(matches: &mut Vec<SearchMatch>) {
@@ -1438,6 +1503,123 @@ mod tests {
 
     fn key(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn remote_search_roots_and_recent_files_never_alias_local_paths() {
+        let _env = crate::persist::test_env("remote-search-roots");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let cwd = app.workspaces[0].cwd.clone();
+        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
+            host: "fake-dev".into(),
+            session: "api".into(),
+            workspace_id: "owner-workspace".into(),
+        });
+        assert!(app.create_workspace_at(cwd.clone()));
+        app.recent_files
+            .push_back((cwd.clone(), cwd.join("Cargo.toml")));
+        let roots = app.search_file_roots();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].0, 1);
+        assert!(app
+            .search_recent_files()
+            .iter()
+            .all(|entry| matches!(entry.target, SearchTarget::File { ws: 1, .. })));
+        assert!(!app.search_metadata().iter().any(|entry| matches!(
+            entry.target,
+            SearchTarget::Workspace { ws: 0, .. } | SearchTarget::Tab { ws: 0, .. }
+        )));
+        assert_eq!(app.search_remote_owners(), vec!["remote-fake-dev-api"]);
+    }
+
+    #[test]
+    fn remote_search_api_does_not_index_a_same_path_on_the_local_machine() {
+        let _env = crate::persist::test_env("remote-search-api-roots");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
+            host: "fake-dev".into(),
+            session: "api".into(),
+            workspace_id: "owner-workspace".into(),
+        });
+        let (reply, response) = mpsc::channel();
+        app.start_search_api(crate::ipc::api::ApiRequest {
+            id: "private-owner".into(), method: "search.query".into(),
+            params: serde_json::json!({"query":"Cargo.toml", "scope":"files", "all_sessions":false}), reply,
+        });
+        let value: serde_json::Value = serde_json::from_str(
+            &response
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["result"]["matches"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remote_search_activation_rejects_local_interpretation_of_an_owner_file() {
+        let _env = crate::persist::test_env("remote-search-file-activation");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let cwd = app.workspaces[0].cwd.clone();
+        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
+            host: "fake-dev".into(),
+            session: "api".into(),
+            workspace_id: "owner-workspace".into(),
+        });
+        let request = crate::ipc::api::ApiRequest {
+            id: "private-owner".into(),
+            method: "search.activate".into(),
+            params: serde_json::json!({"kind":"file", "target":{
+                "workspace":0, "workspace_path":cwd, "path":cwd.join("Cargo.toml")}}),
+            reply: mpsc::channel().0,
+        };
+        let before = app.views.len();
+        let value: serde_json::Value =
+            serde_json::from_str(&app.handle_search_activate(&request)).unwrap();
+        assert!(value.get("error").is_some());
+        assert_eq!(app.views.len(), before);
+    }
+
+    #[test]
+    fn remote_search_handoff_focuses_exact_owner_projection_without_switching_clients() {
+        let _env = crate::persist::test_env("remote-search-owner-focus");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let cwd = app.workspaces[0].cwd.clone();
+        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
+            host: "another-host".into(),
+            session: "api".into(),
+            workspace_id: "same-id".into(),
+        });
+        assert!(app.create_workspace_at(cwd));
+        app.workspaces[1].remote = Some(crate::app::remote::RemoteWorkspaceRef {
+            host: "fake-dev".into(),
+            session: "api".into(),
+            workspace_id: "same-id".into(),
+        });
+        app.active_ws = 0;
+        app.finish_search_handoff(
+            "remote-fake-dev-api".into(),
+            crate::search::federation::SearchActivation {
+                remote: Some(
+                    crate::session::remote::RemoteSession::new("fake-dev", "api").unwrap(),
+                ),
+                workspace_id: Some("same-id".into()),
+            },
+        );
+        assert_eq!(app.active_ws, 1);
+        assert!(app.pending_session_switch.is_none());
+        assert!(app.named_session_menu.is_none());
+        app.finish_search_handoff(
+            "sibling".into(),
+            crate::search::federation::SearchActivation {
+                remote: None,
+                workspace_id: None,
+            },
+        );
+        assert_eq!(app.pending_session_switch.as_deref(), Some("sibling"));
     }
 
     #[test]

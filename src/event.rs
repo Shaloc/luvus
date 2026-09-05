@@ -16,6 +16,7 @@ use crate::terminal::theme_probe::TerminalColors;
 /// performs hit-testing or forwards bytes to a pane.
 pub enum ClientInput {
     Key(KeyEvent),
+    PrefixKey(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
     ClipboardImage(crate::terminal::clipboard::ClipboardImage),
@@ -26,6 +27,7 @@ pub enum ClientInput {
 pub enum AppEvent {
     IoCompleted(crate::app::io_jobs::Completion),
     Key(KeyEvent),
+    PrefixKey(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
     ClipboardImage(crate::terminal::clipboard::ClipboardImage),
@@ -37,6 +39,11 @@ pub enum AppEvent {
     Resize,
     /// The given pane produced output; the screen changed.
     PtyData(PaneId),
+    /// Child OSC52 clipboard writes are effects, independent of frame redraws.
+    PtyClipboard {
+        pane: PaneId,
+        text: String,
+    },
     /// The given pane's child process exited.
     PtyExit(PaneId),
     /// Coalesced overload notification for all input sources, including replies.
@@ -141,7 +148,7 @@ pub enum AppEvent {
     /// A target in another session was revalidated and focused by its owner.
     SearchHandoffReady {
         session: String,
-        result: Result<(), String>,
+        result: Result<crate::search::federation::SearchActivation, String>,
     },
     /// A user-requested snapshot of known named sessions completed off-loop.
     NamedSessionsLoaded {

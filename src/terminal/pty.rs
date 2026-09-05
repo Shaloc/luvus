@@ -439,6 +439,8 @@ impl Pane {
         if let Some(screen) = initial {
             if let Ok(mut e) = engine.lock() {
                 e.advance(screen.as_bytes());
+                // Restoring terminal pixels must not repeat a historical copy.
+                e.take_clipboard();
             }
         }
 
@@ -520,6 +522,7 @@ impl Pane {
         if let Some(screen) = initial {
             if let Ok(mut engine) = engine.lock() {
                 engine.advance(screen.as_bytes());
+                engine.take_clipboard();
             }
         }
 
@@ -1188,6 +1191,28 @@ fn path_with_server_binary(exe: &Path, inherited: Option<OsString>) -> Option<Os
     std::env::join_paths(entries).ok()
 }
 
+/// Parse a Windows PTY read and forward its clipboard effect outside the VT
+/// lock. The Unix actor performs the same effect after its bounded read batch.
+#[cfg(any(windows, test))]
+fn advance_output(
+    id: PaneId,
+    bytes: &[u8],
+    engine: &Arc<Mutex<dyn VtEngine>>,
+    content_revision: &AtomicU64,
+    tx: &Sender<AppEvent>,
+) {
+    let clipboard = if let Ok(mut engine) = engine.lock() {
+        engine.advance(bytes);
+        content_revision.fetch_add(1, Ordering::Release);
+        engine.take_clipboard()
+    } else {
+        None
+    };
+    if let Some(text) = clipboard {
+        let _ = tx.send(AppEvent::PtyClipboard { pane: id, text });
+    }
+}
+
 #[cfg(windows)]
 fn read_loop(
     id: PaneId,
@@ -1205,10 +1230,7 @@ fn read_loop(
                 break;
             }
             Ok(n) => {
-                if let Ok(mut e) = engine.lock() {
-                    e.advance(&buf[..n]);
-                    content_revision.fetch_add(1, Ordering::Release);
-                }
+                advance_output(id, &buf[..n], &engine, &content_revision, &tx);
                 // Announce new output only when no announcement is already in
                 // flight — the loop reads the engine's *latest* state anyway,
                 // so a burst needs one wakeup, not one per read.
@@ -1219,6 +1241,43 @@ fn read_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn osc52_live_output_reaches_app_even_when_pty_data_is_coalesced() {
+        let (input_tx, input_rx) = mpsc::channel();
+        let (app_tx, app_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::default(),
+            20,
+            3,
+            input_tx,
+            64 * 1024,
+            PaneAppearance::default(),
+        );
+        let revision = AtomicU64::new(0);
+        let pane = PaneId(23);
+        // No PtyData event is needed to carry either copy. The same live-read
+        // helper is called by the Unix actor and Windows reader.
+        advance_output(pane, b"\x1b]52;c;Zmlyc3Q=\x07", &engine, &revision, &app_tx);
+        advance_output(pane, b"\x1b]52;c;c2Vjb25k\x07", &engine, &revision, &app_tx);
+        for expected in ["first", "second"] {
+            match app_rx.try_recv().expect("clipboard event") {
+                AppEvent::PtyClipboard { pane: owner, text } => {
+                    assert_eq!(owner, pane);
+                    assert_eq!(text, expected);
+                }
+                _ => panic!("expected clipboard, not a coalesced screen event"),
+            }
+        }
+        assert_eq!(revision.load(Ordering::Acquire), 2);
+        assert!(app_rx.try_recv().is_err());
+        assert!(input_rx.try_recv().is_err());
     }
 }
 

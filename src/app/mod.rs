@@ -45,6 +45,7 @@ mod persistence;
 mod picker;
 mod preview;
 pub(crate) mod remote;
+pub(crate) mod remote_agents;
 mod search;
 pub(crate) mod session_menu;
 mod settings;
@@ -123,6 +124,10 @@ pub enum AgentDockTarget {
     Automation(String),
     Session(usize),
     Elsewhere(PaneId),
+    RemoteLive { view: PaneId, pane: String },
+    RemoteAutomation { view: PaneId, id: String },
+    RemoteSession { view: PaneId, key: [u8; 32] },
+    RemoteElsewhere { view: PaneId, pane: String },
 }
 
 impl DockKind {
@@ -581,6 +586,9 @@ pub enum WsMenuItem {
     OpenOrch,
     /// Open the Mission Control dashboard for this node (docs/54).
     OpenMission,
+    /// Explicit owner-host controls; the ordinary Settings shortcut is local.
+    OwnerSettings,
+    OwnerModules,
     Module(usize),
 }
 
@@ -979,6 +987,8 @@ pub enum AgentTarget {
     Session(usize),
     Live(PaneId),
     Automation(String),
+    RemoteLive { view: PaneId, pane: PaneId },
+    RemoteSession { view: PaneId, key: [u8; 32] },
 }
 
 /// A right-click context menu on an AGENTS-list row. A resumable session offers
@@ -993,6 +1003,8 @@ pub struct AgentMenu {
     pub selected: Option<usize>,
     /// Module actions offered here, snapshotted when the menu opened (docs/13 §3.8).
     pub module_actions: Vec<ModuleMenuAction>,
+    /// A projected owner's secondary menu does not control the outer dock scope.
+    pub owner_only: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1012,6 +1024,7 @@ pub enum AgentMenuItem {
     Unpin,
     /// Toggle the persisted path/detail line for every AGENTS row.
     TogglePath,
+    OwnerActions,
     Divider,
     /// The `i`-th module action declaring `contexts = ["agent"]` (docs/13 §3.8).
     Module(usize),
@@ -1021,14 +1034,18 @@ impl AgentMenu {
     /// The built-in items for a given target, in render order.
     pub fn items_for(target: AgentTarget) -> Vec<AgentMenuItem> {
         match target {
-            AgentTarget::Session(_) => vec![AgentMenuItem::Resume, AgentMenuItem::Close],
-            AgentTarget::Live(_) => vec![AgentMenuItem::RenamePane, AgentMenuItem::Close],
             AgentTarget::Automation(_) => vec![
                 AgentMenuItem::AutomationDetails,
                 AgentMenuItem::AutomationRun,
                 AgentMenuItem::AutomationToggle,
                 AgentMenuItem::AutomationDelete,
             ],
+            AgentTarget::Session(_) | AgentTarget::RemoteSession { .. } => {
+                vec![AgentMenuItem::Resume, AgentMenuItem::Close]
+            }
+            AgentTarget::Live(_) | AgentTarget::RemoteLive { .. } => {
+                vec![AgentMenuItem::RenamePane, AgentMenuItem::Close]
+            }
         }
     }
 }
@@ -2355,6 +2372,10 @@ pub struct App {
     /// are added only by explicit startup/menu merge discovery and removed when
     /// that bounded worker exits; there is no idle polling.
     remote_session_watchers: std::collections::HashMap<String, remote::RemoteWatcher>,
+    /// A pointer gesture begun in a remote frame must release on that same
+    /// owner even when it crosses the local sidebar or the workspace changes.
+    remote_mouse_capture: Option<(PaneId, Rect, ratatui::crossterm::event::MouseButton)>,
+    pending_remote_navigation: Option<remote::PendingRemoteNavigation>,
     remote_registry_generation: u64,
     pub(crate) remote_host_status: Vec<crate::session::remote::HostStatus>,
     pub(crate) remote_merge_enabled: bool,
@@ -2685,6 +2706,8 @@ pub struct App {
     /// when no pane exists to receive the live-agent menu.
     pub automation_rects: Vec<(String, Rect)>,
     pub remote_agent_rects: Vec<(remote::RemoteWorkspaceRef, String, Rect)>,
+    pub remote_history_rects: Vec<(PaneId, [u8; 32], Rect)>,
+    pub remote_automation_rects: Vec<(PaneId, String, Rect)>,
     /// Resumable-session rows in the sidebar (index into `resumable`).
     pub session_rects: Vec<(usize, Rect)>,
     /// The ✕ delete buttons on hovered resumable rows (index into `resumable`).
@@ -2952,6 +2975,8 @@ impl App {
             named_session_row_rects: Vec::new(),
             named_session_generation: 0,
             remote_session_watchers: std::collections::HashMap::new(),
+            remote_mouse_capture: None,
+            pending_remote_navigation: None,
             remote_registry_generation: 0,
             remote_host_status: Vec::new(),
             remote_merge_enabled: crate::session::remote::load_registry().merge_enabled(),
@@ -3102,6 +3127,8 @@ impl App {
             agent_rects: Vec::new(),
             automation_rects: Vec::new(),
             remote_agent_rects: Vec::new(),
+            remote_history_rects: Vec::new(),
+            remote_automation_rects: Vec::new(),
             session_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             new_ws_rect: None,
@@ -3620,6 +3647,8 @@ impl App {
             named_session_row_rects: Vec::new(),
             named_session_generation: 0,
             remote_session_watchers: std::collections::HashMap::new(),
+            remote_mouse_capture: None,
+            pending_remote_navigation: None,
             remote_registry_generation: 0,
             remote_host_status: Vec::new(),
             remote_merge_enabled: crate::session::remote::load_registry().merge_enabled(),
@@ -3770,6 +3799,8 @@ impl App {
             agent_rects: Vec::new(),
             automation_rects: Vec::new(),
             remote_agent_rects: Vec::new(),
+            remote_history_rects: Vec::new(),
+            remote_automation_rects: Vec::new(),
             session_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             new_ws_rect: None,
@@ -3980,11 +4011,18 @@ impl App {
             .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
             .map(|tab| tab.layout.focus);
         let rows = self.agent_dock_targets();
-        self.agent_cursor = current
+        let current_remote = self.remote_workspace_view(self.active_ws).and_then(|remote| {
+            let pane = remote.agents.iter().find(|agent| agent.focused)?.pane.clone();
+            Some(AgentDockTarget::RemoteLive { view: current?, pane })
+        });
+        self.agent_cursor = current_remote
+            .as_ref()
+            .and_then(|current| rows.iter().position(|target| target == current))
+            .or_else(|| current
             .and_then(|pane| {
                 rows.iter()
                     .position(|target| *target == AgentDockTarget::Live(pane))
-            })
+            }))
             .unwrap_or_else(|| self.agent_cursor.min(rows.len().saturating_sub(1)));
     }
 
@@ -3994,8 +4032,26 @@ impl App {
         let scoped = self.agents_scope_active();
         let mut live = Vec::new();
         let mut blocked_elsewhere = Vec::new();
+        let mut remote_blocked_elsewhere = Vec::new();
         for (workspace_index, workspace) in self.workspaces.iter().enumerate() {
             let visible = !scoped || workspace_index == self.active_ws;
+            if let Some(remote) = self.remote_workspace_view(workspace_index) {
+                let view = workspace.tabs[0].layout.focus;
+                for agent in &remote.agents {
+                    if visible {
+                        live.push((agent.pinned, AgentDockTarget::RemoteLive {
+                            view,
+                            pane: agent.pane.clone(),
+                        }));
+                    } else if agent.state == State::Blocked {
+                        remote_blocked_elsewhere.push(AgentDockTarget::RemoteElsewhere {
+                            view,
+                            pane: agent.pane.clone(),
+                        });
+                    }
+                }
+                continue;
+            }
             for tab in &workspace.tabs {
                 for pane in tab.layout.leaves() {
                     let Some(status) = self.status.get(&pane) else {
@@ -4005,67 +4061,56 @@ impl App {
                         continue;
                     }
                     if visible {
-                        live.push(pane);
+                        live.push((self.pinned_agents.contains(&pane), AgentDockTarget::Live(pane)));
                     } else if status.state == State::Blocked {
                         blocked_elsewhere.push(pane);
                     }
                 }
             }
         }
-        if !self.pinned_agents.is_empty() {
-            live.sort_by_key(|pane| !self.pinned_agents.contains(pane));
+        if live.iter().any(|(pinned, _)| *pinned) {
+            live.sort_by_key(|(pinned, _)| !*pinned);
         }
 
-        let mut rows: Vec<AgentDockTarget> = live.into_iter().map(AgentDockTarget::Live).collect();
-        let mut scheduled: Vec<(u64, String)> = self
-            .automation
-            .automations
-            .iter()
-            .filter_map(|automation| {
-                if !automation.enabled {
-                    return None;
-                }
+        let mut rows: Vec<AgentDockTarget> = live.into_iter().map(|(_, target)| target).collect();
+        let mut scheduled: Vec<(u64, AgentDockTarget)> = self
+            .scheduled_agent_rows()
+            .into_iter()
+            .filter_map(|row| {
                 let (workspace_index, _) = self
                     .workspaces
                     .iter()
                     .enumerate()
-                    .find(|(_, workspace)| workspace.id == automation.task.workspace_id)?;
+                    .find(|(_, workspace)| workspace.id == row.workspace_id)?;
                 if scoped && workspace_index != self.active_ws {
                     return None;
                 }
-                let live_run = self
-                    .automation
-                    .runs
-                    .iter()
-                    .rev()
-                    .find(|run| run.automation_id == automation.id && run.status.is_live());
-                let pane_backed = live_run
-                    .and_then(|run| run.task_id.as_deref())
-                    .and_then(|task| self.orch.task(task))
-                    .and_then(|task| task.assignee)
-                    .is_some_and(|pane| self.panes.contains_key(&PaneId(pane)));
-                if pane_backed
-                    || live_run.is_some_and(|run| {
-                        matches!(
-                            run.status,
-                            crate::automation::RunStatus::Running
-                                | crate::automation::RunStatus::Review
-                        )
-                    })
-                {
-                    return None;
-                }
-                let deadline = live_run
-                    .map(|run| run.scheduled_at)
-                    .or(automation.next_run_at)?;
-                Some((deadline, automation.id.clone()))
+                Some((row.deadline, AgentDockTarget::Automation(row.id)))
             })
             .collect();
+        let mut remote_history = Vec::new();
+        for (index, workspace) in self.workspaces.iter().enumerate() {
+            if scoped && index != self.active_ws {
+                continue;
+            }
+            let Some(remote) = self.remote_workspace_view(index) else {
+                continue;
+            };
+            let view = workspace.tabs[0].layout.focus;
+            scheduled.extend(remote.scheduled.iter().map(|row| {
+                (row.deadline, AgentDockTarget::RemoteAutomation { view, id: row.id.clone() })
+            }));
+            if !self.agents_active_only {
+                remote_history.extend(remote.history.iter().map(|row| {
+                    AgentDockTarget::RemoteSession { view, key: row.key }
+                }));
+            }
+        }
         scheduled.sort_by_key(|item| item.0);
         rows.extend(
             scheduled
                 .into_iter()
-                .map(|(_, id)| AgentDockTarget::Automation(id)),
+                .map(|(_, target)| target),
         );
 
         if !self.agents_active_only {
@@ -4073,7 +4118,7 @@ impl App {
                 self.workspaces
                     .iter()
                     .enumerate()
-                    .filter(|(_, workspace)| crate::platform::is_subpath(cwd, &workspace.cwd))
+                    .filter(|(_, workspace)| workspace.remote.is_none() && crate::platform::is_subpath(cwd, &workspace.cwd))
                     .max_by_key(|(_, workspace)| workspace.cwd.as_os_str().len())
                     .map(|(workspace_index, _)| workspace_index)
             };
@@ -4087,9 +4132,12 @@ impl App {
                     .map(|(index, _)| AgentDockTarget::Session(index)),
             );
         }
+        rows.extend(remote_history);
         if scoped {
             if let Some(pane) = blocked_elsewhere.first().copied() {
                 rows.push(AgentDockTarget::Elsewhere(pane));
+            } else if let Some(target) = remote_blocked_elsewhere.into_iter().next() {
+                rows.push(target);
             }
         }
         rows
@@ -4159,7 +4207,8 @@ impl App {
     /// workspace scope; row activation matches the existing mouse behavior.
     pub fn handle_agents_key(&mut self, key: KeyEvent) -> bool {
         let rows = self.agent_dock_targets();
-        let page = (usize::from(self.agents_area.height) / 2).max(1) as isize;
+        let stride = if self.config.layout.agent_paths { 2 } else { 1 };
+        let page = (usize::from(self.agents_area.height) / stride).max(1) as isize;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.sidebar_focus = None,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -4205,6 +4254,22 @@ impl App {
             }
             AgentDockTarget::Automation(id) => self.open_automation_detail(&id),
             AgentDockTarget::Session(index) => self.resume_session(index),
+            AgentDockTarget::RemoteLive { view, pane }
+            | AgentDockTarget::RemoteElsewhere { view, pane } => {
+                if let Some(ViewKind::Remote(remote)) = self.views.get(&view) {
+                    let target = remote.target.clone();
+                    self.activate_remote_agent(&target, &pane, false);
+                }
+            }
+            AgentDockTarget::RemoteAutomation { view, id } => {
+                self.send_agent_view_command(view, format!("automation_detail {id}"));
+            }
+            AgentDockTarget::RemoteSession { view, key } => {
+                self.remote_agent_menu_action(
+                    AgentTarget::RemoteSession { view, key },
+                    AgentMenuItem::Resume,
+                );
+            }
         }
     }
 
@@ -4236,6 +4301,34 @@ impl App {
             }
             AgentDockTarget::Automation(id) => self.open_automation_detail(&id),
             AgentDockTarget::Elsewhere(pane) => self.focus_pane_global(pane),
+            AgentDockTarget::RemoteLive { view, pane } => {
+                let Some(ViewKind::Remote(remote)) = self.views.get(&view) else {
+                    return;
+                };
+                let anchor = self.remote_agent_rects.iter()
+                    .find(|(target, id, _)| *target == remote.target && *id == pane)
+                    .map(|(_, _, rect)| (rect.x.saturating_add(2), rect.y))
+                    .unwrap_or((self.agents_area.x.saturating_add(2), self.agents_area.y));
+                let Ok(pane) = pane.parse::<u32>().map(PaneId) else {
+                    return;
+                };
+                self.open_agent_menu(AgentTarget::RemoteLive { view, pane }, anchor.0, anchor.1);
+                if let Some(menu) = self.agent_menu.as_mut() {
+                    menu.selected = Some(0);
+                }
+            }
+            AgentDockTarget::RemoteSession { view, key } => {
+                let anchor = self.remote_history_rects.iter()
+                    .find(|(owner, id, _)| *owner == view && *id == key)
+                    .map(|(_, _, rect)| (rect.x.saturating_add(2), rect.y))
+                    .unwrap_or((self.agents_area.x.saturating_add(2), self.agents_area.y));
+                self.open_agent_menu(AgentTarget::RemoteSession { view, key }, anchor.0, anchor.1);
+                if let Some(menu) = self.agent_menu.as_mut() {
+                    menu.selected = Some(0);
+                }
+            }
+            target @ (AgentDockTarget::RemoteAutomation { .. }
+            | AgentDockTarget::RemoteElsewhere { .. }) => self.activate_agent_dock_target(target),
         }
     }
 
@@ -4440,13 +4533,10 @@ impl App {
     /// active tab from output owned by another tab or workspace. The server
     /// uses this to keep focused rendering responsive without repeatedly
     /// diffing an unchanged UI for background-only bursts.
-    pub fn rearm_pty_notify_by_visibility(&self) -> (bool, bool, bool) {
-        let layout = self.workspaces.get(self.active_ws).and_then(|workspace| {
-            workspace
-                .tabs
-                .get(workspace.active_tab)
-                .map(|tab| &tab.layout)
-        });
+    pub fn rearm_pty_notify_by_visibility(
+        &self,
+        is_visible: impl Fn(PaneId) -> bool,
+    ) -> (bool, bool, bool) {
         let mut visible = false;
         let mut background = false;
         let mut title_changed = false;
@@ -4454,7 +4544,7 @@ impl App {
             if !pane.take_data_pending() {
                 continue;
             }
-            if layout.is_some_and(|layout| layout.contains(*id)) {
+            if is_visible(*id) {
                 visible = true;
             } else {
                 background = true;
@@ -5408,7 +5498,11 @@ impl App {
                 anchor: (col, row),
                 items: Vec::new(),
                 selected: None,
-                module_actions: self.module_menu_actions("workspace"),
+                module_actions: if self.workspaces[index].remote.is_some() {
+                    Vec::new()
+                } else {
+                    self.module_menu_actions("workspace")
+                },
             });
         }
     }
@@ -5465,6 +5559,11 @@ impl App {
         }
         items.push(WsMenuItem::OpenOrch);
         items.push(WsMenuItem::OpenMission);
+        if ws.is_some_and(|workspace| workspace.remote.is_some()) {
+            items.push(WsMenuItem::Divider);
+            items.push(WsMenuItem::OwnerSettings);
+            items.push(WsMenuItem::OwnerModules);
+        }
         // Module actions declaring `contexts = ["workspace"]`, below a divider.
         let extras = self.ws_menu.as_ref().map_or(0, |m| m.module_actions.len());
         if extras > 0 {
@@ -5542,8 +5641,18 @@ impl App {
             });
         }
         items.push(AgentMenuItem::TogglePath);
-        items.push(AgentMenuItem::Divider);
-        items.push(AgentMenuItem::ToggleWorkspaceScope);
+        if let AgentTarget::RemoteLive { view, pane } = target {
+            items.push(if self.remote_agent_is_pinned(view, pane) {
+                AgentMenuItem::Unpin
+            } else {
+                AgentMenuItem::Pin
+            });
+            items.push(AgentMenuItem::OwnerActions);
+        }
+        if !self.agent_menu.as_ref().is_some_and(|menu| menu.owner_only) {
+            items.push(AgentMenuItem::Divider);
+            items.push(AgentMenuItem::ToggleWorkspaceScope);
+        }
         let extras = self
             .agent_menu
             .as_ref()
@@ -5572,10 +5681,10 @@ impl App {
 
     /// Run a context-menu action for the menu's target, then close the menu.
     pub fn ws_menu_action(&mut self, item: WsMenuItem) {
-        let Some((workspace_id, actions)) = self
+        let Some((workspace_id, actions, anchor)) = self
             .ws_menu
             .as_ref()
-            .map(|m| (m.workspace_id.clone(), m.module_actions.clone()))
+            .map(|m| (m.workspace_id.clone(), m.module_actions.clone(), m.anchor))
         else {
             return;
         };
@@ -5597,19 +5706,28 @@ impl App {
                 WsMenuItem::OpenMission => Some("open_mission"),
                 WsMenuItem::DeleteWorktree => Some("delete_worktree"),
                 WsMenuItem::Rename => Some("rename_workspace"),
+                WsMenuItem::OwnerSettings => Some("open_settings"),
+                WsMenuItem::OwnerModules | WsMenuItem::Module(_) => Some("open_workspace_menu"),
                 _ => None,
             };
             if let Some(command) = command {
+                let command = if command == "open_workspace_menu" {
+                    let (column, row) = self.remote_menu_anchor(index, anchor);
+                    format!("{command} {column} {row}")
+                } else {
+                    command.to_string()
+                };
                 self.active_ws = index;
                 self.send_workspace_remote(
                     index,
-                    crate::ipc::protocol::ClientMessage::Command(command.into()),
+                    crate::ipc::protocol::ClientMessage::Command(command),
                 );
                 return;
             }
         }
         match item {
             WsMenuItem::Divider => {}
+            WsMenuItem::OwnerSettings | WsMenuItem::OwnerModules => {}
             // Pin/Unpin the right-clicked node: float it to the top of the list
             // (docs), persisted across restarts.
             WsMenuItem::Pin | WsMenuItem::Unpin => {
@@ -6280,7 +6398,10 @@ impl App {
         // Only a live agent has a pane for an action to act on.
         let module_actions = match &target {
             AgentTarget::Live(_) => self.module_menu_actions("agent"),
-            AgentTarget::Session(_) | AgentTarget::Automation(_) => Vec::new(),
+            AgentTarget::Session(_)
+            | AgentTarget::Automation(_)
+            | AgentTarget::RemoteLive { .. }
+            | AgentTarget::RemoteSession { .. } => Vec::new(),
         };
         self.agent_menu = Some(AgentMenu {
             target,
@@ -6288,6 +6409,7 @@ impl App {
             items: Vec::new(),
             selected: None,
             module_actions,
+            owner_only: false,
         });
     }
 
@@ -6317,6 +6439,15 @@ impl App {
         else {
             return;
         };
+        if item == AgentMenuItem::ToggleWorkspaceScope {
+            self.agent_menu = None;
+            self.set_agents_scope(!self.agents_this_workspace);
+            return;
+        }
+        if self.remote_agent_menu_action(target.clone(), item) {
+            self.agent_menu = None;
+            return;
+        }
         self.agent_menu = None;
         match (item, target) {
             (AgentMenuItem::ToggleWorkspaceScope, _) => {
@@ -6349,9 +6480,17 @@ impl App {
             (AgentMenuItem::RenamePane, AgentTarget::Session(_) | AgentTarget::Automation(_)) => {}
             (AgentMenuItem::Pin, AgentTarget::Live(id)) => {
                 self.pinned_agents.insert(id);
+                self.emit_event(
+                    "agent.pin_changed",
+                    serde_json::json!({"pane":id.0.to_string(), "pinned":true}),
+                );
             }
             (AgentMenuItem::Unpin, AgentTarget::Live(id)) => {
                 self.pinned_agents.remove(&id);
+                self.emit_event(
+                    "agent.pin_changed",
+                    serde_json::json!({"pane":id.0.to_string(), "pinned":false}),
+                );
             }
             (
                 AgentMenuItem::Pin | AgentMenuItem::Unpin,
@@ -6372,6 +6511,8 @@ impl App {
                 AgentTarget::Session(_) | AgentTarget::Live(_),
             ) => {}
             (AgentMenuItem::Divider, _) => {}
+            (_, AgentTarget::RemoteLive { .. } | AgentTarget::RemoteSession { .. })
+            | (AgentMenuItem::OwnerActions, _) => {}
         }
     }
 
@@ -6772,6 +6913,9 @@ impl App {
                 .zip(&self.resumable)
                 .any(|(a, b)| a.session_id != b.session_id);
         self.resumable = fresh;
+        if changed {
+            self.emit_event("agent.history_changed", serde_json::json!({}));
+        }
         changed
     }
 
@@ -6784,6 +6928,7 @@ impl App {
         }
         let s = self.resumable.remove(idx);
         self.dismissed_sessions.insert(s.session_id);
+        self.emit_event("agent.history_changed", serde_json::json!({}));
     }
 
     /// Reopen a resumable session (from the AGENTS sidebar): spawn a pane in the
@@ -6802,13 +6947,7 @@ impl App {
         let tab = Tab::panes(TileLayout::new(id));
         // Per the Layout setting, reuse the session's own workspace (or the workspace at
         // its cwd); otherwise open it as a tab in the currently active workspace.
-        let target = if self.config.layout.resume_in_new_workspace {
-            self.workspaces
-                .iter()
-                .position(|w| crate::platform::same_path(&w.cwd, &s.cwd))
-        } else {
-            (!self.workspaces.is_empty()).then_some(self.active_ws)
-        };
+        let target = self.resume_workspace_target(&s.cwd);
         if let Some(wi) = target {
             self.active_ws = wi;
             let ws = &mut self.workspaces[wi];
@@ -6839,6 +6978,7 @@ impl App {
         }
         self.mode = Mode::Normal;
         self.resumable.retain(|r| r.session_id != s.session_id);
+        self.emit_event("agent.history_changed", serde_json::json!({}));
     }
 
     /// Focus a pane anywhere (used when clicking an agent in the global list).

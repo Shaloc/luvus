@@ -195,7 +195,17 @@ pub(super) fn draw_ws_menu(
     let rows: Vec<MenuRow> = items
         .iter()
         .map(|it| MenuRow {
-            text: ws_label(*it, cat, &extras, app.config.layout.workspace_paths),
+            text: {
+                let label = ws_label(*it, cat, &extras, app.config.layout.workspace_paths);
+                if matches!(it, WsMenuItem::OwnerSettings | WsMenuItem::OwnerModules) {
+                    app.workspaces[index]
+                        .remote
+                        .as_ref()
+                        .map_or(label.clone(), |owner| format!("{label} [{}]", owner.host))
+                } else {
+                    label
+                }
+            },
             divider: matches!(it, WsMenuItem::Divider),
             destructive: matches!(it, WsMenuItem::Close | WsMenuItem::DeleteWorktree),
         })
@@ -509,6 +519,7 @@ fn agent_label(
             cat.menu_show_path
         }
         .to_string(),
+        AgentMenuItem::OwnerActions => cat.settings.module_actions.to_string(),
         AgentMenuItem::Close => cap_first(cat.act_close),
         AgentMenuItem::AutomationDetails => cap_first(cat.act_details),
         AgentMenuItem::AutomationRun => cap_first(cat.automation_now),
@@ -578,6 +589,8 @@ fn ws_label(
         WsMenuItem::OpenGit => cat.menu_open_git.to_string(),
         WsMenuItem::OpenOrch => cat.menu_open_board.to_string(),
         WsMenuItem::OpenMission => cat.mc_open.to_string(),
+        WsMenuItem::OwnerSettings => cat.settings_title.to_string(),
+        WsMenuItem::OwnerModules => cat.tab_modules.to_string(),
         WsMenuItem::Module(i) => module_label(extras, i),
     }
 }

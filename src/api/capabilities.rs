@@ -463,6 +463,10 @@ mod tests {
         assert!(!is_read_only("mission.open"));
         assert_eq!(required_scope("mission.open"), "workspace");
         assert_eq!(required_scope("session.snapshot"), "read");
+        assert!(is_read_only("agent.sessions"));
+        assert!(is_read_only("automation.list"));
+        assert!(is_read_only("automation.get"));
+        assert!(!is_read_only("agent.resume"));
         assert_eq!(required_scope("events.subscribe"), "read");
         assert_eq!(required_scope("automation.create"), "orchestration");
         assert_eq!(required_scope("automation.rebind"), "orchestration");

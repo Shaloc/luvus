@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,19 @@ import time
 import unicodedata
 
 IMAGE = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII=")
+SELECTORS = ("LUVUS_SOCKET_PATH", "LUVUS_SESSION", "LUVUS_REMOTE_HOST", "LUVUS_REMOTE_SESSION",
+             "LUVUS_PANE_ID", "LUVUS_API_ADDRESS", "LUVUS_SHELL")
+
+
+def fixture_root():
+    """Fail closed before a helper can connect, copy, or launch anything."""
+    repo = Path(__file__).resolve().parent.parent
+    root = Path(os.environ["LUVUS_SMOKE_ROOT"]).resolve()
+    assert root.parent == repo / "target" and root.name.startswith("remote-smoke-"), root
+    assert (root / ".isolated-smoke").read_text() == str(root), root
+    binary = Path(os.environ["LUVUS_SMOKE_BINARY"]).resolve()
+    assert binary.is_relative_to(repo / "target") and binary.is_file(), binary
+    return root
 
 
 def ssh_substitute():
@@ -28,7 +42,7 @@ def ssh_substitute():
     while args and args[0].startswith("-"):
         args = args[2:] if args[0] == "-o" else args[1:]
     host, *command = args
-    root = Path(os.environ["LUVUS_SMOKE_ROOT"])
+    root = fixture_root()
     with (root / "ssh-calls").open("a") as log:
         log.write(host + "\n")
     if host == "fake-old":
@@ -38,8 +52,12 @@ def ssh_substitute():
         raise SystemExit("unexpected SSH destination: " + host)
     os.environ["HOME"] = str(root / "remote-home")
     os.environ["LUVUS_HOME"] = str(root / "remote-state")
-    for key in ("LUVUS_SOCKET_PATH", "LUVUS_SESSION", "LUVUS_REMOTE_HOST", "LUVUS_REMOTE_SESSION"):
+    for key in SELECTORS:
         os.environ.pop(key, None)
+    for key, suffix in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+                        ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
+        os.environ[key] = str(root / "remote-home" / suffix)
+    assert command and Path(command[0]).name == "luvus", command
     os.execv(os.environ["LUVUS_SMOKE_BINARY"], command)
 
 
@@ -50,24 +68,33 @@ def main():
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
+    assert binary.is_relative_to(repo / "target"), "test only a checkout build, never an installed binary"
     root = Path(tempfile.mkdtemp(prefix="remote-smoke-", dir=repo / "target"))
+    (root / ".isolated-smoke").write_text(str(root))
     clients = []
-    env = dict(os.environ)
-    for key in ("LUVUS_SOCKET_PATH", "LUVUS_SESSION", "LUVUS_REMOTE_HOST", "LUVUS_REMOTE_SESSION",
-                "LUVUS_PANE_ID", "LUVUS_API_ADDRESS", "LUVUS_SHELL"):
-        env.pop(key, None)
-    for directory in ("local-home/.ssh", "local-state", "remote-home", "remote-state", "bin", "project", "second"):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("LUVUS_")}
+    for directory in ("local-home/.ssh", "local-home/picker-local", "local-state", "remote-home",
+                      "remote-state", "bin", "project/picker-remote", "second"):
         (root / directory).mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "--quiet", str(root / "project")], check=True)
+    git_env = dict(env, HOME=str(root / "local-home"), GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+        git_env.pop(key, None)
+    subprocess.run(["git", "init", "--quiet", str(root / "project")], env=git_env, check=True)
+    (root / "project/parity.md").write_text("# REMOTE_NATIVE_PREVIEW\n\noriginal parity line\n")
+    subprocess.run(["git", "-C", str(root / "project"), "add", "parity.md"], env=git_env, check=True)
     subprocess.run(["git", "-C", str(root / "project"), "-c", "user.name=Smoke",
                     "-c", "user.email=smoke@example.invalid", "commit", "--quiet",
-                    "--allow-empty", "-m", "fixture"], check=True)
+                    "--allow-empty", "-m", "fixture"], env=git_env, check=True)
     subprocess.run(["git", "-C", str(root / "project"), "worktree", "add", "--quiet",
-                    "-b", "feature/smoke", str(root / "feature-checkout")], check=True)
+                    "-b", "feature/smoke", str(root / "feature-checkout")], env=git_env, check=True)
+    (root / "project/parity.md").write_text("# REMOTE_NATIVE_PREVIEW\n\nmodified parity line\n")
     # A symlink invokes this same file's narrow SSH-substitute role.
     (root / "bin/ssh").symlink_to(Path(__file__).resolve())
     (root / "local-home/.ssh/config").write_text("Host fake-dev fake-old unselected\n  HostName 192.0.2.1\n")
-    (root / "bin/xclip").symlink_to(Path(__file__).resolve())
+    # All native copy helpers are private sinks. OSC 52 is observed only in
+    # this script's PTY pipe, never printed to the operator's real terminal.
+    for helper in ("xclip", "xsel", "wl-copy", "pbcopy"):
+        (root / "bin" / helper).symlink_to(Path(__file__).resolve())
     for state in ("local-state", "remote-state"):
         (root / state / "config.json").write_text(json.dumps({
             "check_updates": False, "remote_hosts": [], "shell": "/bin/sh",
@@ -77,9 +104,24 @@ def main():
                PATH=str(root / "bin") + ":" + env.get("PATH", ""), TERM="xterm-256color",
                LUVUS_SMOKE_ROOT=str(root), LUVUS_SMOKE_BINARY=str(binary), DISPLAY=":smoke")
     env.pop("WAYLAND_DISPLAY", None)
+    for key, suffix in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
+                        ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
+        env[key] = str(root / "local-home" / suffix)
     remote_env = dict(env, HOME=str(root / "remote-home"), LUVUS_HOME=str(root / "remote-state"))
+    for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+        remote_env[key] = remote_env[key].replace("local-home", "remote-home")
+
+    def assert_isolated(selected_env):
+        assert root.parent == repo / "target" and (root / ".isolated-smoke").read_text() == str(root)
+        assert selected_env["LUVUS_HOME"] in (str(root / "local-state"), str(root / "remote-state"))
+        assert selected_env["HOME"] in (str(root / "local-home"), str(root / "remote-home"))
+        assert Path(selected_env["PATH"].split(os.pathsep)[0]) == root / "bin"
+        for key in ("LUVUS_SOCKET_PATH", "LUVUS_API_ADDRESS"):
+            if selected_env.get(key):
+                assert Path(selected_env[key]).resolve().is_relative_to(root), (key, selected_env[key])
 
     def run(*args, remote=False, input_text=None, okay=True):
+        assert_isolated(remote_env if remote else env)
         result = subprocess.run([str(binary), *args], env=remote_env if remote else env,
                                 cwd=root / "project", input=input_text, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
@@ -90,7 +132,22 @@ def main():
     def api(method, params=None, remote=False, session="api"):
         response = run("--session", session, "uhp", "proxy", remote=remote,
                        input_text=json.dumps({"id": "smoke", "method": method, "params": params or {}}) + "\n")
-        return json.loads(response.stdout)["result"]
+        value = json.loads(response.stdout)
+        assert "result" in value, (method, params, value)
+        return value["result"]
+
+    def host_cli(*args):
+        value = json.loads(run("--host", "fake-dev", "--session", "api", *args).stdout)
+        assert "error" not in value, (args, value)
+        return value.get("result", value)
+
+    def case(label, check):
+        try:
+            check()
+        except Exception:
+            print("FAIL:", label, file=sys.stderr, flush=True)
+            raise
+        print("PASS:", label, flush=True)
 
     def wait_for(check):
         deadline = time.monotonic() + 10
@@ -177,6 +234,11 @@ def main():
         if restart_only:
             restart_smoke()
             return
+        absent = run("--session", "search-stopped", "remote-control-bridge", "--existing",
+                     input_text='{"id":"probe","method":"ping"}\n', okay=False)
+        assert absent.returncode, "existing-only discovery must fail for an absent owner"
+        assert not (root / "local-state/sessions/search-stopped/server.pid").exists()
+        print("PASS: existing-only search bridge does not start an absent owner", flush=True)
         denied = run("--host", "unselected", "pane", "list", okay=False)
         assert denied.returncode and "Settings > Remote" in denied.stderr
         assert not (root / "ssh-calls").exists(), "disabled hosts must be rejected before SSH"
@@ -184,6 +246,13 @@ def main():
         run("--session", "second", "server", "start", remote=True)
         run("--session", "api", "server", "start")
         api("config.patch", {"patch": {"remote_hosts": ["fake-dev", "fake-old"]}})
+        missing = run("--host", "fake-dev", "--session", "search-stopped", "workspace", "list", okay=False)
+        assert missing.returncode, "remote CLI must not start a stopped owner"
+        absent_frame = run("--session", "search-stopped", "remote-client-bridge", "--existing",
+                           remote=True, okay=False)
+        assert absent_frame.returncode, "frame subscription must not start an owner"
+        assert not (root / "remote-state/sessions/search-stopped/server.pid").exists()
+        print("PASS: remote CLI and frame discovery never start a stopped owner", flush=True)
         wait_for(lambda: (root / "ssh-calls").exists())
         discovered = json.loads(run("session", "remote", "list", "--json").stdout)
         assert {s["session"] for s in discovered["sessions"]} >= {"api", "second"}
@@ -218,6 +287,7 @@ def main():
         import struct
         import termios
         def start_client(args):
+            assert_isolated(env)
             master, slave = pty.openpty()
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
             process = subprocess.Popen([str(binary), *args], env=env, cwd=root / "project",
@@ -250,25 +320,347 @@ def main():
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
             return drain(master, 0.7)
 
-        def position(screen, label, before_column=None, after_column=0):
+        def position(screen, label, before_column=None, after_column=0, after_row=0, before_row=None):
             text = screen.decode("utf-8", errors="replace")
             text = re.sub(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)", "", text)
             text = re.sub(r"\x1b\[[0-9;?]*[A-GI-Za-z]", "", text)
-            for move in re.finditer(r"\x1b\[(\d+);(\d+)H([^\x1b]*)", text):
+            # A remote resize produces an immediate outer frame followed by
+            # the resized owner frame. Select the last rendered occurrence,
+            # never the old menu position from the earlier frame in this read.
+            for move in reversed(list(re.finditer(r"\x1b\[(\d+);(\d+)H([^\x1b]*)", text))):
                 chunk = move.group(3)
-                if label not in chunk:
+                # Distinguish actual controls from Ctrl+B and terminal markers
+                # such as MENU_NAV_*. The latter must never become UI targets.
+                pattern = (r"(?<!\S)\+(?!\S)" if label == "+" else
+                           r"(?<!\w)MENU(?!\w)" if label == "MENU" else re.escape(label))
+                found = re.search(pattern, chunk)
+                if found is None:
                     continue
-                prefix = chunk[:chunk.index(label)]
+                prefix = chunk[:found.start()]
                 width = sum(0 if unicodedata.combining(char) else
                             2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
                             for char in prefix)
                 x, y = int(move.group(2)) + width, int(move.group(1))
-                if x >= after_column and (before_column is None or x < before_column):
+                if (x >= after_column and (before_column is None or x < before_column)
+                        and y >= after_row and (before_row is None or y < before_row)):
                     return x, y
             raise AssertionError(f"clickable label {label!r} not rendered: {text[-7000:]}")
 
+        # Validate the click-target reader itself against mixed resize frames
+        # and lookalike terminal text before using it as regression evidence.
+        assert position(b"\x1b[28;104HOwner proof\x1b[32;116HOwner proof", "Owner proof") == (116, 32)
+        assert position(b"\x1b[3;22H + \x1b[30;2HCtrl+B", "+") == (23, 3)
+        assert position(b"\x1b[1;28HMENU\x1b[20;28HMENU_NAV_source", "MENU") == (28, 1)
+
         def click(master, x, y, button=0):
             os.write(master, f"\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m".encode())
+
+        def topology(remote=False):
+            # Ignore focus, revisions and detection timing; preserve everything
+            # that could reveal a command mutating the wrong owner's layout.
+            return [{"id": w["id"], "name": w["name"], "cwd": w["cwd"],
+                     "tabs": [{"name": t["name"], "kind": t["kind"],
+                               "panes": [(p["pane_id"], p["kind"]) for p in t["panes"]]}
+                              for t in w["tabs"]]}
+                    for w in api("session.snapshot", remote=remote)["workspaces"] if not w.get("host")]
+
+        parity_dimensions = {}
+
+        def owner_matrix(master, mode):
+            """Identical interaction chain for local, direct remote and merge."""
+            remote = mode != "local"
+            untouched = topology(remote=not remote)
+
+            def owner(method, params=None):
+                return api(method, params, remote=remote)
+
+            def cli(*args):
+                if remote:
+                    return host_cli(*args)
+                value = json.loads(run("--session", "api", *args).stdout)
+                assert "error" not in value, (args, value)
+                return value.get("result", value)
+
+            def unchanged():
+                assert topology(remote=not remote) == untouched, "the other owner's topology changed"
+
+            def row(name, check):
+                def isolated_check():
+                    check()
+                    unchanged()
+                case(f"{mode}: {name}", isolated_check)
+
+            original_tabs = owner("tab.list")["tabs"]
+            original_active = next(t["tab"] for t in original_tabs if t["active"])
+            temp_tab = None
+            temp_pane = None
+
+            def tabs():
+                nonlocal temp_tab, temp_pane
+                screen = repaint(master)
+                click(master, *position(screen, "+", after_column=35))
+                current = wait_for(lambda: owner("tab.list")["tabs"]
+                                   if len(owner("tab.list")["tabs"]) == len(original_tabs) + 1 else None)
+                temp_tab = next(t["tab"] for t in current if t["active"])
+                cli("tab", "rename", "parity-tab", "--tab", temp_tab)
+                assert next(t for t in owner("tab.list")["tabs"] if t["tab"] == temp_tab)["name"] == "parity-tab"
+                cli("tab", "focus", original_active)
+                screen = repaint(master)
+                click(master, *position(screen, "parity-tab", after_column=35))
+                wait_for(lambda: any(t["tab"] == temp_tab and t["active"] for t in owner("tab.list")["tabs"]))
+                temp_pane = next(p["pane"] for p in owner("pane.list")["panes"] if p["focused"])
+
+            row("tab-row + creates owner tab; rename and mouse focus", tabs)
+
+            def panes():
+                before = owner("pane.layout", {"pane": temp_pane})["rect"]
+                split = cli("pane", "split", str(temp_pane))["pane"]
+                assert split != temp_pane
+                cli("pane", "focus", str(temp_pane))
+                wait_for(lambda: any(p["pane"] == temp_pane and p["focused"] for p in owner("pane.list")["panes"]))
+                divided = owner("pane.layout", {"pane": temp_pane})["rect"]
+                assert divided["width"] < before["width"]
+                owner("pane.resize", {"pane": temp_pane, "direction": "right", "cells": 3})
+                assert owner("pane.layout", {"pane": temp_pane})["rect"] != divided
+                cli("pane", "close", str(split))
+                wait_for(lambda: not any(p["pane"] == split for p in owner("pane.list")["panes"]))
+                assert owner("pane.layout", {"pane": temp_pane})["rect"] == before
+
+            row("pane split/focus/resize/close stays on owner", panes)
+
+            def dimensions():
+                def size(label):
+                    marker = f"PTY_SIZE_{mode.replace('-', '_')}_{label}"
+                    cli("pane", "run", str(temp_pane),
+                        f"set -- $(stty size); printf '\\n{marker}_%s_%s\\n' \"$1\" \"$2\"")
+                    pattern = re.compile(rf"(?:^|\n){marker}_(\d+)_(\d+)(?:\r?\n|$)")
+                    match = wait_for(lambda: pattern.search(owner("pane.read", {"pane": temp_pane})["text"]))
+                    return tuple(map(int, match.groups()))
+                before = size("before")
+                assert 10 <= before[0] <= 30 and 40 <= before[1] <= 120, before
+                if mode != "local":
+                    assert before == parity_dimensions["local"], (mode, before, parity_dimensions["local"])
+                parity_dimensions[mode] = before
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 34, 132, 0, 0))
+                drain(master, 0.7)
+                larger = size("larger")
+                assert larger == (before[0] + 4, before[1] + 12), (before, larger)
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+                drain(master, 0.7)
+                assert size("restored") == before
+
+            row("display resize reaches actual owner PTY; grow and restore", dimensions)
+
+            def prefix_help():
+                drain(master)
+                os.write(master, b"\x02?")
+                help_screen = drain(master, 0.7)
+                assert b"shortcuts" in help_screen.lower(), help_screen[-5000:]
+                expected_prefix = b"Ctrl+Space" if remote else b"Ctrl+B"
+                assert expected_prefix.lower() in help_screen.lower(), help_screen[-5000:]
+                os.write(master, b"\x1b")
+                drain(master)
+                # Fixed tab digits use the same owner prefix handler as '?'.
+                os.write(master, b"\x02" + str(original_active).encode())
+                wait_for(lambda: any(t["tab"] == original_active and t["active"] for t in owner("tab.list")["tabs"]))
+                cli("tab", "focus", temp_tab)
+
+            row("prefix help and fixed tab digits execute on owner despite different prefixes", prefix_help)
+
+            def clipboard():
+                payload = f"OSC52 {mode} indentation\n  second line 中文".encode()
+                encoded = base64.b64encode(payload)
+                drain(master)
+                cli("pane", "run", str(temp_pane),
+                    "printf '\\033]52;c;" + encoded.decode() + "\\007'")
+                output = bytearray()
+                def copied():
+                    output.extend(drain(master, 0.1))
+                    return any(base64.b64decode(value) == payload for value in
+                               re.findall(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)", output))
+                wait_for(copied)
+                # Native fallback must also have landed in our private helper,
+                # never in an installed clipboard command or a real display.
+                assert (root / "clipboard-copy").read_bytes() == payload
+
+            row("child OSC52 copy forwards exact bytes to display client", clipboard)
+
+            if shutil.which("nvim", path=env["PATH"]):
+                def nvim_yank():
+                    payload = f"NVIM_YANK_{mode} 中文".encode()
+                    expected = payload + b"\n"  # yy is a linewise yank.
+                    setup = "lua vim.api.nvim_buf_set_lines(0, 0, -1, false, {" + json.dumps(payload.decode(), ensure_ascii=False) + "})"
+                    command = shlex.join(["nvim", "-u", "NONE", "-i", "NONE", "--noplugin",
+                                          "--cmd", "let g:clipboard='osc52'", "-c", setup,
+                                          "-c", 'normal! gg"+yy', "-c", "sleep 20m", "-c", "qa!"])
+                    drain(master)
+                    cli("pane", "run", str(temp_pane), command)
+                    output = bytearray()
+                    def copied():
+                        output.extend(drain(master, 0.1))
+                        return any(base64.b64decode(value) == expected for value in
+                                   re.findall(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)", output))
+                    wait_for(copied)
+                    assert (root / "clipboard-copy").read_bytes() == expected
+                row("real Neovim OSC52 + register yank reaches display clipboard", nvim_yank)
+            else:
+                print(f"SKIP: {mode}: Neovim executable is unavailable", flush=True)
+
+            def native_views():
+                cli("files", "refresh")
+                tree = wait_for(lambda: cli("files", "tree")
+                                if any(r["name"] == "parity.md" for r in cli("files", "tree")["rows"]) else None)
+                assert tree["root"] == str(root / "project")
+                cli("files", "open", "parity.md", "--target", "tab")
+                def native():
+                    return any(p["kind"] == "view" for w in owner("session.snapshot")["workspaces"]
+                               for t in w["tabs"] if t["active"] for p in t["panes"])
+                wait_for(native)
+                assert b"REMOTE_NATIVE_PREVIEW" in repaint(master), "owner Markdown view content missing"
+                cli("tab", "close")
+                cli("tab", "focus", temp_tab)
+                diff = cli("diff", "get", "parity.md", "--include-patch")
+                assert "modified parity line" in json.dumps(diff), diff
+                cli("diff", "open", "parity.md", "--placement", "tab")
+                wait_for(native)
+                assert b"modified parity line" in repaint(master), "owner DIFF content missing"
+                cli("tab", "close")
+                cli("tab", "focus", temp_tab)
+                assert "parity.md" in json.dumps(cli("git", "status"))
+                assert cli("git", "branches")["branches"]
+                cli("git", "open")
+                wait_for(lambda: any(t["kind"] == "git" and t["active"] for t in owner("tab.list")["tabs"]))
+                cli("tab", "close")
+                cli("tab", "focus", temp_tab)
+
+            row("FILES tree, native Markdown, DIFF patch/view and Git dashboard", native_views)
+
+            def search():
+                result = cli("search", "--fuzzy", "parity.md", "--scope", "files")
+                assert result["matches"] and "parity.md" in json.dumps(result["matches"]), result
+
+            row("fuzzy file-search CLI resolves owner fixture", search)
+
+            def worktrees():
+                branch = "parity-" + mode
+                made = cli("worktree", "create", branch)
+                path = Path(made["path"])
+                assert path.is_relative_to(root / ("remote-state" if remote else "local-state")), path
+                assert path.is_dir()
+                assert any(w["path"] == str(path) for w in cli("worktree", "list")["worktrees"])
+                opened = wait_for(lambda: next((w for w in owner("workspace.list")["workspaces"]
+                                                if w["cwd"] == str(path) and not w.get("host")), None))
+                # create already opens it; explicitly close and reopen to
+                # exercise worktree.open independently of create's side effect.
+                cli("workspace", "close", opened["workspace"])
+                cli("worktree", "open", str(path))
+                opened = wait_for(lambda: next((w for w in owner("workspace.list")["workspaces"]
+                                                if w["cwd"] == str(path) and not w.get("host")), None))
+                destination = next(w for w in owner("session.snapshot")["workspaces"]
+                                   if w["cwd"] == str(path) and not w.get("host"))
+                destination_pane = next(p["pane_id"] for t in destination["tabs"]
+                                        if t["active"] for p in t["panes"] if p["kind"] == "terminal")
+                source_name = next(w["name"] for w in owner("workspace.list")["workspaces"]
+                                   if w["workspace"] == "0")
+                # Exercise owner MENU navigation through real client input,
+                # not merely successful owner CLI mutations. At this width
+                # only the remote projection uses its mobile MENU header.
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 80, 0, 0))
+                screen = drain(master, 0.7)
+                for name, target_pane, suffix in ((opened["name"], destination_pane, "destination"),
+                                                  (source_name, temp_pane, "source")):
+                    if remote:
+                        click(master, *position(screen, "MENU", after_column=20))
+                    else:
+                        os.write(master, b"\x02M")
+                    drain(master)
+                    os.write(master, b"\t\t\t" + name.encode() + b"\r")
+                    drain(master, 0.5)
+                    marker = f"MENU_NAV_{mode}_{suffix}"
+                    cli("pane", "run", str(target_pane), "printf '\\n" + marker + "\\n'")
+                    observed = bytearray()
+                    def visible_destination():
+                        observed.extend(drain(master, 0.1))
+                        return marker.encode() in observed
+                    wait_for(visible_destination)
+                    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 81, 0, 0))
+                    drain(master, 0.3)
+                    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 80, 0, 0))
+                    screen = drain(master, 0.7)
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+                drain(master, 0.5)
+                cli("workspace", "close", opened["workspace"])
+                cli("workspace", "focus", "0")
+                cli("worktree", "remove", str(path))
+                assert not path.exists()
+                cli("tab", "focus", temp_tab)
+
+            row("owner worktree create/list/open/remove and real MENU round-trip navigation", worktrees)
+
+            def orchestration():
+                task = cli("task", "add", "parity " + mode)["task"]
+                assert any(t["id"] == task["id"] for t in owner("task.list")["tasks"])
+                cli("task", "get", task["id"])
+                cli("task", "delete", task["id"])
+                workspace_id = next(w["id"] for w in owner("session.snapshot")["workspaces"] if w["active"])
+                # Disabled means no agent can be launched by this test, even
+                # if the selected schedule happens to coincide with wall time.
+                automation = cli("automation", "create", "parity " + mode, "--disabled", "--every", "86400",
+                                 "--title", "Fixture only", "--prompt", "Never executed", "--agent", "codex",
+                                 "--workspace-id", workspace_id, "--mode", "workspace")["automation"]
+                assert not automation["enabled"]
+                assert any(a["id"] == automation["id"] for a in cli("automation", "list")["automations"])
+                cli("automation", "get", automation["id"])
+                cli("automation", "delete", automation["id"])
+                assert not any(a["id"] == automation["id"] for a in owner("automation.list")["automations"])
+                cli("agent", "list")
+
+            row("task and disabled automation CRUD; agent CLI owner routing", orchestration)
+
+            def modules():
+                module = root / ("module-" + mode)
+                module.mkdir()
+                evidence = root / ("module-evidence-" + mode)
+                module_id = "smoke.parity-" + mode
+                command = ["sh", "-c", "printf '%s\\n' \"$HOME\" \"$LUVUS_WORKSPACE_CWD\" > " + shlex.quote(str(evidence))]
+                (module / "luvus-module.toml").write_text(
+                    f'id = "{module_id}"\nname = "Parity fixture"\nversion = "0.1.0"\nmin_luvus_version = "1.0.99"\n'
+                    '[[actions]]\nid = "proof"\ntitle = "Owner proof"\ncontexts = ["workspace", "pane"]\n'
+                    + "command = " + json.dumps(command) + "\n")
+                cli("module", "link", str(module))
+                cli("module", "run", module_id, "proof")
+                expected = [str(root / ("remote-home" if remote else "local-home")), str(root / "project")]
+                wait_for(lambda: evidence.exists() and evidence.read_text().splitlines() == expected)
+                for point, resized in (((80, 15), False), ((118, 27), False), ((118, 27), True)):
+                    evidence.unlink()
+                    repaint(master)
+                    click(master, *point, button=2)
+                    menu = drain(master)
+                    if resized:
+                        fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 34, 132, 0, 0))
+                        menu = drain(master, 0.7)
+                    x, y = position(menu, "Owner proof")
+                    assert 1 <= x <= (132 if resized else 120) and 1 <= y <= (34 if resized else 30)
+                    click(master, x, y)
+                    try:
+                        wait_for(lambda: evidence.exists() and evidence.read_text().splitlines() == expected)
+                    except AssertionError as error:
+                        raise AssertionError(f"module menu {mode}: anchor={point}, resized={resized}, "
+                                             f"click={(x, y)}, evidence={evidence.read_text() if evidence.exists() else None}, "
+                                             f"menu={menu!r}") from error
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+                drain(master, 0.5)
+                cli("module", "unlink", module_id)
+
+            row("module CLI and pane context-menu action execute on owner", modules)
+
+            def close_tab():
+                cli("tab", "focus", temp_tab)
+                cli("tab", "close", temp_tab)
+                assert len(owner("tab.list")["tabs"]) == len(original_tabs)
+                cli("tab", "focus", original_active)
+
+            row("temporary tab closes on owner; opposite owner remains unchanged", close_tab)
 
         def switch(process, master, current, target):
             inventory = json.loads(run("session", "list", "--json").stdout)
@@ -313,6 +705,7 @@ def main():
             process, master = start_client(args)
             remote_view = args[0] == "session"
             drain(master, 2)
+            owner_matrix(master, "direct-remote" if remote_view else "local")
             # Real context-menu click -> owner-side Git choices -> selection.
             os.write(master, b"\x1b[<2;8;4M\x1b[<2;8;4m")
             menu_screen = drain(master)
@@ -393,6 +786,18 @@ def main():
                                      for p in api("pane.list", remote=True)["panes"]))
                 wait_for(lambda: any(w.get("host") == "fake-dev" and w["active"]
                                      for w in api("session.snapshot")["workspaces"]))
+                owner_matrix(master, "merge")
+
+                def federated_search():
+                    result = api("search.query", {"query": "parity.md", "scope": "files",
+                                                  "all_sessions": True})
+                    matches = [match for match in result["matches"]
+                               if match.get("host") == "fake-dev" and match.get("owner_session") == "api"]
+                    assert matches, result
+                    assert all(match["kind"] == "file" for match in matches), matches
+                    assert all("parity.md" in json.dumps(match["target"]) for match in matches), matches
+
+                case("merge: global search returns host-qualified owner results", federated_search)
 
                 # '+' is machine-explicit in merge mode even from a remote
                 # workspace. Both choices open the selected owner's picker.
@@ -407,23 +812,52 @@ def main():
                 click(master, 80, local_row)
                 local_picker = drain(master)
                 assert str(root / "local-home").encode() in local_picker, local_picker[-7000:]
-                os.write(master, b"\x1b")
+                remote_before_open = topology(remote=True)
+                click(master, *position(local_picker, "picker-local/"))
+                local_picker = repaint(master)
+                click(master, *position(local_picker, ".."))
+                local_picker = repaint(master)
+                click(master, *position(local_picker, "picker-local/"))
                 drain(master)
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 34, 132, 0, 0))
+                local_picker = drain(master, 0.7)
+                click(master, *position(local_picker, "Open this folder"))
+                opened_local = wait_for(lambda: next((w for w in api("workspace.list")["workspaces"]
+                                                      if w["cwd"] == str(root / "local-home/picker-local")
+                                                      and not w.get("host")), None))
+                assert topology(remote=True) == remote_before_open, "local picker changed its remote owner"
+                api("workspace.close", {"workspace": opened_local["workspace"]})
+                remote_workspace = next(w for w in api("workspace.list")["workspaces"]
+                                        if w.get("host") == "fake-dev")
+                api("workspace.focus", {"workspace": remote_workspace["workspace"]})
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+                drain(master, 0.7)
                 os.write(master, b"\x02N")
                 choices = drain(master)
-                _, remote_row = position(choices, "fake-dev", after_column=25)
+                _, chooser_first_row = position(choices, "Local machine", after_column=25)
+                _, remote_row = position(choices, "fake-dev", after_column=25,
+                                         after_row=chooser_first_row, before_row=chooser_first_row + 3)
                 click(master, 80, remote_row)
                 remote_picker = drain(master, 1)
                 assert str(root / "project").encode() in remote_picker, remote_picker[-7000:]
+                click(master, *position(remote_picker, "picker-remote/"))
+                remote_picker = repaint(master)
+                click(master, *position(remote_picker, ".."))
+                drain(master)
                 # Navigate to a new folder and open it. Owner API, rather than
                 # the rendered path alone, proves which machine mutated.
                 os.write(master, b"g" + str(root / "second").encode() + b"\r")
                 drain(master)
-                os.write(master, b"\r")
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 34, 132, 0, 0))
+                remote_picker = drain(master, 0.7)
+                click(master, *position(remote_picker, "Open this folder"))
                 workspace = wait_for(lambda: next((w for w in api("workspace.list", remote=True)["workspaces"]
                                                     if w["cwd"] == str(root / "second")), None))
                 assert not any(w["cwd"] == str(root / "second") and not w.get("host")
                                for w in api("workspace.list")["workspaces"])
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+                drain(master, 0.7)
+                print("PASS: merge Open workspace full mouse flow: owner choice, directory/up, resized confirmation; both owners isolated", flush=True)
 
                 # Continue the legal operation chain without reattaching: the
                 # new remote workspace's Rename menu must mutate its owner and
@@ -530,11 +964,18 @@ def main():
             # routing so a local presentation server is not mistaken for SSH.
             inventory = json.loads(run("remote-session-list", remote=remote).stdout)
             for session in inventory:
+                state = root / ("remote-state" if remote else "local-state")
+                name = session["name"]
+                assert name and name not in (".", "..") and "/" not in name and "\\" not in name, session
+                directory = state if name == "default" else state / "sessions" / name
+                assert directory.resolve().is_relative_to(state), session
                 if session["running"]:
                     run("--session", session["name"], "remote-server-command", "stop",
                         remote=remote, okay=False)
         # Retain failure evidence; successful fixtures are disposable test data.
         if sys.exc_info()[0] is None:
+            assert_isolated(env)
+            assert_isolated(remote_env)
             shutil.rmtree(root)
         else:
             print("Smoke-test evidence:", root, file=sys.stderr)
@@ -543,7 +984,11 @@ def main():
 if __name__ == "__main__":
     if Path(sys.argv[0]).name == "ssh":
         ssh_substitute()
-    elif Path(sys.argv[0]).name == "xclip":
-        sys.stdout.buffer.write(IMAGE)
+    elif Path(sys.argv[0]).name in ("xclip", "xsel", "wl-copy", "pbcopy"):
+        root = fixture_root()
+        if any(option in sys.argv[1:] for option in ("-o", "-out", "--output")):
+            sys.stdout.buffer.write(IMAGE)
+        else:
+            (root / "clipboard-copy").write_bytes(sys.stdin.buffer.read())
     else:
         main()

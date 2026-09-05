@@ -115,6 +115,12 @@ pub fn render_into(f: &mut RenderTarget, app: &mut App) {
     render_into_mode(f, app, true, false);
 }
 
+/// Keep ordinary foreground hit geometry while a more recently used workspace
+/// projection owns the shared PTY dimensions.
+pub fn render_into_without_pane_resize(f: &mut RenderTarget, app: &mut App) {
+    render_into_mode(f, app, false, false);
+}
+
 /// Render a secondary client's viewport without letting that projection become
 /// the interactive view or resize the shared PTYs.
 ///
@@ -127,13 +133,28 @@ pub fn render_into(f: &mut RenderTarget, app: &mut App) {
 /// Return the passive client's content geometry before restoring all active
 /// hit-test state. Each client owns this baseline, never the shared App.
 pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(PaneId, Rect)> {
-    render_projection_preserving_state(f, app, false)
+    render_projection_preserving_state(f, app, false, false)
 }
 
 /// Render one stable workspace for a managed merge client. Temporarily selecting
 /// it is safe on the single app-loop thread; the projection wrapper restores
 /// every viewport-owned field before returning.
 pub fn render_workspace_projection(f: &mut RenderTarget, app: &mut App, workspace_id: &str) -> Vec<(PaneId, Rect)> {
+    render_workspace_projection_mode(f, app, workspace_id, false)
+}
+
+/// The interactive owner of this workspace also commits its PTY dimensions
+/// after API layout changes, without replacing another workspace's hit geometry.
+pub fn render_workspace_owner_projection(f: &mut RenderTarget, app: &mut App, workspace_id: &str) -> Vec<(PaneId, Rect)> {
+    render_workspace_projection_mode(f, app, workspace_id, true)
+}
+
+fn render_workspace_projection_mode(
+    f: &mut RenderTarget,
+    app: &mut App,
+    workspace_id: &str,
+    resize_panes: bool,
+) -> Vec<(PaneId, Rect)> {
     let previous = app
         .workspaces
         .get(app.active_ws)
@@ -144,7 +165,7 @@ pub fn render_workspace_projection(f: &mut RenderTarget, app: &mut App, workspac
         .position(|workspace| workspace.id == workspace_id)
     {
         app.active_ws = index;
-        let content = render_projection_preserving_state(f, app, true);
+        let content = render_projection_preserving_state(f, app, true, resize_panes);
         restore_active_workspace(app, previous.as_deref());
         content
     } else {
@@ -183,7 +204,12 @@ fn restore_active_workspace(app: &mut App, previous: Option<&str>) {
     }
 }
 
-fn render_projection_preserving_state(f: &mut RenderTarget, app: &mut App, workspace_only: bool) -> Vec<(PaneId, Rect)> {
+fn render_projection_preserving_state(
+    f: &mut RenderTarget,
+    app: &mut App,
+    workspace_only: bool,
+    resize_panes: bool,
+) -> Vec<(PaneId, Rect)> {
     let compact = app.compact;
     let last_main_area = app.last_main_area;
     let last_pane_area = app.last_pane_area;
@@ -222,6 +248,8 @@ fn render_projection_preserving_state(f: &mut RenderTarget, app: &mut App, works
     let agent_rects = std::mem::take(&mut app.agent_rects);
     let automation_rects = std::mem::take(&mut app.automation_rects);
     let remote_agent_rects = std::mem::take(&mut app.remote_agent_rects);
+    let remote_history_rects = std::mem::take(&mut app.remote_history_rects);
+    let remote_automation_rects = std::mem::take(&mut app.remote_automation_rects);
     let session_rects = std::mem::take(&mut app.session_rects);
     let file_tree_rects = std::mem::take(&mut app.file_tree_rects);
     let files_mode_rects = std::mem::take(&mut app.files_mode_rects);
@@ -328,7 +356,7 @@ fn render_projection_preserving_state(f: &mut RenderTarget, app: &mut App, works
         )
     });
 
-    render_into_mode(f, app, false, workspace_only);
+    render_into_mode(f, app, resize_panes, workspace_only);
 
     app.compact = compact;
     app.last_main_area = last_main_area;
@@ -365,6 +393,8 @@ fn render_projection_preserving_state(f: &mut RenderTarget, app: &mut App, works
     app.agent_rects = agent_rects;
     app.automation_rects = automation_rects;
     app.remote_agent_rects = remote_agent_rects;
+    app.remote_history_rects = remote_history_rects;
+    app.remote_automation_rects = remote_automation_rects;
     app.session_rects = session_rects;
     app.file_tree_rects = file_tree_rects;
     app.files_mode_rects = files_mode_rects;
@@ -538,6 +568,9 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     // leave a dock divider behind as a live drag target.
     app.dock_dividers.clear();
     app.agents_elsewhere_rect = None;
+    // A remote frame supplies its own MENU. Neither the tab bar nor mobile
+    // header is drawn on that path, so their old hit target must not survive.
+    app.switcher_button_rect = None;
     app.mobile_pane_prev_rect = None;
     app.mobile_pane_next_rect = None;
 
@@ -572,6 +605,8 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
         app.agent_rects.clear();
         app.automation_rects.clear();
         app.remote_agent_rects.clear();
+        app.remote_history_rects.clear();
+        app.remote_automation_rects.clear();
         app.session_rects.clear();
         app.new_ws_rect = None;
         app.last_cursor = None;
@@ -594,7 +629,17 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
         mobile::MobileProfile::Mobile
     );
     app.refresh_core_bar_widgets();
-    let status_h = if app.compact || workspace_only { 0 } else { 1 };
+    let owner_bar = workspace_only
+        && app.bar.widgets.iter().any(|(key, widget)| {
+            widget.key.owner != "core"
+                && app.config.bars.region_for(key, widget.region)
+                    == Some(crate::bar::BarRegion::BottomRight)
+        });
+    let status_h = if app.compact || (workspace_only && !owner_bar) {
+        0
+    } else {
+        1
+    };
     let [main, status] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(status_h)]).areas(area);
     // Stored so an in-flight sidebar-edge drag can map a cursor column to a width
@@ -616,9 +661,12 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     };
     // A projected workspace can open its owner's FILES/DIFF dock without
     // duplicating the owner's session/workspace/agent navigation chrome.
-    let projected_files = workspace_only && app.files_focused;
-    let lw = if (workspace_only
-        && !(projected_files && app.sidebars.side_of(&DockKind::Files) == Some(Side::Left)))
+    let projected_docks = |side| {
+        app.sidebars.get(side).docks.iter().any(|dock| {
+            matches!(dock, DockKind::Module(_)) || (*dock == DockKind::Files && app.files_focused)
+        })
+    };
+    let lw = if (workspace_only && !projected_docks(Side::Left))
         || app.compact
         || !app.sidebars.left.shown()
     {
@@ -626,8 +674,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     } else {
         fit(app.sidebars.left.width, main.width)
     };
-    let rw = if (workspace_only
-        && !(projected_files && app.sidebars.side_of(&DockKind::Files) == Some(Side::Right)))
+    let rw = if (workspace_only && !projected_docks(Side::Right))
         || app.compact
         || !app.sidebars.right.shown()
     {
@@ -728,14 +775,14 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     let mut agent_rects = Vec::new();
     let mut automation_rects = Vec::new();
     app.remote_agent_rects.clear();
+    app.remote_history_rects.clear();
+    app.remote_automation_rects.clear();
     let mut session_rects = Vec::new();
     let mut new_ws_rect = None;
     for (opt, side) in [(sidebar_left, Side::Left), (sidebar_right, Side::Right)] {
         if let Some(s) = opt {
             if workspace_only {
-                if app.sidebars.side_of(&DockKind::Files) == Some(side) {
-                    files::draw_files_dock(f, s, app, &t);
-                }
+                sidebar::draw_workspace_sidebar(f, side, s, app, &t);
                 continue;
             }
             let (w, a, scheduled, se, n) = sidebar::draw_sidebar(f, side, s, app, &t);
@@ -876,6 +923,8 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
         };
     if !workspace_only {
         status::draw_status(f, status, app, &t);
+    } else if owner_bar {
+        status::draw_owner_bar(f, status, app, &t);
     }
 
     // Read-only overflow is attachment-local geometry over server-owned bar

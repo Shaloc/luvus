@@ -118,6 +118,8 @@ mod tests {
             "agent.authority_released",
             "agent.authority_reported",
             "agent.hook",
+            "agent.history_changed",
+            "agent.pin_changed",
             "automation.created",
             "automation.deleted",
             "automation.disabled",
@@ -183,6 +185,13 @@ mod tests {
         .collect();
         assert_eq!(actual, expected);
         assert_eq!(declared, expected);
+        assert_eq!(catalog["agent.history_changed"]["$ref"], "#/$defs/empty");
+        assert_eq!(catalog["agent.pin_changed"]["$ref"], "#/$defs/agent_pin");
+        let pin = &bundle["event_catalog"]["$defs"]["agent_pin"];
+        assert_eq!(pin["required"], json!(["pane", "pinned"]));
+        assert_eq!(pin["properties"]["pane"]["type"], "string");
+        assert_eq!(pin["properties"]["pinned"]["type"], "boolean");
+        assert_eq!(pin["additionalProperties"], false);
 
         let agent_status = &bundle["event_catalog"]["$defs"]["agent_status"];
         let required: std::collections::BTreeSet<_> = agent_status["required"]

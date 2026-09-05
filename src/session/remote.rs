@@ -1100,6 +1100,22 @@ pub fn bridge_command(
     role: &str,
     location: RemoteBinaryLocation,
 ) -> Command {
+    // Managed controls, snapshots and frame subscriptions must never acquire
+    // lifecycle authority. Explicit session open/create uses remote-session-start.
+    let options: &[&str] = if matches!(role, "remote-control-bridge" | "remote-client-bridge") {
+        &["--existing"]
+    } else {
+        &[]
+    };
+    bridge_command_with_options(target, role, location, options)
+}
+
+fn bridge_command_with_options(
+    target: &RemoteSession,
+    role: &str,
+    location: RemoteBinaryLocation,
+    options: &[&str],
+) -> Command {
     let mut command = ssh_base(&target.host);
     match location {
         RemoteBinaryLocation::Path => {
@@ -1107,14 +1123,13 @@ pub fn bridge_command(
                 .arg("luvus")
                 .arg("--session")
                 .arg(&target.session)
-                .arg(role);
+                .arg(role)
+                .args(options);
         }
         RemoteBinaryLocation::StandardFallback => {
-            command.arg(standard_binary_script(&[
-                "--session",
-                &target.session,
-                role,
-            ]));
+            let mut args = vec!["--session", &target.session, role];
+            args.extend_from_slice(options);
+            command.arg(standard_binary_script(&args));
         }
     }
     command
@@ -1264,11 +1279,83 @@ pub fn connect_control(target: &RemoteSession) -> Result<ControlConnection, Stri
     connect_control_at(target, location)
 }
 
+/// One bounded request over the existing SSH control bridge, with lifecycle
+/// startup/recovery disabled. Callers already
+/// run off-loop; version negotiation retains its existing bounded preflight.
+/// The response deadline cancels only this request's SSH child, never a server.
+pub(crate) fn request_control(
+    target: &RemoteSession,
+    method: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+    response_limit: usize,
+) -> Result<serde_json::Value, String> {
+    let location = verify_remote_version(&target.host)?;
+    let connection = spawn_control(bridge_command_with_options(
+        target,
+        "remote-control-bridge",
+        location,
+        &["--existing"],
+    ))?;
+    request_on_control(connection, method, params, timeout, response_limit)
+}
+
+fn request_on_control(
+    connection: ControlConnection,
+    method: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+    response_limit: usize,
+) -> Result<serde_json::Value, String> {
+    use std::io::BufRead;
+
+    let scope = Arc::new(ConnectionScope::default());
+    let mut connection = connection.in_scope(&scope)?;
+    let request = serde_json::json!({"id":"remote-request","method":method,"params":params});
+    let wire = format!("{request}\n");
+    if wire.len() > response_limit {
+        return Err("remote control request exceeds its byte limit".into());
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = (|| {
+            connection
+                .write_all(wire.as_bytes())
+                .map_err(|error| error.to_string())?;
+            connection.flush().map_err(|error| error.to_string())?;
+            let mut reader = io::BufReader::new(connection.take(response_limit as u64 + 1));
+            let mut response = Vec::new();
+            reader
+                .read_until(b'\n', &mut response)
+                .map_err(|error| error.to_string())?;
+            if response.len() > response_limit {
+                return Err("remote control response exceeds its byte limit".into());
+            }
+            if !response.ends_with(b"\n") {
+                return Err("remote control response is incomplete".into());
+            }
+            serde_json::from_slice(&response)
+                .map_err(|error| format!("invalid remote control response: {error}"))
+        })();
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(_) => {
+            scope.cancel();
+            Err("remote control request timed out".into())
+        }
+    }
+}
+
 pub(crate) fn connect_control_at(
     target: &RemoteSession,
     location: RemoteBinaryLocation,
 ) -> Result<ControlConnection, String> {
-    let mut command = bridge_command(target, "remote-control-bridge", location);
+    spawn_control(bridge_command(target, "remote-control-bridge", location))
+}
+
+fn spawn_control(mut command: Command) -> Result<ControlConnection, String> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1298,8 +1385,121 @@ pub(crate) fn connect_control_at(
 mod tests {
     use super::*;
 
+    #[test]
+    fn managed_bridge_factories_have_no_implicit_server_lifecycle() {
+        let target = RemoteSession::new("fake-dev", "api").unwrap();
+        for location in [
+            RemoteBinaryLocation::Path,
+            RemoteBinaryLocation::StandardFallback,
+        ] {
+            for role in ["remote-control-bridge", "remote-client-bridge"] {
+                let command = bridge_command(&target, role, location);
+                let args = command
+                    .get_args()
+                    .map(|arg| arg.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(args.contains("--existing"), "{role}: {args}");
+            }
+            let command = bridge_command(&target, "remote-session-start", location);
+            assert!(!command
+                .get_args()
+                .any(|arg| arg.to_string_lossy().contains("--existing")));
+        }
+    }
+
+    #[cfg(unix)]
+    fn fixture_control(script: &str) -> ControlConnection {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take().unwrap();
+        ControlConnection {
+            child: Arc::new(Mutex::new(child)),
+            stdin,
+            stdout,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_remote_control_stops_at_newline_and_reaps_its_own_child() {
+        let connection = fixture_control(
+            "IFS= read -r request; printf '{\"result\":{\"ok\":true}}\\n'; exec sleep 10",
+        );
+        let child = Arc::clone(&connection.child);
+        let started = Instant::now();
+        let result = request_on_control(
+            connection,
+            "ping",
+            serde_json::json!({}),
+            Duration::from_millis(300),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(result["result"]["ok"], true);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.lock().unwrap().try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_remote_control_deadline_cancels_only_its_connection() {
+        let connection = fixture_control("IFS= read -r request; exec sleep 10");
+        let started = Instant::now();
+        let result = request_on_control(
+            connection,
+            "ping",
+            serde_json::json!({}),
+            Duration::from_millis(20),
+            1024,
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_remote_control_rejects_oversized_response() {
+        let connection = fixture_control("IFS= read -r request; printf '%0200d\\n' 0");
+        let result = request_on_control(
+            connection,
+            "ping",
+            serde_json::json!({}),
+            Duration::from_millis(300),
+            100,
+        );
+        assert!(result.unwrap_err().contains("response exceeds"));
+    }
+
     fn strings(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()
+    }
+
+    #[test]
+    fn existing_only_control_option_reaches_both_binary_locations() {
+        let target = RemoteSession::new("fake-dev", "api").unwrap();
+        for location in [
+            RemoteBinaryLocation::Path,
+            RemoteBinaryLocation::StandardFallback,
+        ] {
+            let command = bridge_command_with_options(
+                &target,
+                "remote-control-bridge",
+                location,
+                &["--existing"],
+            );
+            let argv = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy())
+                .collect::<Vec<_>>();
+            assert!(argv.iter().any(|arg| arg.contains("--existing")));
+            assert!(argv.iter().any(|arg| arg.contains("remote-control-bridge")));
+        }
     }
 
     fn exit_status(code: i32) -> ExitStatus {

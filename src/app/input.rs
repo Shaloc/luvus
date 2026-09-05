@@ -424,12 +424,21 @@ impl App {
     /// changes when the pane echoes (a separate `PtyData` event), so we don't waste
     /// a full render per keystroke.
     pub fn handle_event(&mut self, ev: AppEvent) -> bool {
+        // A pending owner-menu focus may not follow the user after they leave
+        // its source workspace. This is an O(1) pane/generation check only.
+        self.discard_stale_remote_navigation();
         // Theme removal starts in Settings but performs bounded filesystem work
         // off-loop. Apply its completed registry before the empty-workspace guard
         // so the single writer always observes the result.
         let ev = match ev {
             AppEvent::IoCompleted(completion) => {
                 return completion.apply(self);
+            }
+            AppEvent::PtyClipboard { pane, text } => {
+                if self.panes.contains_key(&pane) {
+                    self.pending_clipboard = Some(text);
+                }
+                return false;
             }
             AppEvent::BackendCreateReady {
                 id,
@@ -532,7 +541,7 @@ impl App {
             }
             AppEvent::SearchHandoffReady { session, result } => {
                 match result {
-                    Ok(()) => self.pending_session_switch = Some(session),
+                    Ok(activation) => self.finish_search_handoff(session, activation),
                     Err(error) => {
                         log_worker_failed(crate::logging::Worker::Search, "handoff");
                         self.show_toast(format!("session switch failed: {error}"));
@@ -804,11 +813,39 @@ impl App {
                 false
             }
             AppEvent::Key(k) => self.handle_key(k),
+            AppEvent::PrefixKey(key) => {
+                if key.kind == KeyEventKind::Release {
+                    return false;
+                }
+                let previous_mode = self.mode;
+                self.mode = Mode::Prefix;
+                let changed = self.handle_key(key);
+                // Existing overlays retain precedence. If one consumed the
+                // suffix before prefix dispatch, do not leave a latent prefix
+                // armed for the next ordinary key.
+                if self.mode == Mode::Prefix {
+                    self.mode = previous_mode;
+                }
+                changed
+            }
             AppEvent::ClientCommand(command) => {
+                if command == "send_prefix" {
+                    return self.handle_event(AppEvent::PrefixKey(self.prefix.key_event()));
+                }
+                if self.handle_remote_agent_command(&command) {
+                    return true;
+                }
                 if let Some((action, pane)) = command.split_once(' ').filter(|(action, _)| {
                     matches!(*action, "remote_agent_focus" | "remote_agent_menu")
                 }) {
-                    if let Ok(id) = pane.parse::<u32>() {
+                    let mut args = pane.split_whitespace();
+                    let id = args.next().and_then(|id| id.parse::<u32>().ok());
+                    let anchor = if action == "remote_agent_menu" {
+                        Self::owner_menu_coordinates(args)
+                    } else {
+                        args.next().is_none().then_some((2, 2))
+                    };
+                    if let (Some(id), Some(anchor)) = (id, anchor) {
                         let id = PaneId(id);
                         if self
                             .ws()
@@ -818,12 +855,21 @@ impl App {
                         {
                             self.focus_pane_global(id);
                             if action == "remote_agent_menu" {
-                                self.open_agent_menu(AgentTarget::Live(id), 2, 2);
+                                self.open_agent_menu(AgentTarget::Live(id), anchor.0, anchor.1);
+                                if let Some(menu) = self.agent_menu.as_mut() {
+                                    menu.owner_only = true;
+                                }
                             }
                         }
                     }
                 } else if command == "open_local_workspace" {
                     self.open_local_folder_picker();
+                } else if command.split_whitespace().next() == Some("open_workspace_menu") {
+                    if let Some((column, row)) =
+                        Self::owner_menu_coordinates(command.split_whitespace().skip(1))
+                    {
+                        self.open_ws_menu(self.active_ws, column, row);
+                    }
                 } else if command == "open_worktree" {
                     self.open_worktree_picker_at(self.ws().cwd.clone());
                 } else if command == "delete_worktree" {
@@ -1263,6 +1309,7 @@ impl App {
             | AppEvent::BackendCreateReady { .. }
             | AppEvent::BackendObserve { .. }
             | AppEvent::PtyReady { .. }
+            | AppEvent::PtyClipboard { .. }
             | AppEvent::SearchFilesIndexed { .. }
             | AppEvent::SearchResults { .. }
             | AppEvent::SearchFederatedResults { .. }
@@ -1591,6 +1638,9 @@ impl App {
 
     fn apply_mouse(&mut self, m: ratatui::crossterm::event::MouseEvent) {
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        if self.forward_captured_remote_mouse(m) {
+            return;
+        }
         // A new primary-button gesture replaces any copied mouse selection,
         // even when a modal, menu, resize handle, or child TUI claims the press
         // below. This keeps the delayed highlight from surviving an unrelated
@@ -2065,10 +2115,36 @@ impl App {
             }
             return;
         }
+        // An already-open read-only Bar popup owns the complete pointer input,
+        // including the remote frame underneath it. Ordinary Bar actions stay
+        // below the owner boundary; higher modals still take precedence here.
+        if self.bar.overflow.is_some() {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.bar_click(m.column, m.row);
+            }
+            return;
+        }
+        // Clear outer list focus before forwarding a remote press; forwarding
+        // returns early and must not leave invisible keyboard capture behind.
+        if matches!(m.kind, MouseEventKind::Down(_)) {
+            let area = match self.sidebar_focus {
+                Some(SidebarListFocus::Workspaces) => Some(self.workspaces_area),
+                Some(SidebarListFocus::Agents) => Some(self.agents_area),
+                None => None,
+            };
+            if area.is_some_and(|area| !area.contains((m.column, m.row).into())) {
+                self.sidebar_focus = None;
+            }
+        }
         // Pointer interaction outside the FILES dock returns keyboard input to
         // the pane or control the user actually clicked. A click inside keeps
         // the tree focus and its cursor intact.
-        if self.forward_active_remote_mouse(m) {
+        // Remote gestures begun by a forwarded press already returned through
+        // forward_captured_remote_mouse above. An uncaptured release/drag must
+        // stay local, especially after its press dismissed an outer popup.
+        if !matches!(m.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_))
+            && self.forward_active_remote_mouse(m)
+        {
             return;
         }
         if self.ws().remote.is_some()
@@ -2092,30 +2168,9 @@ impl App {
                 self.files_focused = false;
             }
         }
-        // WORKSPACES/AGENTS keyboard ownership follows the same rule as FILES:
-        // a pointer press outside the focused list returns input to the pane.
-        if matches!(m.kind, MouseEventKind::Down(_)) {
-            let area = match self.sidebar_focus {
-                Some(SidebarListFocus::Workspaces) => Some(self.workspaces_area),
-                Some(SidebarListFocus::Agents) => Some(self.agents_area),
-                None => None,
-            };
-            if area.is_some_and(|area| {
-                m.column < area.x
-                    || m.column >= area.right()
-                    || m.row < area.y
-                    || m.row >= area.bottom()
-            }) {
-                self.sidebar_focus = None;
-            }
-        }
-        // Bar actions and the read-only overflow popup own their rendered
-        // rectangles. This sits below every modal guard: while a modal is open,
-        // it owns the screen and a click must never invoke a hidden bar action.
-        // An open overflow popup still consumes the next click, closing when it
-        // is outside, so input never falls through to a pane behind it.
-        let bar_press = matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
-            || (self.bar.overflow.is_some() && matches!(m.kind, MouseEventKind::Down(_)));
+        // Ordinary Bar actions own their rendered rectangles, below all modal
+        // and remote-owner guards. The open-popup guard above owns dismissal.
+        let bar_press = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
         if bar_press && self.bar_click(m.column, m.row) {
             return;
         }
@@ -2136,6 +2191,23 @@ impl App {
                 .cloned()
             {
                 self.activate_remote_agent(&target, &pane, true);
+                if let Some(menu) = self.agent_menu.as_mut() {
+                    menu.anchor = (c, r);
+                }
+            } else if let Some((view, key, _)) = self
+                .remote_history_rects
+                .iter()
+                .find(|(_, _, rect)| hit(*rect))
+                .copied()
+            {
+                self.open_agent_menu(AgentTarget::RemoteSession { view, key }, c, r);
+            } else if let Some((view, id, _)) = self
+                .remote_automation_rects
+                .iter()
+                .find(|(_, _, rect)| hit(*rect))
+                .cloned()
+            {
+                self.send_agent_view_command(view, format!("automation_detail {id}"));
             } else if let Some((i, _)) = self.tab_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_tab_menu(*i, c, r);
             } else if let Some((i, _)) = self.ws_rects.iter().find(|(_, rect)| hit(*rect)) {
@@ -2800,6 +2872,27 @@ impl App {
             return;
         }
         // Clicking a resumable session row reopens it into a pane.
+        if let Some((view, key, _)) = self
+            .remote_history_rects
+            .iter()
+            .find(|(_, _, rect)| hit(*rect))
+            .copied()
+        {
+            self.remote_agent_menu_action(
+                AgentTarget::RemoteSession { view, key },
+                AgentMenuItem::Resume,
+            );
+            return;
+        }
+        if let Some((view, id, _)) = self
+            .remote_automation_rects
+            .iter()
+            .find(|(_, _, rect)| hit(*rect))
+            .cloned()
+        {
+            self.send_agent_view_command(view, format!("automation_detail {id}"));
+            return;
+        }
         if let Some((i, _)) = self.session_rects.iter().find(|(_, rect)| hit(*rect)) {
             let i = *i;
             self.sidebar_focus = None;
@@ -6556,6 +6649,26 @@ mod link_click_tests {
                 "the complete Unicode path is copied from physical column {col}"
             );
         }
+    }
+
+    #[test]
+    fn osc52_child_copy_queues_a_client_effect_without_render_or_clipboard_read() {
+        let _env = crate::persist::test_env("osc52-owner-app");
+        let (mut app, _term, _) = fixture_showing("", 0);
+        let pane = app.layout().focus;
+        assert!(!app.handle_event(AppEvent::PtyClipboard {
+            pane,
+            text: "  yank\n你好".into(),
+        }));
+        assert_eq!(
+            app.pending_clipboard.take().as_deref(),
+            Some("  yank\n你好")
+        );
+        assert!(!app.handle_event(AppEvent::PtyClipboard {
+            pane: PaneId(u32::MAX),
+            text: "closed pane".into(),
+        }));
+        assert!(app.pending_clipboard.is_none());
     }
 
     #[test]

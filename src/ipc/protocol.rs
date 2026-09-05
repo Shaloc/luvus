@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::TerminalColors;
 
-pub const PROTOCOL_VERSION: u32 = 7;
-const MAX_FRAME: usize = 64 * 1024 * 1024;
+pub const PROTOCOL_VERSION: u32 = 8;
+pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub enum ClientMessage {
@@ -45,6 +45,9 @@ pub enum ClientMessage {
     Detach,
     /// Response to [`ServerMessage::Ready`] when terminal colors were requested.
     TerminalColors(Option<TerminalColors>),
+    /// A display prefix has already been consumed. Resolve this suffix through
+    /// the owner's existing prefix handler and configured keymap.
+    PrefixKey(KeyEvent),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -85,6 +88,12 @@ pub enum ServerMessage {
     /// still decode the version-mismatch reply from an older server.
     Ready {
         probe_terminal: bool,
+    },
+    /// A workspace-only client requested navigation in the owner's MENU.
+    /// The display resolves this stable id within that SSH host/session; it
+    /// must not replace another foreground client's workspace or connection.
+    FocusWorkspace {
+        workspace_id: String,
     },
 }
 
@@ -475,6 +484,21 @@ mod tests {
     }
 
     #[test]
+    fn prefix_suffix_roundtrip_preserves_the_native_key_event() {
+        let key = KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('?'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL
+                | ratatui::crossterm::event::KeyModifiers::SHIFT,
+        );
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &ClientMessage::PrefixKey(key)).unwrap();
+        assert!(matches!(
+            read_message::<_, ClientMessage>(&mut &bytes[..]).unwrap(),
+            ClientMessage::PrefixKey(decoded) if decoded == key
+        ));
+    }
+
+    #[test]
     fn sound_signal_roundtrip_preserves_style_and_cue() {
         let signal = crate::sound::SoundSignal {
             cue: crate::sound::SoundCue::Blocked,
@@ -499,6 +523,22 @@ mod tests {
         assert!(matches!(
             read_message::<_, ServerMessage>(&mut &bytes[..]).unwrap(),
             ServerMessage::SwitchSession { name } if name == "api"
+        ));
+    }
+
+    #[test]
+    fn owner_workspace_navigation_roundtrips_a_stable_id_only() {
+        let mut bytes = Vec::new();
+        write_message(
+            &mut bytes,
+            &ServerMessage::FocusWorkspace {
+                workspace_id: "workspace_owner".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_message::<_, ServerMessage>(&mut &bytes[..]).unwrap(),
+            ServerMessage::FocusWorkspace { workspace_id } if workspace_id == "workspace_owner"
         ));
     }
 

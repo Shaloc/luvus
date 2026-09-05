@@ -593,6 +593,15 @@ impl App {
         source: &str,
         target: Target,
     ) -> Result<u64, String> {
+        // Module argv executes on this server. A remote projection's cwd must
+        // never become a local module context, including dock/bar/event calls.
+        if let Some(workspace) = target
+            .workspace
+            .or_else(|| (!self.workspaces.is_empty()).then_some(self.active_ws))
+        {
+            self.require_local_workspace(workspace)
+                .map_err(|(_, message)| message)?;
+        }
         {
             let module = self
                 .modules
@@ -670,6 +679,89 @@ mod tests {
     use super::*;
     use crate::persist::TEST_ENV_LOCK;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn remote_workspace_modules_never_run_local_argv_or_show_local_actions() {
+        let _env = crate::persist::test_env("remote-module-owner-guard");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let (_, receiver, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        let index = app.active_ws;
+        app.open_ws_menu(index, 2, 2);
+        assert!(app.ws_menu.as_ref().unwrap().module_actions.is_empty());
+        assert!(app.ws_menu_items(index).contains(&WsMenuItem::OwnerModules));
+        let (column, row) = app.remote_menu_anchor(index, (2, 2));
+        let expected = format!("open_workspace_menu {column} {row}");
+        app.ws_menu_action(WsMenuItem::OwnerModules);
+        assert!(matches!(receiver.try_recv().unwrap(),
+            crate::ipc::protocol::ClientMessage::Command(command) if command == expected));
+        let error = app
+            .run_module_command_for(
+                "not-local",
+                vec!["must-not-execute".into()],
+                "probe".into(),
+                Vec::new(),
+                "menu:workspace",
+                Target::workspace(index),
+            )
+            .unwrap_err();
+        assert!(error.contains("--host dev-207"));
+        assert!(app.module_logs.is_empty());
+        for method in ["worktree.open", "worktree.remove"] {
+            let error = app
+                .dispatch(method, &json!({"path":"/srv/api"}))
+                .unwrap_err();
+            assert_eq!(error.0, "remote_workspace");
+        }
+    }
+
+    #[test]
+    fn workspace_projection_keeps_owner_extension_docks_and_bar_hits() {
+        use crate::bar::{BarRegion, BarSegment, BarTone, BarWidget, BarWidgetKey};
+        let _env = crate::persist::test_env("projected-owner-module-ui");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        app.push_module_dock(
+            "owner-dock",
+            Some("OWNER DOCK".into()),
+            Side::Left,
+            vec![DockRow {
+                text: "OWNER ROW".into(),
+                dot: None,
+                action: Some("proof".into()),
+                value: None,
+                menu: Vec::new(),
+            }],
+        );
+        let mut segment = BarSegment::text("OWNER BAR", BarTone::Normal);
+        segment.action = Some("proof".into());
+        app.bar
+            .push_widget(
+                BarWidget::new(
+                    BarWidgetKey::new("owner.module", "proof"),
+                    BarRegion::BottomRight,
+                    vec![segment],
+                    Vec::new(),
+                    50,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let area = ratatui::layout::Rect::new(0, 0, 140, 40);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+        crate::ui::render_workspace_interactive(&mut target, &mut app, 0);
+        let text: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(text.contains("OWNER ROW"), "owner module dock disappeared");
+        assert!(text.contains("OWNER BAR"), "owner bottom bar disappeared");
+        assert!(app
+            .bar
+            .hits
+            .iter()
+            .any(|hit| hit.key.owner == "owner.module"));
+        assert!(
+            app.ws_rects.is_empty(),
+            "whole-session workspace chrome must remain local"
+        );
+    }
 
     /// End-to-end: a click on a dock row's right-click menu (docs/52) really
     /// spawns that module's action, with the **snapshotted** row's identity in

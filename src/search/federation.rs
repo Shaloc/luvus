@@ -23,6 +23,28 @@ pub struct FederatedResult {
     pub partial: bool,
 }
 
+#[derive(Debug)]
+pub struct SearchActivation {
+    pub remote: Option<crate::session::remote::RemoteSession>,
+    pub workspace_id: Option<String>,
+}
+
+/// Query each displayed owner once, not its local presentation namespace too.
+/// Keep the established cap and report a partial catalog when it is exceeded.
+pub fn sessions_with_owners(mut owners: Vec<String>) -> (Vec<String>, bool) {
+    let (locals, mut partial) = running_sessions();
+    owners.sort_unstable();
+    owners.dedup();
+    for local in locals {
+        if !owners.contains(&local) {
+            owners.push(local);
+        }
+    }
+    partial |= owners.len() > MAX_FEDERATED_SESSIONS;
+    owners.truncate(MAX_FEDERATED_SESSIONS);
+    (owners, partial)
+}
+
 /// Running sessions in the selected Luvus home, excluding the current owner.
 /// Discovery is side-effect-free and intentionally capped.
 pub fn running_sessions() -> (Vec<String>, bool) {
@@ -47,9 +69,9 @@ pub fn query_session(
     limit: usize,
 ) -> Result<FederatedResult, String> {
     crate::session::validate_name(session)?;
-    let name = crate::session::parse_target_name(session)?;
-    let response = request(
-        &crate::session::api_socket_path_for(name.as_deref()),
+    let remote = crate::session::remote::resolve_canonical(session)?;
+    let response = request_session(
+        session,
         "search.query",
         json!({
             "query": query,
@@ -95,6 +117,10 @@ pub fn query_session(
             .get("detail")
             .and_then(Value::as_str)
             .unwrap_or(session);
+        let detail = remote.as_ref().map_or_else(
+            || detail.to_string(),
+            |owner| format!("[remote · {}] {detail}", owner.host),
+        );
         let target = item
             .get("target")
             .cloned()
@@ -104,7 +130,7 @@ pub fn query_session(
             format!("remote:{session}:{id}"),
             kind,
             label.to_string(),
-            detail.to_string(),
+            detail,
             [],
             SearchTarget::Remote {
                 session: session.to_string(),
@@ -145,35 +171,32 @@ pub fn query_session(
 }
 
 pub fn session_supports_search(session: &str) -> bool {
-    let Ok(name) = crate::session::parse_target_name(session) else {
-        return false;
-    };
-    request(
-        &crate::session::api_socket_path_for(name.as_deref()),
-        "search.capabilities",
-        json!({}),
-    )
-    .ok()
-    .and_then(|response| response.get("result").cloned())
-    .is_some_and(|result| {
-        result.get("version").and_then(Value::as_u64) == Some(1)
-            && result
-                .get("methods")
-                .and_then(Value::as_array)
-                .is_some_and(|methods| {
-                    methods
-                        .iter()
-                        .any(|method| method.as_str() == Some("search.query"))
-                })
-    })
+    request_session(session, "search.capabilities", json!({}))
+        .ok()
+        .and_then(|response| response.get("result").cloned())
+        .is_some_and(|result| {
+            result.get("version").and_then(Value::as_u64) == Some(1)
+                && result
+                    .get("methods")
+                    .and_then(Value::as_array)
+                    .is_some_and(|methods| {
+                        methods
+                            .iter()
+                            .any(|method| method.as_str() == Some("search.query"))
+                    })
+        })
 }
 
 /// Validate and focus/open a target in its owning session before client handoff.
-pub fn activate_session(session: &str, kind: SearchKind, target: Value) -> Result<(), String> {
+pub fn activate_session(
+    session: &str,
+    kind: SearchKind,
+    target: Value,
+) -> Result<SearchActivation, String> {
     crate::session::validate_name(session)?;
-    let name = crate::session::parse_target_name(session)?;
-    let response = request(
-        &crate::session::api_socket_path_for(name.as_deref()),
+    let remote = crate::session::remote::resolve_canonical(session)?;
+    let response = request_session(
+        session,
         "search.activate",
         json!({ "kind": kind.label(), "target": target }),
     )?;
@@ -184,7 +207,39 @@ pub fn activate_session(session: &str, kind: SearchKind, target: Value) -> Resul
             .unwrap_or("target activation failed")
             .to_string());
     }
-    Ok(())
+    let result = response
+        .get("result")
+        .filter(|result| result.get("activated").and_then(Value::as_bool) == Some(true))
+        .ok_or_else(|| "owner did not confirm search target activation".to_string())?;
+    let workspace_id = result
+        .get("workspace_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if remote.is_some() && workspace_id.is_none() {
+        return Err("remote owner did not identify the activated workspace".into());
+    }
+    Ok(SearchActivation {
+        remote,
+        workspace_id,
+    })
+}
+
+fn request_session(session: &str, method: &str, params: Value) -> Result<Value, String> {
+    if let Some(target) = crate::session::remote::resolve_canonical(session)? {
+        return crate::session::remote::request_control(
+            &target,
+            method,
+            params,
+            SESSION_TIMEOUT,
+            MAX_SESSION_RESPONSE_BYTES as usize,
+        );
+    }
+    let name = crate::session::parse_target_name(session)?;
+    request(
+        &crate::session::api_socket_path_for(name.as_deref()),
+        method,
+        params,
+    )
 }
 
 fn request(path: &Path, method: &str, params: Value) -> Result<Value, String> {

@@ -50,7 +50,9 @@ pub struct RemoteAgentMeta {
     pub focused: bool,
     pub name: Option<String>,
     pub session: Option<String>,
+    pub terminal_id: Option<String>,
     pub cwd: String,
+    pub pinned: bool,
 }
 
 fn parse_remote_agents(workspace: &Value) -> Vec<RemoteAgentMeta> {
@@ -88,7 +90,8 @@ fn parse_remote_agents(workspace: &Value) -> Vec<RemoteAgentMeta> {
                 state,
                 tab: tab.get("index").and_then(Value::as_u64).unwrap_or(1) as usize,
                 focused: pane
-                    .get("focused")
+                    .get("workspace_focused")
+                    .or_else(|| pane.get("focused"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
                 name: pane
@@ -99,11 +102,19 @@ fn parse_remote_agents(workspace: &Value) -> Vec<RemoteAgentMeta> {
                     .get("agent_session")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                terminal_id: pane
+                    .get("terminal_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 cwd: pane
                     .get("cwd")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .into(),
+                pinned: pane
+                    .get("agent_pinned")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect()
@@ -112,6 +123,8 @@ fn parse_remote_agents(workspace: &Value) -> Vec<RemoteAgentMeta> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteWorkspaceMeta {
     pub agents: Vec<RemoteAgentMeta>,
+    pub history: Vec<super::remote_agents::AgentHistoryRow>,
+    pub scheduled: Vec<super::remote_agents::ScheduledAgentRow>,
     pub worktree: Option<crate::git::WorktreeMembership>,
     pub id: String,
     pub name: String,
@@ -138,10 +151,34 @@ pub enum RemoteEffect {
     Sound(crate::sound::SoundSignal),
     Clipboard(String),
     OpenUrl(String),
+    Workspace {
+        pane: PaneId,
+        generation: u64,
+        workspace_id: String,
+    },
+    Session {
+        pane: PaneId,
+        generation: u64,
+        name: String,
+    },
+    Detach {
+        pane: PaneId,
+        generation: u64,
+    },
+}
+
+/// One explicit owner-menu destination awaiting the existing topology feed.
+/// Never persisted, retried on a timer, or allowed to outlive its input source.
+pub(super) struct PendingRemoteNavigation {
+    pane: PaneId,
+    generation: u64,
+    target: RemoteWorkspaceRef,
 }
 
 pub struct RemoteView {
     pub agents: Vec<RemoteAgentMeta>,
+    pub history: Vec<super::remote_agents::AgentHistoryRow>,
+    pub scheduled: Vec<super::remote_agents::ScheduledAgentRow>,
     pub target: RemoteWorkspaceRef,
     pub state: RemoteViewState,
     pub error: Option<String>,
@@ -226,15 +263,19 @@ impl App {
         else {
             return false;
         };
-        let Some(index) = self.workspaces.iter().enumerate().find_map(|(index, _)| {
-            self.remote_workspace_view(index)
-                .filter(|view| {
+        // Choosing the current owner should browse from the workspace the
+        // user is viewing, not jump to that owner's first projected checkout.
+        let active = self.active_ws;
+        let Some(index) = std::iter::once(active)
+            .chain((0..self.workspaces.len()).filter(|index| *index != active))
+            .find(|&index| {
+                self.remote_workspace_view(index).is_some_and(|view| {
                     view.target.host == target.host
                         && view.target.session == target.session
                         && view.state == RemoteViewState::Ready
                 })
-                .map(|_| index)
-        }) else {
+            })
+        else {
             return false;
         };
         if self.send_workspace_remote(index, ClientMessage::Command("open_local_workspace".into()))
@@ -270,12 +311,17 @@ impl App {
             return;
         };
         self.active_ws = index;
-        let action = if menu {
-            "remote_agent_menu"
+        if menu {
+            if let Some(pane) = pane.parse::<u32>().ok().map(PaneId) {
+                let view = self.workspaces[index].tabs[0].layout.focus;
+                self.open_agent_menu(super::AgentTarget::RemoteLive { view, pane }, 2, 2);
+            }
         } else {
-            "remote_agent_focus"
-        };
-        self.send_workspace_remote(index, ClientMessage::Command(format!("{action} {pane}")));
+            self.send_workspace_remote(
+                index,
+                ClientMessage::Command(format!("remote_agent_focus {pane}")),
+            );
+        }
     }
 
     pub(crate) fn session_label(&self) -> String {
@@ -297,6 +343,8 @@ impl App {
             pane,
             ViewKind::Remote(RemoteView {
                 agents: Vec::new(),
+                history: Vec::new(),
+                scheduled: Vec::new(),
                 target: reference.clone(),
                 state: RemoteViewState::Connecting,
                 error: None,
@@ -493,6 +541,14 @@ impl App {
     }
 
     pub(crate) fn discover_remote_session(&mut self, target: RemoteSession) {
+        self.discover_remote_session_with_refresh(target, false);
+    }
+
+    fn discover_remote_session_with_refresh(
+        &mut self,
+        target: RemoteSession,
+        force_snapshot: bool,
+    ) {
         let key = target.canonical_name();
         if !self.config.remote_hosts.contains(&target.host) {
             return;
@@ -503,7 +559,7 @@ impl App {
                     && view.target.session == target.session
                     && view.state == RemoteViewState::Disconnected)
         });
-        if self.remote_session_watchers.contains_key(&key) && !disconnected {
+        if self.remote_session_watchers.contains_key(&key) && !disconnected && !force_snapshot {
             return;
         }
         // User-triggered refresh also replaces a healthy topology watcher when
@@ -571,6 +627,7 @@ impl App {
         target: RemoteSession,
         result: Result<RemoteSessionSnapshot, String>,
     ) {
+        self.discard_stale_remote_navigation();
         let snapshot = match result {
             Ok(snapshot) => snapshot,
             Err(error) => {
@@ -595,6 +652,7 @@ impl App {
                         }
                     }
                 }
+                self.discard_stale_remote_navigation();
                 self.show_toast(format!("{}: {error}", target.canonical_name()));
                 return;
             }
@@ -627,6 +685,8 @@ impl App {
                 branch: None,
                 worktree: None,
                 agents: Vec::new(),
+                history: Vec::new(),
+                scheduled: Vec::new(),
             });
         }
         self.closed_remote_workspaces.retain(|remote| {
@@ -654,6 +714,8 @@ impl App {
                 if let Some(pane) = workspace.tabs.first().map(|tab| tab.layout.focus) {
                     if let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) {
                         view.agents = meta.agents;
+                        view.history = meta.history;
+                        view.scheduled = meta.scheduled;
                         if refresh_projections && view.state == RemoteViewState::Disconnected {
                             if let Some(input) = view.input.take() {
                                 let _ = input.send(ClientMessage::Detach);
@@ -733,6 +795,7 @@ impl App {
         }
         self.rebalance_remote_effect_leader(&target);
         self.finish_remote_workspace_picker();
+        self.finish_remote_navigation();
     }
 
     pub(crate) fn apply_remote_session_watcher_closed(
@@ -740,6 +803,15 @@ impl App {
         target: RemoteSession,
         error: String,
     ) {
+        if self
+            .pending_remote_navigation
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.target.host == target.host && pending.target.session == target.session
+            })
+        {
+            self.pending_remote_navigation = None;
+        }
         self.remote_session_watchers
             .remove(&target.canonical_name());
         for view in self.views.values_mut() {
@@ -776,6 +848,8 @@ impl App {
             pane,
             ViewKind::Remote(RemoteView {
                 agents: meta.agents,
+                history: meta.history,
+                scheduled: meta.scheduled,
                 target: remote.clone(),
                 state: RemoteViewState::Connecting,
                 error: None,
@@ -934,6 +1008,7 @@ impl App {
             view.input = None;
             view.error = Some(error);
         }
+        self.discard_stale_remote_navigation();
         self.rebalance_remote_effect_leaders();
     }
 
@@ -943,7 +1018,131 @@ impl App {
             RemoteEffect::Sound(signal) => self.pending_sound = Some(signal),
             RemoteEffect::Clipboard(text) => self.pending_clipboard = Some(text),
             RemoteEffect::OpenUrl(url) => self.pending_open_url = Some(url),
+            RemoteEffect::Workspace {
+                pane,
+                generation,
+                workspace_id,
+            } => {
+                if let Some(target) =
+                    self.apply_remote_workspace_navigation(pane, generation, workspace_id)
+                {
+                    // Closed projections have no retained metadata, and merely
+                    // focusing an existing owner workspace need not emit a new
+                    // topology event. Reuse one explicit discovery, replacing
+                    // its old watcher instead of waiting indefinitely or polling.
+                    self.discover_remote_session_with_refresh(target, true);
+                }
+            }
+            RemoteEffect::Session {
+                pane,
+                generation,
+                name,
+            } => {
+                if let Some(target) = self.remote_session_navigation_target(pane, generation, &name)
+                {
+                    self.pending_remote_navigation = None;
+                    self.open_named_session_menu();
+                    self.prepare_remote_session(target, self.remote_merge_enabled, false);
+                }
+            }
+            RemoteEffect::Detach { pane, generation } => {
+                if self.remote_navigation_source(pane, generation).is_some() {
+                    self.pending_remote_navigation = None;
+                    self.detach_requested = true;
+                }
+            }
         }
+    }
+
+    fn remote_navigation_source(
+        &self,
+        pane: PaneId,
+        generation: u64,
+    ) -> Option<&RemoteWorkspaceRef> {
+        if self.active_remote_pane() != Some(pane) {
+            return None;
+        }
+        match self.views.get(&pane)? {
+            ViewKind::Remote(view)
+                if view.generation == generation && view.state == RemoteViewState::Ready =>
+            {
+                Some(&view.target)
+            }
+            _ => None,
+        }
+    }
+
+    fn remote_session_navigation_target(
+        &self,
+        pane: PaneId,
+        generation: u64,
+        name: &str,
+    ) -> Option<RemoteSession> {
+        let source = self.remote_navigation_source(pane, generation)?;
+        // This is an actual name on the current SSH owner, not a canonical
+        // local registry selector and never a request for a second SSH hop.
+        RemoteSession::new(&source.host, name).ok()
+    }
+
+    pub(crate) fn discard_stale_remote_navigation(&mut self) {
+        if self
+            .pending_remote_navigation
+            .as_ref()
+            .is_some_and(|pending| {
+                self.remote_navigation_source(pending.pane, pending.generation)
+                    .is_none()
+            })
+        {
+            self.pending_remote_navigation = None;
+        }
+    }
+
+    /// Return the owner needing an explicit snapshot only when no matching
+    /// projection exists. Keeping the decision separate also lets native-only
+    /// tests exercise the entire state transition without opening SSH.
+    fn apply_remote_workspace_navigation(
+        &mut self,
+        pane: PaneId,
+        generation: u64,
+        workspace_id: String,
+    ) -> Option<RemoteSession> {
+        let source = self.remote_navigation_source(pane, generation)?;
+        let owner = RemoteSession::new(&source.host, &source.session).ok()?;
+        let target = RemoteWorkspaceRef {
+            host: source.host.clone(),
+            session: source.session.clone(),
+            workspace_id,
+        };
+        // An explicit owner-menu choice may reopen that one locally hidden
+        // projection, but stale or background messages have no such authority.
+        self.closed_remote_workspaces.remove(&target);
+        self.pending_remote_navigation = Some(PendingRemoteNavigation {
+            pane,
+            generation,
+            target,
+        });
+        if self.finish_remote_navigation() {
+            None
+        } else {
+            Some(owner)
+        }
+    }
+
+    fn finish_remote_navigation(&mut self) -> bool {
+        self.discard_stale_remote_navigation();
+        let Some(pending) = self.pending_remote_navigation.as_ref() else {
+            return false;
+        };
+        let Some(index) = self
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.remote.as_ref() == Some(&pending.target))
+        else {
+            return false;
+        };
+        self.pending_remote_navigation = None;
+        self.active_ws = index;
+        true
     }
 
     pub(crate) fn active_remote_pane(&self) -> Option<PaneId> {
@@ -977,12 +1176,66 @@ impl App {
             .is_some_and(|input| input.send(message).is_ok())
     }
 
+    /// Map an outer menu's click into the selected owner's display viewport.
+    /// Sidebar anchors sit outside that viewport and clamp to its nearest edge.
+    pub(crate) fn remote_menu_anchor(&self, workspace: usize, anchor: (u16, u16)) -> (u16, u16) {
+        let rect = self
+            .workspaces
+            .get(workspace)
+            .filter(|workspace| workspace.remote.is_some())
+            .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
+            .and_then(|tab| {
+                self.pane_content_rects
+                    .iter()
+                    .find(|(pane, _)| *pane == tab.layout.focus)
+            })
+            .map(|(_, rect)| *rect)
+            .unwrap_or_else(|| {
+                // A context menu may target an inactive workspace. Its next
+                // projection fills the content between the already-rendered
+                // outer sidebars; unlike local tabs it has no extra tab row.
+                let main = self.last_main_area;
+                let left = self.left_seam.map_or(main.x, |seam| seam.right());
+                let right = self.right_seam.map_or(main.right(), |seam| seam.x);
+                ratatui::layout::Rect::new(left, main.y, right.saturating_sub(left), main.height)
+            });
+        (
+            anchor
+                .0
+                .saturating_sub(rect.x)
+                .min(rect.width.saturating_sub(1)),
+            anchor
+                .1
+                .saturating_sub(rect.y)
+                .min(rect.height.saturating_sub(1)),
+        )
+    }
+
+    pub(crate) fn owner_menu_coordinates<'a>(
+        mut args: impl Iterator<Item = &'a str>,
+    ) -> Option<(u16, u16)> {
+        match (args.next(), args.next(), args.next()) {
+            (None, None, None) => Some((2, 2)),
+            (Some(column), Some(row), None) => Some((column.parse().ok()?, row.parse().ok()?)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn handle_active_remote_key(
         &mut self,
         key: ratatui::crossterm::event::KeyEvent,
     ) -> Option<bool> {
         self.active_remote_pane()?;
         if self.mode == Mode::Normal {
+            // Outer list navigation owns ordinary keys even while its selected
+            // workspace is remote. Explicit direct shortcuts still use the
+            // existing owner-aware command route; the list handles its prefix.
+            if self.sidebar_focus.is_some()
+                && (self.prefix.matches(&key)
+                    || super::keys::direct_command(&self.direct_keymap, &key).is_none())
+            {
+                return None;
+            }
             if self.prefix.matches(&key) {
                 self.mode = Mode::Prefix;
                 return Some(true);
@@ -1002,18 +1255,20 @@ impl App {
 
         if self.mode == Mode::Prefix {
             self.mode = Mode::Normal;
-            let prefix = self.prefix.key_event();
             if self.prefix.matches(&key) {
-                let _ = self.send_active_remote(ClientMessage::Key(prefix));
-                let _ = self.send_active_remote(ClientMessage::Key(key));
+                // The owner's prefix may differ from this display's alias.
+                // Ask its normal double-prefix handler to send exactly once.
+                let _ = self.send_active_remote(ClientMessage::Command("send_prefix".into()));
                 return Some(true);
             }
             let command = super::keys::key_string(&key)
                 .and_then(|binding| self.keymap.get(&binding).copied());
             if command.is_some_and(outer_command) {
                 self.run_cmd(command.expect("checked above"));
-            } else if let Some(command) = command {
-                let _ = self.send_active_remote(ClientMessage::Command(command.id().to_string()));
+            } else {
+                // Fixed keys (?, digits, scrollback) and custom bindings all
+                // belong to the owner; do not duplicate its prefix dispatch.
+                let _ = self.send_active_remote(ClientMessage::PrefixKey(key));
             }
             return Some(true);
         }
@@ -1021,7 +1276,7 @@ impl App {
     }
 
     pub(crate) fn forward_active_remote_mouse(
-        &self,
+        &mut self,
         mut mouse: ratatui::crossterm::event::MouseEvent,
     ) -> bool {
         let Some(pane) = self.active_remote_pane() else {
@@ -1043,7 +1298,58 @@ impl App {
         }
         mouse.column -= rect.x;
         mouse.row -= rect.y;
-        self.send_active_remote(ClientMessage::Mouse(mouse))
+        let sent = self.send_active_remote(ClientMessage::Mouse(mouse));
+        if sent {
+            if let ratatui::crossterm::event::MouseEventKind::Down(button) = mouse.kind {
+                self.remote_mouse_capture = Some((pane, rect, button));
+            }
+        }
+        sent
+    }
+
+    pub(crate) fn forward_captured_remote_mouse(
+        &mut self,
+        mut mouse: ratatui::crossterm::event::MouseEvent,
+    ) -> bool {
+        use ratatui::crossterm::event::MouseEventKind;
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.remote_mouse_capture = None;
+            return false;
+        }
+        let Some((pane, previous_rect, pressed)) = self.remote_mouse_capture else {
+            return false;
+        };
+        let button = match mouse.kind {
+            MouseEventKind::Drag(button) | MouseEventKind::Up(button) => button,
+            _ => return false,
+        };
+        if button != pressed {
+            return false;
+        }
+        if matches!(mouse.kind, MouseEventKind::Up(_)) {
+            self.remote_mouse_capture = None;
+        }
+        let rect = self
+            .pane_content_rects
+            .iter()
+            .find_map(|(candidate, rect)| (*candidate == pane).then_some(*rect))
+            .unwrap_or(previous_rect);
+        mouse.column = mouse
+            .column
+            .saturating_sub(rect.x)
+            .min(rect.width.saturating_sub(1));
+        mouse.row = mouse
+            .row
+            .saturating_sub(rect.y)
+            .min(rect.height.saturating_sub(1));
+        if let Some(ViewKind::Remote(view)) = self.views.get(&pane) {
+            if let Some(input) = &view.input {
+                let _ = input.send(ClientMessage::Mouse(mouse));
+            }
+        }
+        // The gesture still belongs to its original owner if it disconnected;
+        // never reinterpret the release as a local selection/resize action.
+        true
     }
 
     pub(crate) fn resize_active_remote_projection(&mut self) {
@@ -1086,6 +1392,12 @@ fn outer_command(command: Cmd) -> bool {
             | Cmd::OpenSessions
             | Cmd::ToggleSidebar
             | Cmd::ToggleRightSidebar
+            | Cmd::FocusWorkspaces
+            | Cmd::ToggleAgents
+            | Cmd::ToggleAgentScope
+            | Cmd::NextAttention
+            | Cmd::Switcher
+            | Cmd::GlobalSearch
             | Cmd::Detach
     )
 }
@@ -1118,7 +1430,7 @@ fn remote_snapshot_at(
     parse_remote_snapshot(&response, location)
 }
 
-fn parse_remote_snapshot(
+pub(super) fn parse_remote_snapshot(
     response: &Value,
     location: RemoteBinaryLocation,
 ) -> Result<RemoteSessionSnapshot, String> {
@@ -1144,6 +1456,20 @@ fn parse_remote_snapshot(
         .map(|workspace| {
             Ok(RemoteWorkspaceMeta {
                 agents: parse_remote_agents(workspace),
+                history: serde_json::from_value(
+                    workspace
+                        .get("agent_history")
+                        .cloned()
+                        .unwrap_or_else(|| json!([])),
+                )
+                .map_err(|error| error.to_string())?,
+                scheduled: serde_json::from_value(
+                    workspace
+                        .get("scheduled_agents")
+                        .cloned()
+                        .unwrap_or_else(|| json!([])),
+                )
+                .map_err(|error| error.to_string())?,
                 worktree: workspace
                     .get("worktree")
                     .filter(|value| !value.is_null())
@@ -1253,6 +1579,21 @@ fn watch_remote_session(
             if matches!(
                 name,
                 "workspace.created"
+                    | "agent.history_changed"
+                    | "agent.pin_changed"
+                    | "automation.created"
+                    | "automation.updated"
+                    | "automation.rebound"
+                    | "automation.enabled"
+                    | "automation.disabled"
+                    | "automation.deleted"
+                    | "automation.run_queued"
+                    | "automation.run_materialized"
+                    | "automation.run_started"
+                    | "automation.run_finished"
+                    | "automation.run_failed"
+                    | "automation.run_updated"
+                    | "task.updated"
                     | "workspace.closed"
                     | "workspace.renamed"
                     | "workspace.metadata_reported"
@@ -1436,7 +1777,31 @@ fn run_projection(
                     });
                 }
             }
-            Ok(ServerMessage::Detach | ServerMessage::ServerShutdown { .. }) => break,
+            Ok(ServerMessage::FocusWorkspace { workspace_id }) => {
+                let _ = app_tx.send(AppEvent::RemoteEffect {
+                    effect: RemoteEffect::Workspace {
+                        pane,
+                        generation,
+                        workspace_id,
+                    },
+                });
+            }
+            Ok(ServerMessage::SwitchSession { name }) => {
+                let _ = app_tx.send(AppEvent::RemoteEffect {
+                    effect: RemoteEffect::Session {
+                        pane,
+                        generation,
+                        name,
+                    },
+                });
+            }
+            Ok(ServerMessage::Detach) => {
+                let _ = app_tx.send(AppEvent::RemoteEffect {
+                    effect: RemoteEffect::Detach { pane, generation },
+                });
+                break;
+            }
+            Ok(ServerMessage::ServerShutdown { .. }) => break,
             Ok(_) => {}
             Err(error) => return Err(error.to_string()),
         }
@@ -1445,7 +1810,7 @@ fn run_projection(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
@@ -1474,13 +1839,24 @@ mod tests {
         let response = json!({"result": {"event_sequence": 12, "workspaces": [{
             "id": "workspace_remote", "name": "remote-api", "cwd": "/srv/api",
             "tabs": [{"index": 2, "panes": [{"pane_id": "7", "kind": "terminal",
-                "agent": "codex", "is_agent": true, "agent_status": "blocked", "focused": true}]}]
+                "agent": "codex", "terminal_id": "owner-terminal", "is_agent": true,
+                "agent_status": "blocked", "focused": true}]}]
         }]}});
         let snapshot = parse_remote_snapshot(&response, RemoteBinaryLocation::Path).unwrap();
         app.apply_remote_session_discovered(
             RemoteSession::new("dev-207", "api").unwrap(),
             Ok(snapshot),
         );
+        let agents = app.dispatch("agent.list", &json!({})).unwrap();
+        let agent = agents["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["host"] == "dev-207")
+            .unwrap();
+        assert_eq!(agent["workspace_id"], app.workspaces[app.active_ws].id);
+        assert_eq!(agent["owner_workspace_id"], "workspace_remote");
+        assert_eq!(agent["terminal_id"], "owner-terminal");
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         terminal
@@ -1499,7 +1875,9 @@ mod tests {
         );
     }
 
-    fn add_remote_workspace(app: &mut App) -> (PaneId, mpsc::Receiver<ClientMessage>, PathBuf) {
+    pub(crate) fn add_remote_workspace(
+        app: &mut App,
+    ) -> (PaneId, mpsc::Receiver<ClientMessage>, PathBuf) {
         let pane = PaneId::alloc();
         let (input, receiver) = mpsc::channel();
         let target = RemoteWorkspaceRef {
@@ -1512,6 +1890,8 @@ mod tests {
             pane,
             ViewKind::Remote(RemoteView {
                 agents: Vec::new(),
+                history: Vec::new(),
+                scheduled: Vec::new(),
                 target: target.clone(),
                 state: RemoteViewState::Ready,
                 error: None,
@@ -1538,15 +1918,1327 @@ mod tests {
         (pane, receiver, remote_path)
     }
 
-    #[test]
-    fn remote_commands_use_semantics_and_local_session_menu_stays_local() {
-        let _env = crate::persist::test_env("remote-semantic-shortcuts");
+    /// Restore only a native dashboard: these UI tests own no PTY, shell,
+    /// server, SSH connection, or terminal client.
+    pub(crate) fn remote_ui_app() -> App {
         let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(100, 30, tx).unwrap();
+        let snapshot = crate::persist::SessionSnapshot {
+            version: 1,
+            active_ws: 0,
+            closed_workspace_paths: Vec::new(),
+            workspaces: vec![crate::persist::WsSnap {
+                id: "workspace_remote_ui_fixture".into(),
+                name: "owner".into(),
+                cwd: crate::persist::config_dir().join("remote-ui-fixture"),
+                active_tab: 0,
+                pinned: false,
+                tabs: vec![crate::persist::TabSnap {
+                    id: "tab_remote_ui_fixture".into(),
+                    tree: crate::layout::LayoutTree::Leaf(1),
+                    focus: 1,
+                    panes: Vec::new(),
+                    git: false,
+                    orch: true,
+                    mission: false,
+                    name: None,
+                }],
+            }],
+        };
+        let mut app = App::from_snapshot(snapshot, tx).expect("native-only app");
+        app.workspaces[0].tabs[0].name = Some("remote-tab".into());
+        assert!(app.panes.is_empty());
+        app
+    }
+
+    fn navigation_projection(
+        app: &mut App,
+        host: &str,
+        session: &str,
+        workspace_id: &str,
+    ) -> (PaneId, mpsc::Receiver<ClientMessage>) {
+        let (pane, receiver, _) = add_remote_workspace(app);
+        let target = RemoteWorkspaceRef {
+            host: host.into(),
+            session: session.into(),
+            workspace_id: workspace_id.into(),
+        };
+        let workspace = &mut app.workspaces[app.active_ws];
+        workspace.id = format!("projection_{}", pane.0);
+        workspace.remote = Some(target.clone());
+        let Some(ViewKind::Remote(view)) = app.views.get_mut(&pane) else {
+            panic!("native projection fixture missing");
+        };
+        view.target = target;
+        (pane, receiver)
+    }
+
+    #[test]
+    fn remote_navigation_workspace_resolves_exact_owner_without_touching_other_projections() {
+        let _env = crate::persist::test_env("remote-navigation-owner");
+        let mut app = remote_ui_app();
+        let (source, source_input) = navigation_projection(&mut app, "dev-207", "api", "source");
+        let source_index = app.active_ws;
+        let (_, other_host) = navigation_projection(&mut app, "dev-208", "api", "destination");
+        let (_, other_session) = navigation_projection(&mut app, "dev-207", "other", "destination");
+        let (_, destination_input) =
+            navigation_projection(&mut app, "dev-207", "api", "destination");
+        let destination_index = app.active_ws;
+        // Matching a local stable id must not confer remote ownership either.
+        app.workspaces[0].id = "destination".into();
+        app.active_ws = source_index;
+        let count = app.workspaces.len();
+
+        app.apply_remote_effect(RemoteEffect::Workspace {
+            pane: source,
+            generation: 1,
+            workspace_id: "destination".into(),
+        });
+
+        assert_eq!(app.active_ws, destination_index);
+        assert_eq!(app.workspaces.len(), count);
+        assert!(app.pending_remote_navigation.is_none());
+        assert!(app.remote_session_watchers.is_empty());
+        assert!(app.panes.is_empty());
+        assert!(!app.detach_requested && !app.should_quit);
+        for receiver in [source_input, other_host, other_session, destination_input] {
+            assert!(
+                receiver.try_recv().is_err(),
+                "navigation wrote to an unrelated owner"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_navigation_pending_is_bounded_and_next_snapshot_focuses_the_reopened_target() {
+        let _env = crate::persist::test_env("remote-navigation-pending");
+        let mut app = remote_ui_app();
+        let (source, _source_input) = navigation_projection(&mut app, "dev-207", "api", "source");
+        let source_index = app.active_ws;
+        let owner = RemoteSession::new("dev-207", "api").unwrap();
+        let target = RemoteWorkspaceRef {
+            host: owner.host.clone(),
+            session: owner.session.clone(),
+            workspace_id: "destination".into(),
+        };
+        let other_owner = RemoteWorkspaceRef {
+            host: "dev-208".into(),
+            ..target.clone()
+        };
+        app.closed_remote_workspaces
+            .extend([target.clone(), other_owner.clone()]);
+
+        assert!(app
+            .apply_remote_workspace_navigation(source, 0, "destination".into())
+            .is_none());
+        assert!(app.pending_remote_navigation.is_none());
+        assert!(app.closed_remote_workspaces.contains(&target));
+        assert_eq!(
+            app.apply_remote_workspace_navigation(source, 1, "first".into()),
+            Some(owner.clone())
+        );
+        assert_eq!(
+            app.apply_remote_workspace_navigation(source, 1, "destination".into()),
+            Some(owner.clone())
+        );
+        assert_eq!(
+            app.pending_remote_navigation.as_ref().unwrap().target,
+            target
+        );
+        assert!(!app.closed_remote_workspaces.contains(&target));
+        assert!(app.closed_remote_workspaces.contains(&other_owner));
+
+        // Model the projection installed by discovery without starting its SSH
+        // worker. Applying the real snapshot method below must consume pending.
+        let (_, _destination_input) =
+            navigation_projection(&mut app, "dev-207", "api", "destination");
+        let destination_index = app.active_ws;
+        app.active_ws = source_index;
+        let metadata = ["source", "destination"]
+            .into_iter()
+            .map(|id| RemoteWorkspaceMeta {
+                agents: Vec::new(),
+                history: Vec::new(),
+                scheduled: Vec::new(),
+                worktree: None,
+                id: id.into(),
+                name: id.into(),
+                cwd: "/srv/api".into(),
+                branch: None,
+            })
+            .collect();
+        app.apply_remote_session_discovered(
+            owner,
+            Ok(RemoteSessionSnapshot {
+                location: RemoteBinaryLocation::Path,
+                event_sequence: 20,
+                workspaces: metadata,
+            }),
+        );
+
+        assert_eq!(app.active_ws, destination_index);
+        assert!(app.pending_remote_navigation.is_none());
+        assert!(app.closed_remote_workspaces.contains(&other_owner));
+        assert!(app.remote_session_watchers.is_empty());
+        assert!(app.panes.is_empty());
+    }
+
+    #[test]
+    fn remote_navigation_pending_is_discarded_on_source_leave_generation_change_or_disconnect() {
+        let _env = crate::persist::test_env("remote-navigation-source-lifetime");
+        let mut app = remote_ui_app();
+        let (source, _source_input) = navigation_projection(&mut app, "dev-207", "api", "source");
+        let source_index = app.active_ws;
+        assert!(app
+            .apply_remote_workspace_navigation(source, 1, "destination".into())
+            .is_some());
+        app.active_ws = 0;
+        app.handle_event(AppEvent::RemoteEffect {
+            effect: RemoteEffect::Notify("fixture".into()),
+        });
+        assert!(app.pending_remote_navigation.is_none());
+
+        app.active_ws = source_index;
+        assert!(app
+            .apply_remote_workspace_navigation(source, 1, "destination".into())
+            .is_some());
+        let Some(ViewKind::Remote(view)) = app.views.get_mut(&source) else {
+            unreachable!()
+        };
+        view.generation = 2;
+        app.discard_stale_remote_navigation();
+        assert!(app.pending_remote_navigation.is_none());
+
+        assert!(app
+            .apply_remote_workspace_navigation(source, 2, "destination".into())
+            .is_some());
+        app.apply_remote_projection_closed(source, 1, "old bridge".into());
+        assert!(
+            app.pending_remote_navigation.is_some(),
+            "old bridge canceled the current source"
+        );
+        app.apply_remote_projection_closed(source, 2, "current bridge".into());
+        assert!(app.pending_remote_navigation.is_none());
+        assert!(!app.detach_requested && !app.should_quit);
+    }
+
+    #[test]
+    fn remote_navigation_topology_disconnect_drops_pending_without_detaching_the_display() {
+        let _env = crate::persist::test_env("remote-navigation-topology-close");
+        let mut app = remote_ui_app();
+        let (source, _source_input) = navigation_projection(&mut app, "dev-207", "api", "source");
+        assert!(app
+            .apply_remote_workspace_navigation(source, 1, "destination".into())
+            .is_some());
+        app.apply_remote_session_watcher_closed(
+            RemoteSession::new("dev-208", "api").unwrap(),
+            "other owner".into(),
+        );
+        assert!(app.pending_remote_navigation.is_some());
+        app.apply_remote_session_watcher_closed(
+            RemoteSession::new("dev-207", "api").unwrap(),
+            "source owner".into(),
+        );
+        assert!(app.pending_remote_navigation.is_none());
+        assert!(!app.detach_requested && !app.should_quit);
+    }
+
+    #[test]
+    fn remote_navigation_session_and_detach_are_fenced_to_the_active_source() {
+        let _env = crate::persist::test_env("remote-navigation-session-detach");
+        let mut app = remote_ui_app();
+        let (source, source_input) = navigation_projection(&mut app, "dev-207", "api", "source");
+        let source_index = app.active_ws;
+        assert_eq!(
+            app.remote_session_navigation_target(source, 1, "remote-literal-name"),
+            Some(RemoteSession::new("dev-207", "remote-literal-name").unwrap())
+        );
+        assert!(app
+            .remote_session_navigation_target(source, 1, "../invalid")
+            .is_none());
+        assert!(app
+            .remote_session_navigation_target(source, 0, "default")
+            .is_none());
+
+        app.active_ws = 0;
+        assert!(app
+            .remote_session_navigation_target(source, 1, "default")
+            .is_none());
+        for effect in [
+            RemoteEffect::Session {
+                pane: source,
+                generation: 1,
+                name: "default".into(),
+            },
+            RemoteEffect::Detach {
+                pane: source,
+                generation: 1,
+            },
+        ] {
+            app.apply_remote_effect(effect);
+        }
+        assert!(app.named_session_menu.is_none());
+        assert!(app.pending_session_switch.is_none());
+        assert!(!app.detach_requested && !app.should_quit);
+        app.active_ws = source_index;
+        app.apply_remote_effect(RemoteEffect::Detach {
+            pane: source,
+            generation: 0,
+        });
+        assert!(!app.detach_requested);
+
+        app.apply_remote_effect(RemoteEffect::Detach {
+            pane: source,
+            generation: 1,
+        });
+        assert!(app.detach_requested);
+        assert!(!app.should_quit, "owner Exit stopped the local server");
+        assert!(
+            source_input.try_recv().is_err(),
+            "owner Exit wrote lifecycle input to its server"
+        );
+        assert!(app.panes.is_empty());
+    }
+
+    fn remote_ui_buffer(app: &mut App, size: (u16, u16)) -> ratatui::buffer::Buffer {
+        let area = Rect::new(0, 0, size.0, size.1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+        crate::ui::render_into(&mut target, app);
+        buffer
+    }
+
+    fn remote_ui_owner_frame(owner: &mut App, size: (u16, u16), workspace_only: bool) -> FrameData {
+        let area = Rect::new(0, 0, size.0, size.1);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+        if workspace_only {
+            crate::ui::render_workspace_interactive(&mut target, owner, 0);
+        } else {
+            crate::ui::render_into(&mut target, owner);
+        }
+        let cursor = target.cursor();
+        let cursor_visible = target.cursor_visible();
+        protocol::frame_from_buffer(&buffer, cursor, cursor_visible)
+    }
+
+    fn remote_ui_visible_text(
+        buffer: &ratatui::buffer::Buffer,
+        rect: Rect,
+        text: &str,
+    ) -> (u16, u16) {
+        let width = text.chars().count() as u16;
+        for y in rect.y..rect.bottom() {
+            for x in rect.x..rect.right().saturating_sub(width).saturating_add(1) {
+                let visible: String = (x..x + width)
+                    .map(|column| buffer[(column, y)].symbol())
+                    .collect();
+                if visible == text {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("visible owner UI text {text:?} was not rendered in {rect:?}");
+    }
+
+    #[test]
+    fn remote_visible_tab_plus_and_mobile_menu_reach_owner_coordinates() {
+        let _env = crate::persist::test_env("remote-ui-visible-controls");
+        for workspace_only in [false, true] {
+            for size in [(140, 40), (48, 22)] {
+                let mut owner = remote_ui_app();
+                let mut outer = remote_ui_app();
+                if !workspace_only {
+                    outer.workspaces.clear();
+                }
+                let (pane, receiver, _) = add_remote_workspace(&mut outer);
+                remote_ui_buffer(&mut outer, size);
+                let area = outer.pane_content_rects[0].1;
+                let frame =
+                    remote_ui_owner_frame(&mut owner, (area.width, area.height), workspace_only);
+                let Some(ViewKind::Remote(view)) = outer.views.get_mut(&pane) else {
+                    unreachable!()
+                };
+                view.frame = Some(frame);
+                let visible = remote_ui_buffer(&mut outer, size);
+                let (label_x, label_y) = remote_ui_visible_text(&visible, area, "remote-tab");
+                let (point, owner_hit) = if owner.compact {
+                    let menu = owner.switcher_button_rect.expect("mobile menu");
+                    (
+                        remote_ui_visible_text(
+                            &visible,
+                            Rect::new(area.x, label_y, area.width, 1),
+                            &owner.catalog.act_open_menu.to_uppercase(),
+                        ),
+                        menu,
+                    )
+                } else {
+                    let plus = owner
+                        .tab_rects
+                        .iter()
+                        .find(|(index, _)| *index == owner.ws().tabs.len())
+                        .expect("owner new-tab button")
+                        .1;
+                    let after_label = label_x + "remote-tab".len() as u16;
+                    (
+                        remote_ui_visible_text(
+                            &visible,
+                            Rect::new(after_label, label_y, area.right() - after_label, 1),
+                            "+",
+                        ),
+                        plus,
+                    )
+                };
+                outer.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
+                    column: point.0,
+                    row: point.1,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                let ClientMessage::Mouse(mouse) = receiver.try_recv().expect("owner input") else {
+                    panic!("click did not become owner mouse input")
+                };
+                assert!(
+                    owner_hit.contains((mouse.column, mouse.row).into()),
+                    "visible click missed owner control: workspace_only={workspace_only}, \
+                     viewport={size:?}, click={point:?}, owner=({}, {}), hit={owner_hit:?}",
+                    mouse.column,
+                    mouse.row,
+                );
+                assert_eq!(outer.ws().tabs.len(), 1, "no local shadow tab was created");
+                assert!(outer.panes.is_empty());
+                assert!(receiver.try_recv().is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn remote_pointer_release_outside_projection_finishes_owner_gesture() {
+        use ratatui::crossterm::event::MouseButton;
+        let _env = crate::persist::test_env("remote-pointer-capture");
+        let mut app = remote_ui_app();
+        let (pane, receiver, _) = add_remote_workspace(&mut app);
+        app.pane_content_rects = vec![(pane, Rect::new(30, 2, 70, 25))];
+        for (kind, point, expected) in [
+            (MouseEventKind::Down(MouseButton::Left), (35, 5), (5, 3)),
+            (MouseEventKind::Drag(MouseButton::Left), (0, 0), (0, 0)),
+            (MouseEventKind::Up(MouseButton::Left), (110, 35), (69, 24)),
+        ] {
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind,
+                column: point.0,
+                row: point.1,
+                modifiers: KeyModifiers::NONE,
+            }));
+            let ClientMessage::Mouse(mouse) = receiver.try_recv().expect("captured owner gesture")
+            else {
+                panic!("gesture must reach owner")
+            };
+            assert_eq!((mouse.column, mouse.row), expected);
+            assert_eq!(mouse.kind, kind);
+        }
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(
+            receiver.try_recv().is_err(),
+            "the released gesture no longer captures local input"
+        );
+    }
+
+    #[test]
+    fn remote_menu_outside_content_click_dismisses_without_activating_owner_content() {
+        use crate::orch::TaskWorkerMode;
+        use ratatui::crossterm::event::MouseButton;
+
+        let _env = crate::persist::test_env("remote-menu-dismiss-content");
+        for workspace_only in [false, true] {
+            let mut owner = remote_ui_app();
+            let mut second_tab = Tab::panes(TileLayout::new(PaneId::alloc()));
+            second_tab.orch = true;
+            owner.workspaces[0].tabs.push(second_tab);
+            let mut outer = remote_ui_app();
+            if !workspace_only {
+                outer.workspaces.clear();
+            }
+            let (pane, receiver, _) = add_remote_workspace(&mut outer);
+            remote_ui_buffer(&mut outer, (180, 48));
+            let area = outer.pane_content_rects[0].1;
+            let owner_frame =
+                remote_ui_owner_frame(&mut owner, (area.width, area.height), workspace_only);
+            let Some(ViewKind::Remote(view)) = outer.views.get_mut(&pane) else {
+                unreachable!()
+            };
+            view.frame = Some(owner_frame);
+            let visible = remote_ui_buffer(&mut outer, (180, 48));
+            let tab = remote_ui_visible_text(&visible, area, "remote-tab");
+            for kind in [
+                MouseEventKind::Down(MouseButton::Right),
+                MouseEventKind::Up(MouseButton::Right),
+            ] {
+                outer.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind,
+                    column: tab.0,
+                    row: tab.1,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                let ClientMessage::Mouse(mouse) =
+                    receiver.try_recv().expect("owner tab right click")
+                else {
+                    panic!("tab right click did not reach owner");
+                };
+                owner.handle_event(AppEvent::Mouse(mouse));
+            }
+            assert!(owner.tab_menu.is_some(), "owner tab menu did not open");
+            let owner_frame =
+                remote_ui_owner_frame(&mut owner, (area.width, area.height), workspace_only);
+            let Some(ViewKind::Remote(view)) = outer.views.get_mut(&pane) else {
+                unreachable!()
+            };
+            view.frame = Some(owner_frame);
+            let visible = remote_ui_buffer(&mut outer, (180, 48));
+            remote_ui_visible_text(&visible, area, "Move");
+
+            let control = owner
+                .orch_hits
+                .iter()
+                .find_map(|(hit, rect)| {
+                    matches!(
+                        hit,
+                        super::super::OrchHit::FlowMode(TaskWorkerMode::Workspace)
+                    )
+                    .then_some(*rect)
+                })
+                .expect("native content control");
+            let point = (control.x + control.width / 2, control.y);
+            assert!(
+                !owner
+                    .tab_menu
+                    .as_ref()
+                    .unwrap()
+                    .items
+                    .iter()
+                    .any(|(_, rect)| rect.contains(point.into())),
+                "fixture content control is covered by menu"
+            );
+            assert_eq!(owner.orch_flow_mode, TaskWorkerMode::Worktree);
+            // The first full gesture closes the popup. The second must reach
+            // the native owner control, proving this point is actionable while
+            // remaining entirely in memory (no terminal or SSH child required).
+            for (click, expected) in [
+                (1, TaskWorkerMode::Worktree),
+                (2, TaskWorkerMode::Workspace),
+            ] {
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    outer.handle_event(AppEvent::Mouse(MouseEvent {
+                        kind,
+                        column: area.x + point.0,
+                        row: area.y + point.1,
+                        modifiers: KeyModifiers::NONE,
+                    }));
+                    let ClientMessage::Mouse(mouse) =
+                        receiver.try_recv().expect("owner content click")
+                    else {
+                        panic!("content click did not reach owner");
+                    };
+                    owner.handle_event(AppEvent::Mouse(mouse));
+                }
+                assert!(
+                    owner.tab_menu.is_none(),
+                    "owner menu survived outside click {click}"
+                );
+                assert_eq!(
+                    owner.orch_flow_mode, expected,
+                    "outside click {click} leaked through popup"
+                );
+            }
+            assert!(receiver.try_recv().is_err());
+            assert!(outer.panes.is_empty() && owner.panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_menu_bar_overflow_outside_click_is_consumed_before_owner_input() {
+        use crate::bar::{BarRegion, BarSegment, BarTone, BarWidget, BarWidgetKey};
+        use ratatui::crossterm::event::MouseButton;
+
+        let _env = crate::persist::test_env("remote-menu-bar-outside");
+        let mut app = remote_ui_app();
+        let (_pane, receiver, _) = add_remote_workspace(&mut app);
+        for index in 0..4 {
+            app.bar
+                .push_widget(
+                    BarWidget::new(
+                        BarWidgetKey::new("fixture", format!("wide-{index}")),
+                        BarRegion::BottomRight,
+                        vec![BarSegment::text(
+                            "visible overflow fixture ".repeat(3),
+                            BarTone::Normal,
+                        )],
+                        Vec::new(),
+                        50,
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let visible = remote_ui_buffer(&mut app, (180, 48));
+        let overflow_hit = app
+            .bar
+            .overflow_hits
+            .iter()
+            .find(|hit| hit.region == BarRegion::BottomRight)
+            .expect("real rendered bar overflow control")
+            .rect;
+        let point = remote_ui_visible_text(&visible, overflow_hit, "…");
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: point.0,
+            row: point.1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(
+            app.bar.overflow.is_some(),
+            "visible overflow control did not open popup"
+        );
+        assert!(receiver.try_recv().is_err(), "bar control leaked to owner");
+        let visible = remote_ui_buffer(&mut app, (180, 48));
+        let popup = app.bar.overflow.as_ref().unwrap().rect;
+        remote_ui_visible_text(&visible, popup, "Luvus Bar");
+        let area = app.pane_content_rects[0].1;
+        let point = (area.x + 2, area.y + 2);
+        assert!(!popup.contains(point.into()));
+        for kind in [MouseEventKind::ScrollUp, MouseEventKind::ScrollDown] {
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind,
+                column: point.0,
+                row: point.1,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(
+                app.bar.overflow.is_some(),
+                "wheel unexpectedly dismissed read-only popup"
+            );
+            assert!(receiver.try_recv().is_err(), "popup wheel leaked to owner");
+        }
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.bar.overflow.is_none());
+        assert!(receiver.try_recv().is_err(), "popup Escape leaked to owner");
+
+        for (button, size) in [
+            (MouseButton::Left, (140, 38)),
+            (MouseButton::Right, (180, 48)),
+        ] {
+            remote_ui_buffer(&mut app, (180, 48));
+            let hit = app
+                .bar
+                .overflow_hits
+                .iter()
+                .find(|hit| hit.region == BarRegion::BottomRight)
+                .unwrap()
+                .rect;
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind,
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                }));
+            }
+            assert!(app.bar.overflow.is_some());
+            assert!(receiver.try_recv().is_err());
+            let visible = remote_ui_buffer(&mut app, size);
+            let popup = app.bar.overflow.as_ref().unwrap().rect;
+            remote_ui_visible_text(&visible, popup, "Luvus Bar");
+            let area = app.pane_content_rects[0].1;
+            let point = (area.x + 2, area.y + 2);
+            assert!(!popup.contains(point.into()));
+            for kind in [MouseEventKind::Down(button), MouseEventKind::Up(button)] {
+                app.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind,
+                    column: point.0,
+                    row: point.1,
+                    modifiers: KeyModifiers::NONE,
+                }));
+            }
+            assert!(
+                app.bar.overflow.is_none(),
+                "remote content click left outer popup open"
+            );
+            assert!(
+                receiver.try_recv().is_err(),
+                "popup dismissal gesture also interacted with owner content"
+            );
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind,
+                    column: point.0,
+                    row: point.1,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                let ClientMessage::Mouse(sent) =
+                    receiver.try_recv().expect("next real owner gesture")
+                else {
+                    panic!("next owner gesture missing");
+                };
+                assert_eq!(sent.kind, kind);
+            }
+            assert!(receiver.try_recv().is_err());
+        }
+        assert!(app.panes.is_empty());
+    }
+
+    #[test]
+    fn remote_menu_outer_workspace_dismissal_consumes_release_before_owner_input() {
+        use ratatui::crossterm::event::MouseButton;
+
+        let _env = crate::persist::test_env("remote-menu-outer-workspace");
+        for button in [MouseButton::Left, MouseButton::Right] {
+            let mut app = remote_ui_app();
+            let (_pane, receiver, _) = add_remote_workspace(&mut app);
+            remote_ui_buffer(&mut app, (180, 48));
+            let row = app
+                .ws_rects
+                .iter()
+                .find(|(index, _)| *index == app.active_ws)
+                .expect("visible remote workspace sidebar row")
+                .1;
+            for kind in [
+                MouseEventKind::Down(MouseButton::Right),
+                MouseEventKind::Up(MouseButton::Right),
+            ] {
+                app.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind,
+                    column: row.x + 2,
+                    row: row.y,
+                    modifiers: KeyModifiers::NONE,
+                }));
+            }
+            assert!(
+                app.ws_menu.is_some(),
+                "real sidebar right click did not open workspace menu"
+            );
+            let visible = remote_ui_buffer(&mut app, (140, 38));
+            remote_ui_visible_text(&visible, visible.area, app.catalog.menu_rename);
+            let area = app.pane_content_rects[0].1;
+            let point = (area.right() - 3, area.y + area.height / 2);
+            assert!(!app
+                .ws_menu
+                .as_ref()
+                .unwrap()
+                .items
+                .iter()
+                .any(|(_, rect)| rect.contains(point.into())));
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: point.0,
+                row: point.1,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(app.ws_menu.is_some());
+            assert!(
+                receiver.try_recv().is_err(),
+                "outer workspace menu wheel leaked to owner"
+            );
+            for kind in [MouseEventKind::Down(button), MouseEventKind::Up(button)] {
+                app.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind,
+                    column: point.0,
+                    row: point.1,
+                    modifiers: KeyModifiers::NONE,
+                }));
+            }
+            assert!(app.ws_menu.is_none());
+            assert!(
+                receiver.try_recv().is_err(),
+                "outer workspace dismissal leaked its release to owner"
+            );
+            // With the popup gone, an ordinary sidebar click can select the
+            // local workspace without retaining or executing its old popup.
+            remote_ui_buffer(&mut app, (140, 38));
+            let local = app
+                .ws_rects
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .unwrap()
+                .1;
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: local.x + 2,
+                row: local.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert_eq!(app.active_ws, 0);
+            assert!(app.ws_menu.is_none());
+            assert!(receiver.try_recv().is_err());
+            assert!(app.panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_menu_local_sidebar_drag_crossing_owner_content_stays_local() {
+        use ratatui::crossterm::event::MouseButton;
+
+        let _env = crate::persist::test_env("remote-menu-local-sidebar-drag");
+        let mut app = remote_ui_app();
+        let (_pane, receiver, _) = add_remote_workspace(&mut app);
+        remote_ui_buffer(&mut app, (180, 48));
+        let seam = app.left_seam.expect("visible local sidebar seam");
+        let width = app.sidebars.left.width;
+        let row = seam.y + 3;
+        let column = seam.x + 8;
+        assert!(app.pane_content_rects[0].1.contains((column, row).into()));
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), seam.x),
+            (MouseEventKind::Drag(MouseButton::Left), column),
+            (MouseEventKind::Up(MouseButton::Left), column),
+        ] {
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        assert_eq!(app.sidebars.left.width, width + 8);
+        assert!(
+            app.sidebar_resize.is_none(),
+            "local resize never received release inside remote frame"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "local divider gesture leaked to owner"
+        );
+        assert!(app.panes.is_empty());
+    }
+
+    #[test]
+    fn remote_folder_picker_host_choice_and_owner_browse_clicks_stay_on_the_selected_host() {
+        use ratatui::crossterm::event::MouseButton;
+
+        let _env = crate::persist::test_env("remote-folder-picker-host-browse");
+        let root = crate::persist::config_dir().join("owner-folder-fixture");
+        std::fs::create_dir_all(root.join("remote-child")).unwrap();
+        let mut owner = remote_ui_app();
+        owner.workspaces[0].cwd = root.clone();
+        let mut outer = remote_ui_app();
+        outer.remote_merge_enabled = true;
+        outer.config.remote_hosts = vec!["dev-207".into()];
+        let session = crate::session::display_name();
+        let (pane, receiver) =
+            navigation_projection(&mut outer, "dev-207", &session, "owner-workspace");
+        let visible = remote_ui_buffer(&mut outer, (180, 48));
+        let plus = outer.new_ws_rect.expect("outer Open workspace button");
+        let point = remote_ui_visible_text(&visible, plus, "+");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            outer.handle_event(AppEvent::Mouse(MouseEvent {
+                kind,
+                column: point.0,
+                row: point.1,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        let visible = remote_ui_buffer(&mut outer, (140, 38));
+        assert!(outer.picker.as_ref().unwrap().hosts.is_some());
+        let host_row = outer
+            .picker_rects
+            .iter()
+            .find_map(|(hit, rect)| (*hit == super::super::PickerHit::Row(1)).then_some(*rect))
+            .expect("selected SSH host row");
+        let point = remote_ui_visible_text(&visible, host_row, "dev-207");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            outer.handle_event(AppEvent::Mouse(MouseEvent {
+                kind,
+                column: point.0,
+                row: point.1,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        let ClientMessage::Command(command) = receiver.try_recv().expect("owner picker command")
+        else {
+            panic!("host choice did not target the owner's folder picker");
+        };
+        assert_eq!(command, "open_local_workspace");
+        assert!(outer.picker.is_none());
+        assert!(
+            receiver.try_recv().is_err(),
+            "host-choice release leaked into new owner"
+        );
+        owner.handle_event(AppEvent::ClientCommand(command));
+        assert_eq!(owner.picker.as_ref().unwrap().path, root);
+        assert!(owner.picker.as_ref().unwrap().worktrees.is_none());
+
+        for (size, target) in [
+            ((140, 38), "remote-child"),
+            ((180, 48), ".."),
+            ((140, 38), "esc"),
+        ] {
+            remote_ui_buffer(&mut outer, size);
+            let area = outer.pane_content_rects[0].1;
+            let frame = remote_ui_owner_frame(&mut owner, (area.width, area.height), true);
+            let Some(ViewKind::Remote(view)) = outer.views.get_mut(&pane) else {
+                unreachable!()
+            };
+            view.frame = Some(frame);
+            let visible = remote_ui_buffer(&mut outer, size);
+            let point = if target == "esc" {
+                let cancel = owner
+                    .picker_rects
+                    .iter()
+                    .find_map(|(hit, rect)| {
+                        (*hit == super::super::PickerHit::Hint(KeyCode::Esc)).then_some(*rect)
+                    })
+                    .expect("visible owner cancel footer");
+                remote_ui_visible_text(
+                    &visible,
+                    Rect::new(
+                        area.x + cancel.x,
+                        area.y + cancel.y,
+                        cancel.width,
+                        cancel.height,
+                    ),
+                    "esc",
+                )
+            } else {
+                remote_ui_visible_text(&visible, area, target)
+            };
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                outer.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind,
+                    column: point.0,
+                    row: point.1,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                let ClientMessage::Mouse(mouse) = receiver.try_recv().expect("owner picker mouse")
+                else {
+                    panic!("owner picker click not forwarded");
+                };
+                owner.handle_event(AppEvent::Mouse(mouse));
+            }
+            if target == "remote-child" {
+                assert_eq!(
+                    owner.picker.as_ref().unwrap().path,
+                    root.join("remote-child")
+                );
+            } else if target == ".." {
+                assert_eq!(owner.picker.as_ref().unwrap().path, root);
+            } else {
+                assert!(owner.picker.is_none());
+            }
+            assert!(outer.picker.is_none());
+            assert_eq!(outer.workspaces.len(), 2);
+            assert_eq!(owner.workspaces.len(), 1);
+        }
+        assert!(outer.remote_session_watchers.is_empty());
+        assert!(outer.panes.is_empty() && owner.panes.is_empty());
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn remote_folder_picker_same_owner_host_choice_keeps_the_active_workspace() {
+        use ratatui::crossterm::event::MouseButton;
+
+        let _env = crate::persist::test_env("remote-folder-picker-active-owner");
+        let mut app = remote_ui_app();
+        app.remote_merge_enabled = true;
+        app.config.remote_hosts = vec!["dev-207".into()];
+        let session = crate::session::display_name();
+        let (_, first_input) = navigation_projection(&mut app, "dev-207", &session, "workspace-a");
+        let (_, active_input) = navigation_projection(&mut app, "dev-207", &session, "workspace-b");
+        let active = app.active_ws;
+        app.handle_event(AppEvent::ClientCommand("new_node".into()));
+        let visible = remote_ui_buffer(&mut app, (140, 38));
+        let row = app
+            .picker_rects
+            .iter()
+            .find_map(|(hit, rect)| (*hit == super::super::PickerHit::Row(1)).then_some(*rect))
+            .expect("remote host choice");
+        let point = remote_ui_visible_text(&visible, row, "dev-207");
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind,
+                column: point.0,
+                row: point.1,
+                modifiers: KeyModifiers::NONE,
+            }));
+        }
+        assert_eq!(
+            app.active_ws, active,
+            "choosing the current owner switched to its first workspace"
+        );
+        assert!(
+            matches!(active_input.try_recv(), Ok(ClientMessage::Command(command)) if command == "open_local_workspace")
+        );
+        assert!(
+            first_input.try_recv().is_err(),
+            "picker opened on a different workspace's directory"
+        );
+        assert!(active_input.try_recv().is_err());
+        assert!(app.picker.is_none());
+        assert!(app.remote_session_watchers.is_empty());
+        assert!(app.panes.is_empty());
+    }
+
+    #[test]
+    fn remote_folder_picker_compact_cancel_remains_visible_and_clickable() {
+        use ratatui::crossterm::event::MouseButton;
+
+        let _env = crate::persist::test_env("remote-folder-picker-compact-cancel");
+        let root = crate::persist::config_dir().join("folder-fixture");
+        std::fs::create_dir_all(&root).unwrap();
+        for workspace_only in [false, true] {
+            for size in [(140, 38), (48, 22)] {
+                let mut app = remote_ui_app();
+                app.catalog = &crate::i18n::EN;
+                app.workspaces[0].cwd = root.clone();
+                app.handle_event(AppEvent::ClientCommand("open_local_workspace".into()));
+                let frame = remote_ui_owner_frame(&mut app, size, workspace_only);
+                let cancel = app.picker_rects.iter().find_map(|(hit, rect)| {
+                    (*hit == super::super::PickerHit::Hint(KeyCode::Esc)).then_some(*rect)
+                }).unwrap_or_else(|| panic!("folder picker has no clickable cancel: owner_projection={workspace_only}, size={size:?}"));
+                assert!(cancel.width >= 3 && cancel.right() <= size.0 && cancel.bottom() <= size.1);
+                let label: String = (cancel.x..cancel.x + 3)
+                    .map(|column| {
+                        frame.cells
+                            [usize::from(cancel.y) * usize::from(frame.width) + usize::from(column)]
+                        .symbol
+                        .as_str()
+                    })
+                    .collect();
+                assert_eq!(label, "esc");
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    app.handle_event(AppEvent::Mouse(MouseEvent {
+                        kind,
+                        column: cancel.x,
+                        row: cancel.y,
+                        modifiers: KeyModifiers::NONE,
+                    }));
+                }
+                assert!(app.picker.is_none());
+                assert!(app.panes.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn remote_right_click_menu_anchor_and_visible_actions_survive_resize() {
+        use ratatui::crossterm::event::MouseButton;
+
+        let _env = crate::persist::test_env("remote-menu-anchor-resize");
+        for workspace_only in [false, true] {
+            let mut owner = remote_ui_app();
+            let mut second_tab = Tab::panes(TileLayout::new(PaneId::alloc()));
+            second_tab.orch = true;
+            owner.workspaces[0].tabs.push(second_tab);
+            let mut outer = remote_ui_app();
+            if !workspace_only {
+                outer.workspaces.clear();
+            }
+            let (pane, receiver, _) = add_remote_workspace(&mut outer);
+            remote_ui_buffer(&mut outer, (140, 40));
+            let area = outer.pane_content_rects[0].1;
+            let frame =
+                remote_ui_owner_frame(&mut owner, (area.width, area.height), workspace_only);
+            if let Some(ViewKind::Remote(view)) = outer.views.get_mut(&pane) {
+                view.frame = Some(frame);
+            }
+            let visible = remote_ui_buffer(&mut outer, (140, 40));
+            let point = remote_ui_visible_text(&visible, area, "remote-tab");
+            outer.handle_event(AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: point.0,
+                row: point.1,
+                modifiers: KeyModifiers::NONE,
+            }));
+            let ClientMessage::Mouse(mouse) = receiver.try_recv().expect("owner right click")
+            else {
+                panic!("right click must be forwarded")
+            };
+            let anchor = (mouse.column, mouse.row);
+            assert_eq!(anchor, (point.0 - area.x, point.1 - area.y));
+            owner.handle_event(AppEvent::Mouse(mouse));
+            assert_eq!(
+                owner.tab_menu.as_ref().expect("owner tab menu").anchor,
+                anchor
+            );
+            assert!(
+                outer.tab_menu.is_none(),
+                "no local context menu over the remote frame"
+            );
+
+            // Keep the same popup open while both its containing projection
+            // and owner viewport change. Visible rows must still map to the
+            // owner's hit rectangles, including the compact bottom sheet.
+            for size in [(140, 40), (48, 22), (170, 52)] {
+                remote_ui_buffer(&mut outer, size);
+                let area = outer.pane_content_rects[0].1;
+                let frame =
+                    remote_ui_owner_frame(&mut owner, (area.width, area.height), workspace_only);
+                if let Some(ViewKind::Remote(view)) = outer.views.get_mut(&pane) {
+                    view.frame = Some(frame);
+                }
+                let visible = remote_ui_buffer(&mut outer, size);
+                for (_, hit) in &owner.tab_menu.as_ref().unwrap().items {
+                    if hit.width > 0 && hit.height > 0 {
+                        assert!(hit.right() <= area.width && hit.bottom() <= area.height);
+                    }
+                }
+                let point = remote_ui_visible_text(&visible, area, "Move");
+                outer.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: point.0,
+                    row: point.1,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                let ClientMessage::Mouse(mouse) = receiver.try_recv().expect("owner menu hover")
+                else {
+                    panic!("menu hover must reach its owner")
+                };
+                let hit = owner
+                    .tab_menu
+                    .as_ref()
+                    .unwrap()
+                    .items
+                    .iter()
+                    .find(|(item, _)| matches!(item, crate::app::TabMenuItem::MoveRight))
+                    .expect("move right action")
+                    .1;
+                assert!(
+                    hit.contains((mouse.column, mouse.row).into()),
+                    "visible menu action missed its owner after {size:?}"
+                );
+            }
+            assert!(outer.panes.is_empty() && owner.panes.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_frame_resize_preserves_corners_and_cursor_without_extra_chrome() {
+        let _env = crate::persist::test_env("remote-ui-resize-corners");
+        for workspace_only in [false, true] {
+            let mut owner = remote_ui_app();
+            let mut outer = remote_ui_app();
+            if !workspace_only {
+                outer.workspaces.clear();
+            }
+            let (pane, receiver, _) = add_remote_workspace(&mut outer);
+            for size in [(140, 40), (48, 22), (170, 52)] {
+                remote_ui_buffer(&mut outer, size);
+                let area = outer.pane_content_rects[0].1;
+                outer.resize_active_remote_projection();
+                let ClientMessage::Resize { cols, rows } =
+                    receiver.try_recv().expect("owner resize")
+                else {
+                    panic!("expected owner resize before accepting its next frame")
+                };
+                assert_eq!((cols, rows), (area.width, area.height));
+                let mut frame = remote_ui_owner_frame(&mut owner, (cols, rows), workspace_only);
+                frame.cells[0].symbol = "L".into();
+                frame.cells.last_mut().unwrap().symbol = "Z".into();
+                frame.cursor = Some((cols - 1, rows - 1));
+                frame.cursor_visible = true;
+                let Some(ViewKind::Remote(view)) = outer.views.get_mut(&pane) else {
+                    unreachable!()
+                };
+                view.frame = Some(frame);
+                let visible = remote_ui_buffer(&mut outer, size);
+                assert_eq!(visible[(area.x, area.y)].symbol(), "L");
+                assert_eq!(
+                    visible[(area.right() - 1, area.bottom() - 1)].symbol(),
+                    "Z",
+                    "owner's last row/column must not be cropped after {size:?}"
+                );
+                assert_eq!(
+                    outer.last_cursor,
+                    Some((area.right() - 1, area.bottom() - 1))
+                );
+                outer.resize_active_remote_projection();
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "stable geometry must not resize again"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn remote_prefix_help_reaches_the_owner_without_opening_local_help() {
+        let _env = crate::persist::test_env("remote-prefix-help");
+        let mut app = remote_ui_app();
+        let mut owner = remote_ui_app();
+        app.prefix = super::super::keys::PrefixSpec::parse("ctrl+b").unwrap();
+        owner.prefix = super::super::keys::PrefixSpec::parse("ctrl+a").unwrap();
+        let (_pane, receiver, _) = add_remote_workspace(&mut app);
+        app.handle_event(AppEvent::Key(app.prefix.key_event()));
+        assert!(app.mode == Mode::Prefix);
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::NONE,
+        )));
+        let ClientMessage::PrefixKey(key) = receiver
+            .try_recv()
+            .expect("the prefix help suffix must reach its owner")
+        else {
+            panic!("owner must receive a prefix suffix, not the display prefix or command map");
+        };
+        owner.handle_event(AppEvent::PrefixKey(key));
+        assert!(owner.help_open);
+        assert!(owner.mode == Mode::Normal);
+        assert!(
+            !app.help_open,
+            "remote prefix help must not open local help"
+        );
+        assert!(app.mode == Mode::Normal);
+        assert!(app.panes.is_empty());
+    }
+
+    #[test]
+    fn remote_prefix_uses_owner_digits_custom_bindings_and_fixed_scrollback_keys() {
+        let _env = crate::persist::test_env("remote-prefix-owner-map");
+        let mut app = remote_ui_app();
+        let mut owner = remote_ui_app();
+        let (_pane, receiver, _) = add_remote_workspace(&mut app);
+        let mut second = Tab::panes(TileLayout::new(PaneId::alloc()));
+        second.orch = true;
+        owner.workspaces[0].tabs.push(second);
+        app.keymap.insert("u".into(), Cmd::PrevTab);
+        owner.keymap.insert("u".into(), Cmd::NextTab);
+        for suffix in ['2', 'u'] {
+            owner.workspaces[0].active_tab = 0;
+            app.handle_event(AppEvent::Key(app.prefix.key_event()));
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(suffix),
+                KeyModifiers::NONE,
+            )));
+            let ClientMessage::PrefixKey(key) = receiver.try_recv().unwrap() else {
+                panic!("owner must resolve its fixed digits and custom bindings");
+            };
+            owner.handle_event(AppEvent::PrefixKey(key));
+            assert_eq!(owner.workspaces[0].active_tab, 1, "suffix {suffix}");
+            assert_eq!(app.workspaces[app.active_ws].active_tab, 0);
+        }
+        for code in [
+            KeyCode::Char('['),
+            KeyCode::Char(']'),
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            app.handle_event(AppEvent::Key(app.prefix.key_event()));
+            app.handle_event(AppEvent::Key(key));
+            assert!(
+                matches!(receiver.try_recv().unwrap(), ClientMessage::PrefixKey(received) if received == key)
+            );
+        }
+        assert!(app.panes.is_empty());
+        assert!(owner.panes.is_empty());
+    }
+
+    #[test]
+    fn remote_double_prefix_requests_one_owner_prefix_and_preserves_modal_precedence() {
+        let _env = crate::persist::test_env("remote-double-prefix");
+        let mut app = remote_ui_app();
+        let mut owner = remote_ui_app();
+        app.prefix = super::super::keys::PrefixSpec::parse("ctrl+b").unwrap();
+        owner.prefix = super::super::keys::PrefixSpec::parse("ctrl+a").unwrap();
+        let (_pane, receiver, _) = add_remote_workspace(&mut app);
+        app.handle_event(AppEvent::Key(app.prefix.key_event()));
+        app.handle_event(AppEvent::Key(app.prefix.key_event()));
+        let ClientMessage::Command(command) = receiver.try_recv().unwrap() else {
+            panic!("double display prefix must request the owner's own prefix");
+        };
+        assert_eq!(command, "send_prefix");
+        assert!(
+            receiver.try_recv().is_err(),
+            "send only one owner prefix request"
+        );
+        owner.handle_event(AppEvent::ClientCommand(command));
+        assert!(owner.mode == Mode::Normal);
+        assert!(owner
+            .prefix
+            .matches(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)));
+        owner.help_open = true;
+        owner.handle_event(AppEvent::PrefixKey(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(!owner.help_open);
+        assert!(
+            owner.mode == Mode::Normal,
+            "closing an overlay must not leave prefix mode armed"
+        );
+        for command in [Cmd::OpenSettings, Cmd::Switcher] {
+            owner.run_cmd(command);
+            match command {
+                Cmd::OpenSettings => assert!(owner.settings.is_some()),
+                Cmd::Switcher => assert!(owner.switcher),
+                _ => unreachable!(),
+            }
+            owner.handle_event(AppEvent::ClientCommand("send_prefix".into()));
+            assert!(
+                owner.mode == Mode::Normal,
+                "double prefix must retain modal precedence"
+            );
+            owner.handle_event(AppEvent::PrefixKey(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )));
+            assert!(owner.settings.is_none() && !owner.switcher);
+            assert!(
+                owner.mode == Mode::Normal,
+                "closing a modal must not arm the next ordinary key"
+            );
+            owner.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('='),
+                KeyModifiers::NONE,
+            )));
+            assert!(
+                owner.settings.is_none(),
+                "an ordinary key after modal close must not become a prefix command"
+            );
+        }
+        assert!(app.panes.is_empty());
+        assert!(owner.panes.is_empty());
+    }
+
+    #[test]
+    fn remote_prefix_suffixes_route_to_owner_and_local_session_menu_stays_local() {
+        let _env = crate::persist::test_env("remote-semantic-shortcuts");
+        let mut app = remote_ui_app();
         app.server_mode = true;
         let (_pane, receiver, _) = add_remote_workspace(&mut app);
-        // A local prefix command must not synthesize that prefix remotely:
-        // the owner may have an entirely different prefix/key map.
+        // The display's prefix is an alias; the owner resolves the suffix.
         app.mode = Mode::Prefix;
         let key = app
             .keymap
@@ -1560,7 +3252,7 @@ mod tests {
         );
         app.handle_active_remote_key(key);
         assert!(
-            matches!(receiver.recv().unwrap(), ClientMessage::Command(command) if command == "new_tab")
+            matches!(receiver.recv().unwrap(), ClientMessage::PrefixKey(received) if received == key)
         );
         app.mode = Mode::Prefix;
         let key = app
@@ -1666,6 +3358,8 @@ mod tests {
                 event_sequence: 2,
                 workspaces: vec![RemoteWorkspaceMeta {
                     agents: Vec::new(),
+                    history: Vec::new(),
+                    scheduled: Vec::new(),
                     worktree: None,
                     id: "workspace_remote".into(),
                     name: "api".into(),
@@ -1695,6 +3389,8 @@ mod tests {
                 event_sequence: 4,
                 workspaces: vec![RemoteWorkspaceMeta {
                     agents: Vec::new(),
+                    history: Vec::new(),
+                    scheduled: Vec::new(),
                     worktree: None,
                     id: "workspace_remote".into(),
                     name: "renamed-api".into(),
@@ -1769,6 +3465,8 @@ mod tests {
             event_sequence: 9,
             workspaces: vec![RemoteWorkspaceMeta {
                 agents: Vec::new(),
+                history: Vec::new(),
+                scheduled: Vec::new(),
                 worktree: None,
                 id: "workspace_remote".into(),
                 name: "api".into(),
@@ -1927,6 +3625,8 @@ mod tests {
             second,
             ViewKind::Remote(RemoteView {
                 agents: Vec::new(),
+                history: Vec::new(),
+                scheduled: Vec::new(),
                 target: RemoteWorkspaceRef {
                     host: "dev-207".into(),
                     session: "api".into(),
@@ -2011,6 +3711,8 @@ mod tests {
                 event_sequence: 7,
                 workspaces: vec![RemoteWorkspaceMeta {
                     agents: Vec::new(),
+                    history: Vec::new(),
+                    scheduled: Vec::new(),
                     worktree: None,
                     id: "late-workspace".into(),
                     name: "late".into(),
@@ -2049,5 +3751,17 @@ mod tests {
             .dispatch("pane.get", &json!({"pane":local_pane.0.to_string()}))
             .is_ok());
         assert_eq!(app.workspaces.len(), before);
+        let automation = json!({
+            "name":"Owner task", "trigger":{"kind":"once","at_utc":4_000_000_000_u64},
+            "task":{"title":"Check", "prompt":"Check", "agent_id":"codex",
+                "workspace_id":app.workspaces[app.active_ws].id,
+                "mode":"workspace", "access":"workspace"}
+        });
+        assert_eq!(
+            app.dispatch("automation.create", &automation)
+                .unwrap_err()
+                .0,
+            "remote_workspace"
+        );
     }
 }
