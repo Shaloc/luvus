@@ -44,6 +44,7 @@ mod modules;
 mod persistence;
 mod picker;
 mod preview;
+pub(crate) mod remote;
 mod search;
 pub(crate) mod session_menu;
 mod settings;
@@ -154,6 +155,7 @@ pub enum ViewKind {
     File(crate::files::FileView),
     Diff(Box<crate::diff::DiffView>),
     Preview(crate::files::preview::DocumentView),
+    Remote(remote::RemoteView),
 }
 
 /// Which sidebar a dock lives in (docs/29).
@@ -1654,6 +1656,9 @@ pub struct Workspace {
     pub active_tab: usize,
     /// Pinned to the top of the WORKSPACES list (right-click → Pin). Persisted.
     pub pinned: bool,
+    /// A merged workspace is still owned entirely by one remote server. Local
+    /// workspaces leave this empty and preserve every existing code path.
+    pub remote: Option<remote::RemoteWorkspaceRef>,
 }
 
 /// A native agent session reported by an integration hook (M6), used to resume
@@ -2335,6 +2340,9 @@ pub struct App {
     /// finder. The server consumes this once and sends a logical handoff only
     /// to that client.
     pub pending_session_switch: Option<String>,
+    /// Client presence supplied by the server owner, not inferred from a
+    /// persisted remote projection or a saved session name.
+    pub(crate) has_attached_client: bool,
     /// On-demand named-session menu. Its filesystem/process discovery runs only
     /// while opening or activating this surface, never on an idle timer.
     pub named_session_menu: Option<session_menu::NamedSessionMenu>,
@@ -2343,6 +2351,15 @@ pub struct App {
     pub named_session_close_rect: Option<Rect>,
     pub named_session_row_rects: Vec<(usize, Rect)>,
     named_session_generation: u64,
+    /// One event-driven topology subscription per merged SSH session. Entries
+    /// are added only by explicit startup/menu merge discovery and removed when
+    /// that bounded worker exits; there is no idle polling.
+    remote_session_watchers: std::collections::HashMap<String, remote::RemoteWatcher>,
+    remote_registry_generation: u64,
+    pub(crate) remote_host_status: Vec<crate::session::remote::HostStatus>,
+    pub(crate) remote_merge_enabled: bool,
+    remote_watcher_generation: u64,
+    closed_remote_workspaces: std::collections::HashSet<remote::RemoteWorkspaceRef>,
     /// Persist structural state immediately after the last project workspace is
     /// replaced by the neutral home terminal. This prevents a crash inside the
     /// normal debounce window from restoring the project the user closed.
@@ -2667,6 +2684,7 @@ pub struct App {
     /// details on left click and an automation-safe AGENTS menu on right click
     /// when no pane exists to receive the live-agent menu.
     pub automation_rects: Vec<(String, Rect)>,
+    pub remote_agent_rects: Vec<(remote::RemoteWorkspaceRef, String, Rect)>,
     /// Resumable-session rows in the sidebar (index into `resumable`).
     pub session_rects: Vec<(usize, Rect)>,
     /// The ✕ delete buttons on hovered resumable rows (index into `resumable`).
@@ -2784,20 +2802,24 @@ impl App {
         bar.sync_modules(&modules);
 
         let id = PaneId::alloc();
-        let pane = Pane::spawn(
-            id,
-            cols,
-            rows,
-            cwd.clone(),
-            app_tx.clone(),
-            None,
-            &shell,
-            config.scrollback_bytes(),
-            pane_appearance,
-        )?;
-        let command = pane.command.clone();
         let mut panes = HashMap::new();
-        panes.insert(id, pane);
+        let mut status = HashMap::new();
+        if crate::session::remote::view_target().is_none() {
+            let pane = Pane::spawn(
+                id,
+                cols,
+                rows,
+                cwd.clone(),
+                app_tx.clone(),
+                None,
+                &shell,
+                config.scrollback_bytes(),
+                pane_appearance,
+            )?;
+            let command = pane.command.clone();
+            panes.insert(id, pane);
+            status.insert(id, PaneStatus::new(command));
+        }
         let backend_server_generation =
             crate::terminal::backend::random_id().map_err(anyhow::Error::msg)?;
         let backend_terminal_index = panes
@@ -2807,8 +2829,6 @@ impl App {
                     .map(|runtime| (runtime.terminal_id, *pane_id))
             })
             .collect();
-        let mut status = HashMap::new();
-        status.insert(id, PaneStatus::new(command));
 
         let mut app = App {
             panes,
@@ -2830,6 +2850,7 @@ impl App {
                 pinned: false,
                 tabs: vec![Tab::panes(TileLayout::new(id))],
                 active_tab: 0,
+                remote: None,
             }],
             active_ws: 0,
             closed_workspace_paths: Vec::new(),
@@ -2923,12 +2944,19 @@ impl App {
             last_cursor: None,
             detach_requested: false,
             pending_session_switch: None,
+            has_attached_client: false,
             named_session_menu: None,
             named_session_button_rect: None,
             named_session_menu_rect: None,
             named_session_close_rect: None,
             named_session_row_rects: Vec::new(),
             named_session_generation: 0,
+            remote_session_watchers: std::collections::HashMap::new(),
+            remote_registry_generation: 0,
+            remote_host_status: Vec::new(),
+            remote_merge_enabled: crate::session::remote::load_registry().merge_enabled(),
+            remote_watcher_generation: 0,
+            closed_remote_workspaces: std::collections::HashSet::new(),
             persist_session_now: false,
             force_redraw: false,
             pending_notify: Vec::new(),
@@ -3073,6 +3101,7 @@ impl App {
             agents_elsewhere_rect: None,
             agent_rects: Vec::new(),
             automation_rects: Vec::new(),
+            remote_agent_rects: Vec::new(),
             session_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             new_ws_rect: None,
@@ -3106,14 +3135,22 @@ impl App {
         };
         // A fresh start still loads `orch.json` — its pane bindings belong to a
         // previous server run, so rebind/clear them (same as `from_snapshot`).
+        if let Some(target) = crate::session::remote::view_target() {
+            app.workspaces.clear();
+            app.remote_view_placeholder(target);
+        }
         app.orch_reconcile();
         app.refresh_core_bar_widgets();
         app.mark_runtime_scans_dirty();
+        app.start_merged_remote_sessions();
         Ok(app)
     }
 
     /// Restore the saved session, or start fresh if there is none / it fails.
     pub fn restore_or_new(cols: u16, rows: u16, app_tx: Sender<AppEvent>) -> Result<App> {
+        if crate::session::remote::view_target().is_some() {
+            return App::new(cols, rows, app_tx);
+        }
         if let Some(snap) = persist::load() {
             if let Some(mut app) = App::from_snapshot(snap, app_tx.clone()) {
                 // Kick off the async fetch for any restored git tabs.
@@ -3440,6 +3477,7 @@ impl App {
                 pinned: ws.pinned,
                 tabs,
                 active_tab,
+                remote: None,
             });
         }
         if workspaces.is_empty() {
@@ -3574,12 +3612,19 @@ impl App {
             last_cursor: None,
             detach_requested: false,
             pending_session_switch: None,
+            has_attached_client: false,
             named_session_menu: None,
             named_session_button_rect: None,
             named_session_menu_rect: None,
             named_session_close_rect: None,
             named_session_row_rects: Vec::new(),
             named_session_generation: 0,
+            remote_session_watchers: std::collections::HashMap::new(),
+            remote_registry_generation: 0,
+            remote_host_status: Vec::new(),
+            remote_merge_enabled: crate::session::remote::load_registry().merge_enabled(),
+            remote_watcher_generation: 0,
+            closed_remote_workspaces: std::collections::HashSet::new(),
             persist_session_now: false,
             force_redraw: false,
             pending_notify: Vec::new(),
@@ -3724,6 +3769,7 @@ impl App {
             agents_elsewhere_rect: None,
             agent_rects: Vec::new(),
             automation_rects: Vec::new(),
+            remote_agent_rects: Vec::new(),
             session_rects: Vec::new(),
             tab_close_rects: Vec::new(),
             new_ws_rect: None,
@@ -3760,6 +3806,7 @@ impl App {
         // worktree cwd) or clear them, so the board never lies (docs/22).
         app.orch_reconcile();
         app.refresh_core_bar_widgets();
+        app.start_merged_remote_sessions();
         Some(app)
     }
 
@@ -4890,6 +4937,10 @@ impl App {
         if workspace.name != name {
             workspace.name = name.to_string();
             self.session_dirty = true;
+            self.emit_event(
+                "workspace.renamed",
+                serde_json::json!({"workspace":index.to_string(), "name":name}),
+            );
         }
         Ok(())
     }
@@ -4939,6 +4990,7 @@ impl App {
             pinned: false,
             tabs: vec![Tab::panes(TileLayout::new(id))],
             active_tab: 0,
+            remote: None,
         });
         self.active_ws = self.workspaces.len() - 1;
         self.session_dirty = true;
@@ -5002,12 +5054,19 @@ impl App {
     /// hit-testing) and `is_member` marks a nested worktree row.
     pub fn workspace_display_order(&self) -> Vec<(usize, bool)> {
         let order = {
-            let nodes: Vec<(Option<&std::path::Path>, bool)> = self
+            let nodes: Vec<_> = self
                 .workspaces
                 .iter()
                 .map(|w| {
                     (
-                        w.worktree.as_ref().map(|m| m.common_dir.as_path()),
+                        w.worktree.as_ref().map(|m| {
+                            (
+                                m.common_dir.as_path(),
+                                w.remote
+                                    .as_ref()
+                                    .map(|remote| (remote.host.as_str(), remote.session.as_str())),
+                            )
+                        }),
                         w.worktree.as_ref().is_some_and(|m| m.linked),
                     )
                 })
@@ -5338,7 +5397,11 @@ impl App {
     /// Open the workspace context menu for row `index`, anchored at the cursor.
     pub fn open_ws_menu(&mut self, index: usize, col: u16, row: u16) {
         if index < self.workspaces.len() {
-            let is_repo = crate::git::local::is_repo(&self.workspaces[index].cwd);
+            let is_repo = if self.workspaces[index].remote.is_some() {
+                self.workspaces[index].branch.is_some()
+            } else {
+                crate::git::local::is_repo(&self.workspaces[index].cwd)
+            };
             self.ws_menu = Some(WsMenu {
                 workspace_id: self.workspaces[index].id.clone(),
                 is_repo,
@@ -5364,7 +5427,15 @@ impl App {
             .map(|menu| menu.is_repo)
             // Keep this helper useful to callers that inspect rows before
             // opening a menu. The renderer always takes the cached branch.
-            .unwrap_or_else(|| ws.is_some_and(|w| crate::git::local::is_repo(&w.cwd)));
+            .unwrap_or_else(|| {
+                ws.is_some_and(|w| {
+                    if w.remote.is_some() {
+                        w.branch.is_some()
+                    } else {
+                        crate::git::local::is_repo(&w.cwd)
+                    }
+                })
+            });
         // A linked worktree (a `git worktree add` checkout) can be deleted; a main
         // checkout or plain workspace cannot — only closed.
         let is_worktree = ws
@@ -5517,6 +5588,26 @@ impl App {
             return;
         };
         let cwd = self.workspaces.get(index).map(|w| w.cwd.clone());
+        if self.workspaces[index].remote.is_some() {
+            let command = match item {
+                WsMenuItem::NewWorktree => Some("new_worktree"),
+                WsMenuItem::OpenWorktree => Some("open_worktree"),
+                WsMenuItem::OpenGit => Some("open_git"),
+                WsMenuItem::OpenOrch => Some("open_board"),
+                WsMenuItem::OpenMission => Some("open_mission"),
+                WsMenuItem::DeleteWorktree => Some("delete_worktree"),
+                WsMenuItem::Rename => Some("rename_workspace"),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.active_ws = index;
+                self.send_workspace_remote(
+                    index,
+                    crate::ipc::protocol::ClientMessage::Command(command.into()),
+                );
+                return;
+            }
+        }
         match item {
             WsMenuItem::Divider => {}
             // Pin/Unpin the right-clicked node: float it to the top of the list
@@ -5547,10 +5638,7 @@ impl App {
             }
             WsMenuItem::OpenWorktree => {
                 if let Some(cwd) = cwd.filter(|p| crate::git::local::is_repo(p)) {
-                    // Land in this repo's worktrees folder so its checkouts list.
-                    let wt = worktrees_dir_for(&cwd);
-                    let start = if wt.is_dir() { wt } else { cwd };
-                    self.open_folder_picker_at(start);
+                    self.open_worktree_picker_at(cwd);
                 }
             }
             // Both switch to the node first, then open (or focus) its dashboard.
@@ -5591,6 +5679,10 @@ impl App {
         else {
             return;
         };
+        // A remote path is never authority to delete the same path locally.
+        if self.workspaces[index].remote.is_some() {
+            return;
+        }
         // Extract owned paths under an immutable borrow, then act (mutable).
         let target = self.workspaces.get(index).and_then(|ws| {
             ws.worktree.as_ref().filter(|m| m.linked).map(|m| {
@@ -5780,7 +5872,7 @@ impl App {
         let document_preview = match self.views.get(&pane) {
             Some(ViewKind::File(view)) => crate::files::preview::PreviewKind::for_path(&view.path)
                 .map(|kind| (view.path.clone(), kind)),
-            Some(ViewKind::Preview(_) | ViewKind::Diff(_)) => None,
+            Some(ViewKind::Preview(_) | ViewKind::Diff(_) | ViewKind::Remote(_)) => None,
             None => self.editor_files.get(&pane).and_then(|editor| {
                 crate::files::preview::PreviewKind::for_path(&editor.path)
                     .map(|kind| (editor.path.clone(), kind))
@@ -6386,13 +6478,23 @@ impl App {
             return;
         }
         let generation = self.named_session_generation;
+        let remote = self.named_session_menu.as_ref().and_then(|menu| {
+            menu.rows
+                .iter()
+                .find(|row| row.name == name)
+                .and_then(|row| row.remote.clone())
+        });
         let tx = self.app_tx.clone();
         // Keep the sessions list visible while stopping; close the context menu
         // but not the sessions popup itself.
         std::thread::spawn(move || {
-            let result = crate::session::stop_session(Some(&name))
-                .map(|_| ())
-                .map_err(|e| e.to_string());
+            let result = if let Some(target) = remote {
+                crate::session::remote::stop_session(&target)
+            } else {
+                crate::session::stop_session(Some(&name))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            };
             let _ = tx.send(crate::event::AppEvent::NamedSessionStopped {
                 generation,
                 name,
@@ -6724,6 +6826,7 @@ impl App {
                 worktree: worktree_membership(&s.cwd),
                 tabs: vec![tab],
                 active_tab: 0,
+                remote: None,
             });
             self.active_ws = self.workspaces.len() - 1;
         }
@@ -7305,6 +7408,8 @@ impl App {
         if self.active_ws < self.workspaces.len() {
             let closed_workspace_id = self.workspaces[self.active_ws].id.clone();
             let closed_root = self.workspaces[self.active_ws].cwd.clone();
+            let closed_remote = self.workspaces[self.active_ws].remote.clone();
+            let was_remote = closed_remote.is_some();
             if self.workspaces.len() > 1 {
                 self.fail_pending_files_api_for_root(
                     &closed_root,
@@ -7317,7 +7422,14 @@ impl App {
             }
             self.clear_workspace_transients(&closed_workspace_id);
             self.workspaces.remove(self.active_ws);
-            self.remember_closed_workspace_path(closed_root);
+            if let Some(remote) = closed_remote {
+                self.closed_remote_workspaces.insert(remote);
+            } else {
+                self.remember_closed_workspace_path(closed_root);
+            }
+            if was_remote {
+                self.rebalance_remote_effect_leaders();
+            }
             removed = true;
         }
         if removed {
@@ -7343,6 +7455,10 @@ impl App {
     /// creating a neutral terminal at `$HOME`. It uses the ordinary workspace,
     /// tab, pane, and PTY paths, so there is no separate Home UI or terminal mode.
     fn all_workspaces_closed(&mut self) {
+        if let Some(target) = crate::session::remote::view_target() {
+            self.remote_view_placeholder(target);
+            return;
+        }
         self.session_dirty = true;
         self.persist_session_now = true;
         self.fail_pending_files_api("no active workspace while FILES was loading");
@@ -7367,6 +7483,8 @@ impl App {
         }
         let closed_workspace_id = self.workspaces[index].id.clone();
         let closed_root = self.workspaces[index].cwd.clone();
+        let closed_remote = self.workspaces[index].remote.clone();
+        let was_remote = closed_remote.is_some();
         if self.workspaces.len() > 1 {
             self.fail_pending_files_api_for_root(
                 &closed_root,
@@ -7390,7 +7508,14 @@ impl App {
         self.workspaces.remove(index);
         self.session_dirty = true;
         if suppress_reopen {
-            self.remember_closed_workspace_path(closed_root);
+            if let Some(remote) = closed_remote {
+                self.closed_remote_workspaces.insert(remote);
+            } else {
+                self.remember_closed_workspace_path(closed_root);
+            }
+        }
+        if was_remote {
+            self.rebalance_remote_effect_leaders();
         }
         self.emit_event(
             "workspace.closed",
@@ -7472,7 +7597,7 @@ fn ws_name(cwd: &std::path::Path) -> String {
 /// immediately by every linked worktree that shares its common dir. Two passes
 /// so a worktree nests under its main checkout when open (pass 0 seeds groups at
 /// roots only), and pass 1 still emits an orphan worktree whose checkout is not.
-fn group_worktrees(nodes: &[(Option<&std::path::Path>, bool)]) -> Vec<(usize, bool)> {
+fn group_worktrees<K: Copy + Eq>(nodes: &[(Option<K>, bool)]) -> Vec<(usize, bool)> {
     let n = nodes.len();
     let mut out = Vec::with_capacity(n);
     let mut placed = vec![false; n];
@@ -7771,6 +7896,24 @@ mod tests {
             before,
             "a plain workspace is never deleted"
         );
+    }
+
+    #[test]
+    fn remote_worktree_delete_and_rename_do_not_arm_local_modals() {
+        let _env = crate::persist::test_env("remote-wt-owner-menu");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.workspaces[0].remote = Some(remote::RemoteWorkspaceRef {
+            host: "test-host".into(),
+            session: "default".into(),
+            workspace_id: "owner-ws".into(),
+        });
+        for item in [WsMenuItem::DeleteWorktree, WsMenuItem::Rename] {
+            app.open_ws_menu(0, 2, 2);
+            app.ws_menu_action(item);
+            assert!(app.worktree_delete.is_none());
+            assert!(app.ws_rename.is_none());
+        }
     }
 
     fn key(c: char, m: KeyModifiers) -> AppEvent {
@@ -8122,6 +8265,8 @@ mod tests {
     #[test]
     fn picker_w_creates_a_worktree_only_on_a_repo() {
         let mk = |path: &str, is_repo: bool| crate::app::FolderPicker {
+            hosts: None,
+            worktrees: None,
             path: std::path::PathBuf::from(path),
             entries: Vec::new(),
             cursor: 0,
@@ -8941,6 +9086,7 @@ mod tests {
             tabs: vec![Tab::panes(TileLayout::new(pane))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
         app.workspaces.push(Workspace {
             id: crate::ids::public_id("workspace"),
@@ -8955,6 +9101,7 @@ mod tests {
             tabs: vec![Tab::panes(TileLayout::new(pane))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
         app.set_workspace_pinned(2, true).unwrap();
         assert_eq!(
@@ -9034,6 +9181,7 @@ mod tests {
             tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
 
         app.open_ws_menu(1, 0, 0);
@@ -9065,6 +9213,7 @@ mod tests {
             tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
 
         app.open_ws_rename(1);
@@ -9091,6 +9240,7 @@ mod tests {
             tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
 
         let removed_id = app.workspaces[0].id.clone();
@@ -12405,7 +12555,11 @@ mod tests {
         assert!(app.settings.is_none());
         app.open_settings();
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.settings_tab_rects.len(), 7, "seven tabs");
+        assert_eq!(
+            app.settings_tab_rects.len(),
+            SettingsTab::ALL.len(),
+            "every tab"
+        );
         assert!(
             !app.settings_ctl_rects.is_empty(),
             "the opening tab lists controls"
@@ -12587,8 +12741,8 @@ mod tests {
         assert!(modal.width <= 120 && modal.right() <= 120);
         assert_eq!(
             app.settings_tab_rects.len(),
-            7,
-            "all 7 tabs render (none clipped)"
+            SettingsTab::ALL.len(),
+            "all tabs render (none clipped)"
         );
         assert!(
             app.settings_tab_rects
@@ -13245,6 +13399,8 @@ mod tests {
             .position(|r| matches!(r, LayoutRow::Dock(k) if *k == DockKind::Workspaces))
             .unwrap();
         app.settings = Some(SettingsUi {
+            generation: crate::ids::public_id("settings"),
+            remote_hosts: None,
             tab: SettingsTab::Layout,
             cursor: idx,
             prefix_candidate: None,
@@ -13456,6 +13612,7 @@ mod tests {
             tabs: vec![Tab::panes(TileLayout::new(PaneId::alloc()))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
         app.resumable.extend([
             crate::agent::SessionInfo {
@@ -13564,6 +13721,7 @@ mod tests {
             tabs: vec![Tab::panes(TileLayout::new(second))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
 
         app.open_mission_control(0);
@@ -13612,6 +13770,7 @@ mod tests {
             tabs: vec![Tab::panes(TileLayout::new(second))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
 
         app.open_mission_control(0);

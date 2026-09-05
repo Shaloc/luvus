@@ -225,6 +225,10 @@ struct ClientState {
     retained_pane_content: Vec<(crate::ids::PaneId, Rect)>,
     retained_ready: bool,
     last_activity: u64,
+    /// Stable workspace id for a managed remote merge projection. `None` is a
+    /// normal whole-session client and is the only kind eligible for foreground
+    /// ownership.
+    workspace_id: Option<String>,
 }
 
 #[derive(Default)]
@@ -242,6 +246,7 @@ impl ClientState {
         rows: u16,
         terminal_colors: Option<crate::terminal::theme_probe::TerminalColors>,
         last_activity: u64,
+        workspace_id: Option<String>,
     ) -> Self {
         let size = (cols.max(1), rows.max(1));
         Self {
@@ -255,6 +260,7 @@ impl ClientState {
             retained_pane_content: Vec::new(),
             retained_ready: false,
             last_activity,
+            workspace_id,
         }
     }
 
@@ -482,7 +488,7 @@ pub fn run() -> Result<()> {
         };
         if let Some(ev) = received {
             LOOP_EVENT_WAKES.fetch_add(1, Ordering::Relaxed);
-            let source = event_render_source(&app, &ev);
+            let source = event_render_source(&app, &clients, &ev);
             let changed = apply(
                 ev,
                 &mut app,
@@ -494,7 +500,7 @@ pub fn run() -> Result<()> {
             record_event_render_request(source, changed, &mut render_request);
         }
         while let Ok(ev) = rx.try_recv() {
-            let source = event_render_source(&app, &ev);
+            let source = event_render_source(&app, &clients, &ev);
             let changed = apply(
                 ev,
                 &mut app,
@@ -614,7 +620,7 @@ pub fn run() -> Result<()> {
         // flag still set here means un-rendered output → schedule a frame.
         if last_rearm.elapsed() >= rearm_interval {
             last_rearm = Instant::now();
-            let (visible, background, title_changed) = app.rearm_pty_notify_by_visibility();
+            let (visible, background, title_changed) = rearm_pty_notify_by_visibility(&app, &clients);
             if title_changed {
                 render_request.record(RenderCause::Metadata);
             }
@@ -656,7 +662,7 @@ pub fn run() -> Result<()> {
             // Re-arm the PTY readers now that their output is on screen. A flag
             // set during this frame = more output already waiting → stay dirty
             // so the burst keeps rendering at the frame cap, tail included.
-            let (visible, background, title_changed) = app.rearm_pty_notify_by_visibility();
+            let (visible, background, title_changed) = rearm_pty_notify_by_visibility(&app, &clients);
             if title_changed {
                 render_request.record(RenderCause::Metadata);
             }
@@ -682,6 +688,7 @@ fn apply(
     interactive_size: &mut (u16, u16),
     next_activity: &mut u64,
 ) -> bool {
+    app.has_attached_client = !clients.is_empty();
     match ev {
         AppEvent::ClientConnected {
             id,
@@ -690,6 +697,7 @@ fn apply(
             cols,
             rows,
             terminal_colors,
+            workspace_id,
         } => {
             crate::logging::event(
                 crate::logging::EventKind::ServerClientAttach,
@@ -713,10 +721,13 @@ fn apply(
                     rows,
                     terminal_colors,
                     activity,
+                    workspace_id.clone(),
                 ),
             );
-            *foreground = Some(id);
-            apply_foreground_theme(app, clients, *foreground);
+            if workspace_id.is_none() {
+                *foreground = Some(id);
+                apply_foreground_theme(app, clients, *foreground);
+            }
             app.mark_runtime_scans_dirty();
             true
         }
@@ -756,7 +767,65 @@ fn apply(
                 // Resize/focus repair is local to this terminal. Its next frame
                 // must be complete, but other clients keep their diff baselines.
                 client.force_full = true;
+                if let Some(workspace_id) = client.workspace_id.as_deref() {
+                    if let Some(workspace_index) = app
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == workspace_id)
+                    {
+                        let area = Rect::new(0, 0, client.size.0, client.size.1);
+                        client.render_buf = Buffer::empty(area);
+                        let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
+                        ui::render_workspace_interactive(&mut target, app, workspace_index);
+                        *interactive_size = (0, 0);
+                    }
+                }
                 return true;
+            }
+
+            if let Some(workspace_id) = client.workspace_id.clone() {
+                let Some(workspace_index) = app
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == workspace_id)
+                else {
+                    return false;
+                };
+                // Rebuild exactly this projection's hit geometry and PTY sizes
+                // before applying its input. The ordinary foreground viewport
+                // is forced to rebuild its own geometry on its next input.
+                let area = Rect::new(0, 0, client.size.0, client.size.1);
+                if client.render_buf.area != area {
+                    client.render_buf = Buffer::empty(area);
+                }
+                client.render_buf.reset();
+                let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
+                ui::render_workspace_interactive(&mut target, app, workspace_index);
+                let previous = app
+                    .workspaces
+                    .get(app.active_ws)
+                    .map(|workspace| workspace.id.clone());
+                app.active_ws = workspace_index;
+                let event = match input {
+                    ClientInput::Key(key) => AppEvent::Key(key),
+                    ClientInput::Mouse(mouse) => AppEvent::Mouse(mouse),
+                    ClientInput::Paste(text) => AppEvent::Paste(text),
+                    ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
+                    ClientInput::Command(command) => AppEvent::ClientCommand(command),
+                    ClientInput::Resize(..) => unreachable!("handled above"),
+                };
+                let changed = app.handle_event(event);
+                if let Some(previous) = previous {
+                    app.active_ws = app
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == previous)
+                        .unwrap_or_else(|| {
+                            app.active_ws.min(app.workspaces.len().saturating_sub(1))
+                        });
+                }
+                *interactive_size = (0, 0);
+                return changed;
             }
 
             // Input ownership follows actual interaction, not background resize
@@ -788,6 +857,8 @@ fn apply(
                 ClientInput::Key(key) => AppEvent::Key(key),
                 ClientInput::Mouse(mouse) => AppEvent::Mouse(mouse),
                 ClientInput::Paste(text) => AppEvent::Paste(text),
+                ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
+                ClientInput::Command(command) => AppEvent::ClientCommand(command),
                 ClientInput::Resize(..) => unreachable!("handled above"),
             };
             app.handle_event(event)
@@ -805,6 +876,7 @@ fn broadcast(clients: &mut Clients, msg: ServerMessage) {
 fn latest_client(clients: &Clients) -> Option<u64> {
     clients
         .iter()
+        .filter(|(_, client)| client.workspace_id.is_none())
         .max_by_key(|(_, client)| client.last_activity)
         .map(|(&id, _)| id)
 }
@@ -828,9 +900,9 @@ enum EventRenderSource {
     Cause(RenderCause),
 }
 
-fn event_render_source(app: &App, event: &AppEvent) -> EventRenderSource {
+fn event_render_source(app: &App, clients: &Clients, event: &AppEvent) -> EventRenderSource {
     match event {
-        AppEvent::PtyData(id) if app.pane_is_visible(*id) => EventRenderSource::VisiblePty,
+        AppEvent::PtyData(id) if pane_visible_to_any_client(app, clients, *id) => EventRenderSource::VisiblePty,
         AppEvent::PtyData(id) if app.hidden_title_changed(*id) => {
             EventRenderSource::Cause(RenderCause::Metadata)
         }
@@ -843,6 +915,37 @@ fn event_render_source(app: &App, event: &AppEvent) -> EventRenderSource {
         AppEvent::Api(_) => EventRenderSource::Cause(RenderCause::ApiOrMaintenance),
         _ => EventRenderSource::Cause(RenderCause::UserInterface),
     }
+}
+
+fn pane_visible_to_any_client(app: &App, clients: &Clients, pane: crate::ids::PaneId) -> bool {
+    app.pane_is_visible(pane)
+        || clients.values().any(|client| {
+            client.workspace_id.as_deref().is_some_and(|workspace_id| {
+                app.workspaces
+                    .iter()
+                    .find(|workspace| workspace.id == workspace_id)
+                    .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
+                    .is_some_and(|tab| tab.layout.contains(pane))
+            })
+        })
+}
+
+fn rearm_pty_notify_by_visibility(app: &App, clients: &Clients) -> (bool, bool, bool) {
+    let mut visible = false;
+    let mut background = false;
+    let mut title_changed = false;
+    for (id, pane) in &app.panes {
+        if !pane.take_data_pending() {
+            continue;
+        }
+        if pane_visible_to_any_client(app, clients, *id) {
+            visible = true;
+        } else {
+            background = true;
+            title_changed |= app.hidden_title_changed(*id);
+        }
+    }
+    (visible, background, title_changed)
 }
 
 fn record_event_render_request(
@@ -903,9 +1006,9 @@ fn render_clients(
     let partial_candidate =
         visible_pty_only && !force_all && retained_client_ready && ui::retained_pty_eligible(app);
     if partial_candidate {
-        capture_visible_terminal_damage(app, &mut scratch.damage);
+        capture_visible_terminal_damage(app, clients, &mut scratch.damage);
     } else {
-        capture_visible_terminal_generations(app, &mut scratch.generations);
+        capture_visible_terminal_generations(app, clients, &mut scratch.generations);
     }
     let partial_pass = partial_candidate
         && !scratch.damage.is_empty()
@@ -957,17 +1060,11 @@ fn render_clients(
 
 fn capture_visible_terminal_generations(
     app: &App,
+    clients: &Clients,
     generations: &mut HashMap<crate::ids::PaneId, u64>,
 ) {
     generations.clear();
-    if app.workspaces.is_empty()
-        || app.active_is_git()
-        || app.active_is_orch()
-        || app.active_is_mission()
-    {
-        return;
-    }
-    let pane_ids = app.layout().leaves();
+    let pane_ids = visible_terminal_panes(app, clients);
     generations.reserve(pane_ids.len());
     for id in pane_ids {
         let Some(pane) = app.panes.get(&id) else {
@@ -981,17 +1078,11 @@ fn capture_visible_terminal_generations(
 
 fn capture_visible_terminal_damage(
     app: &App,
+    clients: &Clients,
     snapshots: &mut HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
 ) {
     snapshots.clear();
-    if app.workspaces.is_empty()
-        || app.active_is_git()
-        || app.active_is_orch()
-        || app.active_is_mission()
-    {
-        return;
-    }
-    let pane_ids = app.layout().leaves();
+    let pane_ids = visible_terminal_panes(app, clients);
     snapshots.reserve(pane_ids.len());
     for id in pane_ids {
         let Some(pane) = app.panes.get(&id) else {
@@ -1011,6 +1102,39 @@ fn capture_visible_terminal_damage(
             snapshots.insert(id, snapshot);
         }
     }
+}
+
+fn visible_terminal_panes(app: &App, clients: &Clients) -> Vec<crate::ids::PaneId> {
+    let mut panes = Vec::new();
+    if !app.workspaces.is_empty()
+        && !app.active_is_git()
+        && !app.active_is_orch()
+        && !app.active_is_mission()
+    {
+        panes.extend(app.layout().leaves());
+    }
+    for workspace_id in clients
+        .values()
+        .filter_map(|client| client.workspace_id.as_deref())
+    {
+        let Some(workspace) = app
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+        else {
+            continue;
+        };
+        let Some(tab) = workspace.tabs.get(workspace.active_tab) else {
+            continue;
+        };
+        if tab.is_git() || tab.is_orch() || tab.is_mission() {
+            continue;
+        }
+        panes.extend(tab.layout.leaves());
+    }
+    panes.sort_unstable_by_key(|pane| pane.0);
+    panes.dedup();
+    panes
 }
 
 fn acknowledge_visible_terminal_damage(
@@ -1085,8 +1209,12 @@ fn render_client(
         FULL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
         client.render_buf.reset();
         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
-        if interactive {
+        if let Some(workspace_id) = client.workspace_id.as_deref() {
+            ui::render_workspace_projection(&mut target, app, workspace_id);
+            client.retained_ready = false;
+        } else if interactive {
             ui::render_into(&mut target, app);
+            app.resize_active_remote_projection();
             client
                 .retained_pane_content
                 .clone_from(&app.pane_content_rects);
@@ -1211,7 +1339,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
     let mut reader = BufReader::new(stream.clone());
     let mut writer = stream;
 
-    let (cols, rows) = match protocol::read_message::<_, ClientMessage>(&mut reader) {
+    let (cols, rows, workspace_id) = match protocol::read_message::<_, ClientMessage>(&mut reader) {
         Ok(ClientMessage::Hello {
             version,
             cols,
@@ -1234,7 +1362,35 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 );
                 return;
             }
-            (cols, rows)
+            (cols, rows, None)
+        }
+        Ok(ClientMessage::HelloWorkspace {
+            version,
+            cols,
+            rows,
+            workspace_id,
+        }) => {
+            if version != protocol::PROTOCOL_VERSION {
+                let _ = protocol::write_message(
+                    &mut writer,
+                    &ServerMessage::Welcome {
+                        version: protocol::PROTOCOL_VERSION,
+                        error: Some("protocol version mismatch".into()),
+                    },
+                );
+                return;
+            }
+            if workspace_id.len() > 128 || workspace_id.is_empty() {
+                let _ = protocol::write_message(
+                    &mut writer,
+                    &ServerMessage::Welcome {
+                        version: protocol::PROTOCOL_VERSION,
+                        error: Some("invalid workspace projection".into()),
+                    },
+                );
+                return;
+            }
+            (cols, rows, Some(workspace_id))
         }
         _ => return,
     };
@@ -1251,7 +1407,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
         return;
     }
 
-    let probe_terminal = terminal_theme.load(Ordering::Relaxed);
+    let probe_terminal = workspace_id.is_none() && terminal_theme.load(Ordering::Relaxed);
     if protocol::write_message(&mut writer, &ServerMessage::Ready { probe_terminal }).is_err() {
         return;
     }
@@ -1310,6 +1466,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             cols,
             rows,
             terminal_colors,
+            workspace_id,
         })
         .is_err()
     {
@@ -1351,6 +1508,30 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                     break;
                 }
             }
+            Ok(ClientMessage::ClipboardImage(image)) => {
+                if !image.valid()
+                    || app_tx
+                        .send(AppEvent::ClientInput {
+                            id,
+                            input: ClientInput::ClipboardImage(image),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ClientMessage::Command(command)) => {
+                if command.len() > 64
+                    || app_tx
+                        .send(AppEvent::ClientInput {
+                            id,
+                            input: ClientInput::Command(command),
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
             Ok(ClientMessage::Resize { cols, rows }) => {
                 if app_tx
                     .send(AppEvent::ClientInput {
@@ -1366,7 +1547,11 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 let _ = app_tx.send(AppEvent::ClientDetach { id });
                 break;
             }
-            Ok(ClientMessage::Hello { .. } | ClientMessage::TerminalColors(_)) => {}
+            Ok(
+                ClientMessage::Hello { .. }
+                | ClientMessage::HelloWorkspace { .. }
+                | ClientMessage::TerminalColors(_),
+            ) => {}
         }
     }
 }
@@ -1569,8 +1754,8 @@ mod tests {
     use super::ServerMessage;
     use super::{
         apply, broadcast, frame_cadence_ready, frame_wait, record_event_render_request,
-        render_clients, ClientSender, ClientState, EventRenderSource, FrameSendError, RenderCause,
-        RenderRequest, RenderScratch, FRAME_INTERVAL,
+        render_clients, visible_terminal_panes, ClientSender, ClientState, EventRenderSource,
+        FrameSendError, RenderCause, RenderRequest, RenderScratch, FRAME_INTERVAL,
     };
     use crate::app::App;
     use crate::event::{AppEvent, ClientInput};
@@ -1600,9 +1785,83 @@ mod tests {
                 rows,
                 None,
                 activity,
+                None,
             ),
             rx,
         )
+    }
+
+    fn projection_client(
+        workspace_id: String,
+        activity: u64,
+    ) -> (ClientState, mpsc::Receiver<ServerMessage>) {
+        let (messages, rx) = mpsc::channel();
+        (
+            ClientState::new(
+                ClientSender {
+                    messages,
+                    frame_pending: Arc::new(AtomicBool::new(false)),
+                },
+                80,
+                24,
+                None,
+                activity,
+                Some(workspace_id),
+            ),
+            rx,
+        )
+    }
+
+    #[test]
+    fn workspace_projection_clients_never_take_whole_session_foreground() {
+        let _env = crate::persist::test_env("server-workspace-projection-foreground");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(100, 30, app_tx).expect("app starts");
+        let workspace_id = app.workspaces[0].id.clone();
+        let (messages, _rx) = mpsc::channel();
+        let mut clients = HashMap::new();
+        let mut foreground = None;
+        let mut interactive_size = (0, 0);
+        let mut next_activity = 1;
+        assert!(apply(
+            AppEvent::ClientConnected {
+                id: 7,
+                messages,
+                frame_pending: Arc::new(AtomicBool::new(false)),
+                cols: 80,
+                rows: 24,
+                terminal_colors: None,
+                workspace_id: Some(workspace_id),
+            },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut interactive_size,
+            &mut next_activity,
+        ));
+        assert_eq!(foreground, None);
+        assert_eq!(super::latest_client(&clients), None);
+    }
+
+    #[test]
+    fn projected_workspace_panes_are_visible_for_damage_acknowledgement() {
+        let _env = crate::persist::test_env("server-workspace-projection-visibility");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(100, 30, app_tx).expect("app starts");
+        let hidden_workspace = app.workspaces[0].id.clone();
+        let hidden_pane = app.workspaces[0].tabs[0].layout.focus;
+        app.dispatch("workspace.new", &serde_json::json!({}))
+            .expect("second workspace opens");
+        assert!(!app.pane_is_visible(hidden_pane));
+
+        let (client, _rx) = projection_client(hidden_workspace, 1);
+        let clients = HashMap::from([(1, client)]);
+        assert!(super::pane_visible_to_any_client(
+            &app,
+            &clients,
+            hidden_pane
+        ));
+        assert!(visible_terminal_panes(&app, &clients).contains(&hidden_pane));
     }
 
     fn received_frame_size(rx: &mpsc::Receiver<ServerMessage>) -> (u16, u16) {
@@ -1901,6 +2160,7 @@ mod tests {
             32,
             None,
             1,
+            None,
         );
         let frame = || {
             ServerMessage::FrameDiff(FrameDiff {

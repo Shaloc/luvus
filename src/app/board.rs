@@ -23,6 +23,12 @@ impl App {
     /// Open (or focus, if already open) the orchestration board in the active
     /// workspace. There's one board per workspace; the ledger behind it is global.
     pub fn open_orch_board(&mut self) {
+        if self.active_remote_pane().is_some() {
+            self.send_active_remote(crate::ipc::protocol::ClientMessage::Command(
+                "open_board".into(),
+            ));
+            return;
+        }
         let ws = &self.workspaces[self.active_ws];
         if let Some(i) = ws.tabs.iter().position(Tab::is_orch) {
             self.workspaces[self.active_ws].active_tab = i;
@@ -90,6 +96,13 @@ impl App {
         workspace_id: Option<String>,
         automation_access: Option<crate::automation::AutomationAccess>,
     ) -> Result<TaskStartResult, (String, String)> {
+        self.check_remote_workspace_request(
+            "tab.new",
+            &workspace_id
+                .as_ref()
+                .map(|id| serde_json::json!({"workspace_id":id}))
+                .unwrap_or_else(|| serde_json::json!({})),
+        )?;
         let task = self
             .orch
             .task(id)

@@ -18,6 +18,8 @@ pub enum ClientInput {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
+    ClipboardImage(crate::terminal::clipboard::ClipboardImage),
+    Command(String),
     Resize(u16, u16),
 }
 
@@ -26,6 +28,12 @@ pub enum AppEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
+    ClipboardImage(crate::terminal::clipboard::ClipboardImage),
+    ClientCommand(String),
+    ClipboardImageReady {
+        pane: PaneId,
+        result: Result<std::path::PathBuf, String>,
+    },
     Resize,
     /// The given pane produced output; the screen changed.
     PtyData(PaneId),
@@ -73,6 +81,9 @@ pub enum AppEvent {
         cols: u16,
         rows: u16,
         terminal_colors: Option<TerminalColors>,
+        /// `Some(id)` is a host-owned workspace projection used by a managed
+        /// merge client. It never competes for whole-session foreground state.
+        workspace_id: Option<String>,
     },
     /// A binary client detached.
     ClientDetach {
@@ -135,7 +146,15 @@ pub enum AppEvent {
     /// A user-requested snapshot of known named sessions completed off-loop.
     NamedSessionsLoaded {
         generation: u64,
-        result: Result<Vec<crate::session::SessionInfo>, String>,
+        result: Result<crate::app::session_menu::NamedSessionDiscovery, String>,
+    },
+    SettingsRemoteHostsLoaded {
+        generation: String,
+        result: Result<Vec<String>, String>,
+    },
+    WorktreeChoicesLoaded {
+        generation: String,
+        result: Result<Vec<crate::git::model::Worktree>, String>,
     },
     /// A stop request for a named session finished (from the session-menu context menu).
     NamedSessionStopped {
@@ -146,8 +165,51 @@ pub enum AppEvent {
     /// A selected named session is ready for this client to attach.
     NamedSessionPrepared {
         generation: u64,
-        name: String,
+        action: crate::app::session_menu::NamedSessionPreparedAction,
         result: Result<(), crate::app::session_menu::NamedSessionOpenError>,
+    },
+    /// One explicit managed remote-session discovery finished off-loop.
+    RemoteRegistryLoaded {
+        generation: u64,
+        registry: crate::session::remote::RemoteRegistry,
+        hosts: Vec<crate::session::remote::HostStatus>,
+    },
+    RemoteMergeChanged {
+        generation: u64,
+        result: Result<Option<String>, String>,
+    },
+    RemoteSessionDiscovered {
+        generation: u64,
+        target: crate::session::remote::RemoteSession,
+        result: Result<crate::app::remote::RemoteSessionSnapshot, String>,
+    },
+    /// The event-driven topology subscription for one merged remote ended.
+    RemoteSessionWatcherClosed {
+        generation: u64,
+        target: crate::session::remote::RemoteSession,
+        error: String,
+    },
+    /// A remote workspace binary projection completed its handshake.
+    RemoteProjectionReady {
+        pane: PaneId,
+        generation: u64,
+        input: std::sync::mpsc::Sender<crate::ipc::protocol::ClientMessage>,
+    },
+    /// Coalesced newest full frame for a remote workspace is available.
+    RemoteFrameAvailable {
+        pane: PaneId,
+        generation: u64,
+        slot: std::sync::Arc<crate::app::remote::RemoteFrameSlot>,
+    },
+    /// A remote projection ended or failed; its surrogate workspace remains
+    /// visible with a useful reconnect/install diagnostic.
+    RemoteProjectionClosed {
+        pane: PaneId,
+        generation: u64,
+        error: String,
+    },
+    RemoteEffect {
+        effect: crate::app::remote::RemoteEffect,
     },
     /// One structured Git status scan feeds FILES tint and DIFF (docs/88).
     DiffStatus {

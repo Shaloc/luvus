@@ -7,21 +7,76 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::App;
 
+pub(super) const NEW_SESSION_ROWS: usize = 2;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NamedSessionDiscovery {
+    pub sessions: Vec<crate::session::SessionInfo>,
+    pub remote: crate::session::remote::RemoteRegistry,
+    pub hosts: Vec<String>,
+    pub host_error: Option<String>,
+    pub host_status: Vec<crate::session::remote::HostStatus>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamedSessionRow {
     pub name: String,
     pub running: bool,
     pub current: bool,
+    pub remote: Option<crate::session::remote::RemoteSession>,
+    pub merged: bool,
+}
+
+impl NamedSessionRow {
+    pub fn display_name(&self) -> &str {
+        self.remote
+            .as_ref()
+            .map_or(&self.name, |remote| &remote.session)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RemotePromptField {
+    Host,
+    Name,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamedSessionPrompt {
+    Local {
+        name: String,
+    },
+    Remote {
+        name: String,
+        hosts: Vec<String>,
+        host_index: usize,
+        focus: RemotePromptField,
+    },
+}
+
+impl NamedSessionPrompt {
+    fn name(&self) -> &str {
+        match self {
+            Self::Local { name } | Self::Remote { name, .. } => name,
+        }
+    }
+
+    fn name_mut(&mut self) -> &mut String {
+        match self {
+            Self::Local { name } | Self::Remote { name, .. } => name,
+        }
+    }
 }
 
 #[derive(Debug)]
 pub struct NamedSessionMenu {
     pub generation: u64,
     pub rows: Vec<NamedSessionRow>,
+    pub hosts: Vec<String>,
     pub cursor: usize,
     pub scroll: usize,
     pub loading: bool,
-    pub prompt: Option<String>,
+    pub prompt: Option<NamedSessionPrompt>,
     pub error: Option<String>,
     pub preparing: bool,
 }
@@ -32,11 +87,30 @@ pub enum NamedSessionOpenError {
     Failed(String),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NamedSessionPreparedAction {
+    Switch(String),
+    Merge(crate::session::remote::RemoteSession),
+}
+
 impl App {
     fn refresh_named_sessions(&self, generation: u64) {
         let tx = self.app_tx.clone();
         std::thread::spawn(move || {
-            let result = crate::session::list_sessions().map_err(|error| error.to_string());
+            let result = (|| {
+                let (remote, host_status) = crate::session::remote::discover_hosts();
+                let (hosts, host_error) = match crate::session::remote::enabled_hosts() {
+                    Ok(hosts) => (hosts, None),
+                    Err(error) => (Vec::new(), Some(error)),
+                };
+                Ok(NamedSessionDiscovery {
+                    sessions: crate::session::list_sessions().map_err(|err| err.to_string())?,
+                    remote,
+                    hosts,
+                    host_error,
+                    host_status,
+                })
+            })();
             let _ = tx.send(crate::event::AppEvent::NamedSessionsLoaded { generation, result });
         });
     }
@@ -76,7 +150,7 @@ impl App {
                 Ok(()) => {
                     if let Some(pos) = menu.rows.iter().position(|r| r.name == name) {
                         menu.rows.remove(pos);
-                        let count = menu.rows.len() + 1;
+                        let count = menu.rows.len() + NEW_SESSION_ROWS;
                         if menu.cursor >= count {
                             menu.cursor = count.saturating_sub(1);
                         }
@@ -106,6 +180,7 @@ impl App {
         self.named_session_menu = Some(NamedSessionMenu {
             generation,
             rows: Vec::new(),
+            hosts: Vec::new(),
             cursor: 0,
             scroll: 0,
             loading: true,
@@ -125,7 +200,7 @@ impl App {
     pub fn apply_named_sessions_loaded(
         &mut self,
         generation: u64,
-        result: Result<Vec<crate::session::SessionInfo>, String>,
+        result: Result<NamedSessionDiscovery, String>,
     ) {
         let current = crate::session::display_name();
         let Some(menu) = self.named_session_menu.as_mut() else {
@@ -136,13 +211,23 @@ impl App {
         }
         menu.loading = false;
         match result {
-            Ok(sessions) => {
-                menu.rows = session_rows(sessions, &current);
+            Ok(discovery) => {
+                menu.rows = session_rows(&discovery, &current);
+                menu.hosts = discovery.hosts;
+                menu.error = discovery
+                    .host_error
+                    .map(|error| format!("{}: {error}", self.catalog.session_no_ssh_hosts));
                 menu.cursor = menu
                     .rows
                     .iter()
                     .position(|row| row.current)
-                    .map_or(0, |index| index + 1);
+                    .map_or(0, |index| index + NEW_SESSION_ROWS);
+                self.remote_host_status = discovery.host_status;
+                self.remote_registry_generation = self.remote_registry_generation.wrapping_add(1);
+                self.apply_remote_registry_loaded(
+                    self.remote_registry_generation,
+                    discovery.remote,
+                );
             }
             Err(error) => {
                 menu.error = Some(format!("{}: {error}", self.catalog.session_open_failed))
@@ -153,7 +238,7 @@ impl App {
     pub fn apply_named_session_prepared(
         &mut self,
         generation: u64,
-        name: String,
+        action: NamedSessionPreparedAction,
         result: Result<(), NamedSessionOpenError>,
     ) {
         let Some(menu) = self.named_session_menu.as_mut() else {
@@ -167,7 +252,20 @@ impl App {
             Ok(()) => {
                 self.named_session_menu = None;
                 self.named_session_generation = self.named_session_generation.wrapping_add(1);
-                self.pending_session_switch = Some(name);
+                match action {
+                    NamedSessionPreparedAction::Switch(name) => {
+                        self.pending_session_switch = Some(name);
+                    }
+                    NamedSessionPreparedAction::Merge(target) => {
+                        if crate::session::remote::process_target().is_none()
+                            && crate::session::display_name() == target.session
+                        {
+                            self.discover_remote_session(target);
+                        } else {
+                            self.pending_session_switch = Some(target.session);
+                        }
+                    }
+                }
             }
             Err(NamedSessionOpenError::Exists) => {
                 menu.error = Some(self.catalog.session_exists.to_string());
@@ -195,10 +293,42 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.submit_named_session_prompt(),
+                KeyCode::Tab => {
+                    if let Some(menu) = self.named_session_menu.as_mut() {
+                        if !menu.preparing {
+                            cycle_remote_prompt_focus(menu.prompt.as_mut(), 1);
+                        }
+                    }
+                }
+                KeyCode::BackTab => {
+                    if let Some(menu) = self.named_session_menu.as_mut() {
+                        if !menu.preparing {
+                            cycle_remote_prompt_focus(menu.prompt.as_mut(), -1);
+                        }
+                    }
+                }
+                KeyCode::Left | KeyCode::Up => {
+                    if let Some(menu) = self.named_session_menu.as_mut() {
+                        if !menu.preparing {
+                            adjust_remote_prompt(menu.prompt.as_mut(), -1);
+                            menu.error = None;
+                        }
+                    }
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    if let Some(menu) = self.named_session_menu.as_mut() {
+                        if !menu.preparing {
+                            adjust_remote_prompt(menu.prompt.as_mut(), 1);
+                            menu.error = None;
+                        }
+                    }
+                }
                 KeyCode::Backspace => {
                     if let Some(menu) = self.named_session_menu.as_mut() {
                         if !menu.preparing {
-                            menu.prompt.as_mut().map(String::pop);
+                            if let Some(prompt) = menu.prompt.as_mut() {
+                                prompt.name_mut().pop();
+                            }
                             menu.error = None;
                         }
                     }
@@ -209,8 +339,11 @@ impl App {
                     if let Some(menu) = self.named_session_menu.as_mut() {
                         if !menu.preparing {
                             if let Some(prompt) = menu.prompt.as_mut() {
-                                if prompt.len() < 64 && is_session_name_character(character) {
-                                    prompt.push(character);
+                                if prompt_accepts_text(prompt)
+                                    && prompt.name().len() < 64
+                                    && is_session_name_character(character)
+                                {
+                                    prompt.name_mut().push(character);
                                 }
                             }
                             menu.error = None;
@@ -225,8 +358,9 @@ impl App {
         let count = self
             .named_session_menu
             .as_ref()
-            .map_or(0, |menu| menu.rows.len() + 1);
+            .map_or(0, |menu| menu.rows.len() + NEW_SESSION_ROWS);
         match key.code {
+            KeyCode::Char('r') => self.open_named_session_menu(),
             KeyCode::Esc | KeyCode::Char('q') => self.close_named_session_menu(),
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Some(menu) = self.named_session_menu.as_mut() {
@@ -275,10 +409,10 @@ impl App {
             .chars()
             .filter(|character| is_session_name_character(*character))
         {
-            if prompt.len() >= 64 {
+            if !prompt_accepts_text(prompt) || prompt.name().len() >= 64 {
                 break;
             }
-            prompt.push(character);
+            prompt.name_mut().push(character);
         }
         menu.error = None;
         true
@@ -313,7 +447,7 @@ impl App {
         if menu.prompt.is_some() {
             return;
         }
-        let count = menu.rows.len() + 1;
+        let count = menu.rows.len() + NEW_SESSION_ROWS;
         menu.cursor =
             (menu.cursor as i32 + delta).clamp(0, count.saturating_sub(1) as i32) as usize;
     }
@@ -326,14 +460,32 @@ impl App {
             return;
         }
         if index == 0 {
-            menu.prompt = Some(String::new());
+            menu.prompt = Some(NamedSessionPrompt::Local {
+                name: String::new(),
+            });
             menu.error = None;
             return;
         }
-        let Some((name, current)) = menu
+        if index == 1 {
+            if menu.hosts.is_empty() {
+                if menu.error.is_none() {
+                    menu.error = Some(self.catalog.session_no_ssh_hosts.to_string());
+                }
+                return;
+            }
+            menu.prompt = Some(NamedSessionPrompt::Remote {
+                name: String::new(),
+                hosts: menu.hosts.clone(),
+                host_index: 0,
+                focus: RemotePromptField::Name,
+            });
+            menu.error = None;
+            return;
+        }
+        let Some((name, current, remote)) = menu
             .rows
-            .get(index - 1)
-            .map(|row| (row.name.clone(), row.current))
+            .get(index - NEW_SESSION_ROWS)
+            .map(|row| (row.name.clone(), row.current, row.remote.clone()))
         else {
             return;
         };
@@ -341,7 +493,11 @@ impl App {
             self.close_named_session_menu();
             return;
         }
-        self.prepare_named_session(name, false);
+        if let Some(target) = remote {
+            self.prepare_remote_session(target, self.remote_merge_enabled, false);
+        } else {
+            self.prepare_named_session(name, false);
+        }
     }
 
     fn submit_named_session_prompt(&mut self) {
@@ -351,17 +507,37 @@ impl App {
         if menu.preparing {
             return;
         }
-        let name = menu
-            .prompt
-            .as_deref()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
+        let Some(prompt) = menu.prompt.clone() else {
+            return;
+        };
+        let name = prompt.name().trim().to_string();
         if crate::session::validate_name(&name).is_err() {
             menu.error = Some(self.catalog.session_name_hint.to_string());
             return;
         }
-        self.prepare_named_session(name, true);
+        match prompt {
+            NamedSessionPrompt::Local { .. } => self.prepare_named_session(name, true),
+            NamedSessionPrompt::Remote {
+                hosts, host_index, ..
+            } => {
+                let Some(host) = hosts.get(host_index) else {
+                    if let Some(menu) = self.named_session_menu.as_mut() {
+                        menu.error = Some(self.catalog.session_no_ssh_hosts.to_string());
+                    }
+                    return;
+                };
+                match crate::session::remote::RemoteSession::new(host, &name) {
+                    Ok(target) => {
+                        self.prepare_remote_session(target, self.remote_merge_enabled, true)
+                    }
+                    Err(error) => {
+                        if let Some(menu) = self.named_session_menu.as_mut() {
+                            menu.error = Some(error);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn prepare_named_session(&mut self, name: String, must_be_new: bool) {
@@ -387,37 +563,181 @@ impl App {
             })();
             let _ = tx.send(crate::event::AppEvent::NamedSessionPrepared {
                 generation,
-                name,
+                action: NamedSessionPreparedAction::Switch(name),
+                result,
+            });
+        });
+    }
+
+    fn prepare_remote_session(
+        &mut self,
+        target: crate::session::remote::RemoteSession,
+        merge: bool,
+        register: bool,
+    ) {
+        let Some(menu) = self.named_session_menu.as_mut() else {
+            return;
+        };
+        menu.preparing = true;
+        menu.error = None;
+        let generation = menu.generation;
+        let tx = self.app_tx.clone();
+        std::thread::spawn(move || {
+            let result = (|| {
+                crate::session::remote::verify_remote_version(&target.host)
+                    .map_err(NamedSessionOpenError::Failed)?;
+                if register {
+                    let existing = crate::session::remote::list_host_sessions(&target.host)
+                        .map_err(NamedSessionOpenError::Failed)?;
+                    if existing
+                        .iter()
+                        .any(|session| session.name == target.session)
+                    {
+                        return Err(NamedSessionOpenError::Exists);
+                    }
+                    // Connecting the control bridge creates the selected remote
+                    // server through its normal lifecycle. No binary is copied.
+                    crate::session::remote::ensure_session(&target)
+                        .map_err(NamedSessionOpenError::Failed)?;
+                    crate::session::remote::add_session(target.clone(), merge)
+                        .map_err(NamedSessionOpenError::Failed)?;
+                }
+                if merge {
+                    crate::session::start_client_session(&target.session)
+                        .map_err(NamedSessionOpenError::Failed)?;
+                } else {
+                    crate::session::start_client_session(&target.canonical_name())
+                        .map_err(NamedSessionOpenError::Failed)?;
+                    crate::session::remote::reload_local_session(&target.session)
+                        .map_err(NamedSessionOpenError::Failed)?;
+                }
+                Ok(())
+            })();
+            let action = if merge {
+                NamedSessionPreparedAction::Merge(target)
+            } else {
+                NamedSessionPreparedAction::Switch(target.canonical_name())
+            };
+            let _ = tx.send(crate::event::AppEvent::NamedSessionPrepared {
+                generation,
+                action,
                 result,
             });
         });
     }
 }
 
-fn session_rows(sessions: Vec<crate::session::SessionInfo>, current: &str) -> Vec<NamedSessionRow> {
-    let mut rows: Vec<_> = sessions
-        .into_iter()
+fn session_rows(discovery: &NamedSessionDiscovery, current: &str) -> Vec<NamedSessionRow> {
+    let mut rows: Vec<_> = discovery
+        .sessions
+        .iter()
+        .filter(|session| {
+            !discovery
+                .remote
+                .sessions
+                .iter()
+                .any(|remote| remote.canonical_name() == session.name)
+        })
         .map(|session| NamedSessionRow {
             current: session.name == current,
-            name: session.name,
+            name: session.name.clone(),
             running: session.running,
+            remote: None,
+            merged: discovery.remote.merge_enabled(),
         })
         .collect();
-    if !rows.iter().any(|row| row.current) {
+    for target in &discovery.remote.sessions {
+        if discovery.remote.merge_enabled()
+            && rows
+                .iter()
+                .any(|row| row.name == target.session && row.remote.is_none())
+        {
+            continue;
+        }
+        let name = target.canonical_name();
+        rows.push(NamedSessionRow {
+            current: name == current,
+            running: name == current
+                || discovery.host_status.iter().any(|host| {
+                    host.host == target.host
+                        && host
+                            .sessions
+                            .iter()
+                            .any(|session| session.name == target.session && session.running)
+                }),
+            name,
+            remote: Some(target.clone()),
+            merged: discovery.remote.merge_enabled(),
+        });
+    }
+    if !rows.iter().any(|row| row.current) && !current.starts_with("remote-") {
         rows.push(NamedSessionRow {
             name: current.to_string(),
             running: true,
             current: true,
+            remote: None,
+            merged: discovery.remote.merge_enabled(),
         });
     }
     rows.sort_by(|left, right| {
-        (!left.current, !left.running, left.name.to_ascii_lowercase()).cmp(&(
-            !right.current,
-            !right.running,
-            right.name.to_ascii_lowercase(),
-        ))
+        (
+            !left.current,
+            left.remote.is_some(),
+            !left.running,
+            left.display_name().to_ascii_lowercase(),
+        )
+            .cmp(&(
+                !right.current,
+                right.remote.is_some(),
+                !right.running,
+                right.display_name().to_ascii_lowercase(),
+            ))
     });
     rows
+}
+
+fn prompt_accepts_text(prompt: &NamedSessionPrompt) -> bool {
+    matches!(
+        prompt,
+        NamedSessionPrompt::Local { .. }
+            | NamedSessionPrompt::Remote {
+                focus: RemotePromptField::Name,
+                ..
+            }
+    )
+}
+
+fn cycle_remote_prompt_focus(prompt: Option<&mut NamedSessionPrompt>, delta: i32) {
+    let Some(NamedSessionPrompt::Remote { focus, .. }) = prompt else {
+        return;
+    };
+    let index = match focus {
+        RemotePromptField::Host => 0,
+        RemotePromptField::Name => 1,
+    };
+    *focus = match (index + delta).rem_euclid(2) {
+        0 => RemotePromptField::Host,
+        1 => RemotePromptField::Name,
+        _ => RemotePromptField::Name,
+    };
+}
+
+fn adjust_remote_prompt(prompt: Option<&mut NamedSessionPrompt>, delta: i32) {
+    let Some(NamedSessionPrompt::Remote {
+        hosts,
+        host_index,
+        focus,
+        ..
+    }) = prompt
+    else {
+        return;
+    };
+    match focus {
+        RemotePromptField::Host if !hosts.is_empty() => {
+            *host_index = (*host_index as i32 + delta).rem_euclid(hosts.len() as i32) as usize;
+        }
+        RemotePromptField::Name | RemotePromptField::Host => {}
+    }
 }
 
 fn is_session_name_character(character: char) -> bool {
@@ -426,7 +746,10 @@ fn is_session_name_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{session_rows, NamedSessionMenu, NamedSessionRow};
+    use super::{
+        session_rows, NamedSessionDiscovery, NamedSessionMenu, NamedSessionPreparedAction,
+        NamedSessionPrompt, NamedSessionRow,
+    };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::mpsc::Receiver;
     use std::time::Duration;
@@ -452,15 +775,25 @@ mod tests {
         }
     }
 
+    fn discovery(sessions: Vec<crate::session::SessionInfo>) -> NamedSessionDiscovery {
+        NamedSessionDiscovery {
+            sessions,
+            remote: crate::session::remote::RemoteRegistry::default(),
+            hosts: Vec::new(),
+            host_error: None,
+            host_status: Vec::new(),
+        }
+    }
+
     #[test]
     fn rows_put_current_then_running_then_stopped() {
         let rows = session_rows(
-            vec![
+            &discovery(vec![
                 info("z-stopped", false),
                 info("b-running", true),
                 info("active", true),
                 info("a-running", true),
-            ],
+            ]),
             "active",
         );
         let names: Vec<_> = rows.iter().map(|row| row.name.as_str()).collect();
@@ -469,7 +802,7 @@ mod tests {
 
     #[test]
     fn rows_restore_a_missing_current_session() {
-        let rows = session_rows(vec![info("default", true)], "other");
+        let rows = session_rows(&discovery(vec![info("default", true)]), "other");
         assert_eq!(rows[0].name, "other");
         assert!(rows[0].current);
         assert!(rows[0].running);
@@ -483,6 +816,7 @@ mod tests {
         app.named_session_menu = Some(NamedSessionMenu {
             generation: 7,
             rows: Vec::new(),
+            hosts: Vec::new(),
             cursor: 0,
             scroll: 0,
             loading: true,
@@ -490,9 +824,15 @@ mod tests {
             error: None,
             preparing: false,
         });
-        app.apply_named_sessions_loaded(7, Ok(vec![info("stopped", false), info("default", true)]));
+        app.apply_named_sessions_loaded(
+            7,
+            Ok(discovery(vec![
+                info("stopped", false),
+                info("default", true),
+            ])),
+        );
         let menu = app.named_session_menu.as_ref().unwrap();
-        assert_eq!(menu.cursor, 1, "row zero is New; current is row one");
+        assert_eq!(menu.cursor, 2, "two New rows precede the current session");
         assert!(menu.rows[0].current);
     }
 
@@ -508,14 +848,19 @@ mod tests {
                     name: "default".into(),
                     running: true,
                     current: true,
+                    remote: None,
+                    merged: false,
                 },
                 NamedSessionRow {
                     name: "review".into(),
                     running: false,
                     current: false,
+                    remote: None,
+                    merged: false,
                 },
             ],
-            cursor: 1,
+            hosts: Vec::new(),
+            cursor: 2,
             scroll: 0,
             loading: false,
             prompt: None,
@@ -524,13 +869,13 @@ mod tests {
         });
 
         app.named_session_key(key(KeyCode::Char('k')));
-        assert_eq!(app.named_session_menu.as_ref().unwrap().cursor, 0);
+        assert_eq!(app.named_session_menu.as_ref().unwrap().cursor, 1);
         app.named_session_key(key(KeyCode::Char('k')));
         assert_eq!(app.named_session_menu.as_ref().unwrap().cursor, 0);
         app.named_session_key(key(KeyCode::End));
-        assert_eq!(app.named_session_menu.as_ref().unwrap().cursor, 2);
+        assert_eq!(app.named_session_menu.as_ref().unwrap().cursor, 3);
         app.named_session_key(key(KeyCode::Char('j')));
-        assert_eq!(app.named_session_menu.as_ref().unwrap().cursor, 2);
+        assert_eq!(app.named_session_menu.as_ref().unwrap().cursor, 3);
         app.named_session_key(key(KeyCode::Home));
         assert_eq!(app.named_session_menu.as_ref().unwrap().cursor, 0);
         app.named_session_key(key(KeyCode::Char('j')));
@@ -547,10 +892,13 @@ mod tests {
         app.named_session_menu = Some(NamedSessionMenu {
             generation: 1,
             rows: Vec::new(),
+            hosts: Vec::new(),
             cursor: 0,
             scroll: 0,
             loading: false,
-            prompt: Some(String::new()),
+            prompt: Some(NamedSessionPrompt::Local {
+                name: String::new(),
+            }),
             error: None,
             preparing: false,
         });
@@ -560,7 +908,8 @@ mod tests {
         assert_eq!(
             app.named_session_menu
                 .as_ref()
-                .and_then(|menu| menu.prompt.as_deref()),
+                .and_then(|menu| menu.prompt.as_ref())
+                .map(NamedSessionPrompt::name),
             Some("q")
         );
     }
@@ -573,10 +922,13 @@ mod tests {
         app.named_session_menu = Some(NamedSessionMenu {
             generation: 4,
             rows: Vec::new(),
+            hosts: Vec::new(),
             cursor: 0,
             scroll: 0,
             loading: false,
-            prompt: Some("review".into()),
+            prompt: Some(NamedSessionPrompt::Local {
+                name: "review".into(),
+            }),
             error: None,
             preparing: true,
         });
@@ -584,9 +936,80 @@ mod tests {
             ratatui::crossterm::event::KeyCode::Esc,
             ratatui::crossterm::event::KeyModifiers::NONE,
         ));
-        app.apply_named_session_prepared(4, "review".into(), Ok(()));
+        app.apply_named_session_prepared(
+            4,
+            NamedSessionPreparedAction::Switch("review".into()),
+            Ok(()),
+        );
         assert!(app.pending_session_switch.is_none());
         assert!(app.named_session_menu.is_some());
+    }
+
+    #[test]
+    fn global_merge_groups_local_and_remote_default_without_a_prefixed_row() {
+        let target = crate::session::remote::RemoteSession::new("dev-207", "default").unwrap();
+        let mut remote = crate::session::remote::RemoteRegistry::default();
+        remote.sessions.push(target.clone());
+        remote.merged_sessions.insert("default".into());
+        let rows = session_rows(
+            &NamedSessionDiscovery {
+                sessions: vec![info("default", true)],
+                remote,
+                hosts: vec!["dev-207".into()],
+                host_error: None,
+                host_status: Vec::new(),
+            },
+            "default",
+        );
+        assert_eq!(rows[0].name, "default");
+        assert!(rows[0].current);
+        assert!(rows[0].merged);
+        assert_eq!(
+            rows.len(),
+            1,
+            "one logical session must have one menu entry"
+        );
+        assert_eq!(rows[0].display_name(), "default");
+    }
+
+    #[test]
+    fn remote_prompt_selects_only_host_and_name_and_keeps_merge_global() {
+        let _env = crate::persist::test_env("named-session-menu-remote-prompt");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        app.named_session_menu = Some(NamedSessionMenu {
+            generation: 1,
+            rows: Vec::new(),
+            hosts: vec!["build-box".into(), "dev-207".into()],
+            cursor: 1,
+            scroll: 0,
+            loading: false,
+            prompt: None,
+            error: None,
+            preparing: false,
+        });
+
+        app.named_session_key(key(KeyCode::Enter));
+        app.named_session_key(key(KeyCode::Char('a')));
+        app.named_session_key(key(KeyCode::Tab));
+        app.named_session_key(key(KeyCode::Right));
+
+        let Some(NamedSessionPrompt::Remote {
+            name,
+            hosts,
+            host_index,
+            focus,
+        }) = app
+            .named_session_menu
+            .as_ref()
+            .and_then(|menu| menu.prompt.as_ref())
+        else {
+            panic!("remote prompt was not opened");
+        };
+        assert_eq!(name, "a");
+        assert_eq!(hosts[*host_index], "dev-207");
+        assert!(!app.remote_merge_enabled);
+        assert_eq!(*focus, super::RemotePromptField::Host);
     }
 
     #[test]
@@ -595,11 +1018,14 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            hosts: Vec::new(),
             generation: 8,
             rows: vec![NamedSessionRow {
                 name: "review".into(),
                 running: true,
                 current: false,
+                remote: None,
+                merged: false,
             }],
             cursor: 1,
             scroll: 0,
@@ -625,11 +1051,14 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            hosts: Vec::new(),
             generation: 5,
             rows: vec![NamedSessionRow {
                 name: "review".into(),
                 running: true,
                 current: false,
+                remote: None,
+                merged: false,
             }],
             cursor: 1,
             scroll: 0,
@@ -651,11 +1080,14 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            hosts: Vec::new(),
             generation: 3,
             rows: vec![NamedSessionRow {
                 name: "review".into(),
                 running: true,
                 current: false,
+                remote: None,
+                merged: false,
             }],
             cursor: 1,
             scroll: 0,
@@ -678,11 +1110,14 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
+            hosts: Vec::new(),
             generation: 1,
             rows: vec![NamedSessionRow {
                 name: "other".into(),
                 running: true,
                 current: false,
+                remote: None,
+                merged: false,
             }],
             cursor: 1,
             scroll: 0,

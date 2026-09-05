@@ -119,7 +119,7 @@ impl App {
             .filter_map(|id| match self.views.get(id)? {
                 ViewKind::File(v) => Some((*id, v.path.clone(), v.read_token, v.mtime, false)),
                 ViewKind::Preview(v) => Some((*id, v.path.clone(), v.read_token, v.mtime, true)),
-                ViewKind::Diff(_) => None,
+                ViewKind::Diff(_) | ViewKind::Remote(_) => None,
             })
             .collect();
         if inputs.is_empty() {

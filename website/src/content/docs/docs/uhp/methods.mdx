@@ -373,6 +373,13 @@ resynchronization rules.
 `uhp.capabilities` negotiates the app-level automation surface and its
 limits. `session.snapshot` returns every workspace, tab, terminal pane, native
 view, stable terminal identity, root process, and agent state in one response.
+Merged remote workspace rows also include their SSH Host alias in `host`; local
+workspace rows use `host:null`.
+Use `config.get` / `config.patch` with the `remote_hosts` string array to inspect
+or change the same managed-host selection exposed in Settings → Remote. The
+default is empty. Configuration changes reconcile active merge projections;
+only enabled aliases declared in SSH config can be connected. The existing
+`server.reload_config` method also refreshes the saved remote-session registry.
 It includes the current event sequence, so a consumer can subscribe first and
 reconcile later events without a snapshot race. Neither method reads terminal
 text or starts a process.
@@ -543,10 +550,12 @@ on a parent or linked worktree floats that complete worktree group while
 preserving its internal order.
 
 `workspace.list` remains in API-index order. Each row includes `workspace_id`,
-`workspace`, `name`, `cwd`, `terminal_cwd`, `pinned`, `display_position`,
-`active`, and `tabs`. `workspace.get` exposes the same two paths. `cwd` is the
-stable project root. `terminal_cwd` follows the focused pane of the workspace's
-active tab and changes when focus moves to another split. Both
+`workspace`, `name`, `cwd`, `host`, `terminal_cwd`, `pinned`,
+`display_position`, `active`, and `tabs`. `host` is `null` for local workspaces
+and the SSH Host alias for a merged remote projection. `workspace.get` exposes
+the same two paths. `cwd` is the stable project root. `terminal_cwd` follows the
+focused pane of the workspace's active tab and changes when focus moves to
+another split. Both
 `workspace` and `display_position` are 0-based; callers can therefore target a
 current position or use the stable ID and separately verify where it appears in
 the sidebar.
@@ -973,5 +982,6 @@ subscribe-first snapshot reconciliation.
   directory. Windows uses a local-only named pipe with an owner/System DACL and
   same-user server validation. Access equals command execution as your user. See the
   [security model](/docs/explanation/security/).
-- `ping` returns the server's version and selected session name, useful for
-  health checks, upgrade detection, and routing verification.
+- `ping` returns the server's version, binary-client transport protocol, and
+  selected session name, useful for health checks, exact-build upgrade
+  detection, and routing verification.

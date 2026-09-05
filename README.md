@@ -39,8 +39,9 @@
 - **Worktrees and orchestration:** Create worktrees, coordinate dependent tasks,
   reserve file paths, assign agents, schedule timezone-aware recurring work,
   run quality gates, and merge completed work.
-- **Remote and multi-client use:** Attach over SSH, connect several clients with
-  independent viewport sizes, and use the compact switcher on narrow screens.
+- **Remote and multi-client use:** Register SSH-config hosts, target remote
+  panes and worktrees with `--host`, merge same-name local and remote
+  workspaces with hostname tags, or use the raw SSH attach escape hatch.
 - **Terminal tools:** Configure per-pane Scrollback Memory, search across pane
   history, use copy mode, click detected links, and run full-screen terminal apps.
 - **Extensible surfaces:** Install modules with actions, events, settings,

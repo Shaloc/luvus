@@ -21,10 +21,11 @@ pub enum SettingsTab {
     Modules,
     Integrations,
     Language,
+    Remote,
 }
 
 impl SettingsTab {
-    pub const ALL: [SettingsTab; 7] = [
+    pub const ALL: [SettingsTab; 8] = [
         SettingsTab::General,
         SettingsTab::Theme,
         SettingsTab::Layout,
@@ -32,6 +33,7 @@ impl SettingsTab {
         SettingsTab::Modules,
         SettingsTab::Integrations,
         SettingsTab::Language,
+        SettingsTab::Remote,
     ];
 
     /// The tab label in the active UI language (docs/21).
@@ -44,6 +46,7 @@ impl SettingsTab {
             SettingsTab::Modules => cat.tab_modules,
             SettingsTab::Integrations => cat.tab_agents,
             SettingsTab::Language => cat.tab_language,
+            SettingsTab::Remote => cat.settings.remote_hosts,
         }
     }
 
@@ -58,6 +61,8 @@ impl SettingsTab {
 
 /// Transient state of the open Settings modal.
 pub struct SettingsUi {
+    pub generation: String,
+    pub remote_hosts: Option<Result<Vec<String>, String>>,
     pub tab: SettingsTab,
     pub cursor: usize,
     /// Candidate prefix captured once and waiting for the same chord again.
@@ -239,6 +244,8 @@ impl App {
     /// preselects the active palette, via `settings_set_tab`.
     pub fn open_settings(&mut self) {
         self.settings = Some(SettingsUi {
+            generation: crate::ids::public_id("settings"),
+            remote_hosts: None,
             tab: SettingsTab::General,
             cursor: 0,
             prefix_candidate: None,
@@ -280,6 +287,12 @@ impl App {
             SettingsTab::Modules => self.module_rows().len(),
             SettingsTab::Integrations => crate::integration::agent_count(),
             SettingsTab::Language => crate::i18n::LANGS.len(),
+            SettingsTab::Remote => self
+                .settings
+                .as_ref()
+                .and_then(|ui| ui.remote_hosts.as_ref())
+                .and_then(|result| result.as_ref().ok())
+                .map_or(1, |hosts| hosts.len() + 1),
         }
     }
 
@@ -362,7 +375,7 @@ impl App {
                     self.reset_binding(cmd);
                 }
             }
-            KeyCode::Char(c) if ('1'..='7').contains(&c) => {
+            KeyCode::Char(c) if ('1'..='8').contains(&c) => {
                 self.settings_set_tab(SettingsTab::from_index(c as usize - '1' as usize));
             }
             _ => {}
@@ -481,6 +494,73 @@ impl App {
             ui.layout_scroll = 0;
             ui.capturing = false;
         }
+        if tab == SettingsTab::Remote {
+            self.load_settings_remote_hosts();
+        }
+    }
+
+    fn load_settings_remote_hosts(&self) {
+        let Some(ui) = self.settings.as_ref() else {
+            return;
+        };
+        if ui.remote_hosts.is_some() {
+            return;
+        }
+        let generation = ui.generation.clone();
+        let selected = self.config.remote_hosts.clone();
+        let tx = self.app_tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::session::remote::configured_hosts().map(|mut hosts| {
+                // Keep removed aliases visible so users can deselect them.
+                hosts.extend(selected);
+                hosts.sort();
+                hosts.dedup();
+                hosts
+            });
+            let _ = tx.send(AppEvent::SettingsRemoteHostsLoaded { generation, result });
+        });
+    }
+
+    pub(crate) fn apply_settings_remote_hosts_loaded(
+        &mut self,
+        generation: String,
+        result: Result<Vec<String>, String>,
+    ) {
+        if let Some(ui) = self
+            .settings
+            .as_mut()
+            .filter(|ui| ui.generation == generation)
+        {
+            ui.remote_hosts = Some(result);
+        }
+    }
+
+    fn toggle_settings_remote_host(&mut self, cursor: usize) {
+        if cursor == 0 {
+            self.toggle_remote_merge();
+            return;
+        }
+        let Some(host) = self
+            .settings
+            .as_ref()
+            .and_then(|ui| ui.remote_hosts.as_ref())
+            .and_then(|result| result.as_ref().ok())
+            .and_then(|hosts| hosts.get(cursor - 1))
+            .cloned()
+        else {
+            return;
+        };
+        if self.config.remote_hosts.contains(&host) {
+            self.config
+                .remote_hosts
+                .retain(|candidate| candidate != &host);
+        } else {
+            self.config.remote_hosts.push(host);
+            self.config.remote_hosts.sort();
+        }
+        self.persist_config();
+        self.start_merged_remote_sessions();
+        self.emit_event("config.changed", serde_json::json!({}));
     }
 
     /// Mouse-wheel scroll in the open modal: nudge the selection a few rows so a
@@ -532,6 +612,7 @@ impl App {
             SettingsTab::Keys => {}
             SettingsTab::Integrations => self.settings_activate(cursor),
             SettingsTab::Modules => self.toggle_module(cursor, Some(delta)),
+            SettingsTab::Remote => self.toggle_settings_remote_host(cursor),
         }
     }
 
@@ -590,6 +671,7 @@ impl App {
             },
             SettingsTab::Integrations => self.install_integration(cursor),
             SettingsTab::Modules => self.toggle_module(cursor, None),
+            SettingsTab::Remote => self.toggle_settings_remote_host(cursor),
         }
     }
 
@@ -1364,6 +1446,33 @@ fn lang_cursor(code: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_host_selection_persists_and_ignores_closed_settings_results() {
+        let _env = crate::persist::test_env("settings-remote-hosts");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        app.open_settings();
+        let first = app.settings.as_ref().unwrap().generation.clone();
+        app.close_settings();
+        app.open_settings();
+        app.apply_settings_remote_hosts_loaded(first, Ok(vec!["wrong-host".into()]));
+        assert!(app.settings.as_ref().unwrap().remote_hosts.is_none());
+        let generation = app.settings.as_ref().unwrap().generation.clone();
+        app.apply_settings_remote_hosts_loaded(
+            generation,
+            Ok(vec!["dev-a".into(), "dev-b".into()]),
+        );
+        app.settings.as_mut().unwrap().tab = super::SettingsTab::Remote;
+        app.settings_activate(2);
+        assert_eq!(crate::config::load().remote_hosts, ["dev-b"]);
+        assert_eq!(app.remote_host_status[0].host, "dev-b");
+        assert!(
+            app.remote_host_status[0].sessions.is_empty(),
+            "discovery is asynchronous"
+        );
+        app.settings_activate(2);
+        assert!(crate::config::load().remote_hosts.is_empty());
+    }
     use super::*;
 
     #[test]
@@ -1992,7 +2101,11 @@ mod tests {
             "General is first"
         );
         assert_eq!(SettingsTab::ALL[1], SettingsTab::Theme, "before Theme");
-        assert_eq!(SettingsTab::ALL.len(), 7, "still seven tabs");
+        assert_eq!(
+            SettingsTab::ALL.len(),
+            8,
+            "remote host settings are a separate tab"
+        );
     }
 
     /// The General tab's "Open files with" slider cycles read-only → each detected

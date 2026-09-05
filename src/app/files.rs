@@ -66,6 +66,13 @@ impl App {
     /// there is nothing to do (a few `HashSet` checks), and a no-op when the dock
     /// isn't mounted.
     pub fn ensure_file_tree(&mut self) {
+        if self.ws().remote.is_some() {
+            self.files_focused = false;
+            self.file_menu = None;
+            self.file_prompt = None;
+            self.file_delete = None;
+            return;
+        }
         let dock_visible = self.sidebars.side_of(&DockKind::Files).is_some();
         let diff_visible = self
             .layout()
@@ -233,6 +240,13 @@ impl App {
     /// control; Esc/q return input to the unchanged terminal-pane focus.
     pub fn focus_files_tree(&mut self) {
         self.sidebar_focus = None;
+        if self.ws().remote.is_some() {
+            self.files_focused = false;
+            self.send_active_remote(crate::ipc::protocol::ClientMessage::Command(
+                "toggle_files".into(),
+            ));
+            return;
+        }
         if self.sidebars.side_of(&DockKind::Files).is_none() {
             let target = self.sidebars.files_side;
             if !self.move_dock(&DockKind::Files, target) {
@@ -284,6 +298,10 @@ impl App {
     /// A FILES row was clicked: expand/collapse a folder, or open a file at
     /// `target` — the click behavior for a plain click, `Pane` for Shift+click.
     pub fn file_row_activate(&mut self, index: usize, target: OpenTarget) {
+        if self.ws().remote.is_some() {
+            self.focus_files_tree();
+            return;
+        }
         self.file_tree.cursor = index;
         let Some(row) = self.file_tree.visible_rows().get(index).cloned() else {
             return;
@@ -721,6 +739,11 @@ impl App {
         self.file_menu_action(item);
     }
     fn file_menu_action(&mut self, item: FileMenuItem) {
+        if self.ws().remote.is_some() {
+            self.file_menu = None;
+            self.focus_files_tree();
+            return;
+        }
         let Some(menu) = self.file_menu.take() else {
             return;
         };
@@ -899,6 +922,10 @@ impl App {
     }
 
     fn commit_file_prompt(&mut self) {
+        if self.ws().remote.is_some() {
+            self.file_prompt = None;
+            return;
+        }
         let Some(p) = self.file_prompt.as_ref() else {
             return;
         };
@@ -951,6 +978,9 @@ impl App {
         let Some(path) = self.file_delete.take() else {
             return;
         };
+        if self.ws().remote.is_some() {
+            return;
+        }
         if let Err(error) =
             self.schedule_file_mutation(super::file_jobs::FileMutation::Delete(path.clone()))
         {
@@ -1033,6 +1063,10 @@ impl App {
     /// applied via `FileRead`. No target ever spawns a process — an external
     /// editor only ever comes from `open_file_at`.
     pub fn open_file_view(&mut self, path: PathBuf, target: OpenTarget) {
+        if self.ws().remote.is_some() {
+            self.focus_files_tree();
+            return;
+        }
         self.remember_file(&path);
         let open = self.views_showing(&path);
         // A permanent view answers every request: the file already has a home
@@ -1201,6 +1235,7 @@ impl App {
             Some(ViewKind::Preview(view)) => {
                 view.document().map(|document| document.source.to_string())
             }
+            Some(ViewKind::Remote(_)) => None,
             None => return,
         };
         match text {
@@ -1321,6 +1356,26 @@ mod tests {
         assert!(
             reopened.sidebars.right.visible,
             "showing FILES also reveals its sidebar"
+        );
+    }
+
+    #[test]
+    fn remote_workspace_cannot_delete_a_stale_local_file_selection() {
+        let _env = crate::persist::test_env("remote-local-file-guard");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let file = crate::persist::config_dir().join("local-only.txt");
+        std::fs::write(&file, "keep this local file").unwrap();
+        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
+            host: "test-host".into(),
+            session: "default".into(),
+            workspace_id: "owner-ws".into(),
+        });
+        app.file_delete = Some(file.clone());
+        app.confirm_delete();
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            "keep this local file"
         );
     }
 
@@ -2819,7 +2874,7 @@ mod tests {
         assert_eq!(
             app.views.get(&vid).and_then(|view| match view {
                 ViewKind::File(view) => Some(view.line_count()),
-                ViewKind::Diff(_) | ViewKind::Preview(_) => None,
+                ViewKind::Diff(_) | ViewKind::Preview(_) | ViewKind::Remote(_) => None,
             }),
             Some(1),
             "initial content is one line"
@@ -3041,7 +3096,7 @@ mod tests {
             .values()
             .filter_map(|view| match view {
                 ViewKind::File(view) => Some(view.path.clone()),
-                ViewKind::Diff(_) | ViewKind::Preview(_) => None,
+                ViewKind::Diff(_) | ViewKind::Preview(_) | ViewKind::Remote(_) => None,
             })
             .collect();
         assert_eq!(paths, vec![file], "the file view was rebuilt on restore");

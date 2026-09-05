@@ -1686,7 +1686,7 @@ impl App {
             let workspaces: Vec<(String, PathBuf)> = self
                 .workspaces
                 .iter()
-                .filter(|ws| workspace_scope.contains(&ws.id))
+                .filter(|ws| ws.remote.is_none() && workspace_scope.contains(&ws.id))
                 .map(|ws| (ws.id.clone(), ws.cwd.clone()))
                 .collect();
             let homes = self.workspace_homes();
@@ -2336,6 +2336,7 @@ impl App {
 
     /// Validate and execute one bounded local API method against server-owned state.
     pub(crate) fn dispatch(&mut self, method: &str, p: &Value) -> Result<Value, (String, String)> {
+        self.check_remote_workspace_request(method, p)?;
         if Self::is_automation_mutation(method) && self.automation_admission_full() {
             return Err((
                 "busy".into(),
@@ -2347,6 +2348,7 @@ impl App {
                 "type":"pong",
                 "version": env!("CARGO_PKG_VERSION"),
                 "protocol":1,
+                "transport_protocol": crate::ipc::protocol::PROTOCOL_VERSION,
                 "session": crate::session::display_name()
             })),
             "uhp.capabilities" => {
@@ -2854,6 +2856,7 @@ impl App {
                             "workspace_id": w.id,
                             "name": w.name,
                             "cwd": w.cwd.display().to_string(),
+                            "host": w.remote.as_ref().map(|remote| remote.host.clone()),
                             "terminal_cwd": terminal_cwd,
                             "pinned": w.pinned,
                             "display_position": display_positions[i].to_string(),
@@ -3503,6 +3506,22 @@ impl App {
                 let focus = self.layout().focus;
                 let mut arr = Vec::new();
                 for (wi, ws) in self.workspaces.iter().enumerate() {
+                    if let Some(view) = self.remote_workspace_view(wi) {
+                        for agent in &view.agents {
+                            arr.push(json!({
+                                "pane":format!("remote:{}:{}:{}", view.target.host, view.target.session, agent.pane),
+                                "owner_pane":agent.pane, "host":view.target.host, "owner_session":view.target.session,
+                                "agent":agent.agent, "name":agent.name, "status":state_str(agent.state),
+                                "session":agent.session, "workspace":wi.to_string(), "workspace_name":ws.name,
+                                "workspace_id":ws.id,
+                                "project":ws.name, "cwd":agent.cwd, "branch":ws.branch,
+                                "repo":ws.worktree.as_ref().map(|membership| &membership.common_dir),
+                                "worktree":ws.worktree.as_ref().is_some_and(|membership| membership.linked),
+                                "tab":agent.tab.to_string(), "focused":wi == self.active_ws && agent.focused,
+                            }));
+                        }
+                        continue;
+                    }
                     // Node-level context, identical for every pane in the node.
                     // `project` deliberately repeats `workspace_name` so a consumer
                     // can use one field name across `agent.list` *and*
@@ -5694,6 +5713,8 @@ impl App {
                                 })),
                                 "content_revision":pane.content_revision(),
                                 "agent":status.map(|status| status.agent.clone()),
+                                "is_agent":status.is_some_and(|status| self.manifests.is_agent(&status.agent) || status.agent_session.is_some() || status.agent_report.is_some()),
+                                "agent_name":self.agent_name_for(pane_id),
                                 "agent_status":status.map(|status| state_str(status.state)),
                                 "agent_authority":status.map(|status| status.identity_source),
                                 "agent_session":status.and_then(|status| status.agent_session.as_ref().map(|session| session.session_id.clone())),
@@ -5718,10 +5739,13 @@ impl App {
                 }));
             }
             workspaces.push(json!({
+                "id":workspace.id,
                 "index":workspace_index + 1,
                 "name":workspace.name,
                 "cwd":workspace.cwd.display().to_string(),
                 "branch":workspace.branch,
+                "worktree":workspace.worktree.as_ref().map(|membership| json!({"common_dir":membership.common_dir,"linked":membership.linked})),
+                "host":workspace.remote.as_ref().map(|remote| remote.host.clone()),
                 "pinned":workspace.pinned,
                 "active":workspace_index == self.active_ws,
                 "tabs":tabs,
@@ -6582,6 +6606,65 @@ impl App {
         }
     }
 
+    /// Projection leaves are display/input bridges, not local PTYs or paths.
+    /// Require the owning host explicitly before a CLI command accesses them.
+    pub(super) fn check_remote_workspace_request(
+        &self,
+        method: &str,
+        p: &Value,
+    ) -> Result<(), (String, String)> {
+        let pane_scoped = method.starts_with("pane.") || method == "attach.pane";
+        let workspace_scoped = method.starts_with("tab.")
+            || method == "task.start"
+            || (method == "task.next" && p.get("start").and_then(Value::as_bool) == Some(true))
+            || method.starts_with("layout.")
+            || method.starts_with("files.")
+            || method.starts_with("git.")
+            || method.starts_with("diff.")
+            || matches!(
+                method,
+                "workspace.new"
+                    | "node.new"
+                    | "workspace.rename"
+                    | "node.rename"
+                    | "workspace.report_metadata"
+                    | "worktree.list"
+                    | "worktree.create"
+                    | "mission.open"
+                    | "module.pane.open"
+            );
+        if !pane_scoped && !workspace_scoped {
+            return Ok(());
+        }
+        let workspace = if pane_scoped {
+            if let Some(value) = p.get("pane") {
+                value
+                    .as_str()
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .or_else(|| value.as_u64().and_then(|value| u32::try_from(value).ok()))
+                    .and_then(|pane| self.pane_location(PaneId(pane)))
+                    .map(|(workspace, _)| workspace)
+            } else {
+                Some(self.active_ws)
+            }
+        } else {
+            Some(self.optional_socket_workspace(p)?.unwrap_or(self.active_ws))
+        };
+        if let Some(remote) = workspace
+            .and_then(|workspace| self.workspaces.get(workspace))
+            .and_then(|workspace| workspace.remote.as_ref())
+        {
+            return Err((
+                "remote_workspace".into(),
+                format!(
+                    "workspace is owned by SSH host `{}`; use `luvus --host {} --session {} ...`",
+                    remote.host, remote.host, remote.session
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn optional_socket_workspace(&self, p: &Value) -> Result<Option<usize>, (String, String)> {
         let indexed = optional_workspace_param(p)?;
         let by_id = match p.get("workspace_id") {
@@ -6687,6 +6770,7 @@ impl App {
             "type":"workspace", "workspace":index.to_string(), "workspace_id":workspace.id,
             "name":workspace.name,
             "cwd":workspace.cwd.display().to_string(), "branch":workspace.branch,
+            "host":workspace.remote.as_ref().map(|remote| remote.host.clone()),
             "terminal_cwd":terminal_cwd,
             "ahead":workspace.git_ahead_behind.map(|value| value.0),
             "behind":workspace.git_ahead_behind.map(|value| value.1),
@@ -6826,6 +6910,10 @@ impl App {
         })?;
         keys::validate_direct_keybindings(&next.direct_keybindings)
             .map_err(|message| ("invalid_request".to_string(), message))?;
+        for host in &next.remote_hosts {
+            crate::session::remote::validate_host_alias(host)
+                .map_err(|message| ("invalid_request".to_string(), message))?;
+        }
         if self.theme_registry.get(&next.theme).is_none() && next.theme != "terminal" {
             return Err((
                 "invalid_request".to_string(),
@@ -6859,6 +6947,7 @@ impl App {
             self.reset_config_baseline();
         }
         self.emit_event("config.changed", json!({}));
+        self.start_merged_remote_sessions();
         Ok(())
     }
 

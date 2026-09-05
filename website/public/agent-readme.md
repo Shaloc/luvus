@@ -186,6 +186,42 @@ themes, modules, worktrees, and reviews remain shared. `session.json` is a
 saved restoration snapshot, not proof that its processes are currently alive.
 Do not edit sockets, locks, or a live session snapshot by hand.
 
+`luvus server restart` affects only the selected session. With `--all`,
+it restarts all running sessions in the selected `LUVUS_HOME` on this
+machine and leaves stopped sessions stopped. This ends live pane processes
+before normal snapshot restoration. Require explicit whole-batch authorization
+and run from outside the affected sessions. Individual failures are reported,
+remaining sessions are still attempted, and any failure yields a nonzero exit.
+Add `--json` for per-session outcomes. `--host <host> server restart --all`
+applies only on that enabled host; local batches do not restart remote owners.
+
+Managed SSH remotes are local projections backed by one literal `Host`
+alias from `~/.ssh/config`. Their canonical names are
+`remote-<host>-<actual-session-name>`. `luvus session remote add <host> <name>`
+requires the exact same remote-session-enabled Luvus build on that host and
+never copies it there. Use `--host <host> --session <name>` on every related
+server-backed command; place both selectors before prompt text or pass-through
+arguments. Merge mode keeps workspace ownership on its original server and
+marks remote workspace rows with `[host]`.
+Only hosts explicitly selected in Settings → Remote (`config.remote_hosts`)
+are allowed; the default list is empty. Never enable or connect every SSH
+config entry. Merge toggles and registration changes refresh a running local
+session, and disabling a host disconnects its projections without stopping
+remote panes.
+Selecting a host connects and discovers existing sessions. Opening the local
+switcher or pressing `r` refreshes new sessions without registration or idle
+polling. Managed attaches retain the local prefix and session switcher; they
+do not hand over to the remote full-screen TUI. Settings → Remote has one global
+toggle for automatic same-name merge, including discovered sessions. `--host` always pairs
+with the actual remote `--session` name, even if it starts with `remote-`.
+Open worktree lists branches and paths on the workspace owner. Ctrl+V image
+paste sends client clipboard bytes to that owner and pastes its private path;
+headless clients in Kitty can use the optional official `kitten clipboard`
+helper on the display-client host, subject to Kitty's clipboard permission.
+Other headless clients need native desktop clipboard access. Text/Ctrl+Enter
+are unchanged. Merged `agent list` rows expose `host`, `owner_session` and
+`owner_pane`; follow-up automation uses those owner selectors with `--host`.
+
 Every managed pane receives `LUVUS_ENV`, `LUVUS_PANE_ID`, and
 `LUVUS_SOCKET_PATH`. `LUVUS_SHELL` overrides the configured shell for new
 panes. Consult https://luvus.dev/docs/reference/configuration/ before changing
@@ -392,12 +428,15 @@ process closes.
 ```sh
 ssh <host>             # run Luvus on that machine
 luvus --remote <host>  # local thin client, remote Luvus server
+luvus session remote add <host> <name>  # register a managed remote
+luvus --host <host> --session <name> pane list
 ```
 
 Both require Luvus on the remote machine. `--remote` uses the user's existing
-SSH transport. It does not create a Luvus network daemon. For diagnosis,
-identify the server host, selected session, remote binary, noninteractive PATH,
-and inherited endpoint.
+SSH transport and accepts raw destinations. Managed `--host` accepts only a
+literal configured alias and validates the exact modified build. Neither mode
+creates a Luvus network daemon. For diagnosis, identify the server host,
+selected session, remote binary, noninteractive PATH, and inherited endpoint.
 
 ## Troubleshooting order
 

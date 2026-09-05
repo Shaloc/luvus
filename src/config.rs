@@ -73,6 +73,11 @@ pub struct Config {
     /// visible scope chip updates this preference.
     #[serde(default)]
     pub agents_this_workspace: bool,
+    /// Explicitly enabled SSH config aliases for managed remote sessions.
+    /// Empty means no managed remote connections are allowed. Selecting an
+    /// alias connects and discovers sessions; attach and merge remain explicit.
+    #[serde(default)]
+    pub remote_hosts: Vec<String>,
     /// Custom keybindings: command id → key string (overrides the defaults).
     /// An empty value means the command is explicitly unbound.
     #[serde(default)]
@@ -475,6 +480,7 @@ impl Default for Config {
             resume_launch_flags: false,
             agents_active_only: false,
             agents_this_workspace: false,
+            remote_hosts: Vec::new(),
             keybindings: std::collections::HashMap::new(),
             direct_keybindings: std::collections::HashMap::new(),
             prefix: default_prefix(),

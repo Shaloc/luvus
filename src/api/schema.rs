@@ -177,6 +177,7 @@ mod tests {
             "workspace.created",
             "workspace.metadata_reported",
             "workspace.moved",
+            "workspace.renamed",
         ]
         .into_iter()
         .collect();

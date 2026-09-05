@@ -19,14 +19,148 @@ port, configure SSH forwarding, or require another daemon.
 
 | What you want | Use |
 |---|---|
+| Register a reusable, named remote session | `luvus session remote add devbox api` |
+| Control remote panes, agents, or worktrees from the local CLI | `luvus --host devbox --session api pane list` |
+| Automatically show all same-name local and remote sessions together | `luvus session merge on` |
 | Open the full remote Luvus interface from a computer with Luvus installed | `luvus --remote devbox` |
 | Open a specific named session | `luvus --session api --remote devbox` |
 | Connect from a phone that only has an SSH app | SSH to the host, then run `luvus` there |
 | Send one JSON automation request | Pipe the request through `ssh devbox luvus uhp proxy` |
 | Build an independent remote or mobile client | Use [`luvus uhp access`](/docs/uhp/remote-access/) with a secure transport provider |
 
-Most people want the first command. UHP Access is for application developers,
-not a prerequisite for interactive SSH sessions.
+Use managed sessions when you want a reusable identity, CLI control, or merge
+mode. Use raw `--remote` for a one-off full-screen attach. UHP Access is for
+application developers, not a prerequisite for interactive SSH sessions.
+
+## Managed remote sessions
+
+Managed remotes use a literal `Host` alias declared in `~/.ssh/config`. Luvus
+stores that alias rather than the resolved `HostName`. The UI shows the actual
+session name with remote/host tags. `remote-<host>-<name>` remains available as
+a legacy CLI routing name:
+
+First open **Settings → Remote** and select the hosts you want Luvus to use.
+No hosts are enabled by default. The list reads local SSH configuration without
+connecting to its entries. New Remote Session shows only enabled aliases;
+`--host` and canonical remote session attaches enforce the same selection.
+Checking a host connects and discovers its existing sessions. Settings shows
+the session count or connection error. Opening the session switcher, or pressing
+`r` there, refreshes the list, including sessions created independently on the
+remote host. There is no idle polling and no connection to unselected hosts.
+
+```sh
+luvus session remote add devbox api
+# registered name: remote-devbox-api
+
+luvus session remote list
+luvus session attach remote-devbox-api
+```
+
+You can also open the session switcher and choose **New Remote Session**. The
+form lets you select a configured host and enter the actual remote session name.
+Merge is a global setting, not a per-session form option. This creates a new remote session after validating the
+remote binary. Existing sessions are already in the switcher. The CLI `remote
+add` command starts or reuses its selected session.
+
+Managed session attaches keep the **local** interface and session switcher.
+The local prefix still opens the menu, so you can switch from remote to remote
+or back to local. SSH transports control and workspace frames in the background;
+it does not replace your terminal with the remote host's full Luvus interface.
+
+Managed remotes require the exact same modified Luvus build on both machines,
+including the remote-session transport revision. If it is absent, older, or an
+unmodified binary with the same version number, Luvus tells you to install the
+matching build. It never copies a binary with `scp`.
+
+Use `--host` to send server-backed CLI commands directly to that host. The
+selector works with workspace, tab, pane, agent, files, Git, DIFF, worktree,
+task, lease, wait, search, event, module, bar, UI, Mission Control, and UHP
+server controls. Server lifecycle commands use the same selector too:
+
+```sh
+luvus --host devbox --session api pane list
+luvus --session api worktree list --host devbox
+luvus --host devbox --session api workspace open /srv/api
+luvus --host devbox --session api server status
+```
+
+Commands that manage client-machine files or registries intentionally reject
+`--host`: session registration and merge settings, themes, skills, updates,
+integrations, `doctor`, module install/search, and `uhp access`/`schema`. Run an
+explicit `ssh <host> luvus ...` command only when you intend that host-local
+operation. Host-profile methods sent through `uhp proxy` are also rejected;
+`--host` routes only the selected session's server API.
+
+For commands containing free text or pass-through arguments, put `--host`
+before the command so a literal `--host` in the payload remains user data:
+
+```sh
+luvus --host devbox --session api agent prompt reviewer "check --host handling"
+luvus --host devbox --session api pane run 7 tool --host literal
+```
+
+### Merge same-name sessions
+
+Merge mode keeps the local session as the UI owner and adds every discovered
+remote session with the same actual name. Each workspace remains wholly owned
+by either the local server or one remote server; Luvus does not copy its files
+or PTYs. Remote workspace rows carry a `[host]` tag, while their remote branch
+and path are shown from that host.
+
+```sh
+luvus session remote add devbox api --merge
+luvus session remote add buildbox api --merge
+luvus session attach api
+
+# Change the saved mode later.
+luvus session merge off
+luvus session merge on
+```
+
+The CLI toggle saves the mode and refreshes an already-running local server.
+The same applies when adding or removing a registered remote. No server restart
+is needed. Turning merge off or deselecting a host in Settings removes its
+local projections and disconnects their bridges, leaving the remote server and
+panes running. New registration and merge discovery are user-triggered; there
+is no periodic scan or connection to every SSH host. Settings → Remote has a
+single global merge toggle, automatically grouping every same-name session.
+Enabling it from a standalone remote view switches to the matching local
+session and shows the local and remote workspaces together.
+
+Closing a projected remote workspace hides that projection in the current
+local run; it does not close the workspace or its processes on the remote
+owner. Use an explicit `--host` command when you intend to mutate remote state.
+
+### Worktrees and image paste
+
+**Open worktree** in a workspace's context menu lists its Git worktrees with
+branch and path. Choose an entry or use the folder-browser fallback. For a
+remote workspace the list comes from its owner host, not the local filesystem.
+
+**Ctrl+V** reads a clipboard image on the display client, sends the bytes to the
+pane's owner, and pastes a private owner-local file path. Empty terminal paste
+events also try image paste. Images are limited to 16 MiB and remain in the
+owner session's `clipboard/` directory so agents can read them after detach.
+PNG, JPEG, GIF, WebP and BMP are supported where the OS clipboard exposes them.
+Linux uses `wl-paste` or `xclip`; macOS uses `osascript`; Windows/WSL uses
+PowerShell. Missing tools or no image preserves normal input. Ctrl+Enter is
+unchanged. In Kitty, a headless SSH display client can use the optional official
+`kitten clipboard` executable on that client host to request PNG clipboard bytes
+over [OSC 5522](https://sw.kovidgoyal.net/kitty/clipboard/). Kitty controls access
+and may ask for permission; Luvus does not bypass it. Other headless clients need
+native desktop clipboard access. Clipboard reads happen only on paste.
+
+In merge mode, the workspace **+** first asks for Local machine or an enabled
+SSH host. Worktree, rename, delete-worktree, TaskBoard and Mission Control
+actions run on the selected workspace's owner. The Agents dock combines native
+owner-reported statuses and marks remote rows with the host; clicks focus the
+owner's pane. `agent list` includes `host`, `owner_session`, and `owner_pane` for
+remote rows. Follow up with those owner selectors and `--host`, not the qualified
+local presentation row ID. Remote FILES views do not expose a stale local tree.
+
+`--remote` remains the raw compatibility escape hatch. Unlike managed
+`--host`, it may use an arbitrary OpenSSH destination and does not register a
+canonical remote session or participate in merge mode.
 
 ## First connection
 
@@ -162,7 +296,7 @@ also needs OpenSSH Server, and `luvus.exe` must be on the non-interactive `PATH`
 of the account used to sign in. The fallback search through POSIX user
 directories applies only to macOS and Linux remote hosts.
 
-## Named remote sessions
+## Raw named remote sessions
 
 The command without `--session` targets the remote host's `default` session.
 Select another independent remote server namespace by placing the global

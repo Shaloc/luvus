@@ -306,6 +306,7 @@ fn file_tab_name(tab: &crate::app::Tab, app: &App) -> Option<String> {
             let name = v.path.file_name()?.to_string_lossy().into_owned();
             Some(format!("◇ {name}"))
         }
+        Some(crate::app::ViewKind::Remote(_)) => Some("remote".to_string()),
         None => {
             let name = app
                 .editor_files

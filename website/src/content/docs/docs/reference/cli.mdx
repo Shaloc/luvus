@@ -53,6 +53,7 @@ usage: luvus <command> [args]
 
   (no args)            launch / attach the TUI
   --session <name>     target one named server session
+  --host <ssh-alias>   route the TUI or server-backed command to an SSH-config host
   --version, -V        print the version
   --help, -h           show compact help
   help [all|<topic> [command]]  show compact, complete, or focused help
@@ -265,12 +266,23 @@ universal harness protocol:
   uhp proxy                 forward one JSON request from stdin to the selected server
 
 sessions:
-  session list [--json]      list default and named server sessions
+  session list [--json]      list local and discovered remote sessions
   session attach <name>      start or attach the named session
   session stop <name> [--json]    stop only the named session and its panes
   session delete <name> [--json]  delete a stopped named session
+  session remote add <host> <name> [--merge] [--json]
+                             start an SSH-config remote after exact-version validation
+  session remote remove <remote-name> [--json]
+                             forget a registered remote session
+  session remote list [--json]    discover sessions on selected SSH hosts
+  session merge <on|off> [--json]
+                             toggle global same-name session merging
 
 remote:
+  --host <ssh-alias> [--session <name>] <command>
+                             run server-backed CLI controls against the selected
+                             session on a literal Host from ~/.ssh/config
+                             (put --host before prompt/pass-through commands)
   --remote <host> [ssh args] attach to a luvus session on <host> over plain ssh
 
 server:
@@ -278,6 +290,7 @@ server:
   server start               start the background server if it isn't up
   server stop                stop the server (and all panes)
   server restart             stop + start (load a newly-installed binary)
+  server restart --all [--json]  restart all running sessions on this host
   server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
   integration install|uninstall <claude|copilot|codex|antigravity|opencode|kimi|qodercli|grok|hermes|omp>
@@ -289,6 +302,27 @@ server:
 (o_o)   https://luvus.dev/agent-readme.md
 /|_|\
 ```
+
+`luvus server restart` restarts only the selected session. Add `--all`
+to restart every **running** session in the selected
+`LUVUS_HOME` on this machine, including `default`. Saved but stopped sessions
+stay stopped. Each session uses the normal stop/start and snapshot-restore
+path; existing pane processes end, and only supported native agent sessions
+can resume. Run this from a terminal outside the sessions being restarted.
+
+```sh
+luvus server restart --all
+luvus server restart --all --json
+luvus --host dev-207 server restart --all
+```
+
+`--host` applies the batch on that one enabled SSH host, never on the local
+machine as well. Without `--host`, selected SSH hosts and remote-owned panes
+are not restarted; local presentation servers are local sessions. An explicit
+`--session` does not narrow an `--all` batch. Individual failures are reported
+and do not prevent attempts on the remaining running sessions; any failure
+makes the command exit nonzero. JSON output includes `scope`, `sessions`,
+`restarted`, `failed`, and the names of `skipped` stopped sessions.
 
 When `pane split <id>` targets a pane outside the current view, the new pane is
 inserted beside that target in the same workspace and tab. It starts in the
