@@ -318,6 +318,13 @@ pub trait VtEngine: Send {
     /// Feed child output. Must never panic on arbitrary bytes.
     fn advance(&mut self, bytes: &[u8]);
 
+    /// Take the latest child-requested clipboard write from this output batch.
+    /// The PTY owner forwards it to display clients; the engine never accesses
+    /// the OS clipboard, and clipboard read requests remain disabled.
+    fn take_clipboard(&mut self) -> Option<String> {
+        None
+    }
+
     /// Finish allocation maintenance deferred while parsing recent output.
     /// Unix calls this from its existing descriptor actor after a bounded
     /// activity window; Windows uses the app's coalesced output boundary.

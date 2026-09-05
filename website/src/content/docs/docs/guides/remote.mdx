@@ -66,6 +66,11 @@ Managed session attaches keep the **local** interface and session switcher.
 The local prefix still opens the menu, so you can switch from remote to remote
 or back to local. SSH transports control and workspace frames in the background;
 it does not replace your terminal with the remote host's full Luvus interface.
+Workspace prefix suffixes, including `?`, digits and custom bindings, are
+interpreted by the owner's prefix handler even when its prefix differs from
+the display client's. Global session navigation and local Settings/Agents stay
+local. Pressing the prefix twice sends the owner's configured prefix once.
+The bottom status bar identifies the active remote host and actual session.
 
 Managed remotes require the exact same modified Luvus build on both machines,
 including the remote-session transport revision. If it is absent, older, or an
@@ -83,6 +88,11 @@ luvus --session api worktree list --host devbox
 luvus --host devbox --session api workspace open /srv/api
 luvus --host devbox --session api server status
 ```
+
+Ordinary managed control requests and workspace frame connections require an
+already-running owner; they never start or restart it implicitly. Explicitly
+opening a session, `remote add`, and server lifecycle commands remain the
+entry points for starting it.
 
 Commands that manage client-machine files or registries intentionally reject
 `--host`: session registration and merge settings, themes, skills, updates,
@@ -131,6 +141,13 @@ Closing a projected remote workspace hides that projection in the current
 local run; it does not close the workspace or its processes on the remote
 owner. Use an explicit `--host` command when you intend to mutate remote state.
 
+The workspace **+** action in merge mode first asks which enabled host should
+own the workspace (or **Local machine**). Its folder browser reads that owner's
+filesystem. Selecting the currently viewed remote owner preserves the active
+workspace as the starting directory. Directory rows, parent navigation and
+confirmation/cancellation are clickable; narrow dialogs retain their essential
+footer controls instead of clipping Cancel off-screen.
+
 ### Worktrees and image paste
 
 **Open worktree** in a workspace's context menu lists its Git worktrees with
@@ -150,6 +167,11 @@ over [OSC 5522](https://sw.kovidgoyal.net/kitty/clipboard/). Kitty controls acce
 and may ask for permission; Luvus does not bypass it. Other headless clients need
 native desktop clipboard access. Clipboard reads happen only on paste.
 
+Child OSC52 text-copy requests, including Neovim yank, are forwarded to the
+display client's clipboard from local and remote panes. They do not require
+the image helper. Clipboard reads (`OSC 52 ... ?`) and primary-selection writes
+are not forwarded.
+
 In merge mode, the workspace **+** first asks for Local machine or an enabled
 SSH host. Worktree, rename, delete-worktree, TaskBoard and Mission Control
 actions run on the selected workspace's owner. The Agents dock combines native
@@ -157,6 +179,37 @@ owner-reported statuses and marks remote rows with the host; clicks focus the
 owner's pane. `agent list` includes `host`, `owner_session`, and `owner_pane` for
 remote rows. Follow up with those owner selectors and `--host`, not the qualified
 local presentation row ID. Remote FILES views do not expose a stale local tree.
+
+### Which machine owns a control?
+
+The local Settings window, session/workspace navigation, Agents All/Active and
+workspace-scope filters stay local. Next Attention cycles through waiting agents
+across the visible local/remote workspace group. The same rules apply to a
+standalone managed remote session and a globally merged session.
+
+Workspace content belongs to its owner: tabs, panes, FILES/DIFF, Git, TaskBoard,
+Mission Control, and the owner's module docks and bars use the remote server.
+Their mouse actions and `--host <host> --session <name>` CLI commands act there,
+not on an identically named local directory. The remote workspace's context
+menu provides explicit **Settings** and **Module actions** entries for its owner;
+opening the ordinary global Settings window still changes local Luvus
+configuration. Installing a remote integration or module remains an
+explicit action in that owner's settings.
+
+The Agents dock includes remote live agents, pending scheduled-agent rows and,
+in All mode, resumable native agent history. Remote rows show their host. Click
+a scheduled row to open its owner's automation detail; click a history row to
+resume on that owner. A history row's **Close** only dismisses that entry from
+the owner's history list for the current run; it does not delete the native
+agent session on disk. Local history always resumes locally, even if a remote
+workspace is currently focused.
+
+Remote live-agent Rename, Close and Pin/Unpin act on the owner. Pin uses the
+owner's existing per-session pin state and its ordering is reflected locally.
+The row's workspace-scope option controls the visible local Agents dock;
+**Module actions** opens the owner's agent menu. Closing a projected workspace
+still only hides the local projection, as described above; it is not the same
+as closing one of the owner's live agent panes.
 
 `--remote` remains the raw compatibility escape hatch. Unlike managed
 `--host`, it may use an arbitrary OpenSSH destination and does not register a
@@ -376,8 +429,12 @@ where you are sitting:
 - detected links open in the local browser
 - each attached client uses its own terminal size and mobile or desktop layout
 
-The global finder searches the selected remote Luvus home. It does not mix
-local workspaces or sessions into remote results.
+With the raw `luvus --remote` transport, the global finder searches that remote
+Luvus home. In managed remote and merge mode, the local finder also queries the
+displayed remote owners. Remote results have a host tag; files and output are
+searched and opened on their owner, never against a same-named local path.
+Activating an existing remote workspace keeps the local client attached.
+Unavailable owners produce partial results and are not started by a search.
 
 ## Connect from a phone or tablet
 

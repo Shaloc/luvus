@@ -301,7 +301,14 @@ fn draw_one_pane(
     let app = context.app;
     // A view leaf (docs/38 FILE-3) renders natively, not from a PTY.
     if let Some(view) = app.views.get(&id) {
-        let content = pane_content(area, bordered, app.compact)?;
+        // A remote frame already contains its owner's tab bar and pane chrome.
+        // Match the edge-to-edge viewport used for its resize and mouse mapping;
+        // a second local header/pad would crop the frame and shift every click.
+        let content = pane_content(
+            area,
+            bordered,
+            app.compact || matches!(view, crate::app::ViewKind::Remote(_)),
+        )?;
         match view {
             crate::app::ViewKind::File(v) => {
                 let sel = app.selection.filter(|s| s.pane == id);

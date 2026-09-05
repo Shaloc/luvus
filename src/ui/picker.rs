@@ -134,7 +134,7 @@ pub(super) fn draw_picker(
         // over the modal's own background (no black bar). `⏎` acts on the
         // highlighted row (open folder / open with worktree / `..` / descend).
         // Every hint is clickable; a click replays its key.
-        let hints = if p.hosts.is_some() {
+        let mut hints = if p.hosts.is_some() {
             vec![
                 ("↑↓", cat.act_move, KeyCode::Down),
                 ("⏎", cat.act_select, KeyCode::Enter),
@@ -158,6 +158,30 @@ pub(super) fn draw_picker(
                 ("esc", cat.act_cancel, KeyCode::Esc),
             ]
         };
+        let hint_width = |hints: &[(&str, &str, KeyCode)]| {
+            1 + hints
+                .iter()
+                .map(|(key, label, _)| display_width(key) + 1 + display_width(label))
+                .sum::<usize>()
+                + hints.len().saturating_sub(1) * 3
+        };
+        if hint_width(&hints) > usize::from(inner.width) {
+            // A compact picker can cover the entire screen, so dismissing its
+            // backdrop is not an alternative to an off-screen Cancel hint.
+            // Keep navigation/confirmation/cancel clickable; omitted shortcut
+            // descriptions do not change the existing keyboard bindings.
+            hints.retain(|(_, _, code)| {
+                matches!(
+                    code,
+                    KeyCode::Char('g') | KeyCode::Enter | KeyCode::Left | KeyCode::Esc
+                )
+            });
+            if hint_width(&hints) > usize::from(inner.width) {
+                for (_, label, _) in &mut hints {
+                    *label = "";
+                }
+            }
+        }
         let (hints_line, hint_x) = hint_line_with_offsets(
             &hints.iter().map(|(k, l, _)| (*k, *l)).collect::<Vec<_>>(),
             t,
@@ -172,7 +196,12 @@ pub(super) fn draw_picker(
             if available == 0 {
                 continue;
             }
-            let w = (display_width(key) + 1 + display_width(label)).min(available as usize);
+            let label_width = if label.is_empty() {
+                0
+            } else {
+                1 + display_width(label)
+            };
+            let w = (display_width(key) + label_width).min(available as usize);
             footer_hints.push((PickerHit::Hint(*code), Rect::new(x, footer_y, w as u16, 1)));
         }
     }

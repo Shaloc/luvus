@@ -97,7 +97,7 @@ impl App {
         automation_access: Option<crate::automation::AutomationAccess>,
     ) -> Result<TaskStartResult, (String, String)> {
         self.check_remote_workspace_request(
-            "tab.new",
+            "task.start",
             &workspace_id
                 .as_ref()
                 .map(|id| serde_json::json!({"workspace_id":id}))
@@ -363,6 +363,7 @@ impl App {
                         })?
                     })
                 {
+                    self.require_local_workspace(workspace)?;
                     let pane = self.workspaces[workspace].tabs[tab]
                         .layout
                         .leaves()
@@ -401,9 +402,10 @@ impl App {
                 .position(|workspace| workspace.id == binding.workspace_id)
                 .or_else(|| {
                     let root = std::path::PathBuf::from(&binding.root);
-                    self.workspaces
-                        .iter()
-                        .position(|workspace| crate::platform::same_path(&workspace.cwd, &root))
+                    self.workspaces.iter().position(|workspace| {
+                        workspace.remote.is_none()
+                            && crate::platform::same_path(&workspace.cwd, &root)
+                    })
                 });
             if let Some(existing) = existing {
                 existing
@@ -417,7 +419,10 @@ impl App {
                 }
                 self.workspaces
                     .iter()
-                    .position(|workspace| crate::platform::same_path(&workspace.cwd, &root))
+                    .position(|workspace| {
+                        workspace.remote.is_none()
+                            && crate::platform::same_path(&workspace.cwd, &root)
+                    })
                     .ok_or_else(|| {
                         (
                             "workspace_not_found".to_string(),
@@ -428,6 +433,9 @@ impl App {
         } else {
             self.active_ws
         };
+        // Persisted bindings can choose a different target than the active
+        // workspace validated at dispatch, so validate the resolved owner too.
+        self.require_local_workspace(target)?;
         let root = self
             .workspaces
             .get(target)
@@ -2403,6 +2411,39 @@ mod tests {
     use super::*;
     use crate::event::AppEvent;
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[test]
+    fn task_start_rejects_persisted_remote_workspace_binding_before_path_or_spawn() {
+        let _env = crate::persist::test_env("remote-task-binding-owner");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let (_pane, _receiver, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        let remote_root = crate::persist::config_dir().join("absent-remote-task-root");
+        app.workspaces[1].cwd = remote_root.clone();
+        app.active_ws = 0;
+        let task = app
+            .orch
+            .add_task("Owner-bound task".into(), vec![], vec![], None)
+            .unwrap();
+        app.orch.bind_workspace(
+            &task.id,
+            WorkspaceWorkerBinding {
+                workspace_id: app.workspaces[1].id.clone(),
+                tab_id: "gone-owner-tab".into(),
+                root: remote_root.display().to_string(),
+            },
+        );
+        let error = app
+            .dispatch(
+                "task.start",
+                &serde_json::json!({"id":task.id,"mode":"workspace"}),
+            )
+            .unwrap_err();
+        assert_eq!(error.0, "remote_workspace");
+        assert_eq!(app.active_ws, 0);
+        assert!(app.panes.is_empty());
+        assert_eq!(app.workspaces.len(), 2);
+        assert!(app.orch.task(&task.id).unwrap().assignee.is_none());
+    }
 
     #[test]
     fn board_opens_focuses_and_closes() {

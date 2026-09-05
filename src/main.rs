@@ -147,8 +147,8 @@ fn main() -> Result<()> {
             session::remote::set_view_target(target);
             return ipc::server::run();
         }
-        Some("remote-client-bridge") => return remote_client_bridge(),
-        Some("remote-control-bridge") => return remote_control_bridge(),
+        Some("remote-client-bridge") => return remote_client_bridge(&args[2..]),
+        Some("remote-control-bridge") => return remote_control_bridge(&args[2..]),
         _ => {}
     }
 
@@ -696,26 +696,39 @@ fn open_cwd_workspace() {
 /// Remote bridge role (docs/18 RA-1), run *on the remote host* by ssh. Ensure a
 /// server is up, then pump this process's stdin/stdout to/from the local socket
 /// so the `luvus --remote` client on the other end of the ssh pipe drives it.
-fn remote_client_bridge() -> Result<()> {
+fn remote_client_bridge(options: &[String]) -> Result<()> {
     let sock = persist::client_socket_path();
-    ensure_server_ready(&sock)?;
+    if !remote_control_existing_only(options)? {
+        ensure_server_ready(&sock)?;
+    }
     ipc::client::remote_bridge(&sock)
 }
 
 /// Remote-side newline-delimited control bridge. It deliberately shares the
 /// existing owner socket and framing limits; SSH is only a byte transport and
 /// never becomes another application-state writer.
-fn remote_control_bridge() -> Result<()> {
-    let client_sock = persist::client_socket_path();
-    ensure_server_ready(&client_sock)?;
+fn remote_control_bridge(options: &[String]) -> Result<()> {
+    if !remote_control_existing_only(options)? {
+        let client_sock = persist::client_socket_path();
+        ensure_server_ready(&client_sock)?;
+    }
     let api_sock = persist::socket_path();
     ipc::client::remote_bridge(&api_sock)
 }
 
+/// Read-only federation must not turn discovery into a server lifecycle action.
+/// Keep the existing bridge behavior for callers that explicitly open a session.
+fn remote_control_existing_only(options: &[String]) -> Result<bool> {
+    match options {
+        [] => Ok(false),
+        [option] if option == "--existing" => Ok(true),
+        _ => Err(anyhow!("usage: luvus remote-control-bridge [--existing]")),
+    }
+}
+
 fn managed_remote_attach(target: &session::remote::RemoteSession) -> Result<()> {
-    session::remote::verify_remote_version(&target.host).map_err(anyhow::Error::msg)?;
+    session::remote::ensure_session(target).map_err(anyhow::Error::msg)?;
     let name = if session::remote::load_registry().merge_enabled() {
-        session::remote::ensure_session(target).map_err(anyhow::Error::msg)?;
         target.session.clone()
     } else {
         target.canonical_name()
@@ -1736,6 +1749,17 @@ fn app_event(event: Event) -> Option<AppEvent> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn existing_control_bridge_options_are_validated_before_connecting() {
+        assert!(!super::remote_control_existing_only(&[]).unwrap());
+        assert!(super::remote_control_existing_only(&["--existing".into()]).unwrap());
+        assert!(super::remote_control_existing_only(&["--unknown".into()]).is_err());
+        assert!(
+            super::remote_control_existing_only(&["--existing".into(), "--existing".into(),])
+                .is_err()
+        );
+    }
+
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

@@ -7,7 +7,7 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color as VtColor, NamedColor, Processor, Rgb};
 
 use ratatui::style::{Color, Modifier};
@@ -30,6 +30,11 @@ struct TitleState {
 }
 
 type TitleSlot = Arc<Mutex<TitleState>>;
+type ClipboardSlot = Arc<Mutex<Option<String>>>;
+
+// Leave room for the IPC enum/string framing around this text payload. A single
+// pending copy replaces the previous one, matching App's clipboard queue.
+const MAX_CLIPBOARD_BYTES: usize = crate::ipc::protocol::MAX_FRAME - 1024;
 
 /// Receives terminal-generated responses (cursor reports, device attributes,
 /// etc.) and forwards them back to the child via the shared write channel.
@@ -38,6 +43,7 @@ type TitleSlot = Arc<Mutex<TitleState>>;
 pub struct EventProxy {
     tx: InputSender,
     title: TitleSlot,
+    clipboard: ClipboardSlot,
     appearance: Arc<Mutex<PaneAppearance>>,
 }
 
@@ -81,6 +87,13 @@ impl EventListener for EventProxy {
                     }
                 }
             }
+            Event::ClipboardStore(ClipboardType::Clipboard, text)
+                if text.len() <= MAX_CLIPBOARD_BYTES =>
+            {
+                if let Ok(mut clipboard) = self.clipboard.lock() {
+                    *clipboard = Some(text);
+                }
+            }
             _ => {}
         }
     }
@@ -109,6 +122,7 @@ pub struct AlacrittyEngine {
     term: Term<EventProxy>,
     parser: Processor,
     title: TitleSlot,
+    clipboard: ClipboardSlot,
     response_tx: InputSender,
     appearance: Arc<Mutex<PaneAppearance>>,
     history_budget_bytes: usize,
@@ -156,10 +170,12 @@ impl AlacrittyEngine {
             rows: rows.max(1) as usize,
         };
         let title: TitleSlot = Arc::new(Mutex::new(TitleState::default()));
+        let clipboard: ClipboardSlot = Arc::new(Mutex::new(None));
         let appearance = Arc::new(Mutex::new(initial_appearance));
         let proxy = EventProxy {
             tx: resp_tx.clone(),
             title: title.clone(),
+            clipboard: clipboard.clone(),
             appearance: appearance.clone(),
         };
         // Alacritty retains history by rows, not bytes. Derive a conservative
@@ -177,6 +193,7 @@ impl AlacrittyEngine {
             term,
             parser: Processor::new(),
             title,
+            clipboard,
             response_tx: resp_tx,
             appearance,
             history_budget_bytes,
@@ -387,6 +404,10 @@ impl VtEngine for AlacrittyEngine {
         self.history_metrics_cache.set(None);
         self.parser.advance(&mut self.term, bytes);
         self.output_generation = self.output_generation.wrapping_add(1);
+    }
+
+    fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.lock().ok()?.take()
     }
 
     fn finish_output_batch(&mut self) {
@@ -1406,6 +1427,31 @@ mod tests {
     }
 
     #[test]
+    fn osc52_copy_is_available_as_terminal_effect_without_child_input() {
+        let text = "  nvim yank\n你好";
+        for terminator in ["\x07", "\x1b\\"] {
+            let (tx, rx) = channel();
+            let mut engine = AlacrittyEngine::new(24, 2, tx, budget_for_rows(24, 20));
+            let sequence = format!(
+                "\x1b]52;c;{}{terminator}",
+                crate::base64_encode(text.as_bytes())
+            );
+            // Exercise the actual parser across arbitrary PTY read boundaries,
+            // without emitting escapes to a host terminal or reading a clipboard.
+            for chunk in sequence.as_bytes().chunks(3) {
+                engine.advance(chunk);
+            }
+            assert_eq!(engine.take_clipboard().as_deref(), Some(text));
+            assert!(engine.take_clipboard().is_none(), "copy is consumed once");
+            assert!(rx.try_recv().is_err(), "copy is not child terminal input");
+            assert!(engine
+                .visible_rows()
+                .iter()
+                .all(|row| row.trim().is_empty()));
+        }
+    }
+
+    #[test]
     fn incremental_history_maintenance_is_lossless_and_restarts_after_mutation() {
         fn rows(engine: &AlacrittyEngine) -> Vec<String> {
             let mut rows = Vec::new();
@@ -1527,6 +1573,43 @@ mod tests {
         assert_eq!(replay.snapshot_ansi(), snapshot);
         // ED2 retains the initial blank cursor row; replay adds no scrolling.
         assert_eq!(replay.term.grid().history_size(), 1);
+    }
+
+    #[test]
+    fn osc52_reads_invalid_payloads_and_primary_selection_remain_ignored() {
+        let (tx, rx) = channel();
+        let mut engine = AlacrittyEngine::new(24, 2, tx, budget_for_rows(24, 20));
+        // A paired positive copy proves the sink is enabled before testing
+        // negative inputs. OSC52 reads must never expose the host clipboard.
+        engine.advance(b"\x1b]52;c;Y29weQ==\x07");
+        assert_eq!(engine.take_clipboard().as_deref(), Some("copy"));
+        for sequence in [
+            b"\x1b]52;c;?\x07".as_slice(),
+            b"\x1b]52;c;?\x1b\\",
+            b"\x1b]52;c;not-base64!\x07",
+            b"\x1b]52;c;/w==\x07", // not UTF-8
+            b"\x1b]52;p;Y29weQ==\x07",
+            b"\x1b]52;s;Y29weQ==\x07",
+            b"\x1b]52;x;Y29weQ==\x07",
+        ] {
+            engine.advance(sequence);
+            assert!(engine.take_clipboard().is_none());
+            assert!(rx.try_recv().is_err());
+        }
+        engine.advance(b"\x1b]52;;\x07");
+        assert_eq!(engine.take_clipboard(), Some(String::new()));
+    }
+
+    #[test]
+    fn osc52_copy_retains_only_latest_payload_and_survives_history_options() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(24, 2, tx, budget_for_rows(24, 20));
+        engine.advance(b"\x1b]52;c;Zmlyc3Q=\x07\x1b]52;c;c2Vjb25k\x07");
+        assert_eq!(engine.take_clipboard().as_deref(), Some("second"));
+        engine.set_history_budget(budget_for_rows(24, 5));
+        engine.advance(b"\x1b]52;c;dGhpcmQ=\x07");
+        assert_eq!(engine.take_clipboard().as_deref(), Some("third"));
+        assert!(engine.take_clipboard().is_none());
     }
 
     #[test]

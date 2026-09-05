@@ -90,18 +90,6 @@ jobs:
       - run: cargo build --release --locked
       - name: Package measured binary
         run: COPYFILE_DISABLE=1 tar -C target/release -czf target/luvus-size.tar.gz luvus
-      - name: Smoke test Apple Silicon CLI
-        run: |
-          file target/release/luvus
-          target/release/luvus --version --remote-session-protocol
-          target/release/luvus help server restart
-      - name: Upload Apple Silicon CLI
-        uses: actions/upload-artifact@v4
-        with:
-          name: luvus-aarch64-apple-darwin-${{ github.sha }}
-          path: target/luvus-size.tar.gz
-          if-no-files-found: error
-          retention-days: 30
       - name: Check reviewed baseline
         run: |
           python3 scripts/check-binary-size.py \

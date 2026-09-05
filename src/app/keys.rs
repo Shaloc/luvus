@@ -936,15 +936,34 @@ impl App {
     /// nothing waiting it flashes a toast instead of moving focus, so the key is
     /// always safe to mash.
     pub fn focus_next_attention(&mut self) {
-        let mut blocked: Vec<crate::ids::PaneId> = Vec::new();
-        for ws in &self.workspaces {
+        let mut blocked: Vec<super::AgentTarget> = Vec::new();
+        let mut focused = super::AgentTarget::Live(self.layout().focus);
+        for (wi, ws) in self.workspaces.iter().enumerate() {
+            if let Some(view) = self.remote_workspace_view(wi) {
+                for agent in &view.agents {
+                    let Ok(pane) = agent.pane.parse::<u32>() else {
+                        continue;
+                    };
+                    let target = super::AgentTarget::RemoteLive {
+                        view: ws.tabs[0].layout.focus,
+                        pane: crate::ids::PaneId(pane),
+                    };
+                    if wi == self.active_ws && agent.focused {
+                        focused = target.clone();
+                    }
+                    if agent.state == crate::ui::theme::State::Blocked {
+                        blocked.push(target);
+                    }
+                }
+                continue;
+            }
             for tab in &ws.tabs {
                 for id in tab.layout.leaves() {
                     if let Some(s) = self.status.get(&id) {
                         let is_agent =
                             self.manifests.is_agent(&s.agent) || s.agent_session.is_some();
                         if is_agent && s.state == crate::ui::theme::State::Blocked {
-                            blocked.push(id);
+                            blocked.push(super::AgentTarget::Live(id));
                         }
                     }
                 }
@@ -957,12 +976,17 @@ impl App {
         }
         // Advance from the current focus if it's already on a waiting agent,
         // otherwise start at the first one.
-        let focus = self.layout().focus;
-        let next = match blocked.iter().position(|&b| b == focus) {
-            Some(i) => blocked[(i + 1) % blocked.len()],
-            None => blocked[0],
+        let next = match blocked.iter().position(|b| *b == focused) {
+            Some(i) => blocked[(i + 1) % blocked.len()].clone(),
+            None => blocked[0].clone(),
         };
-        self.focus_pane_global(next);
+        match next {
+            super::AgentTarget::Live(pane) => self.focus_pane_global(pane),
+            super::AgentTarget::RemoteLive { view, pane } => {
+                self.send_agent_view_command(view, format!("remote_agent_focus {}", pane.0))
+            }
+            _ => unreachable!("attention rows are live agents"),
+        }
     }
 }
 

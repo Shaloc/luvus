@@ -236,6 +236,10 @@ task and report `delivered` after the prompt reaches the pane input queue.
 `agent.list` returns the stable `workspace_id` and process-lifetime
 `terminal_id` on each live agent row so clients can construct this target
 without consulting terminal-backend methods.
+Merged remote rows also carry `host`, `owner_session`, `owner_pane` and
+`owner_workspace_id`. Their `workspace_id` names the local display projection;
+send automation to the owner using `--host` / `--session` and the owner IDs.
+The local server rejects automation targeting a remote projection.
 
 The read-only methods require the `read` scope. Every mutating automation
 method requires `orchestration`. A remote client should discover this contract
@@ -390,6 +394,16 @@ limits. `session.snapshot` returns every workspace, tab, terminal pane, native
 view, stable terminal identity, root process, and agent state in one response.
 Merged remote workspace rows also include their SSH Host alias in `host`; local
 workspace rows use `host:null`.
+Owned workspace snapshots also publish cached `agent_history` and
+`scheduled_agents` rows. History entries contain `agent`, `cwd`, and a 32-byte
+opaque `key` used to revalidate UI history actions; it is not a native session
+ID and must not be passed to `agent.resume`. For CLI/UHP resumption, request
+`agent.sessions` on the owner and use its `session_id` with `agent.resume`.
+Scheduled rows contain `id`, `agent`, `workspace_id`, `deadline` (UTC Unix
+seconds), and `starting`; inspect that owner's `automation.get` for details.
+Terminal rows add `agent_pinned` and `workspace_focused`. The latter means the
+pane is selected in its own workspace's active tab, independently of which
+workspace another attached client is currently viewing.
 Use `config.get` / `config.patch` with the `remote_hosts` string array to inspect
 or change the same managed-host selection exposed in Settings → Remote. The
 default is empty. Configuration changes reconcile active merge projections;
@@ -495,13 +509,16 @@ request and response fields do not change.
 `scope` must be `all`, `navigate`, `files`, or `output`. `query` must contain
 1 to 256 bytes after trimming, and `limit` must be 1 to 200. Case sensitivity
 applies to retained output. `all_sessions` defaults to false and queries only
-other running sessions in the selected Luvus home when true. `partial:true`
+other running sessions in the selected Luvus home and displayed SSH owners
+when true. Discovery never starts a stopped owner. `partial:true`
 means at least one source was capped, unreadable, unavailable, timed out, or
 incompatible.
 
 Every match has a stable result `kind` and structured `target`. Result kinds are
 `session`, `folder`, `tab`, `pane`, `agent`, `file`, and `output`. Consumers
 must not derive an action by parsing `label` or `detail`.
+Federated rows also carry `owner_session`, and SSH rows include `host`.
+Remote paths are searched on their owner, never in a same-named local folder.
 
 `search.capabilities` returns the search protocol version, supported methods,
 scopes, and response limits. Cross-session callers check it before querying a
@@ -512,6 +529,9 @@ session. The owner revalidates workspace, tab, pane, file containment, and
 output anchors before focusing or opening anything. It is primarily used by
 Luvus during named-session handoff. Invalid or stale targets return a structured
 `invalid_request` error instead of focusing a different object.
+Successful activation returns `activated:true` and the resolved `workspace_id`.
+Managed clients use that owner identity to focus an existing remote projection
+without replacing the local client connection.
 
 ## Mission Control data and UI
 
@@ -1001,6 +1021,13 @@ with future additive names. Register the returned `documents` by `$id` and
 resolve an entry from the catalog document, for example
 `https://luvus.dev/protocol/uhp/v1/event-catalog.schema.json#/properties/pane.agent_status_changed`;
 do not detach a fragment that contains a local `$ref` from its root document.
+
+`agent.history_changed` has an empty payload and invalidates the owner's cached
+resumable history. `agent.pin_changed` carries `{pane, pinned}` for the owner's
+live-agent pin state. Managed projections reconcile these events, agent-state
+changes and automation lifecycle events through the existing sequenced
+`session.snapshot` / `events.subscribe` path; there is no remote history or
+automation polling service.
 
 `terminal.backend.events.subscribe` uses the same stream framing but filters to
 `terminal.*` events. Its acknowledgment includes the current sequence and queue

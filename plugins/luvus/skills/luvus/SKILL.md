@@ -155,7 +155,14 @@ remote workspaces; a `[host]` tag identifies each remote owner.
 server; no restart is needed. Disabling a host or merge removes local
 projections and disconnects their bridges without stopping remote panes.
 Managed attaches retain the local session switcher and local prefix, even when
-the remote prefix differs. Settings → Remote has one global merge toggle:
+the remote prefix differs. Workspace suffixes (`?`, digits and custom bindings)
+are interpreted by the owner's prefix handler; global navigation and local
+Settings/Agents stay local. Double prefix sends the owner's prefix once. The
+bottom status bar identifies the remote host and actual session.
+Managed CLI requests and workspace frame reads require an already-running
+owner and never start/restart it implicitly. Opening a session, `remote add`,
+and explicit server lifecycle commands can start it.
+Settings → Remote has one global merge toggle:
 when enabled, every same-name local/remote session group merges automatically.
 The CLI `session merge on|off` controls the same global preference. This is
 display federation, not Git merge.
@@ -170,8 +177,30 @@ client in Kitty can use the optional official `kitten clipboard` executable
 on the display-client host to request desktop PNG data over OSC 5522. Kitty
 must permit the clipboard read; Luvus never bypasses its prompt. Without native
 clipboard access or this helper, normal text and Ctrl+Enter remain unchanged.
+Child OSC52 clipboard writes (for example Neovim yank) are forwarded to the
+display client's clipboard, including from remote owners. This text-copy path
+does not require the image helper; OSC52 clipboard reads remain unsupported.
 Merged `agent list` rows include `host`, `owner_session`, and `owner_pane`;
 use those owner selectors for follow-up commands, not the qualified local row ID.
+`workspace_id` identifies the local projection; `owner_workspace_id` and
+`terminal_id` identify the owner workspace and terminal lifetime for automation
+sent with `--host` and `--session`.
+
+The local Settings window and Agents All/Active, workspace-scope and Next
+Attention controls remain local across merged owners. Remote workspace menus
+have explicit owner **Settings** and **Module actions** entries. Tabs, panes,
+FILES/DIFF, Git, TaskBoard, Mission Control and owner module docks/bars operate
+on that workspace's host; never treat its path as a local filesystem target.
+
+Agents All also includes remote native history; scheduled rows open their
+owner's automation detail. Resume/Close on a remote history row acts on the
+owner, and Close only dismisses history for the current run, without deleting
+the native session. Local history always resumes locally. Remote live-agent
+Rename/Close/Pin acts on the owner and pin ordering is projected locally.
+Closing a remote workspace in the local UI only hides its projection; use
+explicit `--host` controls when the human intends to close owner resources.
+Snapshot history keys are opaque UI identities, not native `session_id` values:
+for scripted resume, get `agent sessions` on the owner and use its returned ID.
 
 For every related server-backed command, preserve the same `--host` and
 `--session` selectors. Put them before `agent prompt`, `agent send`, `pane run`,
@@ -344,6 +373,11 @@ Use these read routes before a write whose target is not already known:
 - `luvus pane status <id>`
 - `luvus pane read <id> --lines 120`
 - `luvus search <query>`
+
+In managed remote/merge mode, global search also queries displayed owners.
+Federated results carry `owner_session` and SSH results include `host`; pass
+the returned structured target to its owner. Never open a returned remote path
+locally. Search does not start stopped sessions.
 
 When the user supplies a stable 0-based workspace index, run the requested
 mutation directly. Run `workspace list` only to resolve a name, path, or sidebar

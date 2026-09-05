@@ -545,6 +545,7 @@ mod tests {
 
     fn menu() -> NamedSessionMenu {
         NamedSessionMenu {
+            client_id: None,
             generation: 1,
             rows: vec![
                 NamedSessionRow {

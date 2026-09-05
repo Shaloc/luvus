@@ -224,6 +224,7 @@ struct ClientState {
     force_full: bool,
     retained_pane_content: Vec<(crate::ids::PaneId, Rect)>,
     retained_ready: bool,
+    // Attach or actual input priority; a passive resize must not claim a PTY.
     last_activity: u64,
     /// Stable workspace id for a managed remote merge projection. `None` is a
     /// normal whole-session client and is the only kind eligible for foreground
@@ -235,7 +236,7 @@ struct ClientState {
 struct RenderScratch {
     damage: HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
     generations: HashMap<crate::ids::PaneId, u64>,
-    order: Vec<u64>,
+    order: Vec<(u64, bool)>,
     dead: Vec<u64>,
 }
 
@@ -552,22 +553,26 @@ pub fn run() -> Result<()> {
         }
         if app.detach_requested {
             app.detach_requested = false;
-            if let Some(id) = foreground.take() {
-                if let Some(c) = clients.remove(&id) {
-                    let _ = c.send_control(ServerMessage::Detach);
-                }
-                foreground = latest_client(&clients);
-                apply_foreground_theme(&mut app, &clients, foreground);
+            if let Some(id) = foreground {
+                finish_client_navigation(
+                    &mut app,
+                    &mut clients,
+                    &mut foreground,
+                    id,
+                    ServerMessage::Detach,
+                );
                 render_request.record(RenderCause::UserInterface);
             }
         }
         if let Some(name) = app.pending_session_switch.take() {
-            if let Some(id) = foreground.take() {
-                if let Some(client) = clients.remove(&id) {
-                    let _ = client.send_control(ServerMessage::SwitchSession { name });
-                }
-                foreground = latest_client(&clients);
-                apply_foreground_theme(&mut app, &clients, foreground);
+            if let Some(id) = foreground {
+                finish_client_navigation(
+                    &mut app,
+                    &mut clients,
+                    &mut foreground,
+                    id,
+                    ServerMessage::SwitchSession { name },
+                );
                 render_request.record(RenderCause::UserInterface);
             } else {
                 app.show_toast("no attached client to switch".to_string());
@@ -690,6 +695,41 @@ fn apply(
 ) -> bool {
     app.has_attached_client = !clients.is_empty();
     match ev {
+        AppEvent::NamedSessionPrepared {
+            generation,
+            action,
+            result,
+        } => {
+            // The worker completes after the requesting input turn. Preserve
+            // its generation-bound client origin even if another client has
+            // interacted, or the requester has since disconnected.
+            let origin = app
+                .named_session_menu
+                .as_ref()
+                .filter(|menu| menu.generation == generation)
+                .and_then(|menu| menu.client_id);
+            let previous_switch = origin.and_then(|_| app.pending_session_switch.take());
+            let changed = app.handle_event(AppEvent::NamedSessionPrepared {
+                generation,
+                action,
+                result,
+            });
+            if let Some(id) = origin {
+                let requested = app.pending_session_switch.take();
+                app.pending_session_switch = previous_switch;
+                if let Some(name) = requested {
+                    finish_client_navigation(
+                        app,
+                        clients,
+                        foreground,
+                        id,
+                        ServerMessage::SwitchSession { name },
+                    );
+                    *interactive_size = (0, 0);
+                }
+            }
+            changed
+        }
         AppEvent::ClientConnected {
             id,
             messages,
@@ -740,21 +780,26 @@ fn apply(
                 ],
             );
             let was_foreground = *foreground == Some(id);
-            clients.remove(&id);
+            let was_projection = clients
+                .remove(&id)
+                .is_some_and(|client| client.workspace_id.is_some());
             if was_foreground {
                 *foreground = latest_client(clients);
                 apply_foreground_theme(app, clients, *foreground);
             }
-            was_foreground
+            was_foreground || was_projection
         }
         AppEvent::ClientInput { id, input } => {
-            let Some(client) = clients.get_mut(&id) else {
-                return false;
-            };
-            client.last_activity = *next_activity;
-            *next_activity = next_activity.saturating_add(1);
-
             if let ClientInput::Resize(cols, rows) = input {
+                let owns_size = clients
+                    .get(&id)
+                    .and_then(|client| client.workspace_id.as_deref())
+                    .is_some_and(|workspace_id| {
+                        workspace_size_owner(app, clients, *foreground, workspace_id) == Some(id)
+                    });
+                let Some(client) = clients.get_mut(&id) else {
+                    return false;
+                };
                 crate::logging::event(
                     crate::logging::EventKind::ServerClientResize,
                     &[
@@ -767,21 +812,24 @@ fn apply(
                 // Resize/focus repair is local to this terminal. Its next frame
                 // must be complete, but other clients keep their diff baselines.
                 client.force_full = true;
-                if let Some(workspace_id) = client.workspace_id.as_deref() {
-                    if let Some(workspace_index) = app
-                        .workspaces
-                        .iter()
-                        .position(|workspace| workspace.id == workspace_id)
-                    {
+                if owns_size {
+                    if let Some(workspace_id) = client.workspace_id.as_deref() {
                         let area = Rect::new(0, 0, client.size.0, client.size.1);
                         client.render_buf = Buffer::empty(area);
                         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
-                        ui::render_workspace_interactive(&mut target, app, workspace_index);
+                        ui::render_workspace_owner_projection(&mut target, app, workspace_id);
                         *interactive_size = (0, 0);
                     }
                 }
                 return true;
             }
+
+            let Some(client) = clients.get_mut(&id) else {
+                return false;
+            };
+            client.last_activity = *next_activity;
+            *next_activity = next_activity.saturating_add(1);
+            bind_session_navigation_origin(app, id);
 
             if let Some(workspace_id) = client.workspace_id.clone() {
                 let Some(workspace_index) = app
@@ -808,13 +856,45 @@ fn apply(
                 app.active_ws = workspace_index;
                 let event = match input {
                     ClientInput::Key(key) => AppEvent::Key(key),
+                    ClientInput::PrefixKey(key) => AppEvent::PrefixKey(key),
                     ClientInput::Mouse(mouse) => AppEvent::Mouse(mouse),
                     ClientInput::Paste(text) => AppEvent::Paste(text),
                     ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                     ClientInput::Command(command) => AppEvent::ClientCommand(command),
                     ClientInput::Resize(..) => unreachable!("handled above"),
                 };
+                // These flags normally target whole-session foreground in the
+                // loop. Isolate only effects created by this scoped input so
+                // another client's earlier request cannot be consumed here.
+                let previous_switch = app.pending_session_switch.take();
+                let previous_detach = std::mem::take(&mut app.detach_requested);
                 let changed = app.handle_event(event);
+                bind_session_navigation_origin(app, id);
+                let requested_switch = app.pending_session_switch.take();
+                let requested_detach = std::mem::take(&mut app.detach_requested);
+                app.pending_session_switch = previous_switch;
+                app.detach_requested = previous_detach;
+                let requested_workspace = app
+                    .workspaces
+                    .get(app.active_ws)
+                    .filter(|workspace| workspace.id != workspace_id)
+                    .map(|workspace| workspace.id.clone());
+                // Input can select or create a tab, split a pane, or change its
+                // usable area. Commit its resulting PTY sizes before returning
+                // from the input, not on the next keystroke or frame. The
+                // action may also have removed/reordered workspaces: resolve
+                // the stable owner id again before touching any geometry.
+                if changed {
+                    if let Some(workspace_index) = app
+                        .workspaces
+                        .iter()
+                        .position(|workspace| workspace.id == workspace_id)
+                    {
+                        client.render_buf.reset();
+                        let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
+                        ui::render_workspace_interactive(&mut target, app, workspace_index);
+                    }
+                }
                 if let Some(previous) = previous {
                     app.active_ws = app
                         .workspaces
@@ -825,6 +905,19 @@ fn apply(
                         });
                 }
                 *interactive_size = (0, 0);
+                if let Some(name) = requested_switch {
+                    finish_client_navigation(
+                        app,
+                        clients,
+                        foreground,
+                        id,
+                        ServerMessage::SwitchSession { name },
+                    );
+                } else if requested_detach {
+                    finish_client_navigation(app, clients, foreground, id, ServerMessage::Detach);
+                } else if let Some(workspace_id) = requested_workspace {
+                    let _ = client.send_control(ServerMessage::FocusWorkspace { workspace_id });
+                }
                 return changed;
             }
 
@@ -840,7 +933,7 @@ fn apply(
             if promoted || target_size.is_some_and(|size| size != *interactive_size) {
                 let no_damage = HashMap::new();
                 let disconnected = clients.get_mut(&id).is_some_and(|client| {
-                    render_client(app, client, true, false, false, &no_damage).disconnected
+                    render_client(app, client, true, true, false, false, &no_damage).disconnected
                 });
                 if disconnected {
                     clients.remove(&id);
@@ -855,18 +948,51 @@ fn apply(
 
             let event = match input {
                 ClientInput::Key(key) => AppEvent::Key(key),
+                ClientInput::PrefixKey(key) => AppEvent::PrefixKey(key),
                 ClientInput::Mouse(mouse) => AppEvent::Mouse(mouse),
                 ClientInput::Paste(text) => AppEvent::Paste(text),
                 ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                 ClientInput::Command(command) => AppEvent::ClientCommand(command),
                 ClientInput::Resize(..) => unreachable!("handled above"),
             };
-            app.handle_event(event)
+            let changed = app.handle_event(event);
+            bind_session_navigation_origin(app, id);
+            changed
         }
         // Redraw only if the event actually changed the UI — a plain keystroke
         // forwarded to a pane does not (its echo arrives as a separate `PtyData`).
         other => app.handle_event(other),
     }
+}
+
+fn bind_session_navigation_origin(app: &mut App, id: u64) {
+    if let Some(menu) = app
+        .named_session_menu
+        .as_mut()
+        .filter(|menu| !menu.preparing)
+    {
+        menu.client_id = Some(id);
+    }
+}
+
+/// Navigation belongs to its requesting display, never whichever client happens
+/// to be foreground when an async operation finishes. A disconnected requester
+/// consumes its own navigation without redirecting another attached display.
+fn finish_client_navigation(
+    app: &mut App,
+    clients: &mut Clients,
+    foreground: &mut Option<u64>,
+    id: u64,
+    message: ServerMessage,
+) {
+    if let Some(client) = clients.remove(&id) {
+        let _ = client.send_control(message);
+    }
+    if *foreground == Some(id) {
+        *foreground = latest_client(clients);
+        apply_foreground_theme(app, clients, *foreground);
+    }
+    app.has_attached_client = !clients.is_empty();
 }
 
 fn broadcast(clients: &mut Clients, msg: ServerMessage) {
@@ -878,6 +1004,26 @@ fn latest_client(clients: &Clients) -> Option<u64> {
         .iter()
         .filter(|(_, client)| client.workspace_id.is_none())
         .max_by_key(|(_, client)| client.last_activity)
+        .map(|(&id, _)| id)
+}
+
+/// Only one viewport may resize a workspace's shared PTYs. Whole-session
+/// foreground covers the active workspace; projections cover their stable
+/// workspace ids. Priority follows existing actual-input activity, not Resize.
+fn workspace_size_owner(
+    app: &App,
+    clients: &Clients,
+    foreground: Option<u64>,
+    workspace_id: &str,
+) -> Option<u64> {
+    let active_workspace = app.workspaces.get(app.active_ws).map(|ws| ws.id.as_str());
+    clients
+        .iter()
+        .filter(|(id, client)| match client.workspace_id.as_deref() {
+            Some(projected) => projected == workspace_id,
+            None => foreground == Some(**id) && active_workspace == Some(workspace_id),
+        })
+        .max_by_key(|(id, client)| (client.last_activity, **id))
         .map(|(&id, _)| id)
 }
 
@@ -931,21 +1077,7 @@ fn pane_visible_to_any_client(app: &App, clients: &Clients, pane: crate::ids::Pa
 }
 
 fn rearm_pty_notify_by_visibility(app: &App, clients: &Clients) -> (bool, bool, bool) {
-    let mut visible = false;
-    let mut background = false;
-    let mut title_changed = false;
-    for (id, pane) in &app.panes {
-        if !pane.take_data_pending() {
-            continue;
-        }
-        if pane_visible_to_any_client(app, clients, *id) {
-            visible = true;
-        } else {
-            background = true;
-            title_changed |= app.hidden_title_changed(*id);
-        }
-    }
-    (visible, background, title_changed)
+    app.rearm_pty_notify_by_visibility(|pane| pane_visible_to_any_client(app, clients, pane))
 }
 
 fn record_event_render_request(
@@ -973,8 +1105,9 @@ fn record_event_render_request(
 /// and that client would sit on a **stale** screen (missing whatever the dropped
 /// diff carried) until some unrelated change happened to wake the loop. Treating
 /// a pending resync as work to do closes that window to one frame interval.
-/// Render the active client first so its geometry remains authoritative, then
-/// render every other client as a projection at that client's own dimensions.
+/// Render workspace size owners before their passive clients so every frame
+/// reads a correctly sized grid. Only the foreground client commits whole-app
+/// hit geometry; workspace owners preserve it while resizing their own PTYs.
 /// The common one-client case is still exactly one buffer reset, one UI render,
 /// and one in-place diff.
 fn render_clients(
@@ -1018,19 +1151,33 @@ fn render_clients(
             .all(|snapshot| snapshot.kind == crate::terminal::vt::DamageKind::Partial);
 
     scratch.order.clear();
-    scratch.order.extend(clients.keys().copied());
+    scratch.order.extend(clients.iter().map(|(&id, client)| {
+        let interactive = *foreground == Some(id);
+        let workspace_id = client.workspace_id.as_deref().or_else(|| {
+            if interactive {
+                app.workspaces.get(app.active_ws).map(|ws| ws.id.as_str())
+            } else {
+                None
+            }
+        });
+        let owns_size = workspace_id.is_some_and(|workspace_id| {
+            workspace_size_owner(app, clients, *foreground, workspace_id) == Some(id)
+        });
+        (id, owns_size)
+    }));
     scratch
         .order
-        .sort_unstable_by_key(|id| (*foreground != Some(*id), *id));
+        .sort_unstable_by_key(|(id, owns_size)| (!owns_size, *foreground != Some(*id), *id));
     scratch.dead.clear();
     let mut presented = false;
-    for id in scratch.order.iter().copied() {
+    for (id, owns_size) in scratch.order.iter().copied() {
         let interactive = *foreground == Some(id);
         if let Some(client) = clients.get_mut(&id) {
             let outcome = render_client(
                 app,
                 client,
                 interactive,
+                owns_size,
                 force_all,
                 partial_pass,
                 &scratch.damage,
@@ -1039,7 +1186,10 @@ fn render_clients(
             if outcome.disconnected {
                 scratch.dead.push(id);
             } else if interactive {
-                *interactive_size = client.size;
+                // The whole-session client still owns hit geometry, but a
+                // more recently used projection can own this workspace's PTY
+                // sizes. Its next real input must reclaim both synchronously.
+                *interactive_size = if owns_size { client.size } else { (0, 0) };
             }
         }
     }
@@ -1172,6 +1322,7 @@ fn render_client(
     app: &mut App,
     client: &mut ClientState,
     interactive: bool,
+    owns_size: bool,
     force_all: bool,
     partial_pass: bool,
     damage: &HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
@@ -1210,15 +1361,23 @@ fn render_client(
         client.render_buf.reset();
         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
         if let Some(workspace_id) = client.workspace_id.as_deref() {
-            ui::render_workspace_projection(&mut target, app, workspace_id);
+            if owns_size {
+                ui::render_workspace_owner_projection(&mut target, app, workspace_id);
+            } else {
+                ui::render_workspace_projection(&mut target, app, workspace_id);
+            }
             client.retained_ready = false;
         } else if interactive {
-            ui::render_into(&mut target, app);
-            app.resize_active_remote_projection();
+            if owns_size {
+                ui::render_into(&mut target, app);
+                app.resize_active_remote_projection();
+            } else {
+                ui::render_into_without_pane_resize(&mut target, app);
+            }
             client
                 .retained_pane_content
                 .clone_from(&app.pane_content_rects);
-            client.retained_ready = true;
+            client.retained_ready = owns_size;
         } else {
             client.retained_pane_content = ui::render_projection(&mut target, app);
             client.retained_ready = true;
@@ -1480,6 +1639,17 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                     .send(AppEvent::ClientInput {
                         id,
                         input: ClientInput::Key(k),
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ClientMessage::PrefixKey(key)) => {
+                if app_tx
+                    .send(AppEvent::ClientInput {
+                        id,
+                        input: ClientInput::PrefixKey(key),
                     })
                     .is_err()
                 {
@@ -1812,6 +1982,783 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
+    mod projection_geometry {
+        use super::*;
+
+        struct Fixture {
+            app: App,
+            clients: HashMap<u64, ClientState>,
+            foreground: Option<u64>,
+            interactive_size: (u16, u16),
+            next_activity: u64,
+            workspace_id: String,
+            foreground_workspace: String,
+            foreground_pane: crate::ids::PaneId,
+            _client_receivers: Vec<mpsc::Receiver<ServerMessage>>,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                // Only this test's PTYs exist: cat does not read shell startup
+                // files, and no test input is sent to a child process. Fail
+                // closed if an inherited override would launch something else.
+                let config = crate::config::Config {
+                    shell: "/bin/cat".into(),
+                    ..Default::default()
+                };
+                assert_eq!(crate::platform::resolve_shell(&config.shell), "/bin/cat");
+                assert!(std::env::var_os("LUVUS_SOCKET_PATH").is_none());
+                assert!(crate::session::remote::process_target().is_none());
+                crate::config::save(&config);
+                let (app_tx, _app_rx) = mpsc::channel();
+                let mut app = App::new(120, 40, app_tx).expect("isolated cat pane");
+                app.server_mode = true;
+                let workspace_id = app.workspaces[0].id.clone();
+                app.dispatch("workspace.new", &serde_json::json!({}))
+                    .unwrap();
+                let foreground_workspace = app.ws().id.clone();
+                let foreground_pane = app.layout().focus;
+                app.panes.get_mut(&foreground_pane).unwrap().resize(93, 29);
+                let (foreground_client, foreground_rx) = display_client(120, 40, 2);
+                let (projection, projection_rx) = projection_client(workspace_id.clone(), 1);
+                Self {
+                    app,
+                    clients: HashMap::from([(1, foreground_client), (2, projection)]),
+                    foreground: Some(1),
+                    interactive_size: (120, 40),
+                    next_activity: 3,
+                    workspace_id,
+                    foreground_workspace,
+                    foreground_pane,
+                    _client_receivers: vec![foreground_rx, projection_rx],
+                }
+            }
+
+            fn input(&mut self, id: u64, input: ClientInput) {
+                apply(
+                    AppEvent::ClientInput { id, input },
+                    &mut self.app,
+                    &mut self.clients,
+                    &mut self.foreground,
+                    &mut self.interactive_size,
+                    &mut self.next_activity,
+                );
+            }
+
+            fn projection_only(&mut self) {
+                self.clients.remove(&1);
+                self.foreground = None;
+                self.app.active_ws = self.target_index();
+            }
+
+            fn api(&mut self, method: &str, params: serde_json::Value) {
+                let (reply, response) = mpsc::channel();
+                apply(
+                    AppEvent::Api(crate::ipc::api::ApiRequest {
+                        id: "projection-geometry".into(),
+                        method: method.into(),
+                        params,
+                        reply,
+                    }),
+                    &mut self.app,
+                    &mut self.clients,
+                    &mut self.foreground,
+                    &mut self.interactive_size,
+                    &mut self.next_activity,
+                );
+                let response: serde_json::Value =
+                    serde_json::from_str(&response.try_recv().expect("bounded API reply")).unwrap();
+                assert!(response.get("error").is_none(), "{method}: {response}");
+            }
+
+            fn render(&mut self) {
+                for client in self.clients.values() {
+                    client.sender.frame_pending.store(false, Ordering::Release);
+                }
+                render_clients(
+                    &mut self.app,
+                    &mut self.clients,
+                    &mut self.foreground,
+                    &mut self.interactive_size,
+                    true,
+                    false,
+                    &mut RenderScratch::default(),
+                );
+                assert!(
+                    self.clients.contains_key(&2),
+                    "projection remains connected"
+                );
+                assert!(
+                    self.clients[&2].last_frame.is_some(),
+                    "owner frame delivered"
+                );
+            }
+
+            fn target_index(&self) -> usize {
+                self.app
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == self.workspace_id)
+                    .expect("projection workspace exists")
+            }
+
+            fn target_pane(&self) -> crate::ids::PaneId {
+                let workspace = &self.app.workspaces[self.target_index()];
+                workspace.tabs[workspace.active_tab].layout.focus
+            }
+
+            fn assert_foreground_unchanged(&self) {
+                assert_eq!(self.foreground, Some(1));
+                assert_eq!(self.app.ws().id, self.foreground_workspace);
+                assert_eq!(self.app.panes[&self.foreground_pane].size(), (93, 29));
+            }
+
+            fn assert_target_size(&self, expected: (u16, u16)) {
+                let pane = &self.app.panes[&self.target_pane()];
+                assert_eq!(
+                    pane.size(),
+                    expected,
+                    "PTY must resize in the same input turn"
+                );
+                let engine = pane.engine.lock().unwrap();
+                let mut extent = (0, 0);
+                engine.for_each_cell(&mut |row, column, _, _| {
+                    extent.0 = extent.0.max(column + 1);
+                    extent.1 = extent.1.max(row + 1);
+                });
+                assert_eq!(extent, expected, "the VT grid must match the PTY size");
+            }
+        }
+
+        fn menu_outer_buffer(app: &mut App) -> ratatui::buffer::Buffer {
+            let area = ratatui::layout::Rect::new(0, 0, 48, 34);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+            crate::ui::render_into(&mut target, app);
+            buffer
+        }
+
+        fn menu_present_owner(
+            owner: &mut Fixture,
+            outer: &mut App,
+            pane: crate::ids::PaneId,
+        ) -> ratatui::buffer::Buffer {
+            owner.render();
+            let frame = owner.clients[&2].last_frame.as_ref().unwrap().clone();
+            let Some(crate::app::ViewKind::Remote(view)) = outer.views.get_mut(&pane) else {
+                panic!("native remote projection");
+            };
+            view.frame = Some(frame);
+            menu_outer_buffer(outer)
+        }
+
+        fn menu_visible_point(
+            buffer: &ratatui::buffer::Buffer,
+            area: ratatui::layout::Rect,
+            label: &str,
+        ) -> (u16, u16) {
+            let width = label.chars().count() as u16;
+            for row in area.y..area.bottom() {
+                for column in area.x..area.right().saturating_sub(width).saturating_add(1) {
+                    let text: String = (column..column + width)
+                        .map(|x| buffer[(x, row)].symbol())
+                        .collect();
+                    if text == label {
+                        return (column, row);
+                    }
+                }
+            }
+            panic!("visible owner menu label {label:?} missing in {area:?}");
+        }
+
+        fn menu_forward_event(
+            owner: &mut Fixture,
+            outer: &mut App,
+            input: &mpsc::Receiver<crate::ipc::protocol::ClientMessage>,
+            event: AppEvent,
+        ) {
+            use crate::ipc::protocol::ClientMessage;
+            outer.handle_event(event);
+            let message = input.try_recv().expect(
+                "visible remote MENU interaction must reach its owner, not a stale outer control",
+            );
+            let input = match message {
+                ClientMessage::Mouse(mouse) => ClientInput::Mouse(mouse),
+                ClientMessage::Key(key) => ClientInput::Key(key),
+                _ => panic!("unexpected non-mouse/key owner menu input"),
+            };
+            owner.input(2, input);
+        }
+
+        fn projection_menu_scenario(warm_local_header: bool, same_foreground_workspace: bool) {
+            use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+
+            let mut owner = Fixture::new();
+            owner.input(2, ClientInput::Command("new_tab".into()));
+            let workspace = owner.target_index();
+            owner.app.workspaces[workspace].tabs[0].name = Some("owner-one".into());
+            owner.app.workspaces[workspace].tabs[1].name = Some("owner-two".into());
+            if same_foreground_workspace {
+                owner.app.active_ws = workspace;
+            }
+            let foreground_workspace = owner.app.ws().id.clone();
+
+            let mut outer = crate::app::remote::tests::remote_ui_app();
+            outer.remote_merge_enabled = true;
+            if warm_local_header {
+                menu_outer_buffer(&mut outer);
+                assert!(
+                    outer.switcher_button_rect.is_some(),
+                    "real local mobile MENU"
+                );
+            }
+            let (pane, input, _) = crate::app::remote::tests::add_remote_workspace(&mut outer);
+            menu_outer_buffer(&mut outer);
+            let area = outer
+                .pane_content_rects
+                .iter()
+                .find(|(candidate, _)| *candidate == pane)
+                .unwrap()
+                .1;
+            owner.input(2, ClientInput::Resize(area.width, area.height));
+            let mut visible = menu_present_owner(&mut owner, &mut outer, pane);
+            let menu_label = owner.app.catalog.menu.to_uppercase();
+            let header = ratatui::layout::Rect::new(area.x, area.y, area.width, 2);
+            let mouse = |point: (u16, u16)| {
+                AppEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: point.0,
+                    row: point.1,
+                    modifiers: KeyModifiers::NONE,
+                })
+            };
+
+            let menu = menu_visible_point(&visible, header, &menu_label);
+            menu_forward_event(&mut owner, &mut outer, &input, mouse(menu));
+            assert!(owner.app.switcher, "owner MENU opened");
+            assert!(
+                !outer.switcher,
+                "a remote MENU must not open the outer switcher"
+            );
+            visible = menu_present_owner(&mut owner, &mut outer, pane);
+            let row = menu_visible_point(&visible, area, "owner-one");
+            menu_forward_event(&mut owner, &mut outer, &input, mouse(row));
+            assert!(
+                !owner.app.switcher,
+                "visible row activated and closed owner MENU"
+            );
+            assert_eq!(owner.app.workspaces[workspace].active_tab, 0);
+            assert_eq!(owner.app.ws().id, foreground_workspace);
+            assert_eq!(owner.foreground, Some(1));
+
+            visible = menu_present_owner(&mut owner, &mut outer, pane);
+            let menu = menu_visible_point(&visible, header, &menu_label);
+            menu_forward_event(&mut owner, &mut outer, &input, mouse(menu));
+            for code in [KeyCode::Char('o'), KeyCode::Tab, KeyCode::Esc, KeyCode::Esc] {
+                menu_present_owner(&mut owner, &mut outer, pane);
+                menu_forward_event(
+                    &mut owner,
+                    &mut outer,
+                    &input,
+                    AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                );
+                match code {
+                    KeyCode::Char('o') => assert_eq!(owner.app.switcher_query, "o"),
+                    KeyCode::Tab => {
+                        assert_eq!(owner.app.switcher_scope, crate::app::SwitcherScope::Agents)
+                    }
+                    KeyCode::Esc => assert!(owner.app.switcher_query.is_empty()),
+                    _ => unreachable!(),
+                }
+                assert!(outer.switcher_query.is_empty());
+                assert!(!outer.switcher);
+                assert_eq!(owner.app.ws().id, foreground_workspace);
+            }
+            assert!(!owner.app.switcher, "second Esc closes owner MENU");
+            assert!(input.try_recv().is_err());
+            assert!(outer.panes.is_empty(), "outer uses native projection only");
+        }
+
+        #[test]
+        fn projection_menu_visible_rows_and_keys_reach_background_owner() {
+            let _env = crate::persist::test_env("projection-menu-visible-row-key-routing");
+            for same_foreground_workspace in [false, true] {
+                projection_menu_scenario(false, same_foreground_workspace);
+            }
+        }
+
+        #[test]
+        fn projection_menu_after_local_mobile_header_still_reaches_owner() {
+            let _env = crate::persist::test_env("projection-menu-stale-local-header");
+            for same_foreground_workspace in [false, true] {
+                projection_menu_scenario(true, same_foreground_workspace);
+            }
+        }
+
+        fn menu_owner_click(owner: &mut Fixture, label: &str) {
+            use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+            owner.render();
+            let buffer = &owner.clients[&2].render_buf;
+            let point = menu_visible_point(buffer, buffer.area, label);
+            owner.input(
+                2,
+                ClientInput::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: point.0,
+                    row: point.1,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            );
+        }
+
+        fn menu_owner_open(owner: &mut Fixture) {
+            owner.input(2, ClientInput::Resize(48, 34));
+            let label = owner.app.catalog.menu.to_uppercase();
+            menu_owner_click(owner, &label);
+            assert!(owner.app.switcher);
+        }
+
+        fn menu_owner_scroll_to_actions(owner: &mut Fixture) {
+            for _ in 0..24 {
+                owner.input(
+                    2,
+                    ClientInput::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                );
+            }
+        }
+
+        fn menu_complete_session(owner: &mut Fixture, generation: u64, name: &str) {
+            apply(
+                AppEvent::NamedSessionPrepared {
+                    generation,
+                    action: crate::app::session_menu::NamedSessionPreparedAction::Switch(
+                        name.into(),
+                    ),
+                    result: Ok(()),
+                },
+                &mut owner.app,
+                &mut owner.clients,
+                &mut owner.foreground,
+                &mut owner.interactive_size,
+                &mut owner.next_activity,
+            );
+        }
+
+        #[test]
+        fn projection_menu_other_workspace_focus_is_sent_only_to_projection() {
+            let _env = crate::persist::test_env("projection-menu-cross-workspace-focus");
+            let mut owner = Fixture::new();
+            owner.app.workspaces[1].name = "owner-destination".into();
+            menu_owner_open(&mut owner);
+            for _ in 0..3 {
+                owner.input(
+                    2,
+                    ClientInput::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+                );
+            }
+            assert_eq!(
+                owner.app.switcher_scope,
+                crate::app::SwitcherScope::Workspaces
+            );
+            menu_owner_click(&mut owner, "owner-destination");
+            assert!(!owner.app.switcher);
+            assert_eq!(owner.app.ws().id, owner.foreground_workspace);
+            assert_eq!(owner.foreground, Some(1));
+            assert!(owner._client_receivers[1].try_iter().any(|message| matches!(
+                message,
+                ServerMessage::FocusWorkspace { workspace_id } if workspace_id == owner.foreground_workspace
+            )), "a scoped workspace jump must navigate the projection, not get lost when foreground restores");
+            assert!(!owner._client_receivers[0]
+                .try_iter()
+                .any(|message| matches!(message, ServerMessage::FocusWorkspace { .. })));
+        }
+
+        #[test]
+        fn projection_menu_exit_detaches_only_its_display_client() {
+            let _env = crate::persist::test_env("projection-menu-exit-origin");
+            let mut owner = Fixture::new();
+            menu_owner_open(&mut owner);
+            menu_owner_scroll_to_actions(&mut owner);
+            let label = owner.app.catalog.act_exit.to_string();
+            menu_owner_click(&mut owner, &label);
+            assert!(
+                !owner.app.detach_requested,
+                "projection exit must not leak into foreground-only loop delivery"
+            );
+            assert!(owner._client_receivers[1]
+                .try_iter()
+                .any(|message| matches!(message, ServerMessage::Detach)));
+            assert!(!owner._client_receivers[0]
+                .try_iter()
+                .any(|message| matches!(message, ServerMessage::Detach)));
+            assert_eq!(owner.foreground, Some(1));
+            assert!(owner.clients.contains_key(&1));
+            assert_eq!(owner.app.ws().id, owner.foreground_workspace);
+        }
+
+        fn menu_prepare_session_fixture(owner: &mut Fixture) -> u64 {
+            menu_owner_open(owner);
+            menu_owner_scroll_to_actions(owner);
+            owner.input(
+                2,
+                ClientInput::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            );
+            let label = owner.app.catalog.named_sessions.to_string();
+            menu_owner_click(owner, &label);
+            // Opening only starts isolated discovery. Never select/start a
+            // real session: simulate its worker in flight, then deliver the
+            // real generation-fenced completion event directly below.
+            let menu = owner
+                .app
+                .named_session_menu
+                .as_mut()
+                .expect("owner session selector opened");
+            menu.loading = false;
+            menu.preparing = true;
+            menu.generation
+        }
+
+        #[test]
+        fn projection_menu_session_completion_keeps_its_origin_after_foreground_input() {
+            let _env = crate::persist::test_env("projection-menu-session-origin");
+            let mut owner = Fixture::new();
+            let generation = menu_prepare_session_fixture(&mut owner);
+            owner.input(
+                1,
+                ClientInput::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            );
+            menu_complete_session(&mut owner, generation.wrapping_add(1), "stale-session");
+            assert!(owner.app.pending_session_switch.is_none());
+            menu_complete_session(&mut owner, generation, "owner-next-session");
+            assert!(
+                owner.app.pending_session_switch.is_none(),
+                "async projection completion must not leak to the ordinary foreground client"
+            );
+            assert!(owner._client_receivers[1]
+                .try_iter()
+                .any(|message| matches!(
+                    message, ServerMessage::SwitchSession { name } if name == "owner-next-session"
+                )));
+            assert!(!owner._client_receivers[0]
+                .try_iter()
+                .any(|message| matches!(message, ServerMessage::SwitchSession { .. })));
+            assert_eq!(owner.foreground, Some(1));
+            assert_eq!(owner.app.ws().id, owner.foreground_workspace);
+        }
+
+        #[test]
+        fn projection_menu_session_completion_drops_navigation_when_origin_detached() {
+            let _env = crate::persist::test_env("projection-menu-session-origin-detached");
+            let mut owner = Fixture::new();
+            let generation = menu_prepare_session_fixture(&mut owner);
+            apply(
+                AppEvent::ClientDetach { id: 2 },
+                &mut owner.app,
+                &mut owner.clients,
+                &mut owner.foreground,
+                &mut owner.interactive_size,
+                &mut owner.next_activity,
+            );
+            menu_complete_session(&mut owner, generation, "owner-next-session");
+            assert!(
+                owner.app.pending_session_switch.is_none(),
+                "a disconnected requester must not switch another attached client"
+            );
+            assert!(!owner._client_receivers[0]
+                .try_iter()
+                .any(|message| matches!(message, ServerMessage::SwitchSession { .. })));
+            assert_eq!(owner.foreground, Some(1));
+            assert!(owner.clients.contains_key(&1));
+        }
+
+        #[test]
+        fn workspace_projection_new_tab_resizes_before_another_input() {
+            let _env = crate::persist::test_env("projection-new-tab-geometry");
+            let mut fixture = Fixture::new();
+            fixture.input(2, ClientInput::Resize(117, 37));
+            let previous_pane = fixture.target_pane();
+            let expected = fixture.app.panes[&previous_pane].size();
+            assert_ne!(expected, (80, 24));
+            fixture.input(2, ClientInput::Command("new_tab".into()));
+            assert_ne!(fixture.target_pane(), previous_pane);
+            fixture.assert_target_size(expected);
+            fixture.assert_foreground_unchanged();
+        }
+
+        #[test]
+        fn workspace_projection_tab_switch_resizes_without_passive_size_theft() {
+            let _env = crate::persist::test_env("projection-switch-tab-geometry");
+            let mut fixture = Fixture::new();
+            let first_pane = fixture.target_pane();
+            fixture.input(2, ClientInput::Command("new_tab".into()));
+            fixture.input(2, ClientInput::Resize(117, 37));
+            let expected = fixture.app.panes[&fixture.target_pane()].size();
+            fixture
+                .app
+                .panes
+                .get_mut(&first_pane)
+                .unwrap()
+                .resize(77, 18);
+            fixture.input(2, ClientInput::Command("prev_tab".into()));
+            assert_eq!(fixture.target_pane(), first_pane);
+            fixture.assert_target_size(expected);
+            fixture.assert_foreground_unchanged();
+
+            let (mut passive, _rx) = projection_client(fixture.workspace_id.clone(), 0);
+            passive.size = (55, 20);
+            super::super::render_client(
+                &mut fixture.app,
+                &mut passive,
+                false,
+                false,
+                true,
+                false,
+                &HashMap::new(),
+            );
+            fixture.assert_target_size(expected);
+            fixture.assert_foreground_unchanged();
+
+            let (background, _rx) = display_client(50, 20, 0);
+            fixture.clients.insert(3, background);
+            fixture.input(3, ClientInput::Resize(45, 18));
+            fixture.assert_target_size(expected);
+            fixture.assert_foreground_unchanged();
+        }
+
+        #[test]
+        fn workspace_projection_close_does_not_resize_the_shifted_workspace_index() {
+            let _env = crate::persist::test_env("projection-close-workspace-geometry");
+            let mut fixture = Fixture::new();
+            fixture.input(2, ClientInput::Resize(117, 37));
+            assert_eq!(fixture.target_index(), 0);
+            fixture.input(
+                2,
+                ClientInput::Command(crate::app::Cmd::CloseWorkspace.id().into()),
+            );
+            assert_eq!(fixture.app.workspaces.len(), 1);
+            assert!(fixture
+                .app
+                .workspaces
+                .iter()
+                .all(|workspace| workspace.id != fixture.workspace_id));
+            fixture.assert_foreground_unchanged();
+        }
+
+        #[test]
+        fn workspace_projection_api_new_tab_has_size_without_client_input() {
+            let _env = crate::persist::test_env("projection-api-new-tab-geometry");
+            let mut fixture = Fixture::new();
+            fixture.input(2, ClientInput::Resize(117, 37));
+            let expected = fixture.app.panes[&fixture.target_pane()].size();
+            fixture.projection_only();
+            fixture.api("tab.new", serde_json::json!({}));
+            fixture.render();
+            fixture.assert_target_size(expected);
+            assert_eq!(fixture.foreground, None);
+        }
+
+        #[test]
+        fn workspace_projection_api_tab_switch_has_size_without_client_input() {
+            let _env = crate::persist::test_env("projection-api-switch-tab-geometry");
+            let mut fixture = Fixture::new();
+            let first = fixture.target_pane();
+            fixture.input(2, ClientInput::Command("new_tab".into()));
+            fixture.input(2, ClientInput::Resize(117, 37));
+            let expected = fixture.app.panes[&fixture.target_pane()].size();
+            fixture.app.panes.get_mut(&first).unwrap().resize(77, 18);
+            fixture.projection_only();
+            fixture.api("tab.focus", serde_json::json!({"tab":"1"}));
+            fixture.render();
+            assert_eq!(fixture.target_pane(), first);
+            fixture.assert_target_size(expected);
+            assert_eq!(fixture.foreground, None);
+        }
+
+        #[test]
+        fn workspace_projection_api_split_has_size_without_client_input() {
+            let _env = crate::persist::test_env("projection-api-split-geometry");
+            let mut fixture = Fixture::new();
+            fixture.input(2, ClientInput::Resize(117, 37));
+            fixture.projection_only();
+            fixture.api("pane.split", serde_json::json!({"direction":"right"}));
+            fixture.render();
+            let leaves = fixture.app.layout().leaves();
+            assert_eq!(leaves.len(), 2);
+            // Capture the real post-API/post-frame state before asking the
+            // existing interactive renderer for an independent size oracle.
+            let actual: Vec<_> = leaves
+                .iter()
+                .map(|id| fixture.app.panes[id].size())
+                .collect();
+            let area = ratatui::layout::Rect::new(0, 0, 117, 37);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+            let workspace = fixture.target_index();
+            crate::ui::render_workspace_interactive(&mut target, &mut fixture.app, workspace);
+            let expected: Vec<_> = leaves
+                .iter()
+                .map(|id| fixture.app.panes[id].size())
+                .collect();
+            assert!(expected.iter().all(|size| *size != (80, 24)));
+            assert_eq!(
+                actual, expected,
+                "API-created layout must already fit its delivered frame"
+            );
+            assert_eq!(fixture.foreground, None);
+        }
+
+        #[test]
+        fn workspace_projection_api_background_split_preserves_foreground_geometry() {
+            let _env = crate::persist::test_env("projection-api-background-split-geometry");
+            let mut fixture = Fixture::new();
+            fixture.input(2, ClientInput::Resize(117, 37));
+            fixture.render();
+            let foreground_size = fixture.app.panes[&fixture.foreground_pane].size();
+            let foreground_content = fixture.app.pane_content_rects.clone();
+            let foreground_tabs = fixture.app.tab_rects.clone();
+            let foreground_area = fixture.app.last_main_area;
+            let target_pane = fixture.target_pane();
+
+            fixture.api(
+                "pane.split",
+                serde_json::json!({"pane": target_pane.0.to_string(), "focus": false}),
+            );
+            fixture.render();
+            assert_eq!(fixture.foreground, Some(1));
+            assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
+            assert_eq!(
+                fixture.app.panes[&fixture.foreground_pane].size(),
+                foreground_size
+            );
+            assert_eq!(fixture.app.pane_content_rects, foreground_content);
+            assert_eq!(fixture.app.tab_rects, foreground_tabs);
+            assert_eq!(fixture.app.last_main_area, foreground_area);
+
+            let workspace = fixture.target_index();
+            let tab = &fixture.app.workspaces[workspace].tabs[0];
+            let leaves = tab.layout.leaves();
+            assert_eq!(leaves.len(), 2);
+            let actual: Vec<_> = leaves
+                .iter()
+                .map(|id| fixture.app.panes[id].size())
+                .collect();
+            let area = ratatui::layout::Rect::new(0, 0, 117, 37);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+            crate::ui::render_workspace_interactive(&mut target, &mut fixture.app, workspace);
+            let expected: Vec<_> = leaves
+                .iter()
+                .map(|id| fixture.app.panes[id].size())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "background API layout must fit its owner projection"
+            );
+        }
+
+        #[test]
+        fn workspace_projection_passive_resize_does_not_take_owner_size() {
+            let _env = crate::persist::test_env("projection-passive-resize-geometry");
+            let mut fixture = Fixture::new();
+            fixture.projection_only();
+            fixture.input(2, ClientInput::Resize(117, 37));
+            let expected = fixture.app.panes[&fixture.target_pane()].size();
+            let (passive, rx) = projection_client(fixture.workspace_id.clone(), 0);
+            fixture.clients.insert(3, passive);
+            fixture._client_receivers.push(rx);
+
+            fixture.input(3, ClientInput::Resize(65, 21));
+            fixture.assert_target_size(expected);
+            fixture.render();
+            fixture.assert_target_size(expected);
+            assert_eq!(fixture.foreground, None);
+            assert_eq!(fixture.clients[&3].last_frame.as_ref().unwrap().width, 65);
+
+            // A real command, unlike resize noise, transfers this workspace's
+            // viewport ownership. No key bytes are sent to a child process.
+            fixture.input(3, ClientInput::Command("new_tab".into()));
+            fixture.render();
+            let actual = fixture.app.panes[&fixture.target_pane()].size();
+            let area = ratatui::layout::Rect::new(0, 0, 65, 21);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+            let workspace = fixture.target_index();
+            crate::ui::render_workspace_interactive(&mut target, &mut fixture.app, workspace);
+            let promoted = fixture.app.panes[&fixture.target_pane()].size();
+            assert_ne!(promoted, expected);
+            assert_eq!(actual, promoted);
+        }
+
+        #[test]
+        fn workspace_projection_size_follows_actual_input_without_frame_resize_oscillation() {
+            let _env = crate::persist::test_env("projection-shared-workspace-size-owner");
+            let mut fixture = Fixture::new();
+            fixture.app.active_ws = fixture.target_index();
+            fixture.render();
+            let normal_size = fixture.app.panes[&fixture.target_pane()].size();
+            let normal_content = fixture.app.pane_content_rects.clone();
+            let normal_tabs = fixture.app.tab_rects.clone();
+
+            // Both viewports show the same workspace. Resize alone cannot
+            // override the more recently used ordinary foreground client.
+            fixture.input(2, ClientInput::Resize(147, 47));
+            fixture.assert_target_size(normal_size);
+            fixture.render();
+            fixture.assert_target_size(normal_size);
+
+            fixture.input(2, ClientInput::Command("next_tab".into()));
+            fixture.render();
+            let projected_size = fixture.app.panes[&fixture.target_pane()].size();
+            assert!(projected_size.0 > normal_size.0 && projected_size.1 > normal_size.1);
+            assert_eq!(fixture.foreground, Some(1));
+            assert_eq!(fixture.app.ws().id, fixture.workspace_id);
+            assert_eq!(fixture.app.pane_content_rects, normal_content);
+            assert_eq!(fixture.app.tab_rects, normal_tabs);
+
+            // Feed only an in-memory VT, never the child's input. A marker in
+            // the alternate-screen corner would be lost if every frame first
+            // shrank to the ordinary client and then grew to the projection.
+            fixture.app.panes[&fixture.target_pane()]
+                .engine
+                .lock()
+                .unwrap()
+                .advance(
+                    format!(
+                        "\x1b[?1049h\x1b[{};{}HZ",
+                        projected_size.1, projected_size.0
+                    )
+                    .as_bytes(),
+                );
+            for _ in 0..3 {
+                fixture.render();
+                fixture.assert_target_size(projected_size);
+                let engine = fixture.app.panes[&fixture.target_pane()]
+                    .engine
+                    .lock()
+                    .unwrap();
+                let mut corner = String::new();
+                engine.for_each_cell(&mut |row, col, symbol, _| {
+                    if row + 1 == projected_size.1 && col + 1 == projected_size.0 {
+                        corner.push_str(symbol);
+                    }
+                });
+                assert_eq!(corner, "Z", "passive frames must not shrink the shared VT");
+                assert_eq!(fixture.app.pane_content_rects, normal_content);
+            }
+
+            // An ordinary client command takes back PTY ownership immediately;
+            // subsequent projection resizes still cannot steal it.
+            fixture.input(1, ClientInput::Command("next_tab".into()));
+            fixture.assert_target_size(normal_size);
+            fixture.render();
+            fixture.input(2, ClientInput::Resize(155, 51));
+            fixture.render();
+            fixture.assert_target_size(normal_size);
+            assert_eq!(fixture.foreground, Some(1));
+        }
+    }
+
     #[test]
     fn workspace_projection_clients_never_take_whole_session_foreground() {
         let _env = crate::persist::test_env("server-workspace-projection-foreground");
@@ -1914,9 +2861,9 @@ mod tests {
         // Output may arrive while the reader's notification is already set.
         engine.lock().unwrap().advance(b"\x1b]2;finished\x07");
         app.panes[&hidden].mark_data_pending_for_test();
-        assert!(app.rearm_pty_notify_by_visibility().2);
+        assert!(app.rearm_pty_notify_by_visibility(|pane| app.pane_is_visible(pane)).2);
         app.panes[&hidden].mark_data_pending_for_test();
-        assert!(!app.rearm_pty_notify_by_visibility().2);
+        assert!(!app.rearm_pty_notify_by_visibility(|pane| app.pane_is_visible(pane)).2);
     }
 
     #[test]

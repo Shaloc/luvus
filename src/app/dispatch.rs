@@ -3091,7 +3091,7 @@ impl App {
                 match self
                     .workspaces
                     .iter()
-                    .position(|w| crate::platform::same_path(&w.cwd, &path))
+                    .position(|w| w.remote.is_none() && crate::platform::same_path(&w.cwd, &path))
                 {
                     Some(i) => {
                         self.forget_closed_workspace_path(&path);
@@ -3602,6 +3602,8 @@ impl App {
                                 "agent":agent.agent, "name":agent.name, "status":state_str(agent.state),
                                 "session":agent.session, "workspace":wi.to_string(), "workspace_name":ws.name,
                                 "workspace_id":ws.id,
+                                "owner_workspace_id":ws.remote.as_ref().map(|remote| &remote.workspace_id),
+                                "terminal_id":agent.terminal_id,
                                 "project":ws.name, "cwd":agent.cwd, "branch":ws.branch,
                                 "repo":ws.worktree.as_ref().map(|membership| &membership.common_dir),
                                 "worktree":ws.worktree.as_ref().is_some_and(|membership| membership.linked),
@@ -5081,7 +5083,7 @@ impl App {
             }
             // ── git (docs/17) — fast local-git reads + open the git tab ──
             "git.status" => {
-                let cwd = self.git_workspace_cwd(p);
+                let cwd = self.git_workspace_cwd(p)?;
                 let s = crate::git::local::status(&cwd).map_err(git_err)?;
                 let files = |v: &[crate::git::model::FileChange]| -> Vec<Value> {
                     v.iter()
@@ -5096,7 +5098,7 @@ impl App {
                 }))
             }
             "git.branches" => {
-                let cwd = self.git_workspace_cwd(p);
+                let cwd = self.git_workspace_cwd(p)?;
                 let v = crate::git::local::branches(&cwd).map_err(git_err)?;
                 let arr: Vec<Value> = v
                     .iter()
@@ -5105,7 +5107,7 @@ impl App {
                 Ok(json!({"type":"git_branches","branches":arr}))
             }
             "git.log" => {
-                let cwd = self.git_workspace_cwd(p);
+                let cwd = self.git_workspace_cwd(p)?;
                 let n = param_usize(p, "n").unwrap_or(30);
                 let v = crate::git::local::commits(&cwd, n, false).map_err(git_err)?;
                 let arr: Vec<Value> = v
@@ -5115,9 +5117,8 @@ impl App {
                 Ok(json!({"type":"git_log","commits":arr}))
             }
             "git.open" => {
-                let i = param_usize(p, "workspace")
-                    .or_else(|| param_usize(p, "node"))
-                    .unwrap_or(self.active_ws);
+                let i = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+                self.require_local_workspace(i)?;
                 self.open_git_tab(i);
                 Ok(json!({"type":"ok","git": self.active_is_git()}))
             }
@@ -5219,7 +5220,7 @@ impl App {
             }
             // ── worktrees (docs/18 WT-3) ──
             "worktree.list" => {
-                let cwd = self.git_workspace_cwd(p);
+                let cwd = self.git_workspace_cwd(p)?;
                 let v = crate::git::local::worktrees(&cwd).map_err(git_err)?;
                 let arr: Vec<Value> = v
                     .iter()
@@ -5231,7 +5232,7 @@ impl App {
             }
             "worktree.create" => {
                 let branch = p.get("branch").and_then(|v| v.as_str()).unwrap_or("");
-                let repo = self.git_workspace_cwd(p);
+                let repo = self.git_workspace_cwd(p)?;
                 let path = self.create_worktree(&repo, branch).map_err(git_err)?;
                 Ok(json!({"type":"ok","path": path.display().to_string()}))
             }
@@ -5268,7 +5269,7 @@ impl App {
                 if let Some(i) = self
                     .workspaces
                     .iter()
-                    .position(|w| crate::platform::same_path(&w.cwd, &path))
+                    .position(|w| w.remote.is_none() && crate::platform::same_path(&w.cwd, &path))
                 {
                     self.close_workspace(i);
                 }
@@ -5852,6 +5853,8 @@ impl App {
                                 "agent":status.map(|status| status.agent.clone()),
                                 "is_agent":status.is_some_and(|status| self.manifests.is_agent(&status.agent) || status.agent_session.is_some() || status.agent_report.is_some()),
                                 "agent_name":self.agent_name_for(pane_id),
+                                "agent_pinned":self.pinned_agents.contains(&pane_id),
+                                "workspace_focused":tab_index == workspace.active_tab && tab.layout.focus == pane_id,
                                 "agent_status":status.map(|status| state_str(status.state)),
                                 "agent_authority":status.map(|status| status.identity_source),
                                 "agent_session":status.and_then(|status| status.agent_session.as_ref().map(|session| session.session_id.clone())),
@@ -5886,6 +5889,8 @@ impl App {
                 "pinned":workspace.pinned,
                 "active":workspace_index == self.active_ws,
                 "tabs":tabs,
+                "agent_history":self.agent_history_rows(workspace_index),
+                "scheduled_agents":self.scheduled_agent_rows().into_iter().filter(|row| row.workspace_id == workspace.id).collect::<Vec<_>>(),
             }));
         }
         json!({
@@ -6750,7 +6755,11 @@ impl App {
         method: &str,
         p: &Value,
     ) -> Result<(), (String, String)> {
-        let pane_scoped = method.starts_with("pane.") || method == "attach.pane";
+        let pane_scoped = method.starts_with("pane.")
+            || matches!(
+                method,
+                "attach.pane" | "module.pane.focus" | "module.pane.close"
+            );
         let workspace_scoped = method.starts_with("tab.")
             || method == "task.start"
             || (method == "task.next" && p.get("start").and_then(Value::as_bool) == Some(true))
@@ -6767,30 +6776,75 @@ impl App {
                     | "workspace.report_metadata"
                     | "worktree.list"
                     | "worktree.create"
+                    | "worktree.open"
+                    | "worktree.remove"
                     | "mission.open"
                     | "module.pane.open"
             );
         if !pane_scoped && !workspace_scoped {
             return Ok(());
         }
+        // Only trust selectors the handler actually consumes. Legacy active-only
+        // methods must not validate one workspace and then mutate another.
+        let workspace_selected = matches!(
+            method,
+            "tab.get"
+                | "layout.export"
+                | "layout.apply"
+                | "layout.set_split_ratio"
+                | "workspace.rename"
+                | "node.rename"
+                | "workspace.report_metadata"
+                | "git.status"
+                | "git.branches"
+                | "git.log"
+                | "git.open"
+                | "worktree.list"
+                | "worktree.create"
+                | "mission.open"
+        );
+        let task_selected = matches!(method, "task.start" | "task.next");
+        for field in ["workspace", "node", "workspace_id"] {
+            if p.get(field).is_some()
+                && !workspace_selected
+                && !(task_selected && field == "workspace_id")
+            {
+                return Err((
+                    "invalid_request".into(),
+                    format!("{method} does not accept {field}"),
+                ));
+            }
+        }
         let workspace = if pane_scoped {
-            if let Some(value) = p.get("pane") {
-                value
-                    .as_str()
-                    .and_then(|value| value.parse::<u32>().ok())
-                    .or_else(|| value.as_u64().and_then(|value| u32::try_from(value).ok()))
-                    .and_then(|pane| self.pane_location(PaneId(pane)))
-                    .map(|(workspace, _)| workspace)
-            } else {
-                Some(self.active_ws)
+            match p.get("pane") {
+                None | Some(Value::Null) if self.workspaces.is_empty() => None,
+                None | Some(Value::Null) => Some(self.active_ws),
+                Some(value) => self
+                    .pane_location(PaneId(parse_u32_value(value, "pane")?))
+                    .map(|(workspace, _)| workspace),
             }
         } else {
-            Some(self.optional_socket_workspace(p)?.unwrap_or(self.active_ws))
+            match self.optional_socket_workspace(p)? {
+                Some(workspace) => Some(workspace),
+                // Starting a terminal from an empty session remains valid.
+                None if self.workspaces.is_empty() => None,
+                None => Some(self.active_ws),
+            }
         };
-        if let Some(remote) = workspace
-            .and_then(|workspace| self.workspaces.get(workspace))
-            .and_then(|workspace| workspace.remote.as_ref())
-        {
+        if let Some(workspace) = workspace {
+            self.require_local_workspace(workspace)?;
+        }
+        Ok(())
+    }
+
+    /// Validate an already resolved destination, including internal callers that
+    /// should not pretend to send a public API's workspace selector.
+    pub(super) fn require_local_workspace(&self, index: usize) -> Result<(), (String, String)> {
+        let workspace = self
+            .workspaces
+            .get(index)
+            .ok_or_else(|| workspace_update_error(index, WorkspaceUpdateError::NotFound))?;
+        if let Some(remote) = workspace.remote.as_ref() {
             return Err((
                 "remote_workspace".into(),
                 format!(
@@ -7099,15 +7153,12 @@ impl App {
         );
     }
 
-    /// The cwd of the `workspace` param (else the active workspace) for git.* methods.
-    fn git_workspace_cwd(&self, p: &Value) -> PathBuf {
-        let i = param_usize(p, "workspace")
-            .or_else(|| param_usize(p, "node"))
-            .unwrap_or(self.active_ws);
-        self.workspaces
-            .get(i)
-            .map(|w| w.cwd.clone())
-            .unwrap_or_else(|| self.ws().cwd.clone())
+    /// Git uses the same validated selector and owner as the API guard; an
+    /// invalid index or stable ID must never fall back to the active directory.
+    fn git_workspace_cwd(&self, p: &Value) -> Result<PathBuf, (String, String)> {
+        let index = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+        self.require_local_workspace(index)?;
+        Ok(self.workspaces[index].cwd.clone())
     }
 }
 
@@ -7720,6 +7771,16 @@ fn validate_automation_target(
     app: &App,
     input: &mut crate::automation::CreateAutomation,
 ) -> Result<(), (String, String)> {
+    if app
+        .workspaces
+        .iter()
+        .any(|workspace| workspace.id == input.task.workspace_id && workspace.remote.is_some())
+    {
+        app.check_remote_workspace_request(
+            "task.start",
+            &json!({"workspace_id":input.task.workspace_id}),
+        )?;
+    }
     if let crate::automation::AutomationTarget::ActiveAgent { .. } = &input.target {
         app.prepare_active_agent_target(&mut input.target, &mut input.task)?;
         return Ok(());
@@ -8404,6 +8465,188 @@ fn log_agent_authority(id: PaneId, agent: &str, outcome: crate::logging::Outcome
 mod tests {
     use super::*;
     use crate::app::App;
+
+    #[test]
+    fn owner_guard_blocks_null_and_module_pane_targets() {
+        let _env = crate::persist::test_env("remote-api-null-owner");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let (pane, _receiver, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        for (method, params) in [
+            ("pane.get", json!({"pane": null})),
+            ("pane.layout", json!({"pane": null})),
+            ("module.pane.focus", json!({})),
+            ("module.pane.focus", json!({"pane": null})),
+            ("module.pane.close", json!({"pane": pane.0.to_string()})),
+        ] {
+            let error = app.dispatch(method, &params).unwrap_err();
+            assert_eq!(error.0, "remote_workspace", "{method}: {params}");
+        }
+        assert!(app.panes.is_empty());
+        assert_eq!(app.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn owner_guard_rejects_ignored_workspace_selectors() {
+        let _env = crate::persist::test_env("remote-api-ignored-owner");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let local_id = app.workspaces[0].id.clone();
+        let (_pane, _receiver, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        for method in [
+            "tab.rename",
+            "tab.list",
+            "tab.new",
+            "tab.focus",
+            "tab.move",
+            "tab.swap",
+            "tab.close",
+            "workspace.new",
+            "node.new",
+            "files.open",
+            "files.tree",
+            "files.reveal",
+            "files.refresh",
+            "diff.list",
+            "diff.open",
+            "diff.refresh",
+            "diff.note.remove",
+            "worktree.open",
+            "worktree.remove",
+            "module.pane.open",
+        ] {
+            for selector in [
+                json!({"workspace": 0}),
+                json!({"workspace_id": local_id}),
+                json!({"node": 0}),
+            ] {
+                let mut params = selector;
+                params["name"] = json!("must-not-rename-the-projection");
+                let error = app.dispatch(method, &params).unwrap_err();
+                assert_eq!(error.0, "invalid_request", "{method}: {params}");
+            }
+        }
+        assert!(app.panes.is_empty());
+        assert_eq!(app.workspaces[1].tabs.len(), 1);
+        assert_eq!(app.workspaces[1].tabs[0].name, None);
+    }
+
+    #[test]
+    fn owner_guard_keeps_explicit_local_workspace_targets_and_rejects_invalid_indices() {
+        let _env = crate::persist::test_env("remote-api-explicit-owner");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let local_id = app.workspaces[0].id.clone();
+        let root = app.workspaces[0].cwd.clone();
+        std::fs::create_dir_all(&root).unwrap();
+        run_git(&root, &["init", "-q"]);
+        let (_pane, _receiver, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        app.workspaces[1].cwd = crate::persist::config_dir().join("absent-remote-checkout");
+        for selector in [
+            json!({"workspace":0}),
+            json!({"node":0}),
+            json!({"workspace_id":local_id}),
+        ] {
+            let result = app.dispatch("worktree.list", &selector).unwrap();
+            assert_eq!(result["worktrees"][0]["path"], root.display().to_string());
+        }
+        assert!(app
+            .dispatch("tab.get", &json!({"workspace_id":local_id}))
+            .is_ok());
+        for method in [
+            "git.status",
+            "git.branches",
+            "git.log",
+            "git.open",
+            "worktree.list",
+            "worktree.create",
+            "tab.get",
+            "mission.open",
+        ] {
+            for selector in [
+                json!({"workspace":1}),
+                json!({"workspace_id":app.workspaces[1].id}),
+            ] {
+                assert_eq!(
+                    app.dispatch(method, &selector).unwrap_err().0,
+                    "remote_workspace",
+                    "{method}: {selector}"
+                );
+            }
+            for selector in [json!({"workspace":999}), json!({"workspace_id":"missing"})] {
+                assert_eq!(
+                    app.dispatch(method, &selector).unwrap_err().0,
+                    "not_found",
+                    "{method}: {selector}"
+                );
+            }
+        }
+        assert_eq!(app.active_ws, 1);
+        assert!(app.panes.is_empty());
+    }
+
+    #[test]
+    fn opening_local_workspace_does_not_select_same_path_remote_projection() {
+        let _env = crate::persist::test_env("remote-api-local-path");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let path = app.workspaces[0].cwd.clone();
+        let local_id = app.workspaces[0].id.clone();
+        let (_pane, _receiver, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        app.workspaces[1].cwd = path.clone();
+        app.workspaces.swap(0, 1);
+        for method in ["workspace.open", "node.open"] {
+            app.active_ws = 0;
+            let result = app.dispatch(method, &json!({"path":path})).unwrap();
+            assert_eq!(result["workspace"], "1", "{method}");
+            assert_eq!(app.workspaces[app.active_ws].id, local_id);
+        }
+        assert!(app.panes.is_empty());
+        assert_eq!(app.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn removing_local_worktree_does_not_close_same_path_remote_projection() {
+        let _env = crate::persist::test_env("remote-api-worktree-path");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let repo = app.workspaces[0].cwd.clone();
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init", "-q"]);
+        run_git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Luvus Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+        );
+        let worktree = crate::persist::config_dir().join("local-worktree-only");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-qb",
+                "fixture-worktree",
+                worktree.to_str().unwrap(),
+            ],
+        );
+        app.workspaces[0].cwd = worktree.clone();
+        let (_pane, _receiver, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        app.workspaces[1].cwd = worktree.clone();
+        app.workspaces.swap(0, 1);
+        app.active_ws = 1;
+        app.dispatch("worktree.remove", &json!({"path":worktree}))
+            .unwrap();
+        assert_eq!(app.workspaces.len(), 1);
+        assert!(
+            app.workspaces[0].remote.is_some(),
+            "local removal must preserve the remote owner projection"
+        );
+        assert!(!worktree.exists());
+        assert!(app.panes.is_empty());
+    }
 
     fn run_git(repo: &std::path::Path, args: &[&str]) {
         let output = std::process::Command::new("git")

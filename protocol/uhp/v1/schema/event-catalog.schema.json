@@ -10,6 +10,8 @@
     "agent.authority_released",
     "agent.authority_reported",
     "agent.hook",
+    "agent.history_changed",
+    "agent.pin_changed",
     "automation.created",
     "automation.deleted",
     "automation.disabled",
@@ -75,6 +77,8 @@
     "agent.authority_released": { "$ref": "#/$defs/authority_released" },
     "agent.authority_reported": { "$ref": "#/$defs/authority_reported" },
     "agent.hook": { "$ref": "#/$defs/agent_hook" },
+    "agent.history_changed": { "$ref": "#/$defs/empty" },
+    "agent.pin_changed": { "$ref": "#/$defs/agent_pin" },
     "automation.created": { "$ref": "#/$defs/automation_definition" },
     "automation.deleted": { "$ref": "#/$defs/id_only" },
     "automation.disabled": { "$ref": "#/$defs/automation_definition" },
@@ -137,6 +141,15 @@
     "workspace.renamed": { "$ref": "#/$defs/workspace_renamed" }
   },
   "$defs": {
+    "agent_pin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pane", "pinned"],
+      "properties": {
+        "pane": { "type": "string" },
+        "pinned": { "type": "boolean" }
+      }
+    },
     "automation_definition": {
       "type": "object",
       "additionalProperties": false,

@@ -4,6 +4,37 @@
 use super::*;
 use crate::app::SidebarListFocus;
 
+/// A projected owner may expose extension widgets without duplicating local
+/// status guidance or version chrome. Actions still run in the owning App.
+pub(super) fn draw_owner_bar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
+    if area.height == 0 {
+        return;
+    }
+    let (hits, overflow) = {
+        let mut candidates =
+            app.bar
+                .widgets_for(crate::bar::BarRegion::BottomRight, &app.config.bars, false);
+        candidates.retain(|candidate| candidate.widget.key.owner != "core");
+        let layout = crate::bar::compose(
+            &candidates,
+            area.width.min(crate::bar::MAX_BAR_REGION_WIDTH),
+            crate::bar::MAX_BAR_WIDGET_WIDTH,
+        );
+        crate::bar::render::draw_region(
+            f,
+            area,
+            crate::bar::BarRegion::BottomRight,
+            &candidates,
+            &layout,
+            t,
+        )
+    };
+    app.bar.hits.extend(hits);
+    if let Some(overflow) = overflow {
+        app.bar.overflow_hits.push(overflow);
+    }
+}
+
 pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
     if area.height == 0 {
         return;
@@ -179,6 +210,25 @@ fn fixed_guidance(app: &App, t: &Theme, budget: u16) -> (Line<'static>, bool) {
 
     let key = |command: crate::app::Cmd| app.key_for(command);
     let prefix = app.prefix.label();
+    if let Some(owner) = app
+        .workspaces
+        .get(app.active_ws)
+        .and_then(|workspace| workspace.remote.as_ref())
+    {
+        left.push(mode_label(cat.remote_session, t));
+        left.push(Span::raw("  "));
+        let chord = if app.mode == Mode::Prefix {
+            "?".to_string()
+        } else {
+            format!("{prefix} ?")
+        };
+        left.extend(hint(&chord, cat.all_shortcuts, t));
+        left.push(Span::styled(
+            format!("{} / {}", owner.host, owner.session),
+            Style::new().fg(t.accent),
+        ));
+        return (Line::from(left), true);
+    }
     if app.mode == Mode::Prefix {
         left.push(mode_label(cat.mode_prefix, t));
         left.push(Span::raw("  "));
@@ -284,6 +334,36 @@ mod tests {
         (0..buffer.area.width)
             .map(|x| buffer.cell((x, y)).map_or(" ", |cell| cell.symbol()))
             .collect()
+    }
+
+    #[test]
+    fn remote_status_identifies_owner_and_prefix_without_leaking_to_local_workspace() {
+        let _env = crate::persist::test_env("remote-status-owner");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let (_, _receiver, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        assert!(app.set_prefix("ctrl+b"));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        for mode in [Mode::Normal, Mode::Prefix] {
+            app.mode = mode;
+            terminal
+                .draw(|frame| crate::ui::render(frame, &mut app))
+                .unwrap();
+            let status = row(&terminal, 29);
+            assert!(
+                status.contains("remote") && status.contains("dev-207 / api"),
+                "{status}"
+            );
+            assert!(status.contains('?'), "{status}");
+            if mode == Mode::Normal {
+                assert!(status.contains(&app.prefix.label()), "{status}");
+            }
+        }
+        app.active_ws = 0;
+        app.mode = Mode::Normal;
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        assert!(!row(&terminal, 29).contains("dev-207"));
     }
 
     #[test]
