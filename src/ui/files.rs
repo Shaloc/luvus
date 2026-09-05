@@ -27,6 +27,17 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
     app.file_tree_rects.clear();
     app.files_mode_rects.clear();
     app.diff_row_rects.clear();
+    if let Some(remote) = &app.ws().remote {
+        f.render_widget(
+            Paragraph::new(format!(
+                "[{}] {}",
+                remote.host, app.catalog.cmd_toggle_files
+            ))
+            .style(Style::new().fg(t.subtext1)),
+            area,
+        );
+        return;
+    }
 
     let cx = area.x + 2;
     let cw = area.width.saturating_sub(3);

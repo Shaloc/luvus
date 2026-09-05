@@ -21,6 +21,14 @@ fn attention(s: State) -> u8 {
 fn rollup(app: &App, ws_index: usize) -> State {
     let mut best = State::Idle;
     if let Some(ws) = app.workspaces.get(ws_index) {
+        if let Some(view) = app.remote_workspace_view(ws_index) {
+            return view
+                .agents
+                .iter()
+                .map(|agent| agent.state)
+                .max_by_key(|state| attention(*state))
+                .unwrap_or(State::Idle);
+        }
         for tab in &ws.tabs {
             for id in tab.layout.leaves() {
                 let s = pane_state(app, id);
@@ -47,6 +55,11 @@ pub(super) type SidebarHits = (
 /// Clickable geometry a single dock reports back to the container.
 type WorkspaceHits = (Vec<(usize, Rect)>, Option<Rect>);
 type AgentHits = (Vec<(PaneId, Rect)>, Vec<(String, Rect)>, Vec<(usize, Rect)>);
+
+enum AgentDockRow {
+    Local(PaneId, String),
+    Remote(usize, usize),
+}
 
 /// Rows of sidebar chrome above the dock stack: the brand/menu row plus one
 /// blank separator row. The dock body, and therefore dock-height measurement
@@ -374,10 +387,7 @@ fn draw_named_session_button(
     t: &Theme,
 ) {
     let available = right.saturating_sub(x);
-    let name = crate::ui::truncate(
-        &crate::session::display_name(),
-        available.saturating_sub(2) as usize,
-    );
+    let name = crate::ui::truncate(&app.session_label(), available.saturating_sub(2) as usize);
     // Symmetric padding makes the hover/open highlight read as a compact pill
     // without relying on a dropdown glyph or letting the text touch its edges.
     let label = format!(" {name} ");
@@ -483,22 +493,30 @@ fn draw_workspaces_dock(
         // it can't share the row, and the branch is fitted (then ellipsized, then
         // dropped) into whatever space is left, so the row never hard-cuts.
         let avail = (cw as usize).saturating_sub(indent as usize + 2);
-        let name_w = crate::ui::display_width(&ws.name);
+        let display_name = match &ws.remote {
+            Some(remote) => {
+                let tag = format!(" [{}]", remote.host);
+                let budget = avail.saturating_sub(crate::ui::display_width(&tag));
+                format!("{}{}", crate::ui::truncate(&ws.name, budget), tag)
+            }
+            None => ws.name.clone(),
+        };
+        let name_w = crate::ui::display_width(&display_name);
         let (name_disp, branch_disp) = match &ws.branch {
             Some(b) => {
                 let branch_seg = 2 + crate::ui::display_width(b); // "  branch"
                 if name_w + branch_seg <= avail {
-                    (ws.name.clone(), Some(b.clone()))
+                    (display_name.clone(), Some(b.clone()))
                 } else if name_w + 4 <= avail {
                     (
-                        ws.name.clone(),
+                        display_name.clone(),
                         Some(crate::ui::truncate(b, avail - name_w - 2)),
                     )
                 } else {
-                    (crate::ui::truncate(&ws.name, avail), None)
+                    (crate::ui::truncate(&display_name, avail), None)
                 }
             }
-            None => (crate::ui::truncate(&ws.name, avail), None),
+            None => (crate::ui::truncate(&display_name, avail), None),
         };
         let mut line1: Vec<Span> = Vec::new();
         if is_member {
@@ -624,10 +642,21 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     // The row's second line is `workspace · mention`, where the mention is how you
     // delegate to the pane (`=name` or `=<id>`). The tab is intentionally dropped here
     // in favor of the pane token, which is what a script or delegation needs.
-    let mut live: Vec<(PaneId, String)> = Vec::new();
+    let mut live = Vec::new();
+    let mut remote_blocked_elsewhere = Vec::new();
     let mut blocked_elsewhere: Vec<PaneId> = Vec::new();
     for (wi, ws) in app.workspaces.iter().enumerate() {
         let visible = !scoped || wi == app.active_ws;
+        if let Some(view) = app.remote_workspace_view(wi) {
+            for (agent_index, agent) in view.agents.iter().enumerate() {
+                if visible {
+                    live.push(AgentDockRow::Remote(wi, agent_index));
+                } else if agent.state == State::Blocked {
+                    remote_blocked_elsewhere.push((view.target.clone(), agent.pane.clone()));
+                }
+            }
+            continue;
+        }
         for tab in &ws.tabs {
             for id in tab.layout.leaves() {
                 if let Some(s) = app.status.get(&id) {
@@ -636,7 +665,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         continue;
                     }
                     if visible {
-                        live.push((id, ws.name.clone()));
+                        live.push(AgentDockRow::Local(id, ws.name.clone()));
                     } else if s.state == State::Blocked {
                         blocked_elsewhere.push(id);
                     }
@@ -649,7 +678,9 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     // is the common case: the sort itself is cheap, but it does a hash lookup per
     // comparison and this runs on every frame the dock is drawn.
     if !app.pinned_agents.is_empty() {
-        live.sort_by_key(|(id, _)| !app.pinned_agents.contains(id));
+        live.sort_by_key(
+            |row| !matches!(row, AgentDockRow::Local(id, _) if app.pinned_agents.contains(id)),
+        );
     }
     // Armed definitions appear in Active as lightweight placeholders. Their
     // hit target opens read-only automation detail rather than focusing a pane.
@@ -725,7 +756,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         app.workspaces
             .iter()
             .enumerate()
-            .filter(|(_, ws)| crate::platform::is_subpath(cwd, &ws.cwd))
+            .filter(|(_, ws)| ws.remote.is_none() && crate::platform::is_subpath(cwd, &ws.cwd))
             .max_by_key(|(_, ws)| ws.cwd.as_os_str().len())
             .map(|(wi, _)| wi)
     };
@@ -752,7 +783,8 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let atotal = live.len() + scheduled.len() + resumable_total;
     // The overflow line is always visible while attention is hidden, even if no
     // local rows exist. Reserve exactly one terminal row for it.
-    let has_elsewhere = scoped && !blocked_elsewhere.is_empty();
+    let blocked_count = blocked_elsewhere.len() + remote_blocked_elsewhere.len();
+    let has_elsewhere = scoped && blocked_count > 0;
     let keyboard_focused = app.sidebar_focus == Some(SidebarListFocus::Agents);
     let keyboard_total = atotal + usize::from(has_elsewhere);
     app.agent_cursor = app.agent_cursor.min(keyboard_total.saturating_sub(1));
@@ -785,22 +817,56 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         for (vi, k) in (ascroll..atotal).take(acap).enumerate() {
             let y = alist_top + vi as u16 * row_stride;
             let selected = keyboard_focused && app.agent_cursor == k;
-            if let Some((id, wsname)) = live.get(k) {
-                // A live agent: runtime status + which workspace it runs in.
-                let id = *id;
-                let focused = id == focus;
-                let st = pane_state(app, id);
-                let agent = app
-                    .status
-                    .get(&id)
-                    .map(|s| s.agent.clone())
-                    .unwrap_or_default();
+            if let Some(row) = live.get(k) {
+                let rect = Rect::new(area.x, y, area.width, row_stride);
+                let (st, agent, focused, meta) = match row {
+                    AgentDockRow::Local(id, wsname) => {
+                        agent_rects.push((*id, rect));
+                        let mention = app
+                            .agent_name_for(*id)
+                            .map(|name| format!("={name}"))
+                            .unwrap_or_else(|| format!("={}", id.0));
+                        let meta = app
+                            .config
+                            .layout
+                            .agent_title
+                            .then(|| app.pane_title(*id))
+                            .flatten()
+                            .map(|title| format!("  {title}"))
+                            .unwrap_or_else(|| format!("  {wsname} · {mention}"));
+                        (
+                            pane_state(app, *id),
+                            app.status
+                                .get(id)
+                                .map(|s| s.agent.clone())
+                                .unwrap_or_default(),
+                            *id == focus,
+                            meta,
+                        )
+                    }
+                    AgentDockRow::Remote(workspace_index, agent_index) => {
+                        let view = app.remote_workspace_view(*workspace_index).unwrap();
+                        let target = &view.target;
+                        let agent = &view.agents[*agent_index];
+                        let wsname = &app.workspaces[*workspace_index].name;
+                        let focused = app.workspaces[app.active_ws].remote.as_ref() == Some(target)
+                            && agent.focused;
+                        let meta = format!(
+                            "  [{}] {wsname} · ={}",
+                            target.host,
+                            agent.name.as_deref().unwrap_or(&agent.pane)
+                        );
+                        let presentation = (agent.state, agent.agent.clone(), focused, meta);
+                        let hit = (target.clone(), agent.pane.clone(), rect);
+                        app.remote_agent_rects.push(hit);
+                        presentation
+                    }
+                };
                 let name_style = if focused {
                     Style::new().fg(t.accent).bold()
                 } else {
                     Style::new().fg(t.subtext1)
                 };
-                agent_rects.push((id, Rect::new(area.x, y, area.width, row_stride)));
                 // Working stays visually prominent without scheduling animation
                 // frames while the agent is busy.
                 let dot = st.dot();
@@ -817,23 +883,6 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     ]),
                 );
                 if paths_visible {
-                    // Row 2: project + how to mention this pane, styled exactly
-                    // like a workspace's path row. The trailing token is the
-                    // pane's live alias (`=name`) or its pane id (`=3`).
-                    let mention = app
-                        .agent_name_for(id)
-                        .map(|n| format!("={n}"))
-                        .unwrap_or_else(|| format!("={}", id.0));
-                    // When enabled, show the live OSC title in place of the meta
-                    // line; fall back when the agent set no useful title.
-                    let meta = app
-                        .config
-                        .layout
-                        .agent_title
-                        .then(|| app.pane_title(id))
-                        .flatten()
-                        .map(|ttl| format!("  {ttl}"))
-                        .unwrap_or_else(|| format!("  {wsname} · {mention}"));
                     line_at(
                         f,
                         y + 1,
@@ -963,7 +1012,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         if y >= alist_top {
             let text = cat
                 .blocked_elsewhere
-                .replace("{n}", &blocked_elsewhere.len().to_string());
+                .replace("{n}", &blocked_count.to_string());
             let state = State::Blocked;
             let dot = state.dot();
             let prefix_width = crate::ui::display_width(dot) + 1;
@@ -979,8 +1028,13 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     ),
                 ]),
             );
-            app.agents_elsewhere_rect =
-                Some((blocked_elsewhere[0], Rect::new(area.x, y, area.width, 1)));
+            let rect = Rect::new(area.x, y, area.width, 1);
+            if let Some(id) = blocked_elsewhere.first() {
+                app.agents_elsewhere_rect = Some((*id, rect));
+            } else if let Some((target, pane)) = remote_blocked_elsewhere.first() {
+                app.remote_agent_rects
+                    .push((target.clone(), pane.clone(), rect));
+            }
             if keyboard_focused && app.agent_cursor == atotal {
                 f.buffer_mut().set_style(
                     Rect::new(area.x, y, area.width.saturating_sub(1), 1),
@@ -1383,6 +1437,22 @@ mod tests {
             !sidebar.contains(long),
             "the full over-long name is never rendered in the sidebar"
         );
+    }
+
+    #[test]
+    fn remote_workspace_name_keeps_the_ssh_host_alias_tag() {
+        let _env = crate::persist::test_env("sidebar-remote-host-tag");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.workspaces[0].name = "api".into();
+        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
+            host: "dev-207".into(),
+            session: "api".into(),
+            workspace_id: "workspace_remote".into(),
+        });
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "api [dev-207]"));
     }
 
     // The focused agent's "project · =pane" line sits on the selection

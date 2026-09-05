@@ -1059,6 +1059,7 @@ mod tests {
                 tabs: vec![Tab::panes(TileLayout::new(focus))],
                 active_tab: 0,
                 pinned: position == 3,
+                remote: None,
             });
         }
         app.workspaces[2]

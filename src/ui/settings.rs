@@ -325,6 +325,90 @@ fn draw_content(
     let mut resolved_layout_scroll = layout_scroll;
     let cat = app.catalog;
     match tab {
+        SettingsTab::Remote => {
+            ctls.push(ctl_row(
+                f,
+                area,
+                area.y,
+                0,
+                cursor,
+                cat.session_merge,
+                toggle(app.remote_merge_enabled, t),
+                t,
+            ));
+            f.render_widget(
+                Paragraph::new(cat.settings.remote_hosts_hint).style(Style::new().fg(t.overlay1)),
+                Rect::new(
+                    area.x,
+                    area.y + 1,
+                    area.width,
+                    area.height.saturating_sub(1).min(2),
+                ),
+            );
+            let content = Rect::new(
+                area.x,
+                area.y + area.height.min(3),
+                area.width,
+                area.height.saturating_sub(3),
+            );
+            let result = app
+                .settings
+                .as_ref()
+                .and_then(|ui| ui.remote_hosts.as_ref());
+            let hosts = match result {
+                Some(Ok(hosts)) if !hosts.is_empty() => Some(hosts),
+                _ => None,
+            };
+            if let Some(hosts) = hosts {
+                let avail = content.height as usize;
+                let scroll = cursor
+                    .saturating_sub(1)
+                    .saturating_sub(avail.saturating_sub(1));
+                for (index, host) in hosts.iter().enumerate().skip(scroll).take(avail) {
+                    let selected = app.config.remote_hosts.contains(host);
+                    ctls.push(ctl_row(
+                        f,
+                        content,
+                        content.y + (index - scroll) as u16,
+                        index + 1,
+                        cursor,
+                        host,
+                        Line::from(Span::styled(
+                            if !selected {
+                                "[ ]".to_string()
+                            } else {
+                                match app
+                                    .remote_host_status
+                                    .iter()
+                                    .find(|status| status.host == *host)
+                                {
+                                    Some(status) if status.error.is_some() => format!(
+                                        "[!] {}",
+                                        status.error.as_deref().unwrap_or_default()
+                                    ),
+                                    Some(status) if !status.sessions.is_empty() => {
+                                        format!("[✓] {}", status.sessions.len())
+                                    }
+                                    _ => "[…]".to_string(),
+                                }
+                            },
+                            Style::new().fg(if selected { t.mint } else { t.overlay0 }),
+                        )),
+                        t,
+                    ));
+                }
+            } else {
+                let message = match result {
+                    None => cat.settings.remote_hosts_loading,
+                    Some(Err(error)) => error.as_str(),
+                    Some(Ok(_)) => cat.settings.remote_hosts_empty,
+                };
+                f.render_widget(
+                    Paragraph::new(message).style(Style::new().fg(t.overlay1)),
+                    content,
+                );
+            }
+        }
         SettingsTab::Theme => {
             // Scroll the list so the selected theme is always visible (there are
             // more palettes than fit a short modal).
@@ -1739,8 +1823,12 @@ mod tests {
         let narrow_buffer = terminal.backend().buffer();
         for pair in app.settings_tab_rects.windows(2) {
             let separator_x = pair[0].1.right();
-            assert_eq!(pair[1].1.x.saturating_sub(separator_x), 3);
-            assert_eq!(narrow_buffer[(separator_x + 1, pair[0].1.y)].symbol(), "·");
+            let width = pair[1].1.x.saturating_sub(separator_x);
+            assert!(matches!(width, 1 | 3));
+            assert_eq!(
+                narrow_buffer[(separator_x + width / 2, pair[0].1.y)].symbol(),
+                "·"
+            );
         }
         assert!(app
             .settings_tab_rects

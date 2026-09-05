@@ -8,9 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
-#[cfg(windows)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use interprocess::local_socket::prelude::*;
@@ -105,9 +103,64 @@ pub enum TimeoutMode {
     Nonblocking,
 }
 
+/// A single-reader borrow for an absolute-deadline protocol transaction. It
+/// preserves partial reads, so existing binary decoders can use `read_exact`
+/// without resetting their deadline or adding a detached timeout worker.
+pub struct DeadlineReader<'a> {
+    stream: &'a mut Conn,
+    deadline: Instant,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::TimedOut, "protocol read timed out")
+                })?;
+            #[cfg(windows)]
+            if !self.stream.recv_has_data()? {
+                std::thread::sleep(remaining.min(Duration::from_millis(10)));
+                continue;
+            }
+            #[cfg(not(windows))]
+            let _mode = self.stream.set_recv_timeout(remaining)?;
+            match self.stream.read(buf) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error)
+                    if error.kind() == io::ErrorKind::TimedOut
+                        || nonblocking_read_pending(&error) =>
+                {
+                    std::thread::sleep(
+                        self.deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(Duration::from_millis(10)),
+                    );
+                }
+                result => return result,
+            }
+        }
+    }
+}
+
 impl Conn {
     fn new(stream: Stream) -> Self {
         Conn(Arc::new(stream))
+    }
+
+    /// Named pipes remain blocking: poll their byte availability before each
+    /// read instead of enabling PIPE_NOWAIT, including after handshake writes.
+    pub fn deadline_reader(&mut self, deadline: Instant) -> DeadlineReader<'_> {
+        DeadlineReader {
+            stream: self,
+            deadline,
+        }
     }
 
     /// Bound control-plane requests such as cross-session search. Unix local
@@ -124,6 +177,18 @@ impl Conn {
                 TimeoutMode::Kernel
             },
         )
+    }
+
+    /// Return a bounded handshake connection to long-lived display mode.
+    pub fn clear_timeouts(&self) -> io::Result<()> {
+        #[cfg(not(windows))]
+        {
+            use interprocess::local_socket::traits::Stream as _;
+            self.0.set_recv_timeout(None)?;
+            self.0.set_send_timeout(None)?;
+            self.set_blocking()?;
+        }
+        Ok(())
     }
 
     pub fn set_recv_timeout(&self, timeout: Duration) -> io::Result<TimeoutMode> {

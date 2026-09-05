@@ -2120,6 +2120,7 @@ mod tests {
             tabs: vec![Tab::panes(TileLayout::new(id))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
         app.workspaces.len() - 1
     }

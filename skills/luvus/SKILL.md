@@ -103,6 +103,7 @@ luvus session attach <name>
 luvus session stop <name>
 luvus session delete <name>
 luvus --session <name> pane list
+luvus server restart --all [--json]
 ```
 
 `session attach` launches or attaches the TUI. Never run it merely to test
@@ -110,6 +111,73 @@ whether a session exists. `session stop` ends every pane in that named server.
 Before deletion, list sessions once, require the exact stopped name, and obtain
 clear authorization. Never delete `default` and never substitute workspace
 commands for server-session commands.
+
+Bare `server restart` restarts only the selected session. `server restart --all`
+restarts all running sessions in this machine's selected
+`LUVUS_HOME`, leaving stopped sessions stopped. It ends their live pane
+processes before restoring snapshots; use a terminal outside the affected
+sessions, and require explicit authorization for the whole batch. Individual
+failures are reported while the remaining sessions are attempted.
+`--host <host> server restart --all` targets only that enabled SSH host;
+without `--host`, remote owners are not restarted. `--session` does not limit
+an explicit `--all` batch.
+
+### Manage SSH remote sessions
+
+A managed remote session is displayed locally but owned by a Luvus server on
+one literal `Host` alias from `~/.ssh/config`. The UI shows its actual session
+name with remote/host tags. The legacy CLI routing name remains
+`remote-<host>-<actual-session-name>`. Use a host only when the human supplied
+that exact alias or an unambiguous canonical name resolves to it; never
+choose the first SSH host as a guess.
+
+The host must also be explicitly enabled in **Settings → Remote**
+(`config.remote_hosts`, empty by default). Never enable all SSH config entries
+or bypass a disabled host with raw SSH. Selecting a host connects and discovers
+its sessions. Opening the switcher (or pressing `r`) refreshes discovery;
+there is no idle polling. Newly created remote sessions need no registration.
+
+```sh
+luvus session remote list
+luvus session remote add <host> <actual-session-name> [--merge]
+luvus session attach remote-<host>-<actual-session-name>
+luvus --host <host> --session <actual-session-name> pane list
+luvus --host <host> --session <actual-session-name> worktree list
+luvus session merge on|off
+```
+
+`remote add` starts or reuses the remote session and requires the exact same remote-session-enabled Luvus build
+on the host. Report its install/update diagnostic as returned. Never copy or
+install the binary on the host unless the human separately authorizes that
+action. Merge mode displays the local session and all discovered same-name
+remote workspaces; a `[host]` tag identifies each remote owner.
+`session merge` and registration changes refresh an already-running local
+server; no restart is needed. Disabling a host or merge removes local
+projections and disconnects their bridges without stopping remote panes.
+Managed attaches retain the local session switcher and local prefix, even when
+the remote prefix differs. Settings → Remote has one global merge toggle:
+when enabled, every same-name local/remote session group merges automatically.
+The CLI `session merge on|off` controls the same global preference. This is
+display federation, not Git merge.
+With `--host`, `--session` is always the actual remote name, including names
+that themselves start with `remote-`. Without `--host`, use the canonical name.
+
+The workspace menu's Open worktree lists branches and owner-host paths before
+offering manual folder browsing. Ctrl+V reads an available image on the display
+client, sends its bytes to the pane owner, and pastes an owner-local private file
+path. It never pastes a client-only path into a remote pane. A headless SSH
+client in Kitty can use the optional official `kitten clipboard` executable
+on the display-client host to request desktop PNG data over OSC 5522. Kitty
+must permit the clipboard read; Luvus never bypasses its prompt. Without native
+clipboard access or this helper, normal text and Ctrl+Enter remain unchanged.
+Merged `agent list` rows include `host`, `owner_session`, and `owner_pane`;
+use those owner selectors for follow-up commands, not the qualified local row ID.
+
+For every related server-backed command, preserve the same `--host` and
+`--session` selectors. Put them before `agent prompt`, `agent send`, `pane run`,
+and other free-text or pass-through commands so payload text containing the
+literal `--host` is not reinterpreted. `--remote` is a raw interactive SSH
+attach escape hatch, not a managed CLI-control selector.
 
 ## Use the fast command path
 

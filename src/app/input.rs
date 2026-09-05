@@ -303,6 +303,14 @@ fn copy_link_at_grid(
 
 impl App {
     fn handle_api_request(&mut self, req: crate::ipc::api::ApiRequest) -> bool {
+        if let Err((code, message)) = self.check_remote_workspace_request(&req.method, &req.params)
+        {
+            let _ = req.reply.send(
+                serde_json::json!({"id":req.id,"error":{"code":code,"message":message}})
+                    .to_string(),
+            );
+            return false;
+        }
         if req.method == "terminal.backend.create" {
             self.start_backend_create(req);
             return true;
@@ -536,12 +544,108 @@ impl App {
                 self.apply_named_sessions_loaded(generation, result);
                 return true;
             }
+            AppEvent::ClipboardImageReady { pane, result } => {
+                match result {
+                    Ok(path) => {
+                        if self.panes.contains_key(&pane) {
+                            // Capture the destination before IO: a later focus
+                            // change must never redirect this attachment.
+                            self.paste_into_pane(
+                                pane,
+                                &format!("'{}' ", path.to_string_lossy().replace('\'', "'\\''")),
+                            );
+                        } else {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                    Err(error) => self.show_toast(error),
+                }
+                return true;
+            }
             AppEvent::NamedSessionPrepared {
                 generation,
-                name,
+                action,
                 result,
             } => {
-                self.apply_named_session_prepared(generation, name, result);
+                self.apply_named_session_prepared(generation, action, result);
+                return true;
+            }
+            AppEvent::SettingsRemoteHostsLoaded { generation, result } => {
+                self.apply_settings_remote_hosts_loaded(generation, result);
+                return true;
+            }
+            AppEvent::WorktreeChoicesLoaded { generation, result } => {
+                self.apply_worktree_choices(generation, result);
+                return true;
+            }
+            AppEvent::RemoteRegistryLoaded {
+                generation,
+                registry,
+                hosts,
+            } => {
+                if generation == self.remote_registry_generation {
+                    self.remote_host_status = hosts;
+                }
+                self.apply_remote_registry_loaded(generation, registry);
+                return true;
+            }
+            AppEvent::RemoteMergeChanged { generation, result } => {
+                if generation == self.remote_registry_generation {
+                    match result {
+                        Ok(Some(name)) => self.pending_session_switch = Some(name),
+                        Ok(None) => {}
+                        Err(error) => self.show_toast(error),
+                    }
+                }
+                return true;
+            }
+            AppEvent::RemoteSessionDiscovered {
+                generation,
+                target,
+                result,
+            } => {
+                if self.remote_watcher_is_current(&target, generation) {
+                    self.apply_remote_session_discovered(target, result);
+                }
+                return true;
+            }
+            AppEvent::RemoteSessionWatcherClosed {
+                generation,
+                target,
+                error,
+            } => {
+                if self.remote_watcher_is_current(&target, generation) {
+                    self.apply_remote_session_watcher_closed(target, error);
+                }
+                return true;
+            }
+            AppEvent::RemoteProjectionReady {
+                pane,
+                generation,
+                input,
+            } => {
+                self.apply_remote_projection_ready(pane, generation, input);
+                self.finish_remote_workspace_picker();
+                return true;
+            }
+            AppEvent::RemoteFrameAvailable {
+                pane,
+                generation,
+                slot,
+            } => {
+                self.apply_remote_frame(pane, generation, &slot);
+                return true;
+            }
+            AppEvent::RemoteProjectionClosed {
+                pane,
+                generation,
+                error,
+            } => {
+                self.apply_remote_projection_closed(pane, generation, error);
+                return true;
+            }
+            AppEvent::RemoteEffect { effect } => {
+                self.apply_remote_effect(effect);
                 return true;
             }
             AppEvent::NamedSessionStopped {
@@ -560,6 +664,22 @@ impl App {
         // exceptional recovery path from dropping replies or indexing a layout.
         if self.workspaces.is_empty() {
             match ev {
+                AppEvent::ClientCommand(command) if command == "open_local_workspace" => {
+                    self.open_local_folder_picker();
+                    return true;
+                }
+                AppEvent::Key(key) if self.picker.is_some() => {
+                    self.handle_picker_key(key);
+                    return true;
+                }
+                AppEvent::Paste(text) if self.picker.is_some() => {
+                    self.picker_paste(&text);
+                    return true;
+                }
+                AppEvent::Mouse(mouse) if self.picker.is_some() => {
+                    self.apply_mouse(mouse);
+                    return true;
+                }
                 AppEvent::ThemeReloaded {
                     id,
                     registry,
@@ -657,7 +777,70 @@ impl App {
             }
         }
         match ev {
+            AppEvent::ClipboardImage(image) => {
+                if !image.valid()
+                    || self.copy_mode.is_some()
+                    || self.scroll_pane.is_some()
+                    || self.mode != Mode::Normal
+                    || self.paste_into_modal("")
+                {
+                    return true;
+                }
+                if self.active_remote_pane().is_some() {
+                    self.send_active_remote(crate::ipc::protocol::ClientMessage::ClipboardImage(
+                        image,
+                    ));
+                    return false;
+                }
+                let pane = self.layout().focus;
+                if !self.panes.contains_key(&pane) {
+                    return false;
+                }
+                let tx = self.app_tx.clone();
+                std::thread::spawn(move || {
+                    let result = crate::terminal::clipboard::stage(&image);
+                    let _ = tx.send(AppEvent::ClipboardImageReady { pane, result });
+                });
+                false
+            }
             AppEvent::Key(k) => self.handle_key(k),
+            AppEvent::ClientCommand(command) => {
+                if let Some((action, pane)) = command.split_once(' ').filter(|(action, _)| {
+                    matches!(*action, "remote_agent_focus" | "remote_agent_menu")
+                }) {
+                    if let Ok(id) = pane.parse::<u32>() {
+                        let id = PaneId(id);
+                        if self
+                            .ws()
+                            .tabs
+                            .iter()
+                            .any(|tab| tab.layout.leaves().contains(&id))
+                        {
+                            self.focus_pane_global(id);
+                            if action == "remote_agent_menu" {
+                                self.open_agent_menu(AgentTarget::Live(id), 2, 2);
+                            }
+                        }
+                    }
+                } else if command == "open_local_workspace" {
+                    self.open_local_folder_picker();
+                } else if command == "open_worktree" {
+                    self.open_worktree_picker_at(self.ws().cwd.clone());
+                } else if command == "delete_worktree" {
+                    if self.ws().remote.is_none()
+                        && self.ws().worktree.as_ref().is_some_and(|w| w.linked)
+                    {
+                        self.worktree_delete = Some(self.ws().id.clone());
+                    }
+                } else if command == "rename_workspace" {
+                    self.open_ws_rename(self.active_ws);
+                } else if let Some(command) =
+                    Cmd::ALL.iter().find(|cmd| cmd.id() == command).copied()
+                {
+                    self.run_cmd(command);
+                }
+                true
+            }
             AppEvent::Mouse(m) => self.handle_mouse(m),
             AppEvent::Paste(s) => {
                 // Copy mode owns input just like scroll mode: never leak a
@@ -669,6 +852,9 @@ impl App {
                 // rename prompt, …) fills that field, not the pane underneath.
                 if self.paste_into_modal(&s) {
                     return true; // the modal buffer changed → redraw
+                }
+                if self.send_active_remote(crate::ipc::protocol::ClientMessage::Paste(s.clone())) {
+                    return false;
                 }
                 // Otherwise it goes to the focused pane.
                 self.paste_into_focused_pane(&s);
@@ -1080,7 +1266,18 @@ impl App {
             | AppEvent::SearchFilesIndexed { .. }
             | AppEvent::SearchResults { .. }
             | AppEvent::SearchFederatedResults { .. }
-            | AppEvent::SearchHandoffReady { .. } => unreachable!(),
+            | AppEvent::SearchHandoffReady { .. }
+            | AppEvent::RemoteSessionDiscovered { .. }
+            | AppEvent::RemoteRegistryLoaded { .. }
+            | AppEvent::RemoteMergeChanged { .. }
+            | AppEvent::SettingsRemoteHostsLoaded { .. }
+            | AppEvent::ClipboardImageReady { .. }
+            | AppEvent::WorktreeChoicesLoaded { .. }
+            | AppEvent::RemoteSessionWatcherClosed { .. }
+            | AppEvent::RemoteProjectionReady { .. }
+            | AppEvent::RemoteFrameAvailable { .. }
+            | AppEvent::RemoteProjectionClosed { .. }
+            | AppEvent::RemoteEffect { .. } => unreachable!(),
             AppEvent::NamedSessionsLoaded { .. }
             | AppEvent::NamedSessionPrepared { .. }
             | AppEvent::NamedSessionStopped { .. } => {
@@ -1483,13 +1680,15 @@ impl App {
                             })
                             .map(|(i, _)| *i)
                         {
-                            if idx != 0 {
+                            if idx >= super::session_menu::NEW_SESSION_ROWS {
                                 // Keep `menu` bound here so `menu.preparing` is in scope.
                                 // The previous `.and_then(|menu| menu.rows.get(..))` moves
                                 // `menu` into the closure, so a naive `&& !menu.preparing`
                                 // at the row check would not compile.
                                 if let Some(menu) = self.named_session_menu.as_ref() {
-                                    if let Some(row) = menu.rows.get(idx - 1) {
+                                    if let Some(row) =
+                                        menu.rows.get(idx - super::session_menu::NEW_SESSION_ROWS)
+                                    {
                                         if row.running && !row.current && !menu.preparing {
                                             self.open_session_menu(
                                                 row.name.clone(),
@@ -1545,11 +1744,13 @@ impl App {
                         })
                         .map(|(i, _)| *i)
                     {
-                        if idx != 0 {
+                        if idx >= super::session_menu::NEW_SESSION_ROWS {
                             // Same reason as the guard above: bind `menu` first so
                             // `!menu.preparing` is available (`.and_then` would hide it).
                             if let Some(menu) = self.named_session_menu.as_ref() {
-                                if let Some(row) = menu.rows.get(idx - 1) {
+                                if let Some(row) =
+                                    menu.rows.get(idx - super::session_menu::NEW_SESSION_ROWS)
+                                {
                                     if row.running && !row.current && !menu.preparing {
                                         self.open_session_menu(
                                             row.name.clone(),
@@ -1960,6 +2161,21 @@ impl App {
         // Pointer interaction outside the FILES dock returns keyboard input to
         // the pane or control the user actually clicked. A click inside keeps
         // the tree focus and its cursor intact.
+        if self.forward_active_remote_mouse(m) {
+            return;
+        }
+        if self.ws().remote.is_some()
+            && self
+                .sidebars
+                .side_of(&DockKind::Files)
+                .is_some_and(|side| self.sidebars.get(side).shown())
+            && self.files_area.contains((m.column, m.row).into())
+        {
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.focus_files_tree();
+            }
+            return;
+        }
         if matches!(m.kind, MouseEventKind::Down(_)) && self.files_focused {
             let inside_files = m.column >= self.files_area.x
                 && m.column < self.files_area.right()
@@ -2006,7 +2222,14 @@ impl App {
             let (c, r) = (m.column, m.row);
             let hit =
                 |rect: Rect| c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom();
-            if let Some((i, _)) = self.tab_rects.iter().find(|(_, rect)| hit(*rect)) {
+            if let Some((target, pane, _)) = self
+                .remote_agent_rects
+                .iter()
+                .find(|(_, _, rect)| hit(*rect))
+                .cloned()
+            {
+                self.activate_remote_agent(&target, &pane, true);
+            } else if let Some((i, _)) = self.tab_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_tab_menu(*i, c, r);
             } else if let Some((i, _)) = self.ws_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_ws_menu(*i, c, r);
@@ -2473,6 +2696,7 @@ impl App {
                         };
                         v.scroll_by(scroll, viewport, key);
                     }
+                    Some(crate::app::ViewKind::Remote(_)) => {}
                     None => {}
                 }
                 return;
@@ -2645,6 +2869,15 @@ impl App {
         if let Some((id, _)) = self.agents_elsewhere_rect.filter(|(_, rect)| hit(*rect)) {
             self.sidebar_focus = None;
             self.focus_pane_global(id);
+            return;
+        }
+        if let Some((target, pane, _)) = self
+            .remote_agent_rects
+            .iter()
+            .find(|(_, _, rect)| hit(*rect))
+            .cloned()
+        {
+            self.activate_remote_agent(&target, &pane, false);
             return;
         }
         if let Some((id, _)) = self.agent_rects.iter().find(|(_, rect)| hit(*rect)) {
@@ -3390,6 +3623,7 @@ impl App {
             // DIFF owns its source-cell clicks for review and note selection.
             // Do not route it through generic word copying.
             Some(crate::app::ViewKind::Diff(_)) => return false,
+            Some(crate::app::ViewKind::Remote(_)) => return false,
             None => {
                 let Some(p) = self.panes.get(&pane) else {
                     return false;
@@ -3668,12 +3902,17 @@ impl App {
     /// position, and activity tracking cannot drift between the two.
     pub(crate) fn paste_into_focused_pane(&mut self, text: &str) -> Option<PaneId> {
         let id = self.layout().focus;
+        self.paste_into_pane(id, text)
+    }
+
+    fn paste_into_pane(&mut self, id: PaneId, text: &str) -> Option<PaneId> {
+        self.search_flash = None;
         let target = self.panes.get(&id).map(|p| {
             p.scroll_to_bottom(); // pasting is input → snap to live
             p.send_paste(text);
             id
         });
-        self.mark_user_input(); // so the echo isn't misread as agent work
+        self.mark_input_for(id); // so the echo isn't misread as agent work
         target
     }
 
@@ -3934,6 +4173,9 @@ impl App {
         if self.mode == Mode::Resize {
             return self.handle_resize_mode_key(key);
         }
+        if let Some(changed) = self.handle_active_remote_key(key) {
+            return changed;
+        }
         // Explicit direct shortcuts are the only normal-mode keys Luvus takes
         // before pane/dashboard dispatch. The configured prefix retains
         // precedence, and an empty direct map makes this a cheap no-op.
@@ -4068,6 +4310,7 @@ impl App {
                     Some(crate::app::ViewKind::Preview(_)) => {
                         return self.handle_preview_key(focus, key)
                     }
+                    Some(crate::app::ViewKind::Remote(_)) => return false,
                     None => {}
                 }
                 // `Shift+↑` / `Shift+PageUp` enter keyboard scroll mode (no prefix,
@@ -4559,6 +4802,7 @@ mod tests {
                 tabs: vec![Tab::panes(TileLayout::new(focus))],
                 active_tab: 0,
                 pinned: false,
+                remote: None,
             });
         }
 
@@ -4854,6 +5098,7 @@ mod tests {
             ))],
             active_tab: 0,
             pinned: false,
+            remote: None,
         });
 
         let request = |id: &str, method: &str| {

@@ -15,6 +15,9 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &["qoderclicn", "qoder", "qodercn"],
     launch_command: "qodercli",
     task_prompt_args: &["--prompt-interactive"],
+    // Interactive prompts are supported; scheduled access policies have not
+    // been reviewed for Qoder's one-shot entrypoint.
+    automation: None,
     identity: IdentityDescriptor {
         distinct: &["qodercli", "qoderclicn", "qodercn"],
         // `qoder` is also used in prose and package paths. Trust it only where

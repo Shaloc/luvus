@@ -332,7 +332,7 @@ pub fn ensure_server_session_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
-fn ensure_private_server_dir(dir: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn ensure_private_server_dir(dir: &std::path::Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
@@ -683,7 +683,17 @@ fn snapshot_layout(
     sessions: &HashMap<PaneId, Option<(String, String)>>,
 ) -> SessionSnapshot {
     let mut workspaces = Vec::new();
-    for ws in &app.workspaces {
+    let mut active_ws = 0;
+    for (workspace_index, ws) in app.workspaces.iter().enumerate() {
+        // Managed remote workspaces are projections of another server's live
+        // state. Re-discover them from the registry; never duplicate their
+        // frame cells or placeholder leaves in this local snapshot.
+        if ws.remote.is_some() {
+            continue;
+        }
+        if workspace_index == app.active_ws {
+            active_ws = workspaces.len();
+        }
         let mut tabs = Vec::new();
         for tab in &ws.tabs {
             // A git tab (docs/17) has no real panes — record just the flag; it's
@@ -776,6 +786,7 @@ fn snapshot_layout(
                                     scroll: v.scroll,
                                 }),
                             ),
+                            crate::app::ViewKind::Remote(_) => return None,
                         };
                         return Some((
                             id.0,
@@ -871,7 +882,7 @@ fn snapshot_layout(
     }
     SessionSnapshot {
         version: SNAPSHOT_VERSION,
-        active_ws: app.active_ws,
+        active_ws: active_ws.min(workspaces.len().saturating_sub(1)),
         workspaces,
         closed_workspace_paths: app.closed_workspace_paths.clone(),
     }

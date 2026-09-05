@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::TerminalColors;
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -23,9 +23,21 @@ pub enum ClientMessage {
         cols: u16,
         rows: u16,
     },
+    /// A managed merge client requests one stable workspace projection instead
+    /// of the whole remote session chrome. Managed callers perform an exact
+    /// package-version and transport-protocol preflight before sending it.
+    HelloWorkspace {
+        version: u32,
+        cols: u16,
+        rows: u16,
+        workspace_id: String,
+    },
     Key(KeyEvent),
     Mouse(MouseEvent),
     Paste(String),
+    ClipboardImage(crate::terminal::clipboard::ClipboardImage),
+    /// Semantic Luvus action, independent of the remote server's prefix/keymap.
+    Command(String),
     Resize {
         cols: u16,
         rows: u16,
@@ -158,10 +170,9 @@ pub fn diff_runs(old: &FrameData, new: &FrameData) -> Vec<DiffRun> {
     runs
 }
 
-/// Apply a `FrameDiff` to a full `FrameData` in place. The client no longer
-/// reconstructs full frames (it writes changed cells straight to the terminal), so
-/// this is now only a test helper for the diff/round-trip checks.
-#[cfg(test)]
+/// Apply a `FrameDiff` to a full `FrameData` in place. The terminal client writes
+/// changed cells directly, while managed workspace projections retain a complete
+/// frame so they can be embedded in another Luvus server's UI.
 pub fn apply_diff(frame: &mut FrameData, diff: &FrameDiff) {
     frame.width = diff.width;
     frame.height = diff.height;
@@ -488,6 +499,30 @@ mod tests {
         assert!(matches!(
             read_message::<_, ServerMessage>(&mut &bytes[..]).unwrap(),
             ServerMessage::SwitchSession { name } if name == "api"
+        ));
+    }
+
+    #[test]
+    fn managed_workspace_projection_handshake_roundtrips() {
+        let mut bytes = Vec::new();
+        write_message(
+            &mut bytes,
+            &ClientMessage::HelloWorkspace {
+                version: PROTOCOL_VERSION,
+                cols: 120,
+                rows: 40,
+                workspace_id: "workspace_remote".into(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_message::<_, ClientMessage>(&mut &bytes[..]).unwrap(),
+            ClientMessage::HelloWorkspace {
+                version: PROTOCOL_VERSION,
+                cols: 120,
+                rows: 40,
+                workspace_id,
+            } if workspace_id == "workspace_remote"
         ));
     }
 

@@ -297,6 +297,7 @@ impl App {
                 worktree: info.worktree.clone(),
                 tabs: vec![],
                 active_tab: 0,
+                remote: None,
             });
             let ws = self.workspaces.len() - 1;
             self.session_dirty = true;
@@ -729,6 +730,7 @@ mod tests {
             worktree: None,
             tabs: vec![],
             active_tab: 0,
+            remote: None,
         });
         app.panes.get_mut(&pane).unwrap().cwd = wt.clone();
         app.rehome_panes_by_cwd();

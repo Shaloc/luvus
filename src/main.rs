@@ -73,7 +73,17 @@ fn main() -> Result<()> {
     match args.get(1).map(String::as_str) {
         // Standard CLI conveniences (don't start the server).
         Some("--version") | Some("-V") => {
-            println!("luvus {}", env!("CARGO_PKG_VERSION"));
+            if args.get(2).map(String::as_str) == Some("--remote-session-protocol")
+                && args.len() == 3
+            {
+                println!(
+                    "luvus {} remote-session=2 transport={}",
+                    env!("CARGO_PKG_VERSION"),
+                    ipc::protocol::PROTOCOL_VERSION
+                );
+            } else {
+                println!("luvus {}", env!("CARGO_PKG_VERSION"));
+            }
             return Ok(());
         }
         Some("--help") | Some("-h") => {
@@ -82,6 +92,15 @@ fn main() -> Result<()> {
         }
         Some(_) if cli::is_help_request(&args) => std::process::exit(cli::run(&args)?),
         _ => {}
+    }
+
+    if let Some(target) = session::remote::process_target() {
+        if let Some(command) = managed_remote_local_only_command(&args) {
+            return Err(anyhow!(
+                "`--host` cannot route local-only command `{command}`; run it through `ssh {}` explicitly if you intend to change that host",
+                target.host
+            ));
+        }
     }
 
     // Protocol discovery is a deliberately narrow, read-only startup route.
@@ -101,12 +120,51 @@ fn main() -> Result<()> {
     // never downloads or installs a skill; it only removes legacy managed
     // global pointers and exact known auto-installed files.
     let _ = skill::migrate_legacy_installation();
+    // Internal SSH bridge roles always execute against the remote machine's
+    // selected local namespace. Keep them ahead of managed-route dispatch so a
+    // caller cannot accidentally open another SSH hop.
+    match args.get(1).map(String::as_str) {
+        Some("remote-server-command") => return server_cmd(&args),
+        Some("remote-session-start") => {
+            ensure_server_ready(&persist::client_socket_path())?;
+            return Ok(());
+        }
+        Some("remote-session-list") => {
+            let sessions: Vec<_> = session::list_sessions()?
+                .into_iter()
+                .map(|session| session::remote::HostSession {
+                    name: session.name,
+                    running: session.running,
+                })
+                .collect();
+            println!("{}", serde_json::to_string(&sessions)?);
+            return Ok(());
+        }
+        Some("remote-view-server") => {
+            let target = session::remote::resolve_canonical(&session::display_name())
+                .map_err(anyhow::Error::msg)?
+                .ok_or_else(|| anyhow!("remote view needs a canonical session name"))?;
+            session::remote::set_view_target(target);
+            return ipc::server::run();
+        }
+        Some("remote-client-bridge") => return remote_client_bridge(),
+        Some("remote-control-bridge") => return remote_control_bridge(),
+        _ => {}
+    }
+
+    if let Some(target) = session::remote::process_target() {
+        match args.get(1).map(String::as_str) {
+            None | Some("client") => return managed_remote_attach(&target),
+            Some("attach") => return managed_remote_attach_pane(&args, &target),
+            Some("server") => return managed_remote_server_cmd(&args, &target),
+            _ => {}
+        }
+    }
     match args.get(1).map(String::as_str) {
         Some("server") => return server_cmd(&args),
         Some("client") => return ipc::client::run(&persist::client_socket_path()),
         // Remote attach (docs/18 RA): the bridge runs on the remote host (via
         // ssh); `--remote <host>` launches it from the local side.
-        Some("remote-client-bridge") => return remote_client_bridge(),
         Some("--remote") => return remote_attach(&args),
         // `attach <id>` (docs/18 WA-2): focus + zoom the pane, then open the TUI
         // straight into that fullscreen terminal.
@@ -465,6 +523,9 @@ fn base64_encode(data: &[u8]) -> String {
 /// "luvus".
 pub(crate) fn window_title() -> String {
     if let Some(name) = session::active_name() {
+        if let Ok(Some(target)) = session::remote::resolve_canonical(&name) {
+            return format!("luvus · {} [remote · {}]", target.session, target.host);
+        }
         return format!("luvus · {name}");
     }
     match std::env::var("TERM_PROGRAM") {
@@ -519,9 +580,9 @@ fn ensure_server_ready_with_timeouts(
 ) -> Result<()> {
     match ipc::transport::connect_timeout(sock, control_timeout) {
         Ok(_) => match retry_control_probe(control_timeout, recovery_timeout, |timeout| {
-            server_version_with_timeout(timeout)
+            server_runtime_with_timeout(timeout)
         }) {
-            Ok(running) => report_server_version(running),
+            Ok(running) => report_server_runtime(&running),
             // Accept threads stay alive after the app loop dies. Connect is not
             // liveness, but one ordinary timeout is not proof of death either.
             // Recycle only after the longer confirmation probe also fails.
@@ -533,7 +594,7 @@ fn ensure_server_ready_with_timeouts(
             // A saturated client listener is not proof that the app loop died.
             // The API ping distinguishes a responsive server that should be
             // left alone from the mute-listener failure this recovery targets.
-            if server_version_with_timeout(recovery_timeout).is_ok() {
+            if server_runtime_with_timeout(recovery_timeout).is_ok() {
                 return Err(anyhow!(
                     "luvus client endpoint is busy but the server remains responsive; retry attach"
                 ));
@@ -573,12 +634,36 @@ fn retry_control_probe<T>(
     probe(control_timeout).or_else(|_| probe(recovery_timeout))
 }
 
-fn report_server_version(running: String) -> Result<()> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ServerRuntime {
+    version: String,
+    transport_protocol: Option<u32>,
+}
+
+impl ServerRuntime {
+    fn matches_binary(&self) -> bool {
+        self.version == env!("CARGO_PKG_VERSION")
+            && self.transport_protocol == Some(ipc::protocol::PROTOCOL_VERSION)
+    }
+}
+
+fn report_server_runtime(running: &ServerRuntime) -> Result<()> {
     let binary = env!("CARGO_PKG_VERSION");
-    if running != binary {
+    if running.transport_protocol != Some(ipc::protocol::PROTOCOL_VERSION) {
+        let running_transport = running
+            .transport_protocol
+            .map_or_else(|| "unreported".to_string(), |version| version.to_string());
+        return Err(anyhow!(
+            "luvus v{binary} installed, but the running server is v{} with client transport protocol {running_transport}; this binary requires protocol {} — run `luvus server restart` to load it (your session is saved and restored).",
+            running.version,
+            ipc::protocol::PROTOCOL_VERSION
+        ));
+    }
+    if running.version != binary {
         eprintln!(
-            "luvus v{binary} installed, but the running server is v{running} — \
-             run `luvus server restart` to load it (your session is saved and restored)."
+            "luvus v{binary} installed, but the running server is v{} — \
+             run `luvus server restart` to load it (your session is saved and restored).",
+            running.version
         );
         thread::sleep(Duration::from_millis(2000));
     }
@@ -615,6 +700,97 @@ fn remote_client_bridge() -> Result<()> {
     let sock = persist::client_socket_path();
     ensure_server_ready(&sock)?;
     ipc::client::remote_bridge(&sock)
+}
+
+/// Remote-side newline-delimited control bridge. It deliberately shares the
+/// existing owner socket and framing limits; SSH is only a byte transport and
+/// never becomes another application-state writer.
+fn remote_control_bridge() -> Result<()> {
+    let client_sock = persist::client_socket_path();
+    ensure_server_ready(&client_sock)?;
+    let api_sock = persist::socket_path();
+    ipc::client::remote_bridge(&api_sock)
+}
+
+fn managed_remote_attach(target: &session::remote::RemoteSession) -> Result<()> {
+    session::remote::verify_remote_version(&target.host).map_err(anyhow::Error::msg)?;
+    let name = if session::remote::load_registry().merge_enabled() {
+        session::remote::ensure_session(target).map_err(anyhow::Error::msg)?;
+        target.session.clone()
+    } else {
+        target.canonical_name()
+    };
+    session::start_client_session(&name).map_err(anyhow::Error::msg)?;
+    session::remote::clear_process_target();
+    session::apply_explicit_name(&name).map_err(anyhow::Error::msg)?;
+    ipc::client::run(&session::client_socket_path_for(Some(&name)))
+}
+
+fn managed_remote_attach_pane(
+    args: &[String],
+    target: &session::remote::RemoteSession,
+) -> Result<()> {
+    if let Some(id) = args.get(2).filter(|value| value.parse::<u32>().is_ok()) {
+        let _ = cli::request_attach(id);
+    }
+    managed_remote_attach(target)
+}
+
+fn managed_remote_server_cmd(
+    args: &[String],
+    target: &session::remote::RemoteSession,
+) -> Result<()> {
+    let Some(subcommand) = args.get(2).map(String::as_str) else {
+        return Err(anyhow!(
+            "usage: luvus --host <ssh-alias> [--session <name>] server <start|stop|restart|status|update-manifest>"
+        ));
+    };
+    if (args.len() != 3 && !(subcommand == "restart" && parse_restart_all(&args[3..])?.is_some()))
+        || !matches!(
+            subcommand,
+            "start" | "stop" | "restart" | "status" | "update-manifest"
+        )
+    {
+        return Err(anyhow!(
+            "usage: luvus --host <ssh-alias> [--session <name>] server <start|stop|restart|status|update-manifest>"
+        ));
+    }
+    let location =
+        session::remote::verify_remote_version(&target.host).map_err(anyhow::Error::msg)?;
+    let status = session::remote::server_command(target, subcommand, location, &args[3..])
+        .status()
+        .map_err(|error| anyhow!("failed to launch ssh: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "remote Luvus server command on `{}` exited with {status}",
+            target.host
+        ))
+    }
+}
+
+/// Commands that inspect or mutate the client machine must never appear to
+/// honor `--host` while silently acting locally. Server-backed nouns continue
+/// through the SSH control bridge; server lifecycle has its dedicated path.
+fn managed_remote_local_only_command(args: &[String]) -> Option<&str> {
+    let command = args.get(1)?.as_str();
+    let local_only = matches!(
+        command,
+        "session"
+            | "theme"
+            | "skill"
+            | "doctor"
+            | "update"
+            | "integration"
+            | "client"
+            | "--local"
+            | "--remote"
+    ) || (command == "module"
+        && matches!(args.get(2).map(String::as_str), Some("install" | "search")))
+        || (command == "uhp"
+            && matches!(args.get(2).map(String::as_str), Some("access" | "schema")));
+    local_only.then_some(command)
 }
 
 /// `luvus attach <id>` (docs/18 WA-2): focus + zoom the pane (one round-trip via
@@ -831,6 +1007,17 @@ fn server_cmd(args: &[String]) -> Result<()> {
         return ipc::server::run(); // internal role: run the server in the foreground
     };
     let context = i18n::cli::Context::configured();
+    if command == "restart" {
+        if let Some(json) = parse_restart_all(&args[3..])? {
+            return server_restart_all(context, json);
+        }
+    }
+    if args.len() != 3 {
+        return Err(anyhow!(
+            "unexpected server arguments: {}",
+            args[3..].join(" ")
+        ));
+    }
     match command {
         "start" => server_start(context),
         "stop" => server_stop(context),
@@ -849,6 +1036,88 @@ fn server_cmd(args: &[String]) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+/// An explicit machine-local batch; a session selector never expands this into
+/// a federation-wide restart.
+fn parse_restart_all(options: &[String]) -> Result<Option<bool>> {
+    if options.is_empty() {
+        return Ok(None);
+    }
+    let all = options.iter().filter(|arg| arg.as_str() == "--all").count();
+    let json = options
+        .iter()
+        .filter(|arg| arg.as_str() == "--json")
+        .count();
+    if all == 1 && json <= 1 && options.len() == all + json {
+        return Ok(Some(json == 1));
+    }
+    Err(anyhow!("usage: luvus server restart [--all [--json]]"))
+}
+
+#[cfg(test)]
+mod restart_all_tests {
+    #[test]
+    fn restart_all_parser_is_explicit_and_rejects_unknown_or_duplicate_flags() {
+        let parse = |args: &[&str]| {
+            super::parse_restart_all(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(parse(&[]).unwrap(), None);
+        assert_eq!(parse(&["--all"]).unwrap(), Some(false));
+        assert_eq!(parse(&["--all", "--json"]).unwrap(), Some(true));
+        assert_eq!(parse(&["--json", "--all"]).unwrap(), Some(true));
+        for args in [
+            vec!["-all"],
+            vec!["-all", "--json"],
+            vec!["--json"],
+            vec!["--all", "--all"],
+            vec!["--all", "-all"],
+            vec!["--all", "--json", "--json"],
+            vec!["--all", "unknown"],
+        ] {
+            assert!(parse(&args).is_err());
+        }
+    }
+}
+
+fn server_restart_all(context: i18n::cli::Context, json: bool) -> Result<()> {
+    let inventory = session::list_sessions()?;
+    let results = session::restart_running_sessions(&inventory, session::restart_session);
+    let failed = results.iter().filter(|(_, result)| result.is_err()).count();
+    if json {
+        let rows: Vec<_> = results
+            .iter()
+            .map(|(name, result)| {
+                serde_json::json!({
+                    "session":name, "restarted":result.is_ok(), "error":result.as_ref().err(),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({"scope":"local", "sessions":rows,
+                "restarted":results.len() - failed, "failed":failed,
+                "skipped":inventory.iter().filter(|session| !session.running).map(|session| &session.name).collect::<Vec<_>>()
+            })
+        );
+    } else {
+        for (name, result) in &results {
+            match result {
+                Ok(_) => println!("{name}: {}", context.text("restarted")),
+                Err(error) => eprintln!("{name}: {error}"),
+            }
+        }
+        if results.is_empty() {
+            println!("{}", context.text("no luvus server running"));
+        }
+    }
+    if failed > 0 {
+        return Err(anyhow!(context.render(
+            "{count} sessions failed to restart",
+            &[("count", &failed.to_string())]
+        )));
+    }
+    Ok(())
 }
 
 /// The published agent-detection manifest index (`luvus.dev/manifests/index.json`).
@@ -1029,11 +1298,16 @@ fn server_status(context: i18n::cli::Context) -> Result<()> {
         print_server_card(context, context.text("not running"), None, &sock);
         return Ok(());
     }
-    match server_version() {
+    match server_runtime() {
         Ok(running) => {
-            print_server_card(context, context.text("running"), Some(&running), &sock);
+            print_server_card(
+                context,
+                context.text("running"),
+                Some(&running.version),
+                &sock,
+            );
             let binary = env!("CARGO_PKG_VERSION");
-            if running != binary {
+            if !running.matches_binary() {
                 println!(
                     "  {} v{binary} — {}",
                     context.text("note: this binary is"),
@@ -1204,19 +1478,31 @@ fn force_stop_unresponsive(pid: Option<u32>, sock: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Ask the running server its version via `ping`.
-fn server_version() -> Result<String> {
-    server_version_with_timeout(SERVER_CONTROL_TIMEOUT)
+/// Ask the running server for the executable and binary-client protocol it is
+/// actually serving. The transport field is optional so a newly installed CLI
+/// can identify an older same-semver server and ask for a restart explicitly.
+fn server_runtime() -> Result<ServerRuntime> {
+    server_runtime_with_timeout(SERVER_CONTROL_TIMEOUT)
 }
 
-fn server_version_with_timeout(timeout: Duration) -> Result<String> {
+fn server_runtime_with_timeout(timeout: Duration) -> Result<ServerRuntime> {
     let response = server_control_request_with_timeout("ping", timeout)?;
-    response
+    let result = response
         .get("result")
-        .and_then(|result| result.get("version"))
+        .ok_or_else(|| anyhow!("luvus server returned an invalid ping response"))?;
+    let version = result
+        .get("version")
         .and_then(serde_json::Value::as_str)
         .map(String::from)
-        .ok_or_else(|| anyhow!("luvus server returned an invalid ping response"))
+        .ok_or_else(|| anyhow!("luvus server returned an invalid ping response"))?;
+    let transport_protocol = result
+        .get("transport_protocol")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok());
+    Ok(ServerRuntime {
+        version,
+        transport_protocol,
+    })
 }
 
 /// Perform one lifecycle request with a bounded response wait. This keeps
@@ -1523,6 +1809,25 @@ mod tests {
     }
 
     #[test]
+    fn server_runtime_distinguishes_an_older_same_version_build() {
+        let current = ServerRuntime {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            transport_protocol: Some(crate::ipc::protocol::PROTOCOL_VERSION),
+        };
+        assert!(current.matches_binary());
+        assert!(report_server_runtime(&current).is_ok());
+
+        let older_build = ServerRuntime {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            transport_protocol: None,
+        };
+        assert!(!older_build.matches_binary());
+        let error = report_server_runtime(&older_build).unwrap_err().to_string();
+        assert!(error.contains("client transport protocol unreported"));
+        assert!(error.contains("luvus server restart"));
+    }
+
+    #[test]
     fn only_exact_json_session_list_uses_discovery_route() {
         let strings = |items: &[&str]| {
             items
@@ -1712,6 +2017,36 @@ mod tests {
         assert!(script.contains("/home/linuxbrew/.linuxbrew/bin/luvus"));
         assert!(script.contains("'--session' 'api' 'remote-client-bridge'"));
         assert!(script.ends_with("exit 127"));
+    }
+
+    #[test]
+    fn managed_host_rejects_commands_that_would_act_on_the_local_machine() {
+        let args = |parts: &[&str]| {
+            parts
+                .iter()
+                .map(|part| part.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            managed_remote_local_only_command(&args(&["luvus", "theme", "install", "x"])),
+            Some("theme")
+        );
+        assert_eq!(
+            managed_remote_local_only_command(&args(&["luvus", "session", "list"])),
+            Some("session")
+        );
+        assert_eq!(
+            managed_remote_local_only_command(&args(&["luvus", "module", "install", "a/b"])),
+            Some("module")
+        );
+        assert_eq!(
+            managed_remote_local_only_command(&args(&["luvus", "pane", "list"])),
+            None
+        );
+        assert_eq!(
+            managed_remote_local_only_command(&args(&["luvus", "worktree", "list"])),
+            None
+        );
     }
 
     #[test]

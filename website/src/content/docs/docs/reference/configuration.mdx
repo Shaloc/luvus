@@ -9,6 +9,7 @@ owner-only (`0700`).
 | File | Contents |
 |---|---|
 | `config.json` | theme, language, shell, layout, notifications, keybindings, `sidebars`, and Luvus Bar placement |
+| `remote-sessions.json` | SSH remote session registrations and the global same-name merge preference |
 | `session.json` | the auto-saved session snapshot (workspaces → tabs → panes) |
 | `orch.json` | the orchestration task ledger + leases |
 | `modules.json` + `modules/` | installed extensions and their state |
@@ -47,6 +48,7 @@ cleanly across versions because unknown fields get defaults.
 | `notifications.sound_on_blocked` | play the selected blocked cue when an agent needs attention; defaults to `false` |
 | `agents_active_only` | show only live agents in the AGENTS dock when `true`; defaults to `false`, which also shows resumable sessions |
 | `agents_this_workspace` | scope live agents and resumable sessions to the active workspace; defaults to `false` and is independent of `agents_active_only`. Toggle it with prefix `A` or the dynamic workspace-scope action in any AGENTS row's right-click menu. |
+| `remote_hosts` | SSH config aliases enabled in Settings → Remote. Defaults to `[]`. Selecting connects and discovers sessions; deselecting disconnects without stopping remote panes. Opening or refreshing the session switcher discovers new remote sessions. Merge includes discovered same-name sessions. |
 | `sidebars.files_side` | last side used by the FILES dock (`left` or `right`), retained while the dock is hidden |
 | `prefix` | the command-mode prefix (default `ctrl+space`). Accepts `f1`–`f12` as safe single keys, or a character/Space chord containing `Ctrl` or `Alt`, such as `ctrl+b`, `alt+\`, or `shift+f12` (see [Keybindings](/docs/reference/keybindings/)) |
 | `keybindings` | command id → key, overriding the defaults |

@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
+pub mod remote;
+
 pub const SESSION_ENV_VAR: &str = "LUVUS_SESSION";
 pub const DEFAULT_SESSION_NAME: &str = "default";
 
@@ -43,6 +45,8 @@ pub struct SessionEndpoint {
 /// `pane report --session <native-agent-id>`, so parsing stops at its command.
 /// The returned argv no longer contains only the global selector.
 pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
+    let (args, requested_host) = remote::strip_host_selector(args)?;
+    let args = &args;
     if args.get(1).map(String::as_str) == Some("session")
         && args.get(2).map(String::as_str) == Some("attach")
     {
@@ -58,7 +62,7 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
         if args.len() != 4 {
             return Err("usage: luvus session attach <name>".to_string());
         }
-        apply_explicit_name(name)?;
+        apply_explicit_target(name, requested_host.as_deref())?;
         return Ok(vec![args[0].clone()]);
     }
 
@@ -98,11 +102,32 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
     }
 
     if let Some(name) = requested {
-        apply_explicit_name(&name)?;
+        if matches!(
+            cleaned.get(1).map(String::as_str),
+            Some(
+                "remote-client-bridge"
+                    | "remote-control-bridge"
+                    | "remote-session-list"
+                    | "remote-session-start"
+                    | "remote-server-command"
+                    | "remote-view-server"
+            )
+        ) {
+            remote::clear_process_target();
+            apply_explicit_name(&name)?;
+        } else {
+            apply_explicit_target(&name, requested_host.as_deref())?;
+        }
+        return Ok(cleaned);
+    }
+
+    if let Some(host) = requested_host {
+        apply_explicit_target(DEFAULT_SESSION_NAME, Some(&host))?;
         return Ok(cleaned);
     }
 
     EXPLICIT_SESSION_REQUESTED.store(false, Ordering::Relaxed);
+    remote::clear_process_target();
     let inherited_socket = std::env::var_os("LUVUS_SOCKET_PATH").is_some_and(|v| !v.is_empty());
     if !inherited_socket {
         if let Some(name) =
@@ -117,7 +142,40 @@ pub fn configure_from_args(args: &[String]) -> Result<Vec<String>, String> {
     Ok(cleaned)
 }
 
-fn apply_explicit_name(name: &str) -> Result<(), String> {
+fn apply_explicit_target(name: &str, host: Option<&str>) -> Result<(), String> {
+    if let Some(host) = host {
+        // With an explicit host, --session is the owner's actual name, even
+        // when that name itself starts with `remote-`.
+        let session = normalize_name(name)?.unwrap_or_else(|| DEFAULT_SESSION_NAME.to_string());
+        let target = remote::RemoteSession::new(host, &session)?;
+        remote::require_enabled_host(&target.host)?;
+        remote::set_process_target(&target);
+        // Remote control uses the remote namespace, while display_name() uses
+        // the canonical managed name from the process target.
+        match normalize_name(&target.session)? {
+            Some(name) => std::env::set_var(SESSION_ENV_VAR, name),
+            None => std::env::remove_var(SESSION_ENV_VAR),
+        }
+        EXPLICIT_SESSION_REQUESTED.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    if let Some(target) = remote::resolve_canonical(name)? {
+        remote::require_enabled_host(&target.host)?;
+        remote::set_process_target(&target);
+        match normalize_name(&target.session)? {
+            Some(name) => std::env::set_var(SESSION_ENV_VAR, name),
+            None => std::env::remove_var(SESSION_ENV_VAR),
+        }
+        EXPLICIT_SESSION_REQUESTED.store(true, Ordering::Relaxed);
+        return Ok(());
+    }
+
+    remote::clear_process_target();
+    apply_explicit_name(name)
+}
+
+pub(crate) fn apply_explicit_name(name: &str) -> Result<(), String> {
     match normalize_name(name)? {
         Some(name) => {
             std::env::set_var(SESSION_ENV_VAR, name);
@@ -142,6 +200,9 @@ pub fn active_name() -> Option<String> {
 }
 
 pub fn display_name() -> String {
+    if let Some(target) = remote::process_target() {
+        return target.canonical_name();
+    }
     active_name().unwrap_or_else(|| DEFAULT_SESSION_NAME.to_string())
 }
 
@@ -354,7 +415,13 @@ pub fn start_session(name: Option<&str>) -> Result<SessionInfo, String> {
     command
         .arg("--session")
         .arg(name.unwrap_or(DEFAULT_SESSION_NAME))
-        .arg("server")
+        .arg(
+            if name.is_some_and(|name| remote::resolve_canonical(name).ok().flatten().is_some()) {
+                "remote-view-server"
+            } else {
+                "server"
+            },
+        )
         .env_remove("LUVUS_SOCKET_PATH")
         .env_remove(SESSION_ENV_VAR)
         .stdin(Stdio::null())
@@ -404,6 +471,22 @@ pub fn restart_session(name: Option<&str>) -> Result<SessionInfo, String> {
         stop_session(name)?;
     }
     start_session(name)
+}
+
+/// Snapshot the batch before any lifecycle mutation; skip saved/stopped
+/// sessions, continue after individual failures, and never consult SSH hosts.
+pub fn restart_running_sessions(
+    inventory: &[SessionInfo],
+    mut restart: impl FnMut(Option<&str>) -> Result<SessionInfo, String>,
+) -> Vec<(String, Result<SessionInfo, String>)> {
+    inventory
+        .iter()
+        .filter(|session| session.running)
+        .map(|session| {
+            let name = (session.name != DEFAULT_SESSION_NAME).then_some(session.name.as_str());
+            (session.name.clone(), restart(name))
+        })
+        .collect()
 }
 
 fn terminate_and_wait(child: &mut std::process::Child) -> Result<(), String> {
@@ -478,6 +561,7 @@ fn is_running_at(path: &Path) -> bool {
 #[cfg(test)]
 pub(crate) fn clear_explicit_for_test() {
     EXPLICIT_SESSION_REQUESTED.store(false, Ordering::Relaxed);
+    remote::clear_process_target();
 }
 
 #[cfg(test)]
@@ -513,6 +597,37 @@ mod tests {
             assert!(validate_name(name).is_err(), "{name}");
         }
         assert!(validate_name(&"a".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn restart_all_skips_stopped_sessions_and_continues_after_a_failure() {
+        let _env = crate::persist::test_env("restart-all-batch");
+        let mut inventory = vec![
+            session_info(None),
+            session_info(Some("broken")),
+            session_info(Some("last")),
+            session_info(Some("saved")),
+        ];
+        for session in &mut inventory[..3] {
+            session.running = true;
+        }
+        let mut attempts = Vec::new();
+        let results = restart_running_sessions(&inventory, |name| {
+            attempts.push(name.map(str::to_string));
+            if name == Some("broken") {
+                Err("fixture failure".into())
+            } else {
+                Ok(session_info(name))
+            }
+        });
+        assert_eq!(
+            attempts,
+            vec![None, Some("broken".into()), Some("last".into())]
+        );
+        assert_eq!(results.len(), 3);
+        assert!(results[0].1.is_ok());
+        assert!(results[1].1.is_err());
+        assert!(results[2].1.is_ok());
     }
 
     #[test]

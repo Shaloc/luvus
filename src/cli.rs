@@ -7,6 +7,48 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
+enum ServerConnection {
+    Local(crate::ipc::transport::Conn),
+    Remote(crate::session::remote::ControlConnection),
+}
+
+impl Read for ServerConnection {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Local(connection) => connection.read(buffer),
+            Self::Remote(connection) => connection.read(buffer),
+        }
+    }
+}
+
+impl Write for ServerConnection {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Local(connection) => connection.write(buffer),
+            Self::Remote(connection) => connection.write(buffer),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Local(connection) => connection.flush(),
+            Self::Remote(connection) => connection.flush(),
+        }
+    }
+}
+
+fn connect_server() -> Result<ServerConnection> {
+    if let Some(target) = crate::session::remote::process_target() {
+        return crate::session::remote::connect_control(&target)
+            .map(ServerConnection::Remote)
+            .map_err(anyhow::Error::msg);
+    }
+    let path = crate::persist::cli_socket_path();
+    crate::ipc::transport::connect(&path)
+        .map(ServerConnection::Local)
+        .map_err(|error| server_connect_error(&path, error))
+}
+
 /// Returns true if `argv[1]` is a CLI noun we handle (so `main` should not
 /// launch the TUI).
 pub fn is_cli(args: &[String]) -> bool {
@@ -55,6 +97,8 @@ luvus: Mission control for your AI coding agents
 Usage:
   luvus [--session <name>]               Launch or attach to the TUI
   luvus [--session <name>] <command>     Control a local session
+  luvus --host <ssh-alias> [--session <name>] <command>
+                                          Control server-backed commands on a configured SSH host
   luvus --remote <host> [ssh args]       Attach to a remote session
   luvus help all                         Show every command and option
 
@@ -75,7 +119,7 @@ Commands:
   theme        List, create, validate, install, and select themes
   bar          Publish and arrange top and bottom status widgets
   ui           Configure sidebars, docks, and notifications
-  session      List, attach, stop, and delete server sessions
+  session      Manage local, remote, and merged server sessions
   server       Inspect and manage the selected background server
   integration  Manage agent session-resume integrations
   skill        Enable, inspect, show, or remove the bundled agent skill
@@ -93,9 +137,13 @@ Examples:
   luvus workspace open .                 Open the current project
   luvus session attach docs              Start or open a named session
   luvus --session docs agent list        Control a session from another terminal
+  luvus --host dev-207 --session docs pane list
+                                          Control the remote session through SSH
+  luvus worktree list --host dev-207      list the current repo's worktrees
 
 Options:
   --session <name>                       Target a named server session
+  --host <ssh-alias>                     Target a literal Host from ~/.ssh/config
   --remote <host> [ssh args]             Attach through SSH
   --version, -V                          Print the version
   --help, -h                             Show this help
@@ -113,6 +161,7 @@ usage: luvus <command> [args]
 
   (no args)            launch / attach the TUI
   --session <name>     target one named server session
+  --host <ssh-alias>   route the TUI or server-backed command to an SSH-config host
   --version, -V        print the version
   --help, -h           show compact help
   help [all|<topic> [command]]  show compact, complete, or focused help
@@ -325,12 +374,23 @@ universal harness protocol:
   uhp proxy                 forward one JSON request from stdin to the selected server
 
 sessions:
-  session list [--json]      list default and named server sessions
+  session list [--json]      list local and discovered remote sessions
   session attach <name>      start or attach the named session
   session stop <name> [--json]    stop only the named session and its panes
   session delete <name> [--json]  delete a stopped named session
+  session remote add <host> <name> [--merge] [--json]
+                             start an SSH-config remote after exact-version validation
+  session remote remove <remote-name> [--json]
+                             forget a registered remote session
+  session remote list [--json]    discover sessions on selected SSH hosts
+  session merge <on|off> [--json]
+                             toggle global same-name session merging
 
 remote:
+  --host <ssh-alias> [--session <name>] <command>
+                             run server-backed CLI controls against the selected
+                             session on a literal Host from ~/.ssh/config
+                             (put --host before prompt/pass-through commands)
   --remote <host> [ssh args] attach to a luvus session on <host> over plain ssh
 
 server:
@@ -338,6 +398,7 @@ server:
   server start               start the background server if it isn't up
   server stop                stop the server (and all panes)
   server restart             stop + start (load a newly-installed binary)
+  server restart --all [--json]  restart all running sessions on this host
   server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
   integration install|uninstall <claude|copilot|codex|antigravity|opencode|kimi|qodercli|grok|hermes|omp>
@@ -506,9 +567,7 @@ fn run_inner(args: &[String]) -> Result<i32> {
         return agent_start_cmd(args);
     }
     let (method, params) = parse(args)?;
-    let path = crate::persist::cli_socket_path();
-    let mut stream = crate::ipc::transport::connect(&path)
-        .map_err(|error| server_connect_error(&path, error))?;
+    let mut stream = connect_server()?;
 
     let req = json!({ "id": "1", "method": method, "params": params });
     writeln!(stream, "{req}")?;
@@ -909,6 +968,8 @@ fn detailed_section_to_end(start: &str) -> &'static str {
 fn session_cmd(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
     match args.first().map(String::as_str) {
         Some("list") => session_list(&args[1..], context),
+        Some("remote") => session_remote(&args[1..], context),
+        Some("merge") => session_merge(&args[1..], context),
         Some("stop") => session_stop(&args[1..], context),
         Some("delete") => session_delete(&args[1..], context),
         Some("attach")
@@ -942,10 +1003,17 @@ const SESSION_USAGE: &str = "\
 Usage: luvus session <command>
 
 Commands:
-  list [--json]           list default and named server sessions
+  list [--json]           list local and discovered remote sessions
   attach <name>           start or attach to the named session
   stop <name> [--json]    stop only the named session and its panes
   delete <name> [--json]  delete a stopped named session
+  remote add <host> <name> [--merge] [--json]
+                          start an SSH-config remote after exact-version validation
+  remote remove <remote-name> [--json]
+                          forget a registered remote session
+  remote list [--json]    discover sessions on selected SSH hosts
+  merge <name> <on|off> [--json]
+                          show local and discovered same-name remotes together
 ";
 
 fn write_session_help(
@@ -967,11 +1035,23 @@ fn session_list(args: &[String], context: crate::i18n::cli::Context) -> Result<i
             ))
         }
     };
-    let sessions = crate::session::list_sessions()?;
+    let mut sessions = crate::session::list_sessions()?;
+    let (remote, hosts) = crate::session::remote::discover_hosts();
+    sessions.retain(|session| {
+        !remote
+            .sessions
+            .iter()
+            .any(|target| target.canonical_name() == session.name)
+    });
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&json!({"sessions": sessions}))?
+            serde_json::to_string_pretty(&json!({
+                "sessions": sessions,
+                "remote_sessions": remote.sessions,
+                "merge": remote.merge_enabled(),
+                "hosts": hosts,
+            }))?
         );
         return Ok(0);
     }
@@ -996,7 +1076,190 @@ fn session_list(args: &[String], context: crate::i18n::cli::Context) -> Result<i
             session.session_dir
         );
     }
+    let merged = remote.merge_enabled();
+    for target in remote.sessions {
+        println!(
+            "{} {}{}",
+            crate::i18n::cli::pad(&target.session, 24),
+            crate::i18n::cli::pad(
+                if merged {
+                    context.text("remote merged")
+                } else {
+                    context.text("remote")
+                },
+                10
+            ),
+            format_args!("{}:{}", target.host, target.session)
+        );
+    }
     Ok(0)
+}
+
+fn session_remote(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
+    match args.first().map(String::as_str) {
+        Some("list") => {
+            let json_output = match &args[1..] {
+                [] => false,
+                [flag] if flag == "--json" => true,
+                _ => return Err(anyhow!("usage: luvus session remote list [--json]")),
+            };
+            let (registry, hosts) = crate::session::remote::discover_hosts();
+            if json_output {
+                let mut value = serde_json::to_value(&registry)?;
+                value["hosts"] = serde_json::to_value(hosts)?;
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                let merged = registry.merge_enabled();
+                for target in registry.sessions {
+                    let suffix = if merged {
+                        context.text("merged")
+                    } else {
+                        context.text("standalone")
+                    };
+                    println!(
+                        "{}  {}:{}  {suffix}",
+                        target.session, target.host, target.session
+                    );
+                }
+            }
+            Ok(0)
+        }
+        Some("add") => {
+            let mut positional = Vec::new();
+            let mut merge = false;
+            let mut json_output = false;
+            for argument in &args[1..] {
+                match argument.as_str() {
+                    "--merge" => merge = true,
+                    "--json" => json_output = true,
+                    option if option.starts_with('-') => {
+                        return Err(anyhow!("unknown session remote add option: {option}"));
+                    }
+                    _ => positional.push(argument.as_str()),
+                }
+            }
+            let [host, name] = positional.as_slice() else {
+                return Err(anyhow!(
+                    "usage: luvus session remote add <host> <name> [--merge] [--json]"
+                ));
+            };
+            let target = match crate::session::remote::RemoteSession::new(host, name) {
+                Ok(target) => target,
+                Err(message) => {
+                    return session_error("invalid_remote_session", &message, json_output)
+                }
+            };
+            if let Err(message) = crate::session::remote::ensure_session(&target) {
+                return session_error("remote_version_required", &message, json_output);
+            }
+            match crate::session::remote::add_session(target.clone(), merge) {
+                Ok(registry) => {
+                    let applied = if merge {
+                        crate::session::remote::reload_local_sessions(None)
+                            .map_err(anyhow::Error::msg)?
+                    } else if registry.merge_enabled() {
+                        crate::session::remote::reload_local_session(&target.session)
+                            .map_err(anyhow::Error::msg)?
+                    } else {
+                        false
+                    };
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&json!({
+                                "added": true,
+                                "remote_session": target,
+                                "canonical_name": target.canonical_name(),
+                                "merge": registry.merge_enabled(),
+                                "applied_to_running_server": applied,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "{} {}",
+                            context.text("registered remote session"),
+                            target.canonical_name()
+                        );
+                    }
+                    Ok(0)
+                }
+                Err(message) => session_error("remote_session_add_failed", &message, json_output),
+            }
+        }
+        Some("remove") => {
+            let (name, json_output) = parse_session_name_and_json(
+                &args[1..],
+                "usage: luvus session remote remove <remote-name> [--json]",
+                context,
+            )?;
+            let target =
+                crate::session::remote::resolve_canonical(name).map_err(anyhow::Error::msg)?;
+            match crate::session::remote::remove_session(name) {
+                Ok(_) => {
+                    if let Some(target) = target {
+                        crate::session::remote::reload_local_session(&target.session)
+                            .map_err(anyhow::Error::msg)?;
+                    }
+                    if json_output {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(
+                                &json!({"removed": true, "remote_session": name})
+                            )?
+                        );
+                    } else {
+                        println!("{} {name}", context.text("removed remote session"));
+                    }
+                    Ok(0)
+                }
+                Err(message) => {
+                    session_error("remote_session_remove_failed", &message, json_output)
+                }
+            }
+        }
+        _ => Err(anyhow!("usage: luvus session remote <list|add|remove> ...")),
+    }
+}
+
+fn session_merge(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
+    let (name, state, json_output) = match args {
+        [state] => ("default", state.as_str(), false),
+        [state, flag] if flag == "--json" => ("default", state.as_str(), true),
+        [name, state] => (name.as_str(), state.as_str(), false),
+        [name, state, flag] if flag == "--json" => (name.as_str(), state.as_str(), true),
+        _ => return Err(anyhow!("usage: luvus session merge <on|off> [--json]")),
+    };
+    let enabled = match state {
+        "on" => true,
+        "off" => false,
+        _ => return Err(anyhow!("session merge state must be `on` or `off`")),
+    };
+    match crate::session::remote::set_merge(name, enabled) {
+        Ok(_) => {
+            let applied =
+                crate::session::remote::reload_local_sessions(None).map_err(anyhow::Error::msg)?;
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"scope": "global", "merge": enabled, "applied_to_running_server": applied})
+                    )?
+                );
+            } else {
+                println!(
+                    "{}: {}",
+                    context.text("session merge"),
+                    if enabled {
+                        context.text("on")
+                    } else {
+                        context.text("off")
+                    }
+                );
+            }
+            Ok(0)
+        }
+        Err(message) => session_error("session_merge_failed", &message, json_output),
+    }
 }
 
 fn parse_session_name_and_json<'a>(
@@ -2269,12 +2532,14 @@ fn pane_status(pane: &str) -> Result<Option<String>> {
 /// without a safe kernel receive timeout (currently Windows named pipes) retain
 /// bounded status polling instead of leaving a blocked stream reader behind.
 fn wait_status_stream(pane: &str, targets: &[String], deadline: Option<Instant>) -> Result<i32> {
+    if crate::session::remote::process_target().is_some() {
+        return wait_status_poll(pane, targets, deadline);
+    }
     let path = crate::persist::cli_socket_path();
-    let stream = crate::ipc::transport::connect(&path)
+    let mut stream = crate::ipc::transport::connect(&path)
         .map_err(|error| server_connect_error(&path, error))?;
-    let mut writer = stream.clone();
     writeln!(
-        writer,
+        stream,
         "{}",
         json!({"id":"1","method":"events.subscribe","params":{}})
     )?;
@@ -2338,9 +2603,7 @@ pub fn request_attach(pane: &str) -> Result<()> {
 
 /// One request/response over the control socket.
 pub(crate) fn send_request(method: &str, params: Value) -> Result<Value> {
-    let path = crate::persist::cli_socket_path();
-    let mut stream = crate::ipc::transport::connect(&path)
-        .map_err(|error| server_connect_error(&path, error))?;
+    let mut stream = connect_server()?;
     let req = json!({ "id": "1", "method": method, "params": params });
     writeln!(stream, "{req}")?;
     let mut reader = BufReader::new(stream);
@@ -2377,14 +2640,23 @@ fn uhp_proxy() -> Result<i32> {
     let mut input = std::io::BufReader::new(std::io::stdin().lock());
     let request = crate::ipc::api::read_request_frame(&mut input)
         .map_err(|error| anyhow!("invalid request frame: {error}"))?;
-    if let Some(response) = crate::api::host::handle_frame(&request)? {
+    if crate::session::remote::process_target().is_some() {
+        let request_value: Value = serde_json::from_str(&request)?;
+        if request_value
+            .get("method")
+            .and_then(Value::as_str)
+            .is_some_and(crate::api::host::handles)
+        {
+            return Err(anyhow!(
+                "`--host` cannot route host-profile UHP methods through the session control bridge"
+            ));
+        }
+    } else if let Some(response) = crate::api::host::handle_frame(&request)? {
         validate_response_id(&request, &response)?;
         println!("{response}");
         return Ok(api_response_exit_code(&response));
     }
-    let path = crate::persist::cli_socket_path();
-    let mut stream = crate::ipc::transport::connect(&path)
-        .map_err(|error| server_connect_error(&path, error))?;
+    let mut stream = connect_server()?;
     writeln!(stream, "{request}")?;
     let mut reader = BufReader::new(stream);
     let response = crate::ipc::api::read_response_frame(&mut reader)?;
@@ -4223,6 +4495,14 @@ mod tests {
     }
 
     #[test]
+    fn restart_help_exposes_explicit_all_sessions_flag() {
+        for command in [None, Some("restart")] {
+            let help = rendered_topic_help("server", command);
+            assert!(help.contains("server restart --all [--json]"), "{help}");
+        }
+    }
+
+    #[test]
     fn complete_help_translates_every_human_line() {
         let untranslated = DETAILED_USAGE
             .lines()
@@ -4256,6 +4536,8 @@ mod tests {
                     || trimmed.starts_with("[--overlap ")
                     || command_without_description
                     || trimmed.starts_with("session attach <name>")
+                    || (trimmed.starts_with("session ") && !trimmed.contains("  "))
+                    || (trimmed.starts_with("--host ") && !trimmed.contains("  "))
                     || trimmed == "(applies live if the server is up; else on next start)"
                 {
                     false
@@ -4386,7 +4668,7 @@ mod tests {
             assert!(write_topic_help(&mut session, "session", None, language).unwrap());
             let session = String::from_utf8(session).unwrap();
             for english in [
-                "list default and named server sessions",
+                "list local and discovered remote sessions",
                 "start or attach to the named session",
                 "stop only the named session and its panes",
                 "delete a stopped named session",
@@ -4433,7 +4715,7 @@ mod tests {
         )
         .unwrap());
         let chinese = String::from_utf8(chinese).unwrap();
-        assert!(chinese.contains("列出默认和命名服务器会话"));
+        assert!(chinese.contains("列出本地会话和发现的远端会话"));
         assert!(chinese.contains("启动或连接到命名会话"));
     }
 

@@ -36,6 +36,11 @@ pub const KEY_REFERENCE_KEYS: &[&[&str]] = &[
 ];
 
 pub struct Catalog {
+    pub remote_hosts: &'static str,
+    pub remote_hosts_hint: &'static str,
+    pub remote_hosts_empty: &'static str,
+    pub remote_hosts_loading: &'static str,
+    pub remote_prompt_hint: &'static str,
     pub remove: &'static str,
     pub install: &'static str,
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -106,6 +111,11 @@ pub struct Catalog {
 }
 
 pub static EN: Catalog = Catalog {
+    remote_hosts: "Remote",
+    remote_hosts_hint: "Select to connect and discover sessions. Deselect to disconnect.",
+    remote_hosts_empty: "No SSH aliases found in ~/.ssh/config.",
+    remote_hosts_loading: "Reading SSH config…",
+    remote_prompt_hint: "Tab field · ←→ change · Enter open · Esc back",
     remove: "remove",
     install: "Install",
     shell: "Shell",
@@ -260,6 +270,11 @@ pub static EN: Catalog = Catalog {
 };
 
 pub static ES: Catalog = Catalog {
+    remote_hosts: "Remotos",
+    remote_hosts_hint: "Selecciona para conectar y descubrir sesiones. Desmarca para desconectar.",
+    remote_hosts_empty: "No se encontraron alias SSH en ~/.ssh/config.",
+    remote_hosts_loading: "Leyendo configuración SSH…",
+    remote_prompt_hint: "Tab campo · ←→ cambiar · Enter abrir · Esc volver",
     remove: "eliminar", install: "Instalar", shell: "Shell", shell_default: "Predeterminado", shell_command_prompt: "Símbolo del sistema", read_only: "solo lectura", click_preview: "Vista previa", click_tab: "Abrir en pestaña",
     diff_auto: "automático", diff_split: "dividido", diff_stack: "apilado", diff_symbols: "símbolos", diff_bars: "barras", diff_both: "ambos", diff_theme: "tema", diff_red_green: "rojo + verde",
     shift_default: "predeterminado", shift_newline: "nueva línea", preset_default: "luvus (predeterminado)", preset_function: "sin Ctrl (F12)", preset_tmux: "tmux", preset_custom: "Personalizado",
@@ -285,6 +300,11 @@ pub static ES: Catalog = Catalog {
 };
 
 pub static PT: Catalog = Catalog {
+    remote_hosts: "Remotos",
+    remote_hosts_hint: "Selecione para conectar e descobrir sessões. Desmarque para desconectar.",
+    remote_hosts_empty: "Nenhum alias SSH encontrado em ~/.ssh/config.",
+    remote_hosts_loading: "Lendo configuração SSH…",
+    remote_prompt_hint: "Tab campo · ←→ alterar · Enter abrir · Esc voltar",
     remove: "remover", install: "Instalar", shell: "Shell", shell_default: "Padrão", shell_command_prompt: "Prompt de Comando", read_only: "somente leitura", click_preview: "Pré-visualização", click_tab: "Abrir em aba",
     diff_auto: "automático", diff_split: "dividido", diff_stack: "empilhado", diff_symbols: "símbolos", diff_bars: "barras", diff_both: "ambos", diff_theme: "tema", diff_red_green: "vermelho + verde",
     shift_default: "padrão", shift_newline: "nova linha", preset_default: "luvus (padrão)", preset_function: "sem Ctrl (F12)", preset_tmux: "tmux", preset_custom: "Personalizado",
@@ -308,6 +328,11 @@ pub static PT: Catalog = Catalog {
 };
 
 pub static FR: Catalog = Catalog {
+    remote_hosts: "Distants",
+    remote_hosts_hint: "Cochez pour connecter et découvrir les sessions. Décochez pour déconnecter.",
+    remote_hosts_empty: "Aucun alias SSH trouvé dans ~/.ssh/config.",
+    remote_hosts_loading: "Lecture de la configuration SSH…",
+    remote_prompt_hint: "Tab champ · ←→ modifier · Entrée ouvrir · Échap retour",
     remove: "supprimer", install: "Installer", shell: "Shell", shell_default: "Par défaut", shell_command_prompt: "Invite de commandes", read_only: "lecture seule", click_preview: "Aperçu", click_tab: "Ouvrir dans un onglet",
     diff_auto: "automatique", diff_split: "séparé", diff_stack: "empilé", diff_symbols: "symboles", diff_bars: "barres", diff_both: "les deux", diff_theme: "thème", diff_red_green: "rouge + vert",
     shift_default: "par défaut", shift_newline: "nouvelle ligne", preset_default: "luvus (par défaut)", preset_function: "sans Ctrl (F12)", preset_tmux: "tmux", preset_custom: "Personnalisé",
@@ -331,6 +356,11 @@ pub static FR: Catalog = Catalog {
 };
 
 pub static DE: Catalog = Catalog {
+    remote_hosts: "Remote",
+    remote_hosts_hint: "Auswählen verbindet und findet Sitzungen. Abwählen trennt die Verbindung.",
+    remote_hosts_empty: "Keine SSH-Aliasse in ~/.ssh/config gefunden.",
+    remote_hosts_loading: "SSH-Konfiguration wird gelesen…",
+    remote_prompt_hint: "Tab Feld · ←→ ändern · Enter öffnen · Esc zurück",
     remove: "entfernen", install: "Installieren", shell: "Shell", shell_default: "Standard", shell_command_prompt: "Eingabeaufforderung", read_only: "schreibgeschützt", click_preview: "Vorschau", click_tab: "In Tab öffnen",
     diff_auto: "automatisch", diff_split: "geteilt", diff_stack: "gestapelt", diff_symbols: "Symbole", diff_bars: "Balken", diff_both: "beides", diff_theme: "Theme", diff_red_green: "rot + grün",
     shift_default: "Standard", shift_newline: "neue Zeile", preset_default: "luvus (Standard)", preset_function: "ohne Ctrl (F12)", preset_tmux: "tmux", preset_custom: "Benutzerdefiniert",
@@ -354,6 +384,11 @@ pub static DE: Catalog = Catalog {
 };
 
 pub static ID: Catalog = Catalog {
+    remote_hosts: "Remote",
+    remote_hosts_hint: "Pilih untuk menghubungkan dan menemukan sesi. Hapus pilihan untuk memutuskan.",
+    remote_hosts_empty: "Tidak ada alias SSH di ~/.ssh/config.",
+    remote_hosts_loading: "Membaca konfigurasi SSH…",
+    remote_prompt_hint: "Tab kolom · ←→ ubah · Enter buka · Esc kembali",
     remove: "hapus",
     install: "Pasang",
     shell: "Shell",
@@ -505,6 +540,11 @@ pub static ID: Catalog = Catalog {
 };
 
 pub static ZH: Catalog = Catalog {
+    remote_hosts: "远端",
+    remote_hosts_hint: "勾选即连接并发现会话；取消勾选即断开连接。",
+    remote_hosts_empty: "~/.ssh/config 中没有可选的 SSH 别名。",
+    remote_hosts_loading: "正在读取 SSH 配置…",
+    remote_prompt_hint: "Tab 切换字段 · ←→ 修改 · Enter 打开 · Esc 返回",
     remove: "移除",
     install: "安装",
     shell: "Shell",
@@ -652,6 +692,11 @@ pub static ZH: Catalog = Catalog {
 };
 
 pub static JA: Catalog = Catalog {
+    remote_hosts: "リモート",
+    remote_hosts_hint: "選択すると接続してセッションを検出します。解除すると切断します。",
+    remote_hosts_empty: "~/.ssh/config に SSH エイリアスがありません。",
+    remote_hosts_loading: "SSH 設定を読み込み中…",
+    remote_prompt_hint: "Tab 項目 · ←→ 変更 · Enter 開く · Esc 戻る",
     remove: "削除",
     install: "インストール",
     shell: "シェル",
@@ -808,6 +853,11 @@ pub static JA: Catalog = Catalog {
 };
 
 pub static KO: Catalog = Catalog {
+    remote_hosts: "원격",
+    remote_hosts_hint: "선택하면 연결하고 세션을 검색합니다. 선택 해제하면 연결을 끊습니다.",
+    remote_hosts_empty: "~/.ssh/config에 SSH 별칭이 없습니다.",
+    remote_hosts_loading: "SSH 설정을 읽는 중…",
+    remote_prompt_hint: "Tab 항목 · ←→ 변경 · Enter 열기 · Esc 돌아가기",
     remove: "제거",
     install: "설치",
     shell: "셸",

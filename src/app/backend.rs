@@ -819,6 +819,7 @@ impl App {
                             tabs: Vec::new(),
                             active_tab: 0,
                             pinned: false,
+                            remote: None,
                         });
                         let index = self.workspaces.len() - 1;
                         created_workspace = Some(index);

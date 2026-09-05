@@ -68,7 +68,8 @@
     "workspace.closed",
     "workspace.created",
     "workspace.metadata_reported",
-    "workspace.moved"
+    "workspace.moved",
+    "workspace.renamed"
   ],
   "properties": {
     "agent.authority_released": { "$ref": "#/$defs/authority_released" },
@@ -132,7 +133,8 @@
     "workspace.closed": { "$ref": "#/$defs/workspace_only" },
     "workspace.created": { "$ref": "#/$defs/workspace_only" },
     "workspace.metadata_reported": { "$ref": "#/$defs/workspace_only" },
-    "workspace.moved": { "$ref": "#/$defs/workspace_moved" }
+    "workspace.moved": { "$ref": "#/$defs/workspace_moved" },
+    "workspace.renamed": { "$ref": "#/$defs/workspace_renamed" }
   },
   "$defs": {
     "automation_definition": {
@@ -209,6 +211,15 @@
       "properties": {
         "workspace": { "type": "string" },
         "to": { "type": "string" }
+      }
+    },
+    "workspace_renamed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["workspace", "name"],
+      "properties": {
+        "workspace": { "type": "string" },
+        "name": { "type": "string" }
       }
     },
     "workspace_block_moved": {

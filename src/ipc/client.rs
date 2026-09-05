@@ -73,7 +73,7 @@ pub fn run(sock: &Path) -> Result<()> {
     };
     crate::logging::event(crate::logging::EventKind::ClientConnect, &[]);
     // `Conn` is a cloneable duplex handle: one clone reads, the other writes.
-    attach_inner(stream.clone(), stream)
+    attach_inner(stream.clone(), stream, true)
 }
 
 /// Attach a thin client over **any** reader/writer carrying the binary frame
@@ -81,7 +81,7 @@ pub fn run(sock: &Path) -> Result<()> {
 /// (docs/18 RA) passes an `ssh` child's stdout/stdin — the protocol is the same.
 pub fn attach<R, W>(reader: R, writer: W) -> Result<()>
 where
-    R: Read,
+    R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
     let _logging = crate::logging::init(crate::logging::Role::Client);
@@ -90,17 +90,17 @@ where
         &[crate::logging::Field::Role(crate::logging::Role::Client)],
     );
     crate::logging::event(crate::logging::EventKind::ClientConnect, &[]);
-    attach_inner(reader, writer)
+    attach_inner(reader, writer, false)
 }
 
-fn attach_inner<R, W>(reader: R, writer: W) -> Result<()>
+fn attach_inner<R, W>(reader: R, writer: W, local: bool) -> Result<()>
 where
-    R: Read,
+    R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
     let mut terminal = ratatui::init();
     crate::install_tui_panic_hook();
-    let result = run_inner(reader, writer, &mut terminal);
+    let result = run_inner(reader, writer, &mut terminal, local);
     let _ = execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
@@ -136,9 +136,14 @@ enum ClientExit {
     SwitchSession(String),
 }
 
-fn run_inner<R, W>(reader: R, mut writer: W, terminal: &mut DefaultTerminal) -> Result<ClientExit>
+fn run_inner<R, W>(
+    reader: R,
+    mut writer: W,
+    terminal: &mut DefaultTerminal,
+    local: bool,
+) -> Result<ClientExit>
 where
-    R: Read,
+    R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
     let truecolor = protocol::truecolor_supported();
@@ -185,8 +190,10 @@ where
         ServerMessage::Ready { probe_terminal } => probe_terminal,
         _ => return Err(anyhow!("unexpected handshake negotiation")),
     };
+    let mut colors = None;
     let pending = if probe_terminal {
         let probe = crate::terminal::theme_probe::probe();
+        colors = probe.colors.clone();
         protocol::write_message(&mut writer, &ClientMessage::TerminalColors(probe.colors))?;
         probe.pending
     } else {
@@ -220,8 +227,23 @@ where
     // a real "new line" key instead of a bare CR (see `push_key_protocol`).
     crate::push_key_protocol();
 
-    // Input thread: terminal events → the server.
-    thread::spawn(move || input_loop(writer, pending));
+    // One terminal input reader lives for the entire client, across local and
+    // managed-remote session switches. The event-loop owns the current writer.
+    let (tx, rx) = std::sync::mpsc::sync_channel(128);
+    let input_tx = tx.clone();
+    thread::spawn(move || {
+        input_loop(
+            move |event| {
+                input_message_with_clipboard(event, crate::terminal::clipboard::read_image)
+                    .is_none_or(|message| input_tx.send(ClientEvent::Input(message)).is_ok())
+            },
+            pending,
+        )
+    });
+    let mut generation = 0;
+    spawn_frame_reader(reader, generation, tx.clone());
+    let mut writer: Box<dyn Write + Send> = Box::new(writer);
+    let mut current = crate::session::display_name();
 
     // Main thread: paint frames as they arrive. A full frame repaints the screen; a
     // diff writes only its changed cells straight to the terminal (no full re-blit,
@@ -230,7 +252,18 @@ where
     // pane even after `?25l`, so composition does not follow chrome.
     let mut last_cursor = None;
     let exit = loop {
-        match protocol::read_message::<_, ServerMessage>(&mut reader) {
+        let message = match rx.recv() {
+            Ok(ClientEvent::Input(message)) => {
+                // A switch can already be queued behind the final old-server
+                // frame. Its closed socket must not terminate this client.
+                let _ = protocol::write_message(&mut writer, &message);
+                continue;
+            }
+            Ok(ClientEvent::Server(epoch, message)) if epoch == generation => message,
+            Ok(_) => continue,
+            Err(_) => break ClientExit::Done,
+        };
+        match message {
             // A full frame repaints the whole screen; a diff writes *only its changed
             // cells* straight to the terminal (O(changed), not a whole re-blit). Each
             // is wrapped in a DEC 2026 synchronized update so it paints atomically.
@@ -280,6 +313,32 @@ where
             Ok(ServerMessage::Sound(signal)) => crate::emit_sound(signal),
             Ok(ServerMessage::Clipboard(text)) => crate::emit_clipboard(&text),
             Ok(ServerMessage::OpenUrl(url)) => crate::platform::open_url(&url),
+            Ok(ServerMessage::SwitchSession { name }) if local => {
+                // The server prepares the target before sending SwitchSession.
+                // Keep the old frame and terminal modes until its first full frame.
+                let (target, connection) = match connect_switched_session(&name, terminal, &colors)
+                {
+                    Ok(connection) => (name, connection),
+                    Err(error) => {
+                        crate::emit_notification(&format!("Session switch failed: {error}"));
+                        (
+                            current.clone(),
+                            connect_switched_session(&current, terminal, &colors)?,
+                        )
+                    }
+                };
+                generation += 1;
+                let (reader, next_writer) = connection;
+                writer = Box::new(next_writer);
+                spawn_frame_reader(reader, generation, tx.clone());
+                crate::session::apply_explicit_name(&target).map_err(anyhow::Error::msg)?;
+                current = target;
+                let _ = execute!(
+                    std::io::stdout(),
+                    crossterm::terminal::SetTitle(crate::window_title())
+                );
+                last_cursor = None;
+            }
             Ok(ServerMessage::SwitchSession { name }) => break ClientExit::SwitchSession(name),
             Ok(ServerMessage::Detach) => break ClientExit::Detached,
             Ok(ServerMessage::ServerShutdown { .. }) => break ClientExit::ServerStopped,
@@ -304,6 +363,87 @@ where
     Ok(exit)
 }
 
+enum ClientEvent {
+    Input(ClientMessage),
+    Server(u64, std::io::Result<ServerMessage>),
+}
+
+fn spawn_frame_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    generation: u64,
+    tx: std::sync::mpsc::SyncSender<ClientEvent>,
+) {
+    thread::spawn(move || loop {
+        let message = protocol::read_message(&mut reader);
+        let terminal = matches!(
+            &message,
+            Err(_)
+                | Ok(ServerMessage::SwitchSession { .. }
+                    | ServerMessage::Detach
+                    | ServerMessage::ServerShutdown { .. })
+        );
+        if tx.send(ClientEvent::Server(generation, message)).is_err() || terminal {
+            break;
+        }
+    });
+}
+
+fn connect_switched_session(
+    name: &str,
+    terminal: &DefaultTerminal,
+    colors: &Option<crate::terminal::theme_probe::TerminalColors>,
+) -> Result<(BufReader<transport::Conn>, transport::Conn)> {
+    let selected = crate::session::parse_target_name(name).map_err(anyhow::Error::msg)?;
+    let socket = crate::session::client_socket_path_for(selected.as_deref());
+    let timeout = std::time::Duration::from_secs(3);
+    let writer = transport::connect_timeout(&socket, timeout)?;
+    let size = terminal.size()?;
+    negotiate_switched_session(writer, size.width, size.height, colors, timeout)
+}
+
+fn negotiate_switched_session(
+    mut writer: transport::Conn,
+    cols: u16,
+    rows: u16,
+    colors: &Option<crate::terminal::theme_probe::TerminalColors>,
+    timeout: std::time::Duration,
+) -> Result<(BufReader<transport::Conn>, transport::Conn)> {
+    let deadline = std::time::Instant::now() + timeout;
+    // PIPE_NOWAIT turns ordinary named-pipe response latency into a failed
+    // read. The deadline reader polls Windows availability without changing
+    // its mode; Unix also keeps its bounded kernel send timeout.
+    #[cfg(not(windows))]
+    writer.set_send_timeout(timeout)?;
+    let mut connection = writer.clone();
+    let mut reader = connection.deadline_reader(deadline);
+    write_handshake_message(
+        &mut writer,
+        &ClientMessage::Hello {
+            version: protocol::PROTOCOL_VERSION,
+            cols,
+            rows,
+        },
+    )?;
+    match read_handshake_message(&mut reader)? {
+        ServerMessage::Welcome { error: None, .. } => {}
+        ServerMessage::Welcome {
+            error: Some(error), ..
+        } => return Err(anyhow!(error)),
+        _ => return Err(anyhow!("unexpected session handshake")),
+    }
+    match read_handshake_message(&mut reader)? {
+        ServerMessage::Ready {
+            probe_terminal: true,
+        } => protocol::write_message(&mut writer, &ClientMessage::TerminalColors(colors.clone()))?,
+        ServerMessage::Ready {
+            probe_terminal: false,
+        } => {}
+        _ => return Err(anyhow!("unexpected session negotiation")),
+    }
+    writer.clear_timeouts()?;
+    Ok((BufReader::new(connection), writer))
+}
+
 /// Hand this thin client process to the same launch mode targeting another
 /// logical session. Unix replaces the process. Windows starts the successor
 /// and immediately lets this process exit, so the old terminal-input thread is
@@ -312,7 +452,8 @@ where
 fn switch_session_process(name: &str) -> Result<()> {
     crate::session::validate_name(name).map_err(anyhow::Error::msg)?;
     let raw: Vec<String> = std::env::args().collect();
-    let args = switched_args(&raw, name);
+    let remote_host = crate::session::remote::process_target().map(|target| target.host);
+    let args = switched_args(&raw, name, remote_host.as_deref());
     let exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(exe);
     command.args(args).env_remove("LUVUS_SOCKET_PATH");
@@ -328,10 +469,22 @@ fn switch_session_process(name: &str) -> Result<()> {
     }
 }
 
-fn switched_args(raw: &[String], name: &str) -> Vec<String> {
-    let mut out = vec!["--session".to_string(), name.to_string()];
+fn switched_args(raw: &[String], name: &str, remote_host: Option<&str>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(host) = remote_host {
+        out.extend(["--host".to_string(), host.to_string()]);
+    }
+    out.extend(["--session".to_string(), name.to_string()]);
     let mut index = 1;
     while index < raw.len() {
+        if raw[index] == "--host" {
+            index = (index + 2).min(raw.len());
+            continue;
+        }
+        if raw[index].starts_with("--host=") {
+            index += 1;
+            continue;
+        }
         if raw[index] == "--session" {
             index = (index + 2).min(raw.len());
             continue;
@@ -339,6 +492,14 @@ fn switched_args(raw: &[String], name: &str) -> Vec<String> {
         if raw[index].starts_with("--session=") {
             index += 1;
             continue;
+        }
+        // These are launch modes, not payload. Keeping `session attach old`
+        // after a new selector re-targeted the old session (or failed CLI
+        // parsing); keeping `client` bypassed remote presentation startup.
+        if raw[index] == "client"
+            || (raw[index] == "session" && raw.get(index + 1).is_some_and(|arg| arg == "attach"))
+        {
+            break;
         }
         // Only replace an initial global selector. Later flags belong to the
         // command itself, for example `pane report --session <native-id>`.
@@ -348,31 +509,51 @@ fn switched_args(raw: &[String], name: &str) -> Vec<String> {
     out
 }
 
-fn input_loop<W: Write>(mut writer: W, pending: Vec<Event>) {
+fn input_loop(mut send: impl FnMut(Event) -> bool, pending: Vec<Event>) {
     #[cfg(windows)]
     {
-        crate::terminal::host_input::run_input_loop(pending, |event| {
-            write_input_event(&mut writer, event)
-        });
+        crate::terminal::host_input::run_input_loop(pending, send);
     }
 
     #[cfg(not(windows))]
     {
         for event in pending {
-            if !write_input_event(&mut writer, event) {
+            if !send(event) {
                 return;
             }
         }
         while let Ok(event) = read_event() {
-            if !write_input_event(&mut writer, event) {
+            if !send(event) {
                 break;
             }
         }
     }
 }
 
-fn write_input_event(writer: &mut impl Write, event: Event) -> bool {
-    event_message(event).is_none_or(|message| protocol::write_message(writer, &message).is_ok())
+#[cfg(test)]
+fn write_input_with_clipboard(
+    writer: &mut impl Write,
+    event: Event,
+    read_image: impl FnOnce() -> Option<crate::terminal::clipboard::ClipboardImage>,
+) -> bool {
+    input_message_with_clipboard(event, read_image)
+        .is_none_or(|message| protocol::write_message(writer, &message).is_ok())
+}
+
+fn input_message_with_clipboard(
+    event: Event,
+    read_image: impl FnOnce() -> Option<crate::terminal::clipboard::ClipboardImage>,
+) -> Option<ClientMessage> {
+    if matches!(&event, Event::Key(key) if key.code == crossterm::event::KeyCode::Char('v')
+        && key.modifiers == crossterm::event::KeyModifiers::CONTROL
+        && key.kind == crossterm::event::KeyEventKind::Press)
+        || matches!(&event, Event::Paste(text) if text.is_empty())
+    {
+        if let Some(image) = read_image() {
+            return Some(ClientMessage::ClipboardImage(image));
+        }
+    }
+    event_message(event)
 }
 
 fn event_message(event: Event) -> Option<ClientMessage> {
@@ -962,6 +1143,191 @@ mod render_tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn switched_handshake_has_one_deadline_across_partial_messages() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::time::{Duration, Instant};
+
+        let _env = crate::persist::test_env("switch-handshake-deadline");
+        crate::persist::ensure_server_session_dir().unwrap();
+        let socket = crate::persist::client_socket_path();
+        let listener = transport::bind(&socket).unwrap();
+        let peer = thread::spawn(move || {
+            let mut peer = listener.accept().unwrap();
+            let _: ClientMessage = protocol::read_message(&mut peer).unwrap();
+            // Every fragment arrives within the old per-read timeout, while
+            // the complete handshake exceeds the intended total deadline.
+            let mut welcome = Vec::new();
+            protocol::write_message(
+                &mut welcome,
+                &ServerMessage::Welcome {
+                    version: protocol::PROTOCOL_VERSION,
+                    error: None,
+                },
+            )
+            .unwrap();
+            for bytes in [&welcome[..2], &welcome[2..]] {
+                thread::sleep(Duration::from_millis(120));
+                if peer.write_all(bytes).is_err() {
+                    return;
+                }
+            }
+            let _ = protocol::write_message(
+                &mut peer,
+                &ServerMessage::Ready {
+                    probe_terminal: false,
+                },
+            );
+        });
+        let connection = transport::connect(&socket).unwrap();
+        let started = Instant::now();
+        let result =
+            negotiate_switched_session(connection, 80, 24, &None, Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        let error = result
+            .err()
+            .expect("partial reads must not reset the deadline");
+        assert!(is_handshake_io_error(&error));
+        assert!(elapsed < Duration::from_secs(2));
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn switched_handshake_waits_for_fragments_and_clears_the_deadline() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::time::Duration;
+
+        let _env = crate::persist::test_env("switch-handshake-delayed");
+        crate::persist::ensure_server_session_dir().unwrap();
+        let socket = crate::persist::client_socket_path();
+        let listener = transport::bind(&socket).unwrap();
+        let peer = thread::spawn(move || {
+            let mut peer = listener.accept().unwrap();
+            assert!(matches!(
+                protocol::read_message::<_, ClientMessage>(&mut peer).unwrap(),
+                ClientMessage::Hello {
+                    cols: 80,
+                    rows: 24,
+                    ..
+                }
+            ));
+            thread::sleep(Duration::from_millis(40));
+            let mut welcome = Vec::new();
+            protocol::write_message(
+                &mut welcome,
+                &ServerMessage::Welcome {
+                    version: protocol::PROTOCOL_VERSION,
+                    error: None,
+                },
+            )
+            .unwrap();
+            peer.write_all(&welcome[..2]).unwrap();
+            thread::sleep(Duration::from_millis(20));
+            peer.write_all(&welcome[2..]).unwrap();
+            protocol::write_message(
+                &mut peer,
+                &ServerMessage::Ready {
+                    probe_terminal: true,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                protocol::read_message::<_, ClientMessage>(&mut peer).unwrap(),
+                ClientMessage::TerminalColors(None)
+            ));
+            // The display connection must no longer carry the handshake's
+            // receive timeout, including a smaller remaining kernel timeout.
+            thread::sleep(Duration::from_millis(300));
+            protocol::write_message(&mut peer, &ServerMessage::Detach).unwrap();
+        });
+        let connection = transport::connect(&socket).unwrap();
+        let (mut reader, _writer) =
+            negotiate_switched_session(connection, 80, 24, &None, Duration::from_millis(200))
+                .unwrap();
+        assert!(matches!(
+            protocol::read_message::<_, ServerMessage>(&mut reader).unwrap(),
+            ServerMessage::Detach
+        ));
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn switched_handshake_times_out_when_the_peer_stays_silent() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::time::{Duration, Instant};
+
+        let _env = crate::persist::test_env("switch-handshake-silent");
+        crate::persist::ensure_server_session_dir().unwrap();
+        let socket = crate::persist::client_socket_path();
+        let listener = transport::bind(&socket).unwrap();
+        let peer = thread::spawn(move || {
+            let mut peer = listener.accept().unwrap();
+            let _: ClientMessage = protocol::read_message(&mut peer).unwrap();
+            thread::sleep(Duration::from_millis(300));
+        });
+        let connection = transport::connect(&socket).unwrap();
+        let started = Instant::now();
+        let error =
+            negotiate_switched_session(connection, 80, 24, &None, Duration::from_millis(100))
+                .err()
+                .expect("a connected but silent server must not retain this client");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(is_handshake_io_error(&error));
+        assert_eq!(
+            error.downcast_ref::<HandshakeIoError>().unwrap().0.kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn ctrl_v_bridges_images_and_preserves_text_and_ctrl_enter() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        let mut bytes = vec![];
+        assert!(write_input_with_clipboard(
+            &mut bytes,
+            Event::Key(key),
+            || None
+        ));
+        assert!(
+            matches!(protocol::read_message::<_, ClientMessage>(&mut bytes.as_slice()).unwrap(),
+            ClientMessage::Key(sent) if sent == key)
+        );
+        for event in [Event::Key(key), Event::Paste(String::new())] {
+            let mut bytes = vec![];
+            assert!(write_input_with_clipboard(&mut bytes, event, || Some(
+                crate::terminal::clipboard::ClipboardImage {
+                    extension: "png".into(),
+                    bytes: b"\x89PNG\r\n\x1a\ntest".to_vec(),
+                }
+            )));
+            assert!(
+                matches!(protocol::read_message::<_, ClientMessage>(&mut bytes.as_slice()).unwrap(),
+                ClientMessage::ClipboardImage(image) if image.valid())
+            );
+        }
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
+        for event in [Event::Key(enter), Event::Paste("ordinary text".into())] {
+            let mut bytes = vec![];
+            assert!(write_input_with_clipboard(
+                &mut bytes,
+                event.clone(),
+                || panic!("must not read clipboard")
+            ));
+            match (
+                event,
+                protocol::read_message::<_, ClientMessage>(&mut bytes.as_slice()).unwrap(),
+            ) {
+                (Event::Key(expected), ClientMessage::Key(actual)) => assert_eq!(expected, actual),
+                (Event::Paste(expected), ClientMessage::Paste(actual)) => {
+                    assert_eq!(expected, actual)
+                }
+                _ => panic!("original input changed"),
+            }
+        }
+    }
+
+    #[test]
     fn paste_event_preserves_windows_paths_quotes_and_unicode() {
         let command = r#".\.venv\Scripts\python.exe .\youtube_folder_uploader.py --folder "E:\Vídeos\Pendientes €""#;
         let message = event_message(Event::Paste(command.to_string()));
@@ -983,7 +1349,7 @@ mod render_tests {
             "2222".to_string(),
         ];
         assert_eq!(
-            switched_args(&raw, "new"),
+            switched_args(&raw, "new", None),
             ["--session", "new", "--remote", "host", "-p", "2222"]
         );
     }
@@ -1000,7 +1366,7 @@ mod render_tests {
             "native-rollout".to_string(),
         ];
         assert_eq!(
-            switched_args(&raw, "new"),
+            switched_args(&raw, "new", None),
             [
                 "--session",
                 "new",
@@ -1009,6 +1375,44 @@ mod render_tests {
                 "--session",
                 "native-rollout"
             ]
+        );
+    }
+
+    #[test]
+    fn session_attach_handoff_discards_the_previous_attach_target() {
+        let raw = ["luvus", "session", "attach", "remote-dev-63-first"].map(str::to_string);
+        assert_eq!(
+            switched_args(&raw, "default", None),
+            ["--session", "default"]
+        );
+        let raw = ["luvus", "--session", "first", "client"].map(str::to_string);
+        assert_eq!(
+            switched_args(&raw, "remote-dev-63-second", None),
+            ["--session", "remote-dev-63-second"]
+        );
+    }
+
+    #[test]
+    fn managed_remote_session_handoff_stays_on_the_same_ssh_host() {
+        let raw = vec![
+            "luvus".to_string(),
+            "--session".to_string(),
+            "remote-dev-207-api".to_string(),
+        ];
+        assert_eq!(
+            switched_args(&raw, "review", Some("dev-207")),
+            ["--host", "dev-207", "--session", "review"]
+        );
+
+        let raw = vec![
+            "luvus".to_string(),
+            "--host=dev-207".to_string(),
+            "--session".to_string(),
+            "api".to_string(),
+        ];
+        assert_eq!(
+            switched_args(&raw, "review", Some("dev-207")),
+            ["--host", "dev-207", "--session", "review"]
         );
     }
 

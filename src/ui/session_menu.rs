@@ -3,6 +3,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::app::session_menu::{NamedSessionPrompt, RemotePromptField};
 use crate::app::App;
 use crate::ui::theme::Theme;
 use crate::ui::{display_width, truncate, RenderTarget};
@@ -27,12 +28,16 @@ pub(crate) fn draw_session_menu(
             menu.prompt.clone(),
             menu.error.clone(),
             menu.preparing,
-            menu.rows.len() + 1,
+            menu.rows.len() + 2,
         )
     };
     let mobile = app.compact;
     let item_height = if mobile { MOBILE_ITEM_HEIGHT } else { 1 };
-    let prompt_height = if prompt.is_some() { 5 } else { 0 };
+    let prompt_height = match prompt.as_ref() {
+        Some(NamedSessionPrompt::Local { .. }) => 5,
+        Some(NamedSessionPrompt::Remote { .. }) => 7,
+        None => 0,
+    };
     let area = if mobile {
         viewport
     } else {
@@ -42,7 +47,7 @@ pub(crate) fn draw_session_menu(
         // Fill outward from whichever sidebar owns the selector. This removes
         // the dead strip left by anchoring the popup to the label itself and
         // lets a right-only layout open the same menu toward the pane area.
-        let width = 40.min(viewport.width.max(1));
+        let width = 64.min(viewport.width.max(1));
         let on_right = anchor.x >= viewport.x.saturating_add(viewport.width / 2);
         let x = if on_right {
             viewport.right().saturating_sub(width)
@@ -54,7 +59,7 @@ pub(crate) fn draw_session_menu(
         } else {
             (item_count as u16)
                 .saturating_mul(item_height)
-                .saturating_add(2 + u16::from(error.is_some()))
+                .saturating_add(3 + u16::from(error.is_some()))
         };
         let height = desired.min(viewport.height.saturating_sub(1)).max(3);
         Rect::new(x, anchor.bottom(), width, height)
@@ -119,7 +124,7 @@ pub(crate) fn draw_session_menu(
         inner.bottom().saturating_sub(content_top),
     );
 
-    if let Some(prompt) = prompt.as_deref() {
+    if let Some(prompt) = prompt.as_ref() {
         draw_prompt(f, content, app, prompt, preparing, error.as_deref(), theme);
         return;
     }
@@ -145,7 +150,22 @@ pub(crate) fn draw_session_menu(
     }
 
     let top = content.y + u16::from(error.is_some());
-    let available = content.bottom().saturating_sub(top) as usize;
+    let available = content.bottom().saturating_sub(top + 1) as usize;
+    f.render_widget(
+        Paragraph::new(format!(
+            " r {} · {} [{}]",
+            app.catalog.act_refresh,
+            app.catalog.session_merge,
+            if app.remote_merge_enabled { "✓" } else { " " }
+        ))
+        .style(Style::new().fg(theme.overlay1)),
+        Rect::new(
+            content.x,
+            content.bottom().saturating_sub(1),
+            content.width,
+            1,
+        ),
+    );
     let visible_items = available / item_height as usize;
     if cursor < scroll {
         scroll = cursor;
@@ -176,11 +196,34 @@ fn draw_prompt(
     f: &mut RenderTarget,
     area: Rect,
     app: &App,
-    prompt: &str,
+    prompt: &NamedSessionPrompt,
     preparing: bool,
     error: Option<&str>,
     theme: &Theme,
 ) {
+    if let NamedSessionPrompt::Remote {
+        name,
+        hosts,
+        host_index,
+        focus,
+    } = prompt
+    {
+        draw_remote_prompt(
+            f,
+            area,
+            app,
+            name,
+            hosts.get(*host_index).map_or("", String::as_str),
+            *focus,
+            preparing,
+            error,
+            theme,
+        );
+        return;
+    }
+    let NamedSessionPrompt::Local { name: prompt } = prompt else {
+        return;
+    };
     if area.height == 0 {
         return;
     }
@@ -229,6 +272,103 @@ fn draw_prompt(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn draw_remote_prompt(
+    f: &mut RenderTarget,
+    area: Rect,
+    app: &App,
+    name: &str,
+    host: &str,
+    focus: RemotePromptField,
+    preparing: bool,
+    error: Option<&str>,
+    theme: &Theme,
+) {
+    if area.height == 0 {
+        return;
+    }
+    let selectable = |selected: bool| {
+        if selected {
+            Style::new().fg(theme.crust).bg(theme.accent).bold()
+        } else {
+            Style::new().fg(theme.text).bg(theme.surface0)
+        }
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            truncate(
+                &format!("{}: ‹ {} ›", app.catalog.session_host, host),
+                area.width as usize,
+            ),
+            selectable(focus == RemotePromptField::Host),
+        )),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    if area.height > 1 {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                app.catalog.session_name,
+                if focus == RemotePromptField::Name {
+                    Style::new().fg(theme.accent).bold()
+                } else {
+                    Style::new().fg(theme.text).bold()
+                },
+            )),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+    }
+    if area.height > 2 {
+        let suffix = if preparing { " …" } else { "▏" };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                truncate(&format!("{name}{suffix}"), area.width as usize),
+                Style::new().fg(theme.text).bg(theme.surface0),
+            )),
+            Rect::new(area.x, area.y + 2, area.width, 1),
+        );
+    }
+    if area.height > 3 {
+        let state = if app.remote_merge_enabled {
+            app.catalog.session_on
+        } else {
+            app.catalog.session_off
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                truncate(
+                    &format!("{}: {}", app.catalog.session_merge, state),
+                    area.width as usize,
+                ),
+                Style::new().fg(theme.overlay1),
+            )),
+            Rect::new(area.x, area.y + 3, area.width, 1),
+        );
+    }
+    if area.height > 4 {
+        let message = error.unwrap_or(app.catalog.session_name_hint);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                truncate(message, area.width as usize),
+                Style::new().fg(if error.is_some() {
+                    theme.coral
+                } else {
+                    theme.overlay1
+                }),
+            )),
+            Rect::new(area.x, area.y + 4, area.width, 1),
+        );
+    }
+    if area.height > 5 {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                app.catalog.settings.remote_prompt_hint,
+                Style::new().fg(theme.overlay0),
+            )),
+            Rect::new(area.x, area.y + 5, area.width, 1),
+        );
+    }
+}
+
 fn draw_row(
     f: &mut RenderTarget,
     rect: Rect,
@@ -262,14 +402,48 @@ fn draw_row(
         }
         return;
     }
+    if index == 1 {
+        let label = format!("{arrow} + {}", app.catalog.new_remote_session);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                truncate(&label, width),
+                Style::new()
+                    .fg(if hot { theme.crust } else { theme.accent })
+                    .bold(),
+            )),
+            Rect::new(rect.x, rect.y, rect.width, 1),
+        );
+        if rect.height > 1 {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(
+                        "    {} · {}",
+                        app.catalog.session_host, app.catalog.session_name
+                    ),
+                    Style::new().fg(if hot { theme.crust } else { theme.overlay0 }),
+                )),
+                Rect::new(rect.x, rect.y + 1, rect.width, 1),
+            );
+        }
+        return;
+    }
     let Some(row) = app
         .named_session_menu
         .as_ref()
-        .and_then(|menu| menu.rows.get(index - 1))
+        .and_then(|menu| menu.rows.get(index - 2))
     else {
         return;
     };
-    let state = if row.current {
+    let mut state = if let Some(remote) = &row.remote {
+        if row.current {
+            format!(
+                "{} · {} · {}",
+                app.catalog.session_current, app.catalog.remote_session, remote.host
+            )
+        } else {
+            format!("{} · {}", app.catalog.remote_session, remote.host)
+        }
+    } else if row.current {
         format!(
             "{} · {}",
             app.catalog.session_current, app.catalog.session_running
@@ -279,7 +453,24 @@ fn draw_row(
     } else {
         app.catalog.session_stopped.to_string()
     };
-    let dot = if row.running { "●" } else { "○" };
+    if row.merged && row.remote.is_none() {
+        for host in &app.remote_host_status {
+            if host
+                .sessions
+                .iter()
+                .any(|session| session.name == row.display_name())
+            {
+                state.push_str(&format!(" [{}]", host.host));
+            }
+        }
+    }
+    let dot = if row.remote.is_some() {
+        "◆"
+    } else if row.running {
+        "●"
+    } else {
+        "○"
+    };
     let state_width = if rect.height > 1 {
         0
     } else {
@@ -292,7 +483,7 @@ fn draw_row(
             Style::new().fg(if hot { theme.crust } else { theme.accent }),
         ),
         Span::styled(
-            truncate(&row.name, name_width),
+            truncate(row.display_name(), name_width),
             Style::new()
                 .fg(if hot {
                     theme.crust
@@ -360,14 +551,19 @@ mod tests {
                     name: "default".into(),
                     running: true,
                     current: true,
+                    remote: None,
+                    merged: false,
                 },
                 NamedSessionRow {
                     name: "review".into(),
                     running: false,
                     current: false,
+                    remote: None,
+                    merged: false,
                 },
             ],
-            cursor: 1,
+            hosts: vec!["dev-207".into()],
+            cursor: 2,
             scroll: 0,
             loading: false,
             prompt: None,
@@ -456,7 +652,7 @@ mod tests {
         assert!(!top.contains('↔'));
         assert!(!top.contains('▾'));
         assert!(!top.contains("luvus"));
-        assert_eq!(app.named_session_row_rects.len(), 3);
+        assert_eq!(app.named_session_row_rects.len(), 4);
         assert!(app.named_session_button_rect.is_some());
         assert!(
             app.named_session_menu_rect.unwrap().right() > app.sidebars.left.width,
@@ -477,7 +673,7 @@ mod tests {
         let selected = app
             .named_session_row_rects
             .iter()
-            .find(|(index, _)| *index == 1)
+            .find(|(index, _)| *index == 2)
             .unwrap()
             .1;
         assert_eq!(
@@ -548,7 +744,7 @@ mod tests {
         draw_session_menu(&mut target, area, &mut app, &theme);
 
         assert_eq!(app.named_session_menu_rect, Some(area));
-        assert_eq!(app.named_session_row_rects.len(), 3);
+        assert_eq!(app.named_session_row_rects.len(), 4);
         assert!(app
             .named_session_row_rects
             .iter()

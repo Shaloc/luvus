@@ -181,6 +181,13 @@ impl App {
             return;
         }
         self.active_ws = wsi;
+        if self.workspaces[wsi].remote.is_some() {
+            self.send_workspace_remote(
+                wsi,
+                crate::ipc::protocol::ClientMessage::Command("open_mission".into()),
+            );
+            return;
+        }
         if let Some(i) = self.workspaces[wsi].tabs.iter().position(Tab::is_mission) {
             self.workspaces[wsi].active_tab = i;
             self.request_mission_usage_refresh();

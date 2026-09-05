@@ -47,6 +47,9 @@ pub(super) fn draw_pane_titles(
                             .unwrap_or_default()
                     ),
                 ),
+                crate::app::ViewKind::Remote(v) => {
+                    ("⇄", format!("{} · {}", v.target.host, v.target.session))
+                }
             };
             let path_fg = if focused { t.accent } else { t.subtext0 };
             // Plain terminal glyphs only: files use a square, DIFF uses its
@@ -328,6 +331,9 @@ fn draw_one_pane(
                         .map(|(target, rect)| (id, target, rect)),
                 );
             }
+            crate::app::ViewKind::Remote(v) => {
+                return draw_remote_view(f, content, v, focused, app.downsample, app.catalog, t);
+            }
         }
         return None; // views own no terminal cursor
     }
@@ -532,6 +538,95 @@ fn draw_one_pane(
         }
     }
     cursor_pos
+}
+
+fn draw_remote_view(
+    f: &mut RenderTarget,
+    area: Rect,
+    view: &crate::app::remote::RemoteView,
+    focused: bool,
+    downsample: bool,
+    catalog: &crate::i18n::Catalog,
+    t: &Theme,
+) -> Option<(u16, u16, bool)> {
+    f.render_widget(Block::new().style(Style::new().bg(t.mantle)), area);
+    let Some(frame) = &view.frame else {
+        let label = match (&view.state, &view.error) {
+            (crate::app::remote::RemoteViewState::Connecting, _) => format!(
+                "{} {} / {}…",
+                catalog.remote_connecting, view.target.host, view.target.session
+            ),
+            (_, Some(error)) => format!("{}: {error}", catalog.remote_workspace_unavailable),
+            _ => format!("{}…", catalog.remote_workspace_waiting),
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                crate::ui::truncate(&label, area.width as usize),
+                Style::new().fg(t.overlay1).bg(t.mantle),
+            ))),
+            area,
+        );
+        return None;
+    };
+
+    let width = frame.width.min(area.width);
+    let height = frame.height.min(area.height);
+    let buffer = f.buffer_mut();
+    for row in 0..height {
+        for column in 0..width {
+            let index = row as usize * frame.width as usize + column as usize;
+            let Some(source) = frame.cells.get(index) else {
+                continue;
+            };
+            if source.symbol.is_empty() {
+                continue;
+            }
+            let symbol = if source.symbol.chars().any(char::is_control) {
+                " "
+            } else {
+                source.symbol.as_str()
+            };
+            let color = |packed| {
+                let color = crate::ipc::protocol::unpack(packed);
+                if downsample {
+                    crate::ipc::protocol::to_256(color)
+                } else {
+                    color
+                }
+            };
+            let cell = &mut buffer[(area.x + column, area.y + row)];
+            cell.set_symbol(symbol);
+            cell.set_fg(color(source.fg));
+            cell.set_bg(color(source.bg));
+            cell.modifier = crate::ipc::protocol::unpack_mods(source.mods);
+        }
+    }
+    if view.state == crate::app::remote::RemoteViewState::Disconnected {
+        let message = format!(
+            "{}: {}",
+            catalog.remote_workspace_unavailable,
+            view.error
+                .as_deref()
+                .unwrap_or(catalog.remote_workspace_waiting)
+        );
+        f.render_widget(
+            Paragraph::new(crate::ui::truncate(&message, area.width as usize))
+                .style(Style::new().fg(t.coral).bg(t.mantle)),
+            Rect::new(area.x, area.y, area.width, area.height.min(1)),
+        );
+        return None;
+    }
+    if focused {
+        frame.cursor.and_then(|(column, row)| {
+            (column < width && row < height).then_some((
+                area.x + column,
+                area.y + row,
+                frame.cursor_visible,
+            ))
+        })
+    } else {
+        None
+    }
 }
 
 /// In-view PTY cell, mapped into the pane. Hidden still returns a park so the
