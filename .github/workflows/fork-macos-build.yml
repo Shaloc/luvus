@@ -58,7 +58,8 @@ jobs:
           unset LUVUS_SOCKET_PATH LUVUS_SESSION
           binary="$RUNNER_TEMP/luvus-install/bin/luvus"
           file "$binary"
-          lipo -verify_arch arm64 "$binary"
+          # -verify_arch consumes all remaining arguments as architecture names.
+          lipo "$binary" -verify_arch arm64
           otool -L "$binary"
           "$binary" --version --remote-session-protocol
           "$binary" help kitten
