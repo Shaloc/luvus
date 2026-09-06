@@ -36,6 +36,11 @@ pub enum AppEvent {
         pane: PaneId,
         result: Result<std::path::PathBuf, String>,
     },
+    ClipboardHelperResult {
+        client: Option<u64>,
+        generation: String,
+        result: crate::terminal::clipboard::kitten::Outcome,
+    },
     Resize,
     /// The given pane produced output; the screen changed.
     PtyData(PaneId),

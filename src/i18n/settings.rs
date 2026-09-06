@@ -36,6 +36,10 @@ pub const KEY_REFERENCE_KEYS: &[&[&str]] = &[
 ];
 
 pub struct Catalog {
+    pub clipboard_helper: &'static str,
+    pub clipboard_helper_checking: &'static str,
+    pub clipboard_helper_installing: &'static str,
+    pub clipboard_helper_unsupported: &'static str,
     pub remote_hosts: &'static str,
     pub remote_hosts_hint: &'static str,
     pub remote_hosts_empty: &'static str,
@@ -111,6 +115,10 @@ pub struct Catalog {
 }
 
 pub static EN: Catalog = Catalog {
+    clipboard_helper: "Kitty clipboard (client)",
+    clipboard_helper_checking: "Checking…",
+    clipboard_helper_installing: "Installing…",
+    clipboard_helper_unsupported: "Unsupported platform",
     remote_hosts: "Remote",
     remote_hosts_hint: "Select to connect and discover sessions. Deselect to disconnect.",
     remote_hosts_empty: "No SSH aliases found in ~/.ssh/config.",
@@ -270,6 +278,10 @@ pub static EN: Catalog = Catalog {
 };
 
 pub static ES: Catalog = Catalog {
+    clipboard_helper: "Portapapeles Kitty (cliente)",
+    clipboard_helper_checking: "Comprobando…",
+    clipboard_helper_installing: "Instalando…",
+    clipboard_helper_unsupported: "Plataforma no compatible",
     remote_hosts: "Remotos",
     remote_hosts_hint: "Selecciona para conectar y descubrir sesiones. Desmarca para desconectar.",
     remote_hosts_empty: "No se encontraron alias SSH en ~/.ssh/config.",
@@ -300,6 +312,10 @@ pub static ES: Catalog = Catalog {
 };
 
 pub static PT: Catalog = Catalog {
+    clipboard_helper: "Clipboard Kitty (cliente)",
+    clipboard_helper_checking: "Verificando…",
+    clipboard_helper_installing: "Instalando…",
+    clipboard_helper_unsupported: "Plataforma incompatível",
     remote_hosts: "Remotos",
     remote_hosts_hint: "Selecione para conectar e descobrir sessões. Desmarque para desconectar.",
     remote_hosts_empty: "Nenhum alias SSH encontrado em ~/.ssh/config.",
@@ -328,6 +344,10 @@ pub static PT: Catalog = Catalog {
 };
 
 pub static FR: Catalog = Catalog {
+    clipboard_helper: "Presse-papiers Kitty (client)",
+    clipboard_helper_checking: "Vérification…",
+    clipboard_helper_installing: "Installation…",
+    clipboard_helper_unsupported: "Plateforme non prise en charge",
     remote_hosts: "Distants",
     remote_hosts_hint: "Cochez pour connecter et découvrir les sessions. Décochez pour déconnecter.",
     remote_hosts_empty: "Aucun alias SSH trouvé dans ~/.ssh/config.",
@@ -356,6 +376,10 @@ pub static FR: Catalog = Catalog {
 };
 
 pub static DE: Catalog = Catalog {
+    clipboard_helper: "Kitty-Zwischenablage (Client)",
+    clipboard_helper_checking: "Wird geprüft…",
+    clipboard_helper_installing: "Wird installiert…",
+    clipboard_helper_unsupported: "Plattform nicht unterstützt",
     remote_hosts: "Remote",
     remote_hosts_hint: "Auswählen verbindet und findet Sitzungen. Abwählen trennt die Verbindung.",
     remote_hosts_empty: "Keine SSH-Aliasse in ~/.ssh/config gefunden.",
@@ -384,6 +408,10 @@ pub static DE: Catalog = Catalog {
 };
 
 pub static ID: Catalog = Catalog {
+    clipboard_helper: "Papan klip Kitty (klien)",
+    clipboard_helper_checking: "Memeriksa…",
+    clipboard_helper_installing: "Memasang…",
+    clipboard_helper_unsupported: "Platform tidak didukung",
     remote_hosts: "Remote",
     remote_hosts_hint: "Pilih untuk menghubungkan dan menemukan sesi. Hapus pilihan untuk memutuskan.",
     remote_hosts_empty: "Tidak ada alias SSH di ~/.ssh/config.",
@@ -540,6 +568,10 @@ pub static ID: Catalog = Catalog {
 };
 
 pub static ZH: Catalog = Catalog {
+    clipboard_helper: "Kitty 剪贴板（显示端）",
+    clipboard_helper_checking: "检测中…",
+    clipboard_helper_installing: "安装中…",
+    clipboard_helper_unsupported: "不支持此平台",
     remote_hosts: "远端",
     remote_hosts_hint: "勾选即连接并发现会话；取消勾选即断开连接。",
     remote_hosts_empty: "~/.ssh/config 中没有可选的 SSH 别名。",
@@ -692,6 +724,10 @@ pub static ZH: Catalog = Catalog {
 };
 
 pub static JA: Catalog = Catalog {
+    clipboard_helper: "Kitty クリップボード（表示側）",
+    clipboard_helper_checking: "確認中…",
+    clipboard_helper_installing: "インストール中…",
+    clipboard_helper_unsupported: "非対応の環境",
     remote_hosts: "リモート",
     remote_hosts_hint: "選択すると接続してセッションを検出します。解除すると切断します。",
     remote_hosts_empty: "~/.ssh/config に SSH エイリアスがありません。",
@@ -853,6 +889,10 @@ pub static JA: Catalog = Catalog {
 };
 
 pub static KO: Catalog = Catalog {
+    clipboard_helper: "Kitty 클립보드 (클라이언트)",
+    clipboard_helper_checking: "확인 중…",
+    clipboard_helper_installing: "설치 중…",
+    clipboard_helper_unsupported: "지원하지 않는 플랫폼",
     remote_hosts: "원격",
     remote_hosts_hint: "선택하면 연결하고 세션을 검색합니다. 선택 해제하면 연결을 끊습니다.",
     remote_hosts_empty: "~/.ssh/config에 SSH 별칭이 없습니다.",

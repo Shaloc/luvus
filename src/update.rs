@@ -433,17 +433,37 @@ fn release_target() -> Result<&'static str> {
 }
 
 #[cfg(not(windows))]
-fn download_file(url: &str, destination: &Path) -> Result<()> {
-    let curl = Command::new("curl")
+pub(crate) fn download_file(url: &str, destination: &Path) -> Result<()> {
+    download_file_bounded(url, destination, None)
+}
+
+/// Shared explicit-install transport. Callers verify the downloaded bytes before
+/// execution or replacement; the optional limit also bounds helper downloads.
+#[cfg(not(windows))]
+pub(crate) fn download_file_bounded(
+    url: &str,
+    destination: &Path,
+    limit: Option<u64>,
+) -> Result<()> {
+    let mut curl = Command::new("curl");
+    if let Some(limit) = limit {
+        curl.args(["--max-filesize", &limit.to_string()]);
+    }
+    let curl = curl
         .args(["-fsSL", "--max-time", "120", "-H", "User-Agent: luvus"])
         .arg("-o")
         .arg(destination)
         .arg(url)
+        .stderr(std::process::Stdio::null())
         .status();
     if matches!(curl, Ok(status) if status.success()) {
         return Ok(());
     }
 
+    // wget has no reliable total-file-size limit. Bounded callers fail closed.
+    if limit.is_some() {
+        bail!("bounded download failed (curl is required): {url}");
+    }
     let wget = Command::new("wget")
         .args(["-q", "--timeout=120", "--header=User-Agent: luvus"])
         .arg("-O")

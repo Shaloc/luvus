@@ -259,6 +259,16 @@ where
                 let _ = protocol::write_message(&mut writer, &message);
                 continue;
             }
+            Ok(ClientEvent::Helper(epoch, request, result)) if epoch == generation => {
+                let _ = protocol::write_message(
+                    &mut writer,
+                    &ClientMessage::ClipboardHelperResult {
+                        generation: request.generation,
+                        result,
+                    },
+                );
+                continue;
+            }
             Ok(ClientEvent::Server(epoch, message)) if epoch == generation => message,
             Ok(_) => continue,
             Err(_) => break ClientExit::Done,
@@ -313,6 +323,13 @@ where
             Ok(ServerMessage::Sound(signal)) => crate::emit_sound(signal),
             Ok(ServerMessage::Clipboard(text)) => crate::emit_clipboard(&text),
             Ok(ServerMessage::OpenUrl(url)) => crate::platform::open_url(&url),
+            Ok(ServerMessage::ClipboardHelper(request)) => {
+                let sender = tx.clone();
+                thread::spawn(move || {
+                    let result = crate::terminal::clipboard::kitten::perform(request.install);
+                    let _ = sender.send(ClientEvent::Helper(generation, request, result));
+                });
+            }
             Ok(ServerMessage::SwitchSession { name }) if local => {
                 // The server prepares the target before sending SwitchSession.
                 // Keep the old frame and terminal modes until its first full frame.
@@ -365,6 +382,11 @@ where
 
 enum ClientEvent {
     Input(ClientMessage),
+    Helper(
+        u64,
+        crate::terminal::clipboard::kitten::Request,
+        crate::terminal::clipboard::kitten::Outcome,
+    ),
     Server(u64, std::io::Result<ServerMessage>),
 }
 

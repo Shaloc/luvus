@@ -1,0 +1,75 @@
+name: Fork macOS ARM64 artifact
+run-name: macOS ARM64 artifact · ${{ github.sha }}
+
+# Deliberately separate from release.yml and scripts/release*.sh: no tags,
+# releases, package registries, Homebrew taps, or downstream dispatches.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'Shaloc/luvus' && github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      CARGO_NET_RETRY: "10"
+      CARGO_HTTP_MULTIPLEXING: "false"
+      SQLITE3_LIB_DIR: /usr/lib
+      TARGET: aarch64-apple-darwin
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: Set up native Rust toolchain
+        run: |
+          test "$(uname -m)" = arm64
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add --toolchain stable "$TARGET"
+          rustc +stable --version
+      - name: Build only the command-line binary
+        run: cargo +stable build --release --locked --bin luvus --target "$TARGET"
+      - name: Package and smoke-test an isolated installation
+        id: package
+        run: |
+          package="luvus-$(cargo +stable metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "luvus"))')-${GITHUB_SHA:0:12}-$TARGET"
+          mkdir -p "target/artifact/$package" "$RUNNER_TEMP/luvus-install/bin"
+          install -m 755 "target/$TARGET/release/luvus" "target/artifact/$package/luvus"
+          cp LICENSE "target/artifact/$package/"
+          {
+            echo "repository=$GITHUB_REPOSITORY"
+            echo "commit=$GITHUB_SHA"
+            echo "target=$TARGET"
+            rustc +stable --version
+            "target/artifact/$package/luvus" --version --remote-session-protocol
+          } > "target/artifact/$package/build-info.txt"
+          COPYFILE_DISABLE=1 tar -C target/artifact -czf "target/artifact/$package.tar.gz" "$package"
+          (cd target/artifact && shasum -a 256 "$package.tar.gz" > "$package.tar.gz.sha256")
+          # Test the extracted archive, never a live user's installation/session.
+          tar -xzf "target/artifact/$package.tar.gz" -C "$RUNNER_TEMP/luvus-install"
+          install -m 755 "$RUNNER_TEMP/luvus-install/$package/luvus" "$RUNNER_TEMP/luvus-install/bin/luvus"
+          export LUVUS_HOME="$RUNNER_TEMP/luvus-smoke-home"
+          unset LUVUS_SOCKET_PATH LUVUS_SESSION
+          binary="$RUNNER_TEMP/luvus-install/bin/luvus"
+          file "$binary"
+          lipo -verify_arch arm64 "$binary"
+          otool -L "$binary"
+          "$binary" --version --remote-session-protocol
+          "$binary" help kitten
+          "$binary" skill show > "$RUNNER_TEMP/luvus-skill.md"
+          cmp skills/luvus/SKILL.md "$RUNNER_TEMP/luvus-skill.md"
+          echo "name=$package" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            target/artifact/*.tar.gz
+            target/artifact/*.sha256
+          if-no-files-found: error
+          retention-days: 30

@@ -14470,6 +14470,10 @@ mod tests {
             .unwrap();
         app.settings = Some(SettingsUi {
             generation: crate::ids::public_id("settings"),
+            kitten_status: None,
+            kitten_installing: false,
+            kitten_request: None,
+            kitten_client: None,
             remote_hosts: None,
             tab: SettingsTab::Layout,
             cursor: idx,

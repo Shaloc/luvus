@@ -890,6 +890,35 @@ fn draw_content(
                     break;
                 }
                 match row {
+                    GeneralRow::ClipboardHelper => {
+                        use crate::terminal::clipboard::kitten::Status;
+                        let ui = app.settings.as_ref().expect("settings are open");
+                        let label = if ui.kitten_installing {
+                            cat.settings.clipboard_helper_installing.to_string()
+                        } else {
+                            match &ui.kitten_status {
+                                None => cat.settings.clipboard_helper_checking.to_string(),
+                                Some(Ok(Status::Installed(version))) => format!("✓ {version}"),
+                                Some(Ok(Status::Unsupported)) => {
+                                    cat.settings.clipboard_helper_unsupported.to_string()
+                                }
+                                Some(Ok(Status::Missing)) => {
+                                    format!("[ {} ]", cat.settings.install)
+                                }
+                                Some(Err(_)) => format!("! [ {} ]", cat.settings.install),
+                            }
+                        };
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.settings.clipboard_helper,
+                            Line::from(Span::styled(label, Style::new().fg(t.accent))),
+                            t,
+                        ));
+                    }
                     GeneralRow::FileOpen => {
                         let r = slider_row(
                             f,

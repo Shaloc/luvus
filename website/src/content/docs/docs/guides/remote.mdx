@@ -167,6 +167,21 @@ over [OSC 5522](https://sw.kovidgoyal.net/kitty/clipboard/). Kitty controls acce
 and may ask for permission; Luvus does not bypass it. Other headless clients need
 native desktop clipboard access. Clipboard reads happen only on paste.
 
+Install the optional helper from **Menu → General → Kitty clipboard (client)**,
+or run `luvus kitten install` on the display-client machine (`luvus kitten status`
+checks it). Opening General only checks local availability; it does not download
+anything or read your clipboard. Explicit installation downloads the pinned
+official Kitty 0.48.2 helper with SHA-256 verification into the display client's
+Luvus home, under `tools/kitten`, without replacing an existing PATH installation,
+changing PATH, or restarting a session. Luvus uses the private helper immediately.
+Linux and macOS x86-64/ARM64 installation targets are provided; other platforms
+report unsupported. The install runs on the display client even when the server
+is reached through SSH; in a managed remote workspace use the outer Settings,
+not the owner's projected Settings. This local-only command rejects `--host`.
+Kitty may still ask you to authorize the clipboard read. Denied reads, missing
+helpers and non-image clipboards preserve the child application's Ctrl+V;
+an SSH-hosted child may then report its own X11 clipboard error.
+
 Child OSC52 text-copy requests, including Neovim yank, are forwarded to the
 display client's clipboard from local and remote panes. They do not require
 the image helper. Clipboard reads (`OSC 52 ... ?`) and primary-selection writes
@@ -573,3 +588,23 @@ Do not expose `~/.luvus` sockets or Windows named pipes through a public tunnel.
 For an independent client that cannot run through the interactive SSH bridge,
 use the scoped, expiring pairing flow documented in
 [Remote access and transport providers](/docs/uhp/remote-access/).
+
+## Fork macOS build artifacts
+
+The `Shaloc/luvus` fork provides a manual **Fork macOS ARM64 artifact** workflow
+for `aarch64-apple-darwin`. It builds the selected commit and uploads a tarball
+and SHA-256 checksum to that workflow run, retained for 30 days. The archive
+contains `luvus`, its license, and `build-info.txt` identifying the source commit.
+An isolated installation of the archive is smoke-tested on the macOS runner.
+
+This workflow does not create releases or tags, publish packages, update
+Homebrew taps, build the website, or dispatch downstream workflows. Existing
+upstream CI and release workflows are unchanged. To keep a fork-only build
+isolated, push its commit with `[skip ci]` and run this workflow manually; do not
+run the upstream release scripts or installer to distribute the custom binary.
+
+On Apple Silicon, verify the downloaded `.tar.gz.sha256` with `shasum -a 256 -c`,
+extract the archive, and install its binary into your chosen PATH directory.
+Check `luvus --version --remote-session-protocol` on each host: managed remote
+connections need matching fork and transport versions. Installing a binary does
+not restart any existing server; restart is a separate, explicit operation.

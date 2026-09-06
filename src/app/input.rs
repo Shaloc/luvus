@@ -553,6 +553,13 @@ impl App {
                 self.apply_named_sessions_loaded(generation, result);
                 return true;
             }
+            AppEvent::ClipboardHelperResult {
+                client,
+                generation,
+                result,
+            } => {
+                return self.apply_clipboard_helper_result(client, &generation, result);
+            }
             AppEvent::ClipboardImageReady { pane, result } => {
                 match result {
                     Ok(path) => {
@@ -1319,6 +1326,7 @@ impl App {
             | AppEvent::RemoteMergeChanged { .. }
             | AppEvent::SettingsRemoteHostsLoaded { .. }
             | AppEvent::ClipboardImageReady { .. }
+            | AppEvent::ClipboardHelperResult { .. }
             | AppEvent::WorktreeChoicesLoaded { .. }
             | AppEvent::RemoteSessionWatcherClosed { .. }
             | AppEvent::RemoteProjectionReady { .. }

@@ -62,6 +62,10 @@ impl SettingsTab {
 /// Transient state of the open Settings modal.
 pub struct SettingsUi {
     pub generation: String,
+    pub kitten_status: Option<crate::terminal::clipboard::kitten::Outcome>,
+    pub kitten_installing: bool,
+    pub kitten_request: Option<crate::terminal::clipboard::kitten::Request>,
+    pub kitten_client: Option<u64>,
     pub remote_hosts: Option<Result<Vec<String>, String>>,
     pub tab: SettingsTab,
     pub cursor: usize,
@@ -116,6 +120,7 @@ pub enum GeneralRow {
     FileClick,
     FilesShowHidden,
     ShiftEnter,
+    ClipboardHelper,
     CheckUpdates,
     /// Replay each agent's own CLI options on resume (docs/62).
     ResumeFlags,
@@ -151,6 +156,7 @@ impl App {
             GeneralRow::FileClick,
             GeneralRow::FilesShowHidden,
             GeneralRow::ShiftEnter,
+            GeneralRow::ClipboardHelper,
             GeneralRow::CheckUpdates,
             GeneralRow::ResumeFlags,
             GeneralRow::NewPaneToWorkspaceRoot,
@@ -166,13 +172,13 @@ impl App {
     /// Index of the first notification row (where the `── Notify ──` divider
     /// goes), mirroring `dock_section_start` in the Layout tab.
     ///
-    /// This is one short: `AgentTitle` is a general setting, so the divider
-    /// renders above it and it reads as a notification option. That off-by-one
-    /// predates the `File click behavior` row — the constant went 6 → 7 only to
-    /// keep the divider where it already was. Fixing it properly means 8, which
-    /// moves a row users have already learned, so it is left for its own change.
+    /// Preserve the existing divider above AgentTitle when new general rows
+    /// are added, without coupling notification placement to a numeric offset.
     pub fn general_section_start(&self) -> usize {
-        7
+        self.general_rows()
+            .iter()
+            .position(|row| *row == GeneralRow::AgentTitle)
+            .unwrap_or_else(|| self.general_rows().len())
     }
 
     /// The Layout tab's ordered selectable rows (docs/29). The first index of the
@@ -245,6 +251,10 @@ impl App {
     pub fn open_settings(&mut self) {
         self.settings = Some(SettingsUi {
             generation: crate::ids::public_id("settings"),
+            kitten_status: None,
+            kitten_installing: false,
+            kitten_request: None,
+            kitten_client: None,
             remote_hosts: None,
             tab: SettingsTab::General,
             cursor: 0,
@@ -252,6 +262,48 @@ impl App {
             layout_scroll: 0,
             capturing: false,
         });
+        self.request_clipboard_helper(false);
+    }
+
+    fn request_clipboard_helper(&mut self, install: bool) {
+        let Some(settings) = self.settings.as_mut() else {
+            return;
+        };
+        if settings.kitten_installing
+            || settings.kitten_request.is_some()
+            || (install && settings.kitten_status.is_none())
+        {
+            return;
+        }
+        settings.kitten_status = None;
+        settings.kitten_installing = install;
+        settings.kitten_client = None;
+        settings.kitten_request = Some(crate::terminal::clipboard::kitten::Request {
+            generation: settings.generation.clone(),
+            install,
+        });
+    }
+
+    pub(crate) fn apply_clipboard_helper_result(
+        &mut self,
+        client: Option<u64>,
+        generation: &str,
+        result: crate::terminal::clipboard::kitten::Outcome,
+    ) -> bool {
+        let Some(settings) = self
+            .settings
+            .as_mut()
+            .filter(|ui| ui.generation == generation && ui.kitten_client == client)
+        else {
+            return false;
+        };
+        let error = result.as_ref().err().cloned();
+        settings.kitten_status = Some(result);
+        settings.kitten_installing = false;
+        if let Some(error) = error {
+            self.show_toast(error);
+        }
+        true
     }
 
     pub fn close_settings(&mut self) {
@@ -642,6 +694,7 @@ impl App {
             SettingsTab::Layout => self.activate_layout(cursor),
             // Enter/click: Test rows ring their cue, everything else steps.
             SettingsTab::General => match self.general_rows().get(cursor).copied() {
+                Some(GeneralRow::ClipboardHelper) => self.request_clipboard_helper(true),
                 Some(GeneralRow::TestDoneSound) => self.test_sound(crate::sound::SoundCue::Done),
                 Some(GeneralRow::TestBlockedSound) => {
                     self.test_sound(crate::sound::SoundCue::Blocked)
@@ -1383,7 +1436,11 @@ impl App {
             }
             // Test rows fire on Enter/click only (see `settings_activate`) —
             // arrows must not ring them, or holding ‹ › would spam cues.
-            Some(GeneralRow::TestDoneSound | GeneralRow::TestBlockedSound) => {}
+            Some(
+                GeneralRow::TestDoneSound
+                | GeneralRow::TestBlockedSound
+                | GeneralRow::ClipboardHelper,
+            ) => {}
             None => {}
         }
     }
@@ -1446,6 +1503,77 @@ fn lang_cursor(code: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kitten_install_is_explicit_and_late_or_other_client_results_are_ignored() {
+        use crate::terminal::clipboard::kitten::Status;
+        let _env = crate::persist::test_env("settings-kitten");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        app.open_settings();
+        let request = app
+            .settings
+            .as_mut()
+            .unwrap()
+            .kitten_request
+            .take()
+            .unwrap();
+        assert!(
+            !request.install,
+            "opening General must not install anything"
+        );
+        app.settings.as_mut().unwrap().kitten_client = Some(7);
+        assert!(!app.apply_clipboard_helper_result(
+            Some(8),
+            &request.generation,
+            Ok(Status::Missing)
+        ));
+        assert!(app.settings.as_ref().unwrap().kitten_status.is_none());
+        app.request_clipboard_helper(true);
+        assert!(
+            app.settings.as_ref().unwrap().kitten_request.is_none(),
+            "do not race an outstanding availability check"
+        );
+        assert!(app.apply_clipboard_helper_result(
+            Some(7),
+            &request.generation,
+            Ok(Status::Missing)
+        ));
+        let row = app
+            .general_rows()
+            .iter()
+            .position(|row| *row == super::GeneralRow::ClipboardHelper)
+            .unwrap();
+        app.settings_adjust(row, 1);
+        assert!(
+            app.settings.as_ref().unwrap().kitten_request.is_none(),
+            "arrow navigation cannot install"
+        );
+        app.settings_activate(row);
+        assert!(
+            app.settings
+                .as_ref()
+                .unwrap()
+                .kitten_request
+                .as_ref()
+                .unwrap()
+                .install
+        );
+        app.settings.as_mut().unwrap().kitten_request.take();
+        app.settings_activate(row);
+        assert!(
+            app.settings.as_ref().unwrap().kitten_request.is_none(),
+            "double-click cannot queue another install"
+        );
+        app.close_settings();
+        app.open_settings();
+        assert!(!app.apply_clipboard_helper_result(
+            Some(7),
+            &request.generation,
+            Ok(Status::Installed("kitten 0.48.2".into()))
+        ));
+        assert!(app.settings.as_ref().unwrap().kitten_status.is_none());
+    }
+
     #[test]
     fn remote_host_selection_persists_and_ignores_closed_settings_results() {
         let _env = crate::persist::test_env("settings-remote-hosts");
@@ -1862,7 +1990,7 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 13);
+        assert_eq!(app.settings_rows(SettingsTab::General), 14);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
         assert_eq!(
