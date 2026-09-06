@@ -626,7 +626,8 @@ pub fn run() -> Result<()> {
         // flag still set here means un-rendered output → schedule a frame.
         if last_rearm.elapsed() >= rearm_interval {
             last_rearm = Instant::now();
-            let (visible, background, title_changed) = rearm_pty_notify_by_visibility(&app, &clients);
+            let (visible, background, title_changed) =
+                rearm_pty_notify_by_visibility(&app, &clients);
             if title_changed {
                 render_request.record(RenderCause::Metadata);
             }
@@ -668,7 +669,8 @@ pub fn run() -> Result<()> {
             // Re-arm the PTY readers now that their output is on screen. A flag
             // set during this frame = more output already waiting → stay dirty
             // so the burst keeps rendering at the frame cap, tail included.
-            let (visible, background, title_changed) = rearm_pty_notify_by_visibility(&app, &clients);
+            let (visible, background, title_changed) =
+                rearm_pty_notify_by_visibility(&app, &clients);
             if title_changed {
                 render_request.record(RenderCause::Metadata);
             }
@@ -1082,7 +1084,9 @@ enum EventRenderSource {
 
 fn event_render_source(app: &App, clients: &Clients, event: &AppEvent) -> EventRenderSource {
     match event {
-        AppEvent::PtyData(id) if pane_visible_to_any_client(app, clients, *id) => EventRenderSource::VisiblePty,
+        AppEvent::PtyData(id) if pane_visible_to_any_client(app, clients, *id) => {
+            EventRenderSource::VisiblePty
+        }
         AppEvent::PtyData(id) if app.hidden_title_changed(*id) => {
             EventRenderSource::Cause(RenderCause::Metadata)
         }
@@ -2978,7 +2982,7 @@ mod tests {
         app.config.layout.agent_title = true;
 
         engine.lock().unwrap().advance(b"\x1b]2;reviewing\x07");
-        let source = super::event_render_source(&app, &AppEvent::PtyData(hidden));
+        let source = super::event_render_source(&app, &HashMap::new(), &AppEvent::PtyData(hidden));
         let mut request = RenderRequest::default();
         record_event_render_request(source, true, &mut request);
         assert!(request.needs_render());
@@ -2991,16 +2995,22 @@ mod tests {
             .unwrap()
             .advance(b"ordinary output\x1b]2;reviewing\x07");
         assert!(matches!(
-            super::event_render_source(&app, &AppEvent::PtyData(hidden)),
+            super::event_render_source(&app, &HashMap::new(), &AppEvent::PtyData(hidden)),
             EventRenderSource::HiddenPty
         ));
 
         // Output may arrive while the reader's notification is already set.
         engine.lock().unwrap().advance(b"\x1b]2;finished\x07");
         app.panes[&hidden].mark_data_pending_for_test();
-        assert!(app.rearm_pty_notify_by_visibility(|pane| app.pane_is_visible(pane)).2);
+        assert!(
+            app.rearm_pty_notify_by_visibility(|pane| app.pane_is_visible(pane))
+                .2
+        );
         app.panes[&hidden].mark_data_pending_for_test();
-        assert!(!app.rearm_pty_notify_by_visibility(|pane| app.pane_is_visible(pane)).2);
+        assert!(
+            !app.rearm_pty_notify_by_visibility(|pane| app.pane_is_visible(pane))
+                .2
+        );
     }
 
     #[test]

@@ -2447,6 +2447,7 @@ pub struct App {
     remote_mouse_capture: Option<(PaneId, Rect, ratatui::crossterm::event::MouseButton)>,
     pending_remote_navigation: Option<remote::PendingRemoteNavigation>,
     remote_registry_generation: u64,
+    remote_config_refresh_pending: bool,
     pub(crate) remote_host_status: Vec<crate::session::remote::HostStatus>,
     pub(crate) remote_merge_enabled: bool,
     remote_watcher_generation: u64,
@@ -3052,6 +3053,7 @@ impl App {
             remote_mouse_capture: None,
             pending_remote_navigation: None,
             remote_registry_generation: 0,
+            remote_config_refresh_pending: false,
             remote_host_status: Vec::new(),
             remote_merge_enabled: crate::session::remote::load_registry().merge_enabled(),
             remote_watcher_generation: 0,
@@ -3726,6 +3728,7 @@ impl App {
             remote_mouse_capture: None,
             pending_remote_navigation: None,
             remote_registry_generation: 0,
+            remote_config_refresh_pending: false,
             remote_host_status: Vec::new(),
             remote_merge_enabled: crate::session::remote::load_registry().merge_enabled(),
             remote_watcher_generation: 0,
@@ -4087,18 +4090,29 @@ impl App {
             .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
             .map(|tab| tab.layout.focus);
         let rows = self.agent_dock_targets();
-        let current_remote = self.remote_workspace_view(self.active_ws).and_then(|remote| {
-            let pane = remote.agents.iter().find(|agent| agent.focused)?.pane.clone();
-            Some(AgentDockTarget::RemoteLive { view: current?, pane })
-        });
+        let current_remote = self
+            .remote_workspace_view(self.active_ws)
+            .and_then(|remote| {
+                let pane = remote
+                    .agents
+                    .iter()
+                    .find(|agent| agent.focused)?
+                    .pane
+                    .clone();
+                Some(AgentDockTarget::RemoteLive {
+                    view: current?,
+                    pane,
+                })
+            });
         self.agent_cursor = current_remote
             .as_ref()
             .and_then(|current| rows.iter().position(|target| target == current))
-            .or_else(|| current
-            .and_then(|pane| {
-                rows.iter()
-                    .position(|target| *target == AgentDockTarget::Live(pane))
-            }))
+            .or_else(|| {
+                current.and_then(|pane| {
+                    rows.iter()
+                        .position(|target| *target == AgentDockTarget::Live(pane))
+                })
+            })
             .unwrap_or_else(|| self.agent_cursor.min(rows.len().saturating_sub(1)));
     }
 
@@ -4115,10 +4129,13 @@ impl App {
                 let view = workspace.tabs[0].layout.focus;
                 for agent in &remote.agents {
                     if visible {
-                        live.push((agent.pinned, AgentDockTarget::RemoteLive {
-                            view,
-                            pane: agent.pane.clone(),
-                        }));
+                        live.push((
+                            agent.pinned,
+                            AgentDockTarget::RemoteLive {
+                                view,
+                                pane: agent.pane.clone(),
+                            },
+                        ));
                     } else if agent.state == State::Blocked {
                         remote_blocked_elsewhere.push(AgentDockTarget::RemoteElsewhere {
                             view,
@@ -4137,7 +4154,10 @@ impl App {
                         continue;
                     }
                     if visible {
-                        live.push((self.pinned_agents.contains(&pane), AgentDockTarget::Live(pane)));
+                        live.push((
+                            self.pinned_agents.contains(&pane),
+                            AgentDockTarget::Live(pane),
+                        ));
                     } else if status.state == State::Blocked {
                         blocked_elsewhere.push(pane);
                     }
@@ -4174,27 +4194,35 @@ impl App {
             };
             let view = workspace.tabs[0].layout.focus;
             scheduled.extend(remote.scheduled.iter().map(|row| {
-                (row.deadline, AgentDockTarget::RemoteAutomation { view, id: row.id.clone() })
+                (
+                    row.deadline,
+                    AgentDockTarget::RemoteAutomation {
+                        view,
+                        id: row.id.clone(),
+                    },
+                )
             }));
             if !self.agents_active_only {
-                remote_history.extend(remote.history.iter().map(|row| {
-                    AgentDockTarget::RemoteSession { view, key: row.key }
-                }));
+                remote_history.extend(
+                    remote
+                        .history
+                        .iter()
+                        .map(|row| AgentDockTarget::RemoteSession { view, key: row.key }),
+                );
             }
         }
         scheduled.sort_by_key(|item| item.0);
-        rows.extend(
-            scheduled
-                .into_iter()
-                .map(|(_, target)| target),
-        );
+        rows.extend(scheduled.into_iter().map(|(_, target)| target));
 
         if !self.agents_active_only {
             let session_owner = |cwd: &std::path::Path| {
                 self.workspaces
                     .iter()
                     .enumerate()
-                    .filter(|(_, workspace)| workspace.remote.is_none() && crate::platform::is_subpath(cwd, &workspace.cwd))
+                    .filter(|(_, workspace)| {
+                        workspace.remote.is_none()
+                            && crate::platform::is_subpath(cwd, &workspace.cwd)
+                    })
                     .max_by_key(|(_, workspace)| workspace.cwd.as_os_str().len())
                     .map(|(workspace_index, _)| workspace_index)
             };
@@ -4381,7 +4409,9 @@ impl App {
                 let Some(ViewKind::Remote(remote)) = self.views.get(&view) else {
                     return;
                 };
-                let anchor = self.remote_agent_rects.iter()
+                let anchor = self
+                    .remote_agent_rects
+                    .iter()
                     .find(|(target, id, _)| *target == remote.target && *id == pane)
                     .map(|(_, _, rect)| (rect.x.saturating_add(2), rect.y))
                     .unwrap_or((self.agents_area.x.saturating_add(2), self.agents_area.y));
@@ -4394,7 +4424,9 @@ impl App {
                 }
             }
             AgentDockTarget::RemoteSession { view, key } => {
-                let anchor = self.remote_history_rects.iter()
+                let anchor = self
+                    .remote_history_rects
+                    .iter()
                     .find(|(owner, id, _)| *owner == view && *id == key)
                     .map(|(_, _, rect)| (rect.x.saturating_add(2), rect.y))
                     .unwrap_or((self.agents_area.x.saturating_add(2), self.agents_area.y));

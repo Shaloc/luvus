@@ -21,6 +21,7 @@ use crate::layout::TileLayout;
 use crate::session::remote::{RemoteBinaryLocation, RemoteSession};
 
 pub(super) struct RemoteWatcher {
+    target: RemoteSession,
     generation: u64,
     scope: Arc<crate::session::remote::ConnectionScope>,
     /// Only the first snapshot after an explicit discovery may reconnect an
@@ -376,6 +377,20 @@ impl App {
         }
         self.remote_registry_generation = self.remote_registry_generation.wrapping_add(1);
         let generation = self.remote_registry_generation;
+        // Revocation follows the in-memory selection immediately, including
+        // while a save is pending or failing. Only new admission waits for disk.
+        let enabled_hosts = self.config.remote_hosts.clone();
+        self.retain_remote_sessions(|host, _| enabled_hosts.iter().any(|item| item == host));
+        self.remote_host_status
+            .retain(|status| enabled_hosts.contains(&status.host));
+        // SSH admission and discovery read the saved configuration. Settings
+        // now saves asynchronously; fence older results and defer discovery
+        // until the existing save completion has persisted the latest choices.
+        if self.config_save_pending() {
+            self.remote_config_refresh_pending = true;
+            return;
+        }
+        self.remote_config_refresh_pending = false;
         if self.config.remote_hosts.is_empty() {
             self.remote_host_status.clear();
             self.apply_remote_registry_loaded(
@@ -455,34 +470,11 @@ impl App {
                 .cloned()
                 .collect()
         };
-        self.remote_session_watchers
-            .retain(|key, _| targets.iter().any(|target| target.canonical_name() == *key));
-        let active_id = self
-            .workspaces
-            .get(self.active_ws)
-            .map(|workspace| workspace.id.clone());
-        let removed: Vec<_> = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .filter_map(|(index, workspace)| {
-                let remote = workspace.remote.as_ref()?;
-                (!targets
-                    .iter()
-                    .any(|target| target.host == remote.host && target.session == remote.session))
-                .then_some(index)
-            })
-            .collect();
-        for index in removed.into_iter().rev() {
-            self.close_workspace_after_rehome(index);
-        }
-        if let Some(index) = active_id.and_then(|id| {
-            self.workspaces
+        self.retain_remote_sessions(|host, session| {
+            targets
                 .iter()
-                .position(|workspace| workspace.id == id)
-        }) {
-            self.active_ws = index;
-        }
+                .any(|target| target.host == host && target.session == session)
+        });
         for target in targets {
             self.discover_remote_session(target);
         }
@@ -496,6 +488,43 @@ impl App {
                     )),
                 );
             }
+        }
+    }
+
+    fn retain_remote_sessions(&mut self, keep: impl Fn(&str, &str) -> bool) {
+        self.remote_session_watchers
+            .retain(|_, watcher| keep(&watcher.target.host, &watcher.target.session));
+        let active_id = self
+            .workspaces
+            .get(self.active_ws)
+            .map(|workspace| workspace.id.clone());
+        let removed: Vec<_> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter_map(|(index, workspace)| {
+                let remote = workspace.remote.as_ref()?;
+                (!keep(&remote.host, &remote.session)).then_some(index)
+            })
+            .collect();
+        for index in removed.into_iter().rev() {
+            self.close_workspace_after_rehome(index);
+        }
+        if let Some(index) = active_id.and_then(|id| {
+            self.workspaces
+                .iter()
+                .position(|workspace| workspace.id == id)
+        }) {
+            self.active_ws = index;
+        }
+    }
+
+    pub(super) fn finish_remote_config_refresh(&mut self) -> bool {
+        if self.remote_config_refresh_pending && !self.config_save_pending() {
+            self.start_merged_remote_sessions();
+            true
+        } else {
+            false
         }
     }
 
@@ -572,6 +601,7 @@ impl App {
         self.remote_session_watchers.insert(
             key,
             RemoteWatcher {
+                target: target.clone(),
                 generation,
                 scope: scope.clone(),
                 refresh_projections: true,
@@ -3455,6 +3485,7 @@ pub(crate) mod tests {
         app.remote_session_watchers.insert(
             target.canonical_name(),
             RemoteWatcher {
+                target: target.clone(),
                 generation: 5,
                 scope: Arc::new(Default::default()),
                 refresh_projections: true,
@@ -3529,6 +3560,7 @@ pub(crate) mod tests {
         app.remote_session_watchers.insert(
             target.canonical_name(),
             RemoteWatcher {
+                target: target.clone(),
                 generation: 4,
                 scope: Arc::new(Default::default()),
                 refresh_projections: false,
@@ -3690,6 +3722,7 @@ pub(crate) mod tests {
         app.remote_session_watchers.insert(
             target.canonical_name(),
             RemoteWatcher {
+                target: target.clone(),
                 generation: 5,
                 scope: Arc::new(Default::default()),
                 refresh_projections: true,
@@ -3725,6 +3758,71 @@ pub(crate) mod tests {
             .workspaces
             .iter()
             .all(|workspace| workspace.remote.is_none()));
+    }
+
+    #[test]
+    fn disabling_one_host_revokes_its_live_and_pending_sessions_before_config_save() {
+        let _env = crate::persist::test_env("remote-disable-pending-save");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let disabled = RemoteSession::new("dev-207", "api-one").unwrap();
+        let pending = RemoteSession::new("dev-207", "api-two").unwrap();
+        let enabled = RemoteSession::new("dev-other", "api-one").unwrap();
+        let (_, disabled_input) =
+            navigation_projection(&mut app, &disabled.host, &disabled.session, "disabled");
+        let (_, enabled_input) =
+            navigation_projection(&mut app, &enabled.host, &enabled.session, "enabled");
+        let active_id = app.workspaces[app.active_ws].id.clone();
+        for target in [&disabled, &pending, &enabled] {
+            app.remote_session_watchers.insert(
+                target.canonical_name(),
+                RemoteWatcher {
+                    target: target.clone(),
+                    generation: 5,
+                    scope: Arc::new(Default::default()),
+                    refresh_projections: false,
+                },
+            );
+        }
+        app.config.remote_hosts = vec![enabled.host.clone()];
+        app.persist_config();
+        assert!(app.config_save_pending());
+        app.start_merged_remote_sessions();
+
+        assert!(app.remote_config_refresh_pending);
+        assert!(!app.remote_watcher_is_current(&disabled, 5));
+        assert!(!app.remote_watcher_is_current(&pending, 5));
+        assert!(app.remote_watcher_is_current(&enabled, 5));
+        assert_eq!(app.remote_session_watchers.len(), 1);
+        assert_eq!(app.workspaces[app.active_ws].id, active_id);
+        assert!(app
+            .workspaces
+            .iter()
+            .filter_map(|workspace| workspace.remote.as_ref())
+            .all(|remote| remote.host == enabled.host));
+        assert!(matches!(
+            disabled_input.try_recv(),
+            Ok(ClientMessage::Detach)
+        ));
+        assert!(matches!(
+            enabled_input.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        // Even with a second save coalesced behind the first, revoking the last
+        // host is immediate and does not start discovery against stale disk data.
+        app.config.remote_hosts.clear();
+        app.persist_config();
+        app.start_merged_remote_sessions();
+        assert!(app.remote_session_watchers.is_empty());
+        assert!(app
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.remote.is_none()));
+        assert!(matches!(
+            enabled_input.try_recv(),
+            Ok(ClientMessage::Detach)
+        ));
     }
 
     #[test]

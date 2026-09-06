@@ -94,9 +94,15 @@ mod tests {
         let active_before = app.agents_active_only;
         app.mode = crate::app::Mode::Prefix;
         app.handle_active_remote_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert_eq!(app.sidebar_focus, Some(crate::app::SidebarListFocus::Agents));
+        assert_eq!(
+            app.sidebar_focus,
+            Some(crate::app::SidebarListFocus::Agents)
+        );
         assert_eq!(app.agents_active_only, active_before);
-        app.handle_event(crate::event::AppEvent::Key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE)));
+        app.handle_event(crate::event::AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::NONE,
+        )));
         assert_eq!(app.agents_active_only, !active_before);
         let scoped_before = app.agents_this_workspace;
         app.mode = crate::app::Mode::Prefix;
@@ -141,11 +147,21 @@ mod tests {
             pane: PaneId(7),
         };
         app.open_agent_menu(target.clone(), 2, 2);
-        assert!(app.agent_menu_items(target.clone()).contains(&AgentMenuItem::Pin));
+        assert!(app
+            .agent_menu_items(target.clone())
+            .contains(&AgentMenuItem::Pin));
         let scoped_before = app.agents_this_workspace;
         app.agent_menu_action(AgentMenuItem::ToggleWorkspaceScope);
         assert_eq!(app.agents_this_workspace, !scoped_before);
         assert!(input.try_recv().is_err());
+        let paths_before = app.config.layout.agent_paths;
+        app.open_agent_menu(target.clone(), 2, 2);
+        app.agent_menu_action(AgentMenuItem::TogglePath);
+        assert_eq!(app.config.layout.agent_paths, !paths_before);
+        assert!(
+            input.try_recv().is_err(),
+            "path visibility belongs to the display"
+        );
         for (item, expected) in [
             (AgentMenuItem::Pin, "agent_pin 7"),
             (AgentMenuItem::Unpin, "agent_unpin 7"),
@@ -357,7 +373,10 @@ mod tests {
                 "mode":"workspace"}, "next_run_at":1_900_000_000, "created_at":1, "updated_at":1
         })).unwrap();
         owner.automation.automations.push(automation);
-        owner.automation.active_target_states.insert("a1".into(), crate::automation::ActiveTargetState::Restoring);
+        owner
+            .automation
+            .active_target_states
+            .insert("a1".into(), crate::automation::ActiveTargetState::Restoring);
         let snapshot = owner.runtime_snapshot();
         let parsed = crate::app::remote::parse_remote_snapshot(
             &json!({"result":snapshot}),
@@ -366,11 +385,15 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.workspaces[0].history.len(), 1);
         assert_eq!(parsed.workspaces[0].scheduled[0].id, "a1");
-        assert_eq!(parsed.workspaces[0].scheduled[0].target_state, Some(crate::automation::ActiveTargetState::Restoring));
+        assert_eq!(
+            parsed.workspaces[0].scheduled[0].target_state,
+            Some(crate::automation::ActiveTargetState::Restoring)
+        );
         let legacy_row: ScheduledAgentRow = serde_json::from_value(json!({
             "id":"old", "agent":"codex", "workspace_id":"w", "deadline":1,
             "starting":false
-        })).unwrap();
+        }))
+        .unwrap();
         assert_eq!(legacy_row.target_state, None);
         assert_eq!(
             parsed.workspaces[0].history[0].key,
@@ -407,18 +430,31 @@ mod tests {
         let mut pinned = agent(7, true);
         pinned.focused = true;
         remote.agents = vec![pinned];
-        remote.history.push(AgentHistoryRow { key, agent: "codex".into(), cwd: "/srv/api".into() });
+        remote.history.push(AgentHistoryRow {
+            key,
+            agent: "codex".into(),
+            cwd: "/srv/api".into(),
+        });
         remote.scheduled.push(ScheduledAgentRow {
-            id: "remote-plan".into(), agent: "codex".into(),
-            workspace_id: remote.target.workspace_id.clone(), deadline: 1_900_000_000,
-            starting: false, target_state: Some(crate::automation::ActiveTargetState::NeedsRebind),
+            id: "remote-plan".into(),
+            agent: "codex".into(),
+            workspace_id: remote.target.workspace_id.clone(),
+            deadline: 1_900_000_000,
+            starting: false,
+            target_state: Some(crate::automation::ActiveTargetState::NeedsRebind),
         });
         app.agents_active_only = false;
         app.agents_this_workspace = false;
         let expected = vec![
-            AgentDockTarget::RemoteLive { view, pane: "7".into() },
+            AgentDockTarget::RemoteLive {
+                view,
+                pane: "7".into(),
+            },
             AgentDockTarget::Live(local),
-            AgentDockTarget::RemoteAutomation { view, id: "remote-plan".into() },
+            AgentDockTarget::RemoteAutomation {
+                view,
+                id: "remote-plan".into(),
+            },
             AgentDockTarget::Session(0),
             AgentDockTarget::RemoteSession { view, key },
         ];
@@ -436,44 +472,71 @@ mod tests {
         }
 
         app.focus_agents_dock();
-        assert_eq!(app.agent_cursor, 0, "focus follows the owner's focused agent");
+        assert_eq!(
+            app.agent_cursor, 0,
+            "focus follows the owner's focused agent"
+        );
         let key_event = |code| AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
         app.handle_event(key_event(KeyCode::Down));
         assert_eq!(app.agent_cursor, 1);
-        assert!(input.try_recv().is_err(), "list navigation must not reach the owner PTY");
+        assert!(
+            input.try_recv().is_err(),
+            "list navigation must not reach the owner PTY"
+        );
         app.handle_event(key_event(KeyCode::Enter));
         assert_eq!(app.active_ws, 0);
         assert_eq!(app.sidebar_focus, None);
         app.focus_agents_dock();
         app.handle_event(key_event(KeyCode::Home));
         app.handle_event(key_event(KeyCode::Char('a')));
-        assert_eq!(app.agent_menu.as_ref().unwrap().target, AgentTarget::RemoteLive { view, pane: PaneId(7) });
+        assert_eq!(
+            app.agent_menu.as_ref().unwrap().target,
+            AgentTarget::RemoteLive {
+                view,
+                pane: PaneId(7)
+            }
+        );
         app.handle_event(key_event(KeyCode::Esc));
         app.handle_event(key_event(KeyCode::Enter));
         assert_eq!(app.active_ws, 1);
-        assert!(matches!(input.try_recv().unwrap(), ClientMessage::Command(command) if command == "remote_agent_focus 7"));
+        assert!(
+            matches!(input.try_recv().unwrap(), ClientMessage::Command(command) if command == "remote_agent_focus 7")
+        );
         app.focus_agents_dock();
         app.agent_cursor = 2;
         app.handle_event(key_event(KeyCode::Enter));
-        assert!(matches!(input.try_recv().unwrap(), ClientMessage::Command(command) if command == "automation_detail remote-plan"));
+        assert!(
+            matches!(input.try_recv().unwrap(), ClientMessage::Command(command) if command == "automation_detail remote-plan")
+        );
         app.focus_agents_dock();
         app.handle_event(key_event(KeyCode::End));
         app.handle_event(key_event(KeyCode::Enter));
-        assert!(matches!(input.try_recv().unwrap(), ClientMessage::Command(command) if command == format!("agent_resume {}", crate::base64_encode(&key))));
+        assert!(
+            matches!(input.try_recv().unwrap(), ClientMessage::Command(command) if command == format!("agent_resume {}", crate::base64_encode(&key)))
+        );
         assert!(app.panes.is_empty());
 
         app.active_ws = 0;
         app.agents_this_workspace = true;
-        assert_eq!(app.agent_dock_targets(), vec![
-            AgentDockTarget::Live(local), AgentDockTarget::Session(0),
-            AgentDockTarget::RemoteElsewhere { view, pane: "7".into() },
-        ]);
+        assert_eq!(
+            app.agent_dock_targets(),
+            vec![
+                AgentDockTarget::Live(local),
+                AgentDockTarget::Session(0),
+                AgentDockTarget::RemoteElsewhere {
+                    view,
+                    pane: "7".into()
+                },
+            ]
+        );
         app.focus_agents_dock();
         app.handle_event(key_event(KeyCode::End));
         app.handle_event(key_event(KeyCode::Enter));
         assert_eq!(app.active_ws, 1);
         assert_eq!(app.sidebar_focus, None);
-        assert!(matches!(input.try_recv().unwrap(), ClientMessage::Command(command) if command == "remote_agent_focus 7"));
+        assert!(
+            matches!(input.try_recv().unwrap(), ClientMessage::Command(command) if command == "remote_agent_focus 7")
+        );
         assert_ne!(app.sidebar_focus, Some(SidebarListFocus::Agents));
     }
 }
@@ -564,7 +627,11 @@ impl App {
                         .map(|run| run.scheduled_at)
                         .or(automation.next_run_at)?,
                     starting: live.is_some(),
-                    target_state: self.automation.active_target_states.get(&automation.id).copied(),
+                    target_state: self
+                        .automation
+                        .active_target_states
+                        .get(&automation.id)
+                        .copied(),
                 })
             })
             .collect();
@@ -607,6 +674,9 @@ impl App {
         target: AgentTarget,
         item: AgentMenuItem,
     ) -> bool {
+        if item == AgentMenuItem::TogglePath {
+            return false; // Shared display setting, even on a remote row.
+        }
         let (view, command) = match target {
             AgentTarget::RemoteLive { view, pane } => {
                 let action = match item {

@@ -1688,6 +1688,7 @@ mod tests {
         app.workspaces.push(Workspace {
             id: crate::ids::public_id("workspace"),
             name: "second".into(),
+            remote: None,
             cwd: std::env::current_dir().unwrap(),
             branch: None,
             git_ahead_behind: None,
