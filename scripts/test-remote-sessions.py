@@ -64,7 +64,9 @@ def ssh_substitute():
 def main():
     repo = Path(__file__).resolve().parent.parent
     restart_only = "--restart-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg != "--restart-only"]
+    agent_state_only = "--agent-state-only" in sys.argv[1:]
+    clipboard_only = "--clipboard-helper-only" in sys.argv[1:]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--clipboard-helper-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -104,6 +106,13 @@ def main():
                PATH=str(root / "bin") + ":" + env.get("PATH", ""), TERM="xterm-256color",
                LUVUS_SMOKE_ROOT=str(root), LUVUS_SMOKE_BINARY=str(binary), DISPLAY=":smoke")
     env.pop("WAYLAND_DISPLAY", None)
+    if clipboard_only:
+        helper = Path(os.environ["LUVUS_TEST_KITTEN"]).resolve()
+        assert helper.is_relative_to(repo / "target") and helper.is_file(), helper
+        shutil.copyfile(helper, root / "official-kitten")
+        (root / "bin/curl").symlink_to(Path(__file__).resolve())
+        env["TERM"] = "xterm-kitty"
+        env.pop("DISPLAY", None)
     for key, suffix in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
                         ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
         env[key] = str(root / "local-home" / suffix)
@@ -354,6 +363,115 @@ def main():
 
         def click(master, x, y, button=0):
             os.write(master, f"\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m".encode())
+
+        if agent_state_only:
+            run("session", "merge", "on")
+            wait_for(projected)
+            process, master = start_client(["--session", "api"])
+            drain(master)
+            command = "exec -a qodercli " + shlex.join([sys.executable, str(Path(__file__).resolve()), "--qoder-fixture"])
+            run("--host", "fake-dev", "--session", "api", "pane", "run", pane,
+                "bash -c " + shlex.quote(command))
+            # Native Qoder screen evidence, not agent.report. No local click,
+            # resize or API mutation may be needed to refresh a remote row.
+            for expected, text in (("idle", "Ready for your next task"),
+                                   ("working", "Generating answer (esc to cancel, 12s)"),
+                                   ("blocked", "Permission required for shell"),
+                                   ("working", "Generating answer (esc to cancel, 13s)"),
+                                   ("idle", "Ready for your next task")):
+                started = time.monotonic()
+                run("--host", "fake-dev", "--session", "api", "pane", "run", pane,
+                    text)
+                wait_for(lambda: any(a["pane"] == pane and a["agent"] == "qodercli"
+                                     and a["status"] == expected
+                                     for a in api("agent.list", remote=True)["agents"]))
+                screen = bytearray()
+                def synchronized():
+                    screen.extend(drain(master, 0.1))
+                    return any(a.get("owner_pane") == pane and a["status"] == expected
+                               for a in api("agent.list")["agents"])
+                wait_for(synchronized)
+                screen.extend(drain(master, 0.3))
+                position(screen, expected, before_column=40)
+                assert process.poll() is None
+                print("PASS: native Qoder state without navigation:", expected,
+                      f"{time.monotonic() - started:.3f}s", flush=True)
+            return
+
+        if clipboard_only:
+            clipboard_mode = os.environ.get("LUVUS_TEST_CLIPBOARD_MODE", "local")
+            assert clipboard_mode in ("local", "direct-remote", "merge"), clipboard_mode
+            if clipboard_mode == "merge":
+                run("session", "merge", "on")
+                wait_for(projected)
+                remote_workspace = next(w for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
+                api("workspace.focus", {"workspace": remote_workspace["workspace"]})
+            process, master = start_client(["session", "attach", "remote-fake-dev-api"]
+                                           if clipboard_mode == "direct-remote" else ["--session", "api"])
+            os.write(master, b"\x02=")
+            screen = bytearray()
+            def install_row():
+                screen.extend(drain(master, 0.1))
+                return b"Install" in screen and b"Kitty clipboard" in screen
+            wait_for(install_row)
+            assert not (root / "curl-calls").exists(), "opening General must not download"
+            # A corrupt download must not become executable, and the same
+            # clickable row must permit a retry with the verified official file.
+            (root / "bad-download").touch()
+            click(master, *position(screen, "Kitty clipboard"))
+            failure = bytearray()
+            def failed():
+                failure.extend(drain(master, 0.1))
+                return b"SHA-256 mismatch" in failure
+            wait_for(failed)
+            installed = root / "local-state/tools/kitten"
+            assert not installed.exists()
+            (root / "bad-download").unlink()
+            click(master, *position(screen, "Kitty clipboard"))
+            success = bytearray()
+            def completed():
+                success.extend(drain(master, 0.1))
+                return b"kitten 0.48.2" in success
+            wait_for(completed)
+            assert installed.read_bytes() == (root / "official-kitten").read_bytes()
+            assert installed.stat().st_mode & 0o777 == 0o700
+            assert not (root / "remote-state/tools/kitten").exists()
+            print(f"PASS: {clipboard_mode}: General click installs verified official kitten on display only; corrupt download and retry", flush=True)
+            os.write(master, b"\x1b")
+            drain(master)
+            os.write(master, b"\x16")
+            clipboard_wire = bytearray()
+            requests = []
+            def image_staged():
+                clipboard_wire.extend(drain(master, 0.05))
+                if b"\x1b[?5522$p" in clipboard_wire:
+                    clipboard_wire[:] = clipboard_wire.replace(b"\x1b[?5522$p", b"")
+                    os.write(master, b"\x1b[?5522;2$y")
+                for match in list(re.finditer(rb"\x1b\]5522;([^;\x1b]*);([^\x1b]*)\x1b\\", clipboard_wire)):
+                    metadata, payload = match.groups()
+                    if b"type=read" not in metadata:
+                        continue
+                    mime = base64.b64decode(payload)
+                    requests.append(mime)
+                    content = b"image/png" if mime == b"." else IMAGE
+                    kind = b"." if mime == b"." else b"image/png"
+                    response = (b"\x1b]5522;type=read:status=OK\x1b\\"
+                                b"\x1b]5522;type=read:status=DATA:mime=" + base64.b64encode(kind)
+                                + b";" + base64.b64encode(content) + b"\x1b\\"
+                                b"\x1b]5522;type=read:status=DONE\x1b\\")
+                    os.write(master, response)
+                if requests:
+                    clipboard_wire.clear()
+                owner_state = "local-state" if clipboard_mode == "local" else "remote-state"
+                images = list((root / owner_state / "sessions/api/clipboard").glob("*.png"))
+                return bool(images) and images[0].read_bytes() == IMAGE
+            try:
+                wait_for(image_staged)
+            except AssertionError as error:
+                raise AssertionError(f"official kitten request={requests!r}, wire={clipboard_wire!r}") from error
+            assert process.poll() is None
+            print(f"PASS: {clipboard_mode}: Ctrl+V through the real official kitten and an isolated OSC 5522 terminal peer stages exact PNG bytes", flush=True)
+            return
 
         def topology(remote=False):
             # Ignore focus, revisions and detection timing; preserve everything
@@ -984,6 +1102,22 @@ def main():
 if __name__ == "__main__":
     if Path(sys.argv[0]).name == "ssh":
         ssh_substitute()
+    elif Path(sys.argv[0]).name == "curl":
+        root = fixture_root()
+        args = sys.argv[1:]
+        assert args[-1] == "https://github.com/kovidgoyal/kitty/releases/download/v0.48.2/kitten-linux-amd64", args
+        destination = Path(args[args.index("-o") + 1]).resolve()
+        assert destination.parent in (root / "local-state/tools", root / "remote-state/tools"), destination
+        with (root / "curl-calls").open("a") as log:
+            log.write(str(destination) + "\n")
+        if (root / "bad-download").exists():
+            destination.write_bytes(b"invalid download")
+        else:
+            shutil.copyfile(root / "official-kitten", destination)
+    elif "--qoder-fixture" in sys.argv:
+        fixture_root()
+        for line in sys.stdin:
+            print("\033[2J\033[999;1H\033]0;Qoder CLI\007" + line.strip(), flush=True)
     elif Path(sys.argv[0]).name in ("xclip", "xsel", "wl-copy", "pbcopy"):
         root = fixture_root()
         if any(option in sys.argv[1:] for option in ("-o", "-out", "--output")):

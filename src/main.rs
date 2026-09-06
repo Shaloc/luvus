@@ -794,6 +794,7 @@ fn managed_remote_local_only_command(args: &[String]) -> Option<&str> {
             | "theme"
             | "skill"
             | "doctor"
+            | "kitten"
             | "update"
             | "integration"
             | "client"
@@ -1665,6 +1666,21 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         }
         if let Some(text) = app.pending_clipboard.take() {
             emit_clipboard(&text);
+        }
+        if let Some(request) = app
+            .settings
+            .as_mut()
+            .and_then(|ui| ui.kitten_request.take())
+        {
+            let sender = tx.clone();
+            std::thread::spawn(move || {
+                let result = terminal::clipboard::kitten::perform(request.install);
+                let _ = sender.send(event::AppEvent::ClipboardHelperResult {
+                    client: None,
+                    generation: request.generation,
+                    result,
+                });
+            });
         }
         app.tick_toast(Instant::now());
         app.tick_copy_highlight(Instant::now());

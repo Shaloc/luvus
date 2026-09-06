@@ -607,6 +607,7 @@ pub fn run() -> Result<()> {
         if let Some(text) = app.pending_clipboard.take() {
             broadcast(&mut clients, ServerMessage::Clipboard(text));
         }
+        send_clipboard_helper_request(&mut app, &clients, foreground);
         // An expired toast forces one render so it disappears (idle frames don't).
         if app.tick_toast(Instant::now()) {
             render_request.record(RenderCause::Metadata);
@@ -966,12 +967,45 @@ fn apply(
 }
 
 fn bind_session_navigation_origin(app: &mut App, id: u64) {
+    if let Some(settings) = app
+        .settings
+        .as_mut()
+        .filter(|ui| ui.kitten_request.is_some() && ui.kitten_client.is_none())
+    {
+        settings.kitten_client = Some(id);
+    }
     if let Some(menu) = app
         .named_session_menu
         .as_mut()
         .filter(|menu| !menu.preparing)
     {
         menu.client_id = Some(id);
+    }
+}
+
+fn send_clipboard_helper_request(app: &mut App, clients: &Clients, foreground: Option<u64>) {
+    let Some(settings) = app.settings.as_mut() else {
+        return;
+    };
+    let Some(request) = settings.kitten_request.take() else {
+        return;
+    };
+    let origin = settings.kitten_client.or(foreground);
+    settings.kitten_client = origin;
+    let sent = origin
+        .and_then(|id| clients.get(&id))
+        .filter(|client| client.workspace_id.is_none())
+        .is_some_and(|client| {
+            client
+                .send_control(ServerMessage::ClipboardHelper(request.clone()))
+                .is_ok()
+        });
+    if !sent {
+        app.apply_clipboard_helper_result(
+            origin,
+            &request.generation,
+            Err("Open Menu > General on the display client to install kitten".into()),
+        );
     }
 }
 
@@ -1634,6 +1668,27 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
 
     loop {
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::ClipboardHelperResult { generation, result }) => {
+                let valid = generation.len() <= 128
+                    && match &result {
+                        Ok(crate::terminal::clipboard::kitten::Status::Installed(version)) => {
+                            version.len() <= 128
+                        }
+                        Err(error) => error.len() <= 2048,
+                        _ => true,
+                    };
+                if !valid
+                    || app_tx
+                        .send(AppEvent::ClipboardHelperResult {
+                            client: Some(id),
+                            generation,
+                            result,
+                        })
+                        .is_err()
+                {
+                    break;
+                }
+            }
             Ok(ClientMessage::Key(k)) => {
                 if app_tx
                     .send(AppEvent::ClientInput {
@@ -1959,6 +2014,88 @@ mod tests {
             ),
             rx,
         )
+    }
+
+    #[test]
+    fn kitten_request_is_sent_only_to_its_display_origin() {
+        let _env = crate::persist::test_env("server-kitten-origin");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let (first, first_rx) = display_client(100, 30, 1);
+        let (second, second_rx) = display_client(100, 30, 2);
+        let clients = HashMap::from([(1, first), (2, second)]);
+        app.open_settings();
+        super::bind_session_navigation_origin(&mut app, 1);
+        super::send_clipboard_helper_request(&mut app, &clients, Some(2));
+        assert!(
+            matches!(first_rx.try_recv().unwrap(), ServerMessage::ClipboardHelper(request) if !request.install)
+        );
+        assert!(
+            second_rx.try_recv().is_err(),
+            "helper installation must never be broadcast"
+        );
+
+        app.open_settings();
+        super::bind_session_navigation_origin(&mut app, 3);
+        super::send_clipboard_helper_request(&mut app, &clients, Some(2));
+        assert!(
+            second_rx.try_recv().is_err(),
+            "a disconnected requester cannot install on another display"
+        );
+        assert!(app
+            .settings
+            .as_ref()
+            .unwrap()
+            .kitten_status
+            .as_ref()
+            .unwrap()
+            .is_err());
+    }
+
+    #[test]
+    fn kitten_origin_survives_batched_input_and_changes_only_for_a_new_request() {
+        use crate::terminal::clipboard::kitten::Status;
+
+        let _env = crate::persist::test_env("server-kitten-batched-origin");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let (first, first_rx) = display_client(100, 30, 1);
+        let (second, second_rx) = display_client(100, 30, 2);
+        let clients = HashMap::from([(1, first), (2, second)]);
+
+        // The event loop can drain input from both displays before it sends
+        // the request. Later unrelated input cannot claim its origin.
+        app.open_settings();
+        super::bind_session_navigation_origin(&mut app, 1);
+        super::bind_session_navigation_origin(&mut app, 2);
+        super::send_clipboard_helper_request(&mut app, &clients, Some(2));
+        let ServerMessage::ClipboardHelper(check) = first_rx
+            .try_recv()
+            .expect("availability check belongs to the display opening Settings")
+        else {
+            panic!("expected clipboard helper check");
+        };
+        assert!(!check.install);
+        assert!(second_rx.try_recv().is_err());
+        assert!(app.apply_clipboard_helper_result(Some(1), &check.generation, Ok(Status::Missing),));
+
+        // A different display can explicitly start the next request. It must
+        // not inherit the earlier check's origin or a later input's origin.
+        let row = app
+            .general_rows()
+            .iter()
+            .position(|row| *row == crate::app::GeneralRow::ClipboardHelper)
+            .unwrap();
+        app.settings.as_mut().unwrap().cursor = row;
+        app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        super::bind_session_navigation_origin(&mut app, 2);
+        super::bind_session_navigation_origin(&mut app, 1);
+        super::send_clipboard_helper_request(&mut app, &clients, Some(1));
+        assert!(matches!(
+            second_rx.try_recv().expect("installation belongs to its explicit requester"),
+            ServerMessage::ClipboardHelper(request) if request.install
+        ));
+        assert!(first_rx.try_recv().is_err());
     }
 
     fn projection_client(

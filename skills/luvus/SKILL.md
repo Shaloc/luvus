@@ -176,6 +176,12 @@ path. It never pastes a client-only path into a remote pane. A headless SSH
 client in Kitty can use the optional official `kitten clipboard` executable
 on the display-client host to request desktop PNG data over OSC 5522. Kitty
 must permit the clipboard read; Luvus never bypasses its prompt. Without native
+clipboard access, offer Menu → General → Kitty clipboard (client), or explicitly
+authorized `luvus kitten install` on the display-client host. `luvus kitten status`
+checks availability without downloading. The installer verifies a pinned official
+helper and places it under that client's Luvus home (`tools/kitten`); it does not
+change PATH, install on the focused remote owner, or restart sessions. `--host`
+is rejected for this local-only command. Without native
 clipboard access or this helper, normal text and Ctrl+Enter remain unchanged.
 Child OSC52 clipboard writes (for example Neovim yank) are forwarded to the
 display client's clipboard, including from remote owners. This text-copy path

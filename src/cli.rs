@@ -84,6 +84,7 @@ pub fn is_cli(args: &[String]) -> bool {
                 | "search"
                 | "help"
                 | "doctor"
+                | "kitten"
                 | "update"
                 | "skill"
                 | "session"
@@ -129,6 +130,7 @@ Commands:
   uhp          Discover and use Universal Harness Protocol 1.0
   attach       Open the TUI focused on one pane
   doctor       Check optional external tools
+  kitten       Manage Kitty clipboard helper
   update       Check for and install a newer Luvus release
   ping         Check whether the selected server responds
 Examples:
@@ -166,6 +168,8 @@ usage: luvus <command> [args]
   --help, -h           show compact help
   help [all|<topic> [command]]  show compact, complete, or focused help
   doctor               check optional external tools (git, gh, …)
+  kitten status        Manage Kitty clipboard helper
+  kitten install       Manage Kitty clipboard helper
   update               check for and install a newer Luvus release
   ping                 check the server
 
@@ -532,6 +536,20 @@ fn run_inner(args: &[String]) -> Result<i32> {
             crate::i18n::cli::Context::configured(),
         );
     }
+    if args.get(1).map(String::as_str) == Some("kitten") {
+        let install = match args.get(2..).unwrap_or_default() {
+            [command] if command == "status" => false,
+            [command] if command == "install" => true,
+            _ => return Err(anyhow!("usage: luvus kitten status|install")),
+        };
+        let result =
+            crate::terminal::clipboard::kitten::perform(install).map_err(anyhow::Error::msg)?;
+        println!("{}", serde_json::to_string(&result)?);
+        return Ok(i32::from(matches!(
+            result,
+            crate::terminal::clipboard::kitten::Status::Unsupported
+        )));
+    }
     // `doctor` is a local environment check — no server needed.
     if args.get(1).map(String::as_str) == Some("doctor") {
         return Ok(doctor(crate::i18n::cli::Context::configured()));
@@ -665,6 +683,7 @@ fn help_topic_has_subcommands(topic: &str) -> bool {
             | "server"
             | "integration"
             | "skill"
+            | "kitten"
             | "wait"
             | "uhp"
     )
@@ -675,7 +694,7 @@ fn normalize_help_topic(topic: &str) -> Option<&str> {
         "workspace" | "tab" | "pane" | "agent" | "files" | "git" | "mission" | "worktree"
         | "task" | "lease" | "automation" | "module" | "theme" | "bar" | "ui" | "session"
         | "server" | "integration" | "diff" | "skill" | "wait" | "search" | "events" | "uhp"
-        | "ping" | "doctor" | "update" | "attach" => Some(topic),
+        | "ping" | "doctor" | "kitten" | "update" | "attach" => Some(topic),
         "node" => Some("pane"),
         "remote" | "--remote" => Some("remote"),
         _ => None,
@@ -883,6 +902,10 @@ fn write_topic_help_english(
         "doctor" => (
             "luvus doctor",
             "Check optional external tools used by Luvus.\n",
+        ),
+        "kitten" => (
+            "luvus kitten <status|install>",
+            "  kitten status        Manage Kitty clipboard helper\n  kitten install       Manage Kitty clipboard helper\n",
         ),
         "update" => (
             "luvus update",
@@ -4365,6 +4388,27 @@ mod tests {
     use super::*;
     use std::fs;
     use std::io::BufRead;
+
+    #[test]
+    fn kitten_cli_help_and_invalid_flags_are_local_and_non_mutating() {
+        let _env = crate::persist::test_env("cli-kitten");
+        assert!(is_cli(&argv("luvus kitten status")));
+        assert!(rendered_topic_help("kitten", None).contains("kitten install"));
+        assert!(rendered_topic_help("kitten", Some("status")).contains("kitten status"));
+        for args in [
+            "luvus kitten",
+            "luvus kitten install --host fake",
+            "luvus kitten install --yes",
+            "luvus kitten nope",
+        ] {
+            assert!(run_inner(&argv(args)).is_err());
+        }
+        assert!(!crate::persist::config_dir().join("tools/kitten").exists());
+        assert_eq!(
+            crate::managed_remote_local_only_command(&argv("luvus kitten install")),
+            Some("kitten")
+        );
+    }
 
     #[test]
     fn socket_permission_errors_are_not_reported_as_an_offline_server() {

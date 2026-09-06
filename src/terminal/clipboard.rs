@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+pub mod kitten;
+
 pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,7 +161,7 @@ fn read_kitty_image() -> Option<ClipboardImage> {
     {
         return None;
     }
-    let mut command = Command::new("kitten");
+    let mut command = Command::new(kitten::executable()?);
     command.args([
         "clipboard",
         "--get-clipboard",

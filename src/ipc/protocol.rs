@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::TerminalColors;
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -48,6 +48,10 @@ pub enum ClientMessage {
     /// A display prefix has already been consumed. Resolve this suffix through
     /// the owner's existing prefix handler and configured keymap.
     PrefixKey(KeyEvent),
+    ClipboardHelperResult {
+        generation: String,
+        result: crate::terminal::clipboard::kitten::Outcome,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -95,6 +99,7 @@ pub enum ServerMessage {
     FocusWorkspace {
         workspace_id: String,
     },
+    ClipboardHelper(crate::terminal::clipboard::kitten::Request),
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]

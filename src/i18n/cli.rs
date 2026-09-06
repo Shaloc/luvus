@@ -870,6 +870,7 @@ static HELP: &[Translation] = &[
         "選択したバックグラウンドサーバーを確認、管理",
         "선택한 백그라운드 서버 검사 및 관리"
     ),
+    tr!("Manage Kitty clipboard helper", "Gestionar el asistente del portapapeles Kitty", "Gerenciar o auxiliar de clipboard Kitty", "Gérer l'assistant de presse-papiers Kitty", "Kitty-Zwischenablagehelfer verwalten", "Kelola pembantu papan klip Kitty", "管理 Kitty 剪贴板助手", "Kitty クリップボードヘルパーを管理", "Kitty 클립보드 도우미 관리"),
     tr!(
         "Manage agent session-resume integrations",
         "Gestionar integraciones de reanudación de agentes",

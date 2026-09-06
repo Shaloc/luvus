@@ -224,6 +224,11 @@ Open worktree lists branches and paths on the workspace owner. Ctrl+V image
 paste sends client clipboard bytes to that owner and pastes its private path;
 headless clients in Kitty can use the optional official `kitten clipboard`
 helper on the display-client host, subject to Kitty's clipboard permission.
+Use Menu → General → Kitty clipboard (client), or explicitly authorized
+`luvus kitten install` on that client host; `luvus kitten status` is read-only.
+The installer verifies the pinned official helper and installs it into the
+client's Luvus home under `tools/kitten`, without changing PATH or restarting
+sessions. This is display-local, not a remote-workspace action; `--host` is rejected.
 Other headless clients need native desktop clipboard access. Text/Ctrl+Enter
 behavior is unchanged. Child OSC52 text-copy requests (such as Neovim yank)
 are forwarded to the display client, including remote owners, without the image
