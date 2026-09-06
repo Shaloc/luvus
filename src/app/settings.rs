@@ -1577,7 +1577,7 @@ mod tests {
     #[test]
     fn remote_host_selection_persists_and_ignores_closed_settings_results() {
         let _env = crate::persist::test_env("settings-remote-hosts");
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.open_settings();
         let first = app.settings.as_ref().unwrap().generation.clone();
@@ -1592,6 +1592,13 @@ mod tests {
         );
         app.settings.as_mut().unwrap().tab = super::SettingsTab::Remote;
         app.settings_activate(2);
+        assert!(app.remote_config_refresh_pending);
+        assert!(
+            app.remote_host_status.is_empty(),
+            "discovery waits for saved host admission"
+        );
+        app.flush_config_for_test(&rx);
+        assert!(!app.remote_config_refresh_pending);
         assert_eq!(crate::config::load().remote_hosts, ["dev-b"]);
         assert_eq!(app.remote_host_status[0].host, "dev-b");
         assert!(
@@ -1599,6 +1606,7 @@ mod tests {
             "discovery is asynchronous"
         );
         app.settings_activate(2);
+        app.flush_config_for_test(&rx);
         assert!(crate::config::load().remote_hosts.is_empty());
     }
     use super::*;

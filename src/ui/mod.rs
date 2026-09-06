@@ -139,13 +139,21 @@ pub(crate) fn render_projection(f: &mut RenderTarget, app: &mut App) -> Vec<(Pan
 /// Render one stable workspace for a managed merge client. Temporarily selecting
 /// it is safe on the single app-loop thread; the projection wrapper restores
 /// every viewport-owned field before returning.
-pub fn render_workspace_projection(f: &mut RenderTarget, app: &mut App, workspace_id: &str) -> Vec<(PaneId, Rect)> {
+pub fn render_workspace_projection(
+    f: &mut RenderTarget,
+    app: &mut App,
+    workspace_id: &str,
+) -> Vec<(PaneId, Rect)> {
     render_workspace_projection_mode(f, app, workspace_id, false)
 }
 
 /// The interactive owner of this workspace also commits its PTY dimensions
 /// after API layout changes, without replacing another workspace's hit geometry.
-pub fn render_workspace_owner_projection(f: &mut RenderTarget, app: &mut App, workspace_id: &str) -> Vec<(PaneId, Rect)> {
+pub fn render_workspace_owner_projection(
+    f: &mut RenderTarget,
+    app: &mut App,
+    workspace_id: &str,
+) -> Vec<(PaneId, Rect)> {
     render_workspace_projection_mode(f, app, workspace_id, true)
 }
 

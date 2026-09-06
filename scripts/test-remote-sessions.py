@@ -828,7 +828,7 @@ def main():
             os.write(master, b"\x1b[<2;8;4M\x1b[<2;8;4m")
             menu_screen = drain(master)
             assert b"open worktree" in menu_screen.lower(), menu_screen[-5000:]
-            os.write(master, b"\x1b[<0;10;9M\x1b[<0;10;9m")
+            click(master, *position(menu_screen, "Open Worktree"))
             choices_screen = drain(master, 1)
             assert b"feature/smoke" in choices_screen and b"feature-checkout" in choices_screen, choices_screen[-5000:]
             os.write(master, b"j\r")

@@ -56,6 +56,17 @@ pub(super) type SidebarHits = (
 type WorkspaceHits = (Vec<(usize, Rect)>, Option<Rect>);
 type AgentHits = (Vec<(PaneId, Rect)>, Vec<(String, Rect)>, Vec<(usize, Rect)>);
 
+/// Scheduled-row presentation, including owner recovery state and remote route.
+type ScheduledDockRow = (
+    String,
+    String,
+    String,
+    u64,
+    bool,
+    Option<crate::automation::ActiveTargetState>,
+    Option<PaneId>,
+);
+
 enum AgentDockRow {
     Local(PaneId, String),
     Remote(usize, usize),
@@ -734,15 +745,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     // hit target opens read-only automation detail rather than focusing a pane.
     // As soon as a due occurrence owns a live ORCH task, the ordinary pane row
     // replaces this projection.
-    let mut scheduled: Vec<(
-        String,
-        String,
-        String,
-        u64,
-        bool,
-        Option<crate::automation::ActiveTargetState>,
-        Option<PaneId>,
-    )> = app
+    let mut scheduled: Vec<ScheduledDockRow> = app
         .scheduled_agent_rows()
         .into_iter()
         .filter_map(|row| {
@@ -952,8 +955,15 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         }
                     }
                 }
-            } else if let Some((automation, agent, workspace, deadline, starting, target_state, owner)) =
-                scheduled.get(k.saturating_sub(live.len()))
+            } else if let Some((
+                automation,
+                agent,
+                workspace,
+                deadline,
+                starting,
+                target_state,
+                owner,
+            )) = scheduled.get(k.saturating_sub(live.len()))
             {
                 let rect = Rect::new(area.x, y, area.width, row_stride);
                 if let Some(view) = owner {
