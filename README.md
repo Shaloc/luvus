@@ -7,7 +7,7 @@
 **Mission control for your AI coding agents.**
 
 [![release](https://img.shields.io/github/v/release/Shaloc/luvus)](https://github.com/Shaloc/luvus/releases/latest)
-[![macOS build](https://github.com/Shaloc/luvus/actions/workflows/fork-macos-build.yml/badge.svg)](https://github.com/Shaloc/luvus/actions/workflows/fork-macos-build.yml)
+[![CLI builds](https://github.com/Shaloc/luvus/actions/workflows/fork-macos-build.yml/badge.svg)](https://github.com/Shaloc/luvus/actions/workflows/fork-macos-build.yml)
 [![docs](https://img.shields.io/badge/docs-luvus.dev-c6ff1a.svg)](https://luvus.dev/docs/)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20·%20Linux%20·%20Windows-lightgrey.svg)
@@ -23,6 +23,9 @@
 This is the [Shaloc/luvus](https://github.com/Shaloc/luvus) fork of
 [RizRiyz/luvus](https://github.com/RizRiyz/luvus), with Qoder CLI, One Dark and
 One Light themes, and managed SSH sessions with same-name session merging.
+Remote-only sessions stay remote: merge reuses an existing local owner but
+does not create a local copy. Stopped sessions can be deleted with confirmation
+from the session row's context menu, with a separate target for each machine.
 Choose a flat workspace list or a collapsible machine tree in
 **Menu > Settings > Layout > Workspace display**.
 Tabs stay in their chosen workspace by default, even when an agent launches

@@ -1,5 +1,5 @@
-name: Fork macOS ARM64 artifact
-run-name: macOS ARM64 artifact · ${{ github.sha }}
+name: Fork CLI artifacts
+run-name: CLI artifacts · ${{ github.sha }}
 
 # Deliberately separate from release.yml and scripts/release*.sh: no tags,
 # releases, package registries, Homebrew taps, or downstream dispatches.
@@ -12,13 +12,21 @@ permissions:
 jobs:
   build:
     if: github.repository == 'Shaloc/luvus' && github.event_name == 'workflow_dispatch'
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
       CARGO_NET_RETRY: "10"
       CARGO_HTTP_MULTIPLEXING: "false"
-      SQLITE3_LIB_DIR: /usr/lib
-      TARGET: aarch64-apple-darwin
+      SQLITE3_LIB_DIR: ${{ contains(matrix.target, 'apple-darwin') && '/usr/lib' || '' }}
+      TARGET: ${{ matrix.target }}
     defaults:
       run:
         shell: bash
@@ -28,11 +36,20 @@ jobs:
           persist-credentials: false
       - name: Set up native Rust toolchain
         run: |
-          test "$(uname -m)" = arm64
+          if [ "$TARGET" = aarch64-apple-darwin ]; then
+            test "$(uname -m)" = arm64
+          else
+            test "$(uname -m)" = x86_64
+          fi
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add --toolchain stable "$TARGET"
           rustc +stable --version
+      - name: Set up static Linux toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends musl-tools
       - name: Build only the command-line binary
         run: cargo +stable build --release --locked --bin luvus --target "$TARGET"
       - name: Package and smoke-test an isolated installation
@@ -55,12 +72,16 @@ jobs:
           tar -xzf "target/artifact/$package.tar.gz" -C "$RUNNER_TEMP/luvus-install"
           install -m 755 "$RUNNER_TEMP/luvus-install/$package/luvus" "$RUNNER_TEMP/luvus-install/bin/luvus"
           export LUVUS_HOME="$RUNNER_TEMP/luvus-smoke-home"
-          unset LUVUS_SOCKET_PATH LUVUS_SESSION
+          unset LUVUS_SOCKET_PATH LUVUS_SESSION LUVUS_REMOTE_HOST LUVUS_REMOTE_SESSION
           binary="$RUNNER_TEMP/luvus-install/bin/luvus"
           file "$binary"
-          # -verify_arch consumes all remaining arguments as architecture names.
-          lipo "$binary" -verify_arch arm64
-          otool -L "$binary"
+          if [ "$TARGET" = aarch64-apple-darwin ]; then
+            # -verify_arch consumes all remaining arguments as architecture names.
+            lipo "$binary" -verify_arch arm64
+            otool -L "$binary"
+          else
+            file "$binary" | grep -E 'statically linked|static-pie linked'
+          fi
           "$binary" --version --remote-session-protocol
           "$binary" help kitten
           "$binary" skill show > "$RUNNER_TEMP/luvus-skill.md"
