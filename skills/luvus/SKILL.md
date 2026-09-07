@@ -150,7 +150,11 @@ luvus session merge on|off
 on the host. Report its install/update diagnostic as returned. Never copy or
 install the binary on the host unless the human separately authorizes that
 action. Merge mode displays the local session and all discovered same-name
-remote workspaces; a `[host]` tag identifies each remote owner.
+remote workspaces; a `[host]` tag identifies each remote owner in the default
+flat sidebar. Settings → Layout → Workspace display also offers a collapsible
+machine tree. `config.patch` can set `layout.workspace_display` to `flat` or
+`tree`; this is presentation only and does not change merge, host admission,
+workspace indices, or public pin/worktree `display_position` values.
 `session merge` and registration changes refresh an already-running local
 server; no restart is needed. Disabling a host or merge removes local
 projections and disconnects their bridges without stopping remote panes.

@@ -220,6 +220,11 @@ restart an owner; opening a session, `remote add` and explicit lifecycle
 commands are the startup entry points. Settings → Remote has one global
 toggle for automatic same-name merge, including discovered sessions. `--host` always pairs
 with the actual remote `--session` name, even if it starts with `remote-`.
+Settings → Layout → Workspace display selects the default flat list with host
+tags or a collapsible machine tree. `config.patch` accepts
+`{"patch":{"layout":{"workspace_display":"tree"}}}` (or `"flat"`). This
+changes presentation only, not merge, host admission, workspace indices, or
+public pin/worktree `display_position` values.
 Open worktree lists branches and paths on the workspace owner. Ctrl+V image
 paste sends client clipboard bytes to that owner and pastes its private path;
 headless clients in Kitty can use the optional official `kitten clipboard`

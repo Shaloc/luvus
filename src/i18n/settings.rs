@@ -36,6 +36,9 @@ pub const KEY_REFERENCE_KEYS: &[&[&str]] = &[
 ];
 
 pub struct Catalog {
+    pub workspace_display: &'static str,
+    pub workspace_flat: &'static str,
+    pub workspace_tree: &'static str,
     pub clipboard_helper: &'static str,
     pub clipboard_helper_checking: &'static str,
     pub clipboard_helper_installing: &'static str,
@@ -115,6 +118,9 @@ pub struct Catalog {
 }
 
 pub static EN: Catalog = Catalog {
+    workspace_display: "Workspace display",
+    workspace_flat: "Flat",
+    workspace_tree: "Tree",
     clipboard_helper: "Kitty clipboard (client)",
     clipboard_helper_checking: "Checking…",
     clipboard_helper_installing: "Installing…",
@@ -278,6 +284,9 @@ pub static EN: Catalog = Catalog {
 };
 
 pub static ES: Catalog = Catalog {
+    workspace_display: "Vista de espacios",
+    workspace_flat: "Lista plana",
+    workspace_tree: "Árbol",
     clipboard_helper: "Portapapeles Kitty (cliente)",
     clipboard_helper_checking: "Comprobando…",
     clipboard_helper_installing: "Instalando…",
@@ -312,6 +321,9 @@ pub static ES: Catalog = Catalog {
 };
 
 pub static PT: Catalog = Catalog {
+    workspace_display: "Visualização dos espaços",
+    workspace_flat: "Lista plana",
+    workspace_tree: "Árvore",
     clipboard_helper: "Clipboard Kitty (cliente)",
     clipboard_helper_checking: "Verificando…",
     clipboard_helper_installing: "Instalando…",
@@ -344,6 +356,9 @@ pub static PT: Catalog = Catalog {
 };
 
 pub static FR: Catalog = Catalog {
+    workspace_display: "Vue des espaces",
+    workspace_flat: "Liste à plat",
+    workspace_tree: "Arborescence",
     clipboard_helper: "Presse-papiers Kitty (client)",
     clipboard_helper_checking: "Vérification…",
     clipboard_helper_installing: "Installation…",
@@ -376,6 +391,9 @@ pub static FR: Catalog = Catalog {
 };
 
 pub static DE: Catalog = Catalog {
+    workspace_display: "Arbeitsbereichsansicht",
+    workspace_flat: "Flach",
+    workspace_tree: "Baum",
     clipboard_helper: "Kitty-Zwischenablage (Client)",
     clipboard_helper_checking: "Wird geprüft…",
     clipboard_helper_installing: "Wird installiert…",
@@ -408,6 +426,9 @@ pub static DE: Catalog = Catalog {
 };
 
 pub static ID: Catalog = Catalog {
+    workspace_display: "Tampilan ruang kerja",
+    workspace_flat: "Datar",
+    workspace_tree: "Pohon",
     clipboard_helper: "Papan klip Kitty (klien)",
     clipboard_helper_checking: "Memeriksa…",
     clipboard_helper_installing: "Memasang…",
@@ -568,6 +589,9 @@ pub static ID: Catalog = Catalog {
 };
 
 pub static ZH: Catalog = Catalog {
+    workspace_display: "工作区展示",
+    workspace_flat: "平铺",
+    workspace_tree: "树形",
     clipboard_helper: "Kitty 剪贴板（显示端）",
     clipboard_helper_checking: "检测中…",
     clipboard_helper_installing: "安装中…",
@@ -724,6 +748,9 @@ pub static ZH: Catalog = Catalog {
 };
 
 pub static JA: Catalog = Catalog {
+    workspace_display: "ワークスペース表示",
+    workspace_flat: "フラット",
+    workspace_tree: "ツリー",
     clipboard_helper: "Kitty クリップボード（表示側）",
     clipboard_helper_checking: "確認中…",
     clipboard_helper_installing: "インストール中…",
@@ -889,6 +916,9 @@ pub static JA: Catalog = Catalog {
 };
 
 pub static KO: Catalog = Catalog {
+    workspace_display: "작업 공간 표시",
+    workspace_flat: "평면",
+    workspace_tree: "트리",
     clipboard_helper: "Kitty 클립보드 (클라이언트)",
     clipboard_helper_checking: "확인 중…",
     clipboard_helper_installing: "설치 중…",

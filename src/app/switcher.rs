@@ -307,13 +307,13 @@ impl App {
                 if let Some(w) = self.workspaces.get_mut(ws) {
                     if tab < w.tabs.len() {
                         w.active_tab = tab;
-                        self.active_ws = ws;
+                        self.focus_workspace(ws);
                     }
                 }
             }
             SwitcherTarget::Workspace(i) => {
                 if i < self.workspaces.len() {
-                    self.active_ws = i;
+                    self.focus_workspace(i);
                 }
             }
             SwitcherTarget::NewWorkspace => self.open_folder_picker(),

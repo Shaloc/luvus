@@ -904,9 +904,9 @@ impl App {
                     return;
                 };
                 if let Some(&(workspace, _)) =
-                    self.workspace_display_order().get(usize::from(index))
+                    self.workspace_sidebar_order().get(usize::from(index))
                 {
-                    self.active_ws = workspace;
+                    self.focus_workspace(workspace);
                 }
             }
             Cmd::NewWorktree => self.open_worktree_prompt(),

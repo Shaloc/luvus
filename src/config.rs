@@ -204,6 +204,16 @@ impl BarConfig {
     }
 }
 
+/// WORKSPACES presentation only; neither mode changes workspace IDs or routing.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDisplay {
+    Tree,
+    #[default]
+    #[serde(other)]
+    Flat,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct LayoutConfig {
     #[serde(default = "one")]
@@ -228,6 +238,9 @@ pub struct LayoutConfig {
     /// compact one-row preference when this is disabled.
     #[serde(default = "yes")]
     pub workspace_paths: bool,
+    /// Flat keeps hostname tags; tree groups the same workspaces by machine.
+    #[serde(default)]
+    pub workspace_display: WorkspaceDisplay,
     /// Show the workspace/path detail line beneath each AGENTS entry. On by
     /// default; the row context menu can hide it for a denser one-row list.
     #[serde(default = "yes")]
@@ -501,6 +514,7 @@ impl Default for LayoutConfig {
             pane_title_path: false,
             agent_title: false,
             workspace_paths: true,
+            workspace_display: WorkspaceDisplay::Flat,
             agent_paths: true,
             resume_in_new_workspace: true,
             new_pane_to_workspace_root: false,
@@ -863,6 +877,25 @@ fn apply_delta(target: &mut Value, delta: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workspace_display_defaults_roundtrips_and_tolerates_future_disk_values() {
+        for source in [
+            "{}",
+            r#"{"layout":{}}"#,
+            r#"{"layout":{"workspace_display":"future-mode"}}"#,
+        ] {
+            let config: Config = serde_json::from_str(source).unwrap();
+            assert_eq!(config.layout.workspace_display, WorkspaceDisplay::Flat);
+        }
+        let config: Config =
+            serde_json::from_str(r#"{"layout":{"workspace_display":"tree"}}"#).unwrap();
+        assert_eq!(config.layout.workspace_display, WorkspaceDisplay::Tree);
+        assert_eq!(
+            serde_json::to_value(&config).unwrap()["layout"]["workspace_display"],
+            "tree"
+        );
+    }
 
     #[test]
     fn defaults_and_roundtrip() {

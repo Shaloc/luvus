@@ -821,7 +821,7 @@ impl App {
                     .get(ws)
                     .is_some_and(|workspace| workspace.cwd == cwd)
                 {
-                    self.active_ws = ws;
+                    self.focus_workspace(ws);
                 }
             }
             SearchTarget::Tab {
@@ -831,7 +831,7 @@ impl App {
                 tab_leaves,
             } => {
                 if let Some(tab) = self.resolve_search_tab(ws, &workspace_cwd, &tab_leaves) {
-                    self.active_ws = ws;
+                    self.focus_workspace(ws);
                     self.workspaces[ws].active_tab = tab;
                 }
             }
@@ -846,7 +846,7 @@ impl App {
                 if self.workspaces.get(ws).is_some_and(|workspace| {
                     workspace.remote.is_none() && workspace.cwd == workspace_cwd
                 }) {
-                    self.active_ws = ws;
+                    self.focus_workspace(ws);
                     self.open_file_search_result(path);
                 }
             }
@@ -888,7 +888,7 @@ impl App {
                     && Some(remote.workspace_id.as_str()) == activation.workspace_id.as_deref()
             })
         }) {
-            self.active_ws = index;
+            self.focus_workspace(index);
             return;
         }
         // An owner may have gained a workspace after the catalog was queried.
@@ -940,7 +940,7 @@ impl App {
             match kind {
                 "folder" => {
                     let ws = workspace()?;
-                    self.active_ws = ws;
+                    self.focus_workspace(ws);
                 }
                 "tab" => {
                     let ws = workspace()?;
@@ -969,7 +969,7 @@ impl App {
                     let tab = self
                         .resolve_search_tab(ws, &workspace_cwd, &leaves)
                         .ok_or_else(|| "target tab no longer exists".to_string())?;
-                    self.active_ws = ws;
+                    self.focus_workspace(ws);
                     self.workspaces[ws].active_tab = tab;
                 }
                 "pane" | "agent" => self.focus_pane_global(pane()?),
@@ -994,7 +994,7 @@ impl App {
                     if !canonical_path.starts_with(&canonical_root) || !canonical_path.is_file() {
                         return Err("target file is outside its workspace".to_string());
                     }
-                    self.active_ws = ws;
+                    self.focus_workspace(ws);
                     self.open_file_search_result(canonical_path);
                 }
                 "output" => {

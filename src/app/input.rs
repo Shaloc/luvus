@@ -2967,10 +2967,19 @@ impl App {
             }
             return;
         }
+        if let Some((host, _)) = self
+            .workspace_machine_rects
+            .iter()
+            .find(|(_, rect)| hit(*rect))
+        {
+            self.toggle_workspace_machine(host.clone());
+            self.sidebar_focus = None;
+            return;
+        }
         if let Some((i, _)) = self.ws_rects.iter().find(|(_, rect)| hit(*rect)) {
             let i = (*i).min(self.workspaces.len().saturating_sub(1));
             self.sidebar_focus = None;
-            self.active_ws = i;
+            self.focus_workspace(i);
             return;
         }
         // Clicking a view-selector tab in the git tab switches section (docs/17).

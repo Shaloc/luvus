@@ -299,13 +299,15 @@ impl App {
             .iter()
             .map(|workspace| (workspace.id.clone(), workspace.active_tab))
             .collect();
-        let started = self.task_start_automation(
-            &task_id,
-            run.task.agent_id.clone(),
-            run.task.mode,
-            run.task.workspace_id.clone(),
-            run.task.access,
-        );
+        let started = self.with_preserved_workspace_sidebar(|app| {
+            app.task_start_automation(
+                &task_id,
+                run.task.agent_id.clone(),
+                run.task.mode,
+                run.task.workspace_id.clone(),
+                run.task.access,
+            )
+        });
         for (workspace_id, active_tab) in active_tabs {
             if let Some(workspace) = self
                 .workspaces

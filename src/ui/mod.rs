@@ -225,8 +225,11 @@ fn render_projection_preserving_state(
     let right_seam = app.right_seam;
     let last_cursor = app.last_cursor;
     let workspaces_scroll = app.workspaces_scroll;
+    let workspace_cursor = app.workspace_cursor;
+    let collapsed_workspace_machines = app.collapsed_workspace_machines.clone();
     let agents_scroll = app.agents_scroll;
     let last_active_ws_shown = app.last_active_ws_shown;
+    let last_active_ws_id_shown = app.last_active_ws_id_shown.clone();
     let switcher_scroll = app.switcher_scroll;
     let named_session_scroll = app.named_session_menu.as_ref().map(|menu| menu.scroll);
     let orch_scroll = app.orch_scroll;
@@ -250,6 +253,7 @@ fn render_projection_preserving_state(
     let tab_rects = std::mem::take(&mut app.tab_rects);
     let tab_close_rects = std::mem::take(&mut app.tab_close_rects);
     let ws_rects = std::mem::take(&mut app.ws_rects);
+    let workspace_machine_rects = std::mem::take(&mut app.workspace_machine_rects);
     let git_section_rects = std::mem::take(&mut app.git_section_rects);
     let agents_filter_rects = std::mem::take(&mut app.agents_filter_rects);
     let agents_elsewhere_rect = app.agents_elsewhere_rect;
@@ -373,8 +377,11 @@ fn render_projection_preserving_state(
     app.right_seam = right_seam;
     app.last_cursor = last_cursor;
     app.workspaces_scroll = workspaces_scroll;
+    app.workspace_cursor = workspace_cursor;
+    app.collapsed_workspace_machines = collapsed_workspace_machines;
     app.agents_scroll = agents_scroll;
     app.last_active_ws_shown = last_active_ws_shown;
+    app.last_active_ws_id_shown = last_active_ws_id_shown;
     app.switcher_scroll = switcher_scroll;
     if let (Some(scroll), Some(menu)) = (named_session_scroll, app.named_session_menu.as_mut()) {
         menu.scroll = scroll;
@@ -395,6 +402,7 @@ fn render_projection_preserving_state(
     app.tab_rects = tab_rects;
     app.tab_close_rects = tab_close_rects;
     app.ws_rects = ws_rects;
+    app.workspace_machine_rects = workspace_machine_rects;
     app.git_section_rects = git_section_rects;
     app.agents_filter_rects = agents_filter_rects;
     app.agents_elsewhere_rect = agents_elsewhere_rect;
@@ -575,6 +583,11 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     // a frame that bails out (window too small, no workspace yet) must not
     // leave a dock divider behind as a live drag target.
     app.dock_dividers.clear();
+    // Includes the too-small-window and empty-session exits: old machine or
+    // workspace rows must not remain clickable when the dock is not drawn.
+    app.ws_rects.clear();
+    app.workspace_machine_rects.clear();
+    app.workspaces_area = Rect::ZERO;
     app.agents_elsewhere_rect = None;
     // A remote frame supplies its own MENU. Neither the tab bar nor mobile
     // header is drawn on that path, so their old hit target must not survive.
@@ -607,7 +620,6 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
         app.pane_title_rects.clear();
         app.tab_rects.clear();
         app.tab_close_rects.clear();
-        app.ws_rects.clear();
         app.agents_filter_rects.clear();
         app.agents_elsewhere_rect = None;
         app.agent_rects.clear();
@@ -763,7 +775,6 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     app.sidebar_toggle_rect = None;
     app.right_sidebar_toggle_rect = None;
     app.version_rect = None;
-    app.workspaces_area = Rect::ZERO;
     app.agents_area = Rect::ZERO;
     app.agents_filter_rects.clear();
     app.agents_elsewhere_rect = None;

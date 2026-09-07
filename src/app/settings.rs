@@ -86,6 +86,7 @@ pub struct SettingsUi {
 #[derive(Clone)]
 pub enum LayoutRow {
     SidebarWidth,
+    WorkspaceDisplay,
     ColGap,
     RowGap,
     Scrollback,
@@ -206,6 +207,7 @@ impl App {
         v.push(LayoutRow::RightVisible);
         v.push(LayoutRow::SidebarWidth);
         v.push(LayoutRow::RightWidth);
+        v.push(LayoutRow::WorkspaceDisplay);
         for k in self.available_docks() {
             v.push(LayoutRow::Dock(k));
         }
@@ -504,6 +506,7 @@ impl App {
                 Some(SettingsTab::Layout) => matches!(
                     self.layout_rows().get(i),
                     Some(LayoutRow::SidebarWidth)
+                        | Some(LayoutRow::WorkspaceDisplay)
                         | Some(LayoutRow::RightWidth)
                         | Some(LayoutRow::MobileWidth)
                         | Some(LayoutRow::DiffContext)
@@ -1081,6 +1084,14 @@ impl App {
             return;
         };
         match row {
+            LayoutRow::WorkspaceDisplay => {
+                self.config.layout.workspace_display = match self.config.layout.workspace_display {
+                    config::WorkspaceDisplay::Flat => config::WorkspaceDisplay::Tree,
+                    config::WorkspaceDisplay::Tree => config::WorkspaceDisplay::Flat,
+                };
+                self.reset_workspace_sidebar_view();
+                self.persist_config();
+            }
             LayoutRow::SidebarWidth => {
                 let w = (self.sidebars.left.width as i32 + 2 * delta)
                     .clamp(SIDEBAR_WIDTH_MIN as i32, SIDEBAR_WIDTH_MAX as i32)
@@ -1698,6 +1709,58 @@ mod tests {
         assert_eq!(right_visible, left_visible + 1);
         assert_eq!(left_width, right_visible + 1);
         assert_eq!(right_width, left_width + 1);
+    }
+
+    #[test]
+    fn workspace_display_settings_click_and_keyboard_persist_without_changing_merge() {
+        use crate::config::WorkspaceDisplay;
+        let _env = crate::persist::test_env("workspace-display-settings");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 50, tx).unwrap();
+        app.open_settings();
+        app.settings_set_tab(SettingsTab::Layout);
+        let row = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::WorkspaceDisplay))
+            .unwrap();
+        app.settings.as_mut().unwrap().cursor = row;
+        let before_merge = app.remote_merge_enabled;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 50)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let rect = app
+            .settings_ctl_rects
+            .iter()
+            .find(|(i, _)| *i == row)
+            .unwrap()
+            .1;
+        app.handle_settings_click(rect.x, rect.y);
+        assert_eq!(
+            app.config.layout.workspace_display,
+            WorkspaceDisplay::Flat,
+            "selecting a slider body must not change its value"
+        );
+        let arrow = app
+            .settings_arrow_rects
+            .iter()
+            .find(|(i, delta, _)| *i == row && *delta > 0)
+            .unwrap()
+            .2;
+        app.handle_settings_click(arrow.x, arrow.y);
+        assert_eq!(app.config.layout.workspace_display, WorkspaceDisplay::Tree);
+        app.flush_config_for_test(&rx);
+        assert_eq!(
+            crate::config::load().layout.workspace_display,
+            WorkspaceDisplay::Tree
+        );
+        app.handle_settings_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.flush_config_for_test(&rx);
+        assert_eq!(
+            crate::config::load().layout.workspace_display,
+            WorkspaceDisplay::Flat
+        );
+        assert_eq!(app.remote_merge_enabled, before_merge);
     }
 
     #[test]

@@ -598,6 +598,24 @@ fn draw_content(
                     V::Ctl(i) => *i,
                 };
                 match &rows[i] {
+                    LayoutRow::WorkspaceDisplay => {
+                        let value = match app.config.layout.workspace_display {
+                            crate::config::WorkspaceDisplay::Flat => cat.settings.workspace_flat,
+                            crate::config::WorkspaceDisplay::Tree => cat.settings.workspace_tree,
+                        };
+                        let rect = slider_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor == i,
+                            cat.settings.workspace_display,
+                            value.to_string(),
+                            t,
+                            &mut arrows,
+                        );
+                        ctls.push((i, rect));
+                    }
                     LayoutRow::SidebarWidth => {
                         let r = slider_row(
                             f,

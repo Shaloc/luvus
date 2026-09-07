@@ -906,6 +906,39 @@ def main():
                                      for w in api("session.snapshot")["workspaces"]))
                 owner_matrix(master, "merge")
 
+                # The selectable tree is an outer presentation, not a new
+                # owner/session. Exercise it through the real binary transport
+                # and mouse parser, then run the existing owner parity matrix.
+                identity = lambda: [(w["workspace"], w["workspace_id"], w.get("host"))
+                                    for w in api("workspace.list")["workspaces"]]
+                before_tree = identity()
+                api("config.patch", {"patch": {"layout": {"workspace_display": "tree"}}})
+                screen = repaint(master)
+                position(screen, "Local machine", before_column=35)
+                click(master, *position(screen, "▾ fake-dev", before_column=35))
+                screen = repaint(master)
+                position(screen, "▸ fake-dev", before_column=35)
+                active_remote = next(w["workspace"] for w in api("workspace.list")["workspaces"]
+                                     if w["active"] and w.get("host") == "fake-dev")
+                api("workspace.focus", {"workspace": active_remote})
+                screen = repaint(master)
+                click(master, *position(screen, "▾ fake-dev", before_column=35))
+                screen = repaint(master)
+                click(master, *position(screen, "▸ fake-dev", before_column=35))
+                screen = repaint(master)
+                _, heading_row = position(screen, "▾ fake-dev", before_column=35)
+                click(master, 8, heading_row + 1)
+                wait_for(lambda: any(w.get("host") == "fake-dev" and w["active"]
+                                     for w in api("session.snapshot")["workspaces"]))
+                assert identity() == before_tree
+                owner_matrix(master, "merge-tree")
+                assert identity() == before_tree
+                api("config.patch", {"patch": {"layout": {"workspace_display": "flat"}}})
+                screen = repaint(master)
+                position(screen, "[fake-dev]", before_column=35)
+                assert identity() == before_tree
+                print("PASS: tree machine headings fold/unfold, remote row selection, full owner matrix, flat restore and stable workspace identities", flush=True)
+
                 def federated_search():
                     result = api("search.query", {"query": "parity.md", "scope": "files",
                                                   "all_sessions": True})

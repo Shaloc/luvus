@@ -50,6 +50,7 @@ mod search;
 pub(crate) mod session_menu;
 mod settings;
 mod switcher;
+pub(crate) mod workspace_sidebar;
 
 pub use search::{GlobalSearch, SearchFlash};
 
@@ -2540,6 +2541,8 @@ pub struct App {
     pub sidebar_focus: Option<SidebarListFocus>,
     /// Display-order cursors for the two built-in sidebar lists.
     pub workspace_cursor: usize,
+    /// Presentation-only machine folds. None denotes this server's local workspaces.
+    pub(crate) collapsed_workspace_machines: HashSet<Option<String>>,
     pub agent_cursor: usize,
     /// The FILES dock (docs/38): the tree model, its scroll region, and the
     /// clickable rect per visible row (`(row index, rect)`), re-set each frame.
@@ -2648,6 +2651,8 @@ pub struct App {
     pub agents_this_workspace: bool,
     /// Last active workspace shown, to auto-reveal it on a programmatic change.
     pub last_active_ws_shown: usize,
+    /// Stable identity catches replacement/removal without an index change.
+    pub last_active_ws_id_shown: Option<String>,
     /// Last mouse position, for hover affordances (the session delete ✕).
     pub hover: Option<(u16, u16)>,
     /// Scroll offsets for context-menu popups that do not fit (see
@@ -2694,6 +2699,7 @@ pub struct App {
     pub tab_rects: Vec<(usize, Rect)>,
     pub tab_close_rects: Vec<(usize, Rect)>,
     pub ws_rects: Vec<(usize, Rect)>,
+    pub(crate) workspace_machine_rects: Vec<(Option<String>, Rect)>,
     /// Clickable view-selector tabs in the active git tab (Commits/Flow/…).
     pub git_section_rects: Vec<(crate::git::Section, Rect)>,
     /// The All/Active filter toggle in the AGENTS header (`bool` = active_only).
@@ -3048,6 +3054,7 @@ impl App {
             agents_area: Rect::ZERO,
             sidebar_focus: None,
             workspace_cursor: 0,
+            collapsed_workspace_machines: HashSet::new(),
             agent_cursor: 0,
             // Rooted at nothing; the first detect tick re-roots it to the active
             // node (set_root is a no-op when already correct).
@@ -3105,6 +3112,7 @@ impl App {
             mobile_pane_next_rect: None,
             switcher_close_rect: None,
             last_active_ws_shown: 0,
+            last_active_ws_id_shown: None,
             hover: None,
             menu_scroll: MenuScroll::default(),
             app_tx,
@@ -3123,6 +3131,7 @@ impl App {
             last_main_area: Rect::ZERO,
             tab_rects: Vec::new(),
             ws_rects: Vec::new(),
+            workspace_machine_rects: Vec::new(),
             git_section_rects: Vec::new(),
             agents_filter_rects: Vec::new(),
             agents_elsewhere_rect: None,
@@ -3721,6 +3730,7 @@ impl App {
             agents_area: Rect::ZERO,
             sidebar_focus: None,
             workspace_cursor: 0,
+            collapsed_workspace_machines: HashSet::new(),
             agent_cursor: 0,
             // Rooted at nothing; the first detect tick re-roots it to the active
             // node (set_root is a no-op when already correct).
@@ -3778,6 +3788,7 @@ impl App {
             mobile_pane_next_rect: None,
             switcher_close_rect: None,
             last_active_ws_shown: 0,
+            last_active_ws_id_shown: None,
             hover: None,
             menu_scroll: MenuScroll::default(),
             app_tx,
@@ -3796,6 +3807,7 @@ impl App {
             last_main_area: Rect::ZERO,
             tab_rects: Vec::new(),
             ws_rects: Vec::new(),
+            workspace_machine_rects: Vec::new(),
             git_section_rects: Vec::new(),
             agents_filter_rects: Vec::new(),
             agents_elsewhere_rect: None,
@@ -3997,7 +4009,8 @@ impl App {
         }
         self.files_focused = false;
         self.sidebar_focus = Some(SidebarListFocus::Workspaces);
-        self.workspace_cursor = self.workspace_display_position(self.active_ws).unwrap_or(0);
+        self.reveal_workspace_machine(self.active_ws);
+        self.workspace_cursor = self.workspace_sidebar_position(self.active_ws).unwrap_or(0);
     }
 
     /// Give normal-mode keyboard input to the AGENTS list. The cursor starts at
@@ -4183,8 +4196,14 @@ impl App {
 
     /// Keyboard navigation for WORKSPACES, mirroring FILES and DIFF.
     pub fn handle_workspaces_key(&mut self, key: KeyEvent) -> bool {
-        let order = self.workspace_display_order();
-        let page = (usize::from(self.workspaces_area.height) / 2).max(1) as isize;
+        use workspace_sidebar::WorkspaceSidebarRow;
+        let order = self.workspace_sidebar_rows();
+        let stride = if self.config.layout.workspace_paths {
+            2
+        } else {
+            1
+        };
+        let page = (usize::from(self.workspaces_area.height) / stride).max(1) as isize;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.sidebar_focus = None,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -4203,14 +4222,41 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => {
                 self.workspace_cursor = order.len().saturating_sub(1)
             }
-            KeyCode::Enter => {
-                if let Some(&(workspace, _)) = order.get(self.workspace_cursor) {
-                    self.active_ws = workspace;
+            KeyCode::Enter | KeyCode::Char(' ') => match order.get(self.workspace_cursor) {
+                Some(WorkspaceSidebarRow::Machine(host)) => {
+                    self.toggle_workspace_machine(host.clone())
+                }
+                Some(WorkspaceSidebarRow::Workspace(workspace, _))
+                    if key.code == KeyCode::Enter =>
+                {
+                    self.focus_workspace(*workspace);
                     self.sidebar_focus = None;
                 }
-            }
+                _ => {}
+            },
+            KeyCode::Left | KeyCode::Right => match order.get(self.workspace_cursor) {
+                Some(WorkspaceSidebarRow::Machine(host)) => {
+                    let collapsed = self.collapsed_workspace_machines.contains(host);
+                    if (key.code == KeyCode::Left && !collapsed)
+                        || (key.code == KeyCode::Right && collapsed)
+                    {
+                        self.toggle_workspace_machine(host.clone());
+                    }
+                }
+                Some(WorkspaceSidebarRow::Workspace(workspace, _)) if key.code == KeyCode::Left => {
+                    let host = self.workspace_machine(*workspace);
+                    if let Some(pos) = order.iter().position(
+                        |row| matches!(row, WorkspaceSidebarRow::Machine(owner) if *owner == host),
+                    ) {
+                        self.workspace_cursor = pos;
+                    }
+                }
+                _ => {}
+            },
             KeyCode::Char('a') => {
-                if let Some(&(workspace, _)) = order.get(self.workspace_cursor) {
+                if let Some(&WorkspaceSidebarRow::Workspace(workspace, _)) =
+                    order.get(self.workspace_cursor)
+                {
                     let anchor = self
                         .ws_rects
                         .iter()
@@ -4881,7 +4927,7 @@ impl App {
             }
         }
         if focus {
-            self.active_ws = workspace;
+            self.focus_workspace(workspace);
             self.workspaces[workspace].active_tab = tab;
             self.scroll_pane = None;
             self.zoomed = false;
@@ -5114,7 +5160,7 @@ impl App {
             active_tab: 0,
             remote: None,
         });
-        self.active_ws = self.workspaces.len() - 1;
+        self.focus_workspace(self.workspaces.len() - 1);
         self.session_dirty = true;
         let ws = self.active_ws;
         self.emit_event(
@@ -5226,7 +5272,8 @@ impl App {
             .collect()
     }
 
-    /// A workspace's 0-based position in the sidebar after pin/group ordering.
+    /// Public 0-based workspace order after pin/worktree grouping. Presentation
+    /// headers and folds are not workspace positions (see workspace_sidebar_position).
     pub fn workspace_display_position(&self, index: usize) -> Option<usize> {
         self.workspace_display_order()
             .iter()
@@ -5749,7 +5796,7 @@ impl App {
                 } else {
                     command.to_string()
                 };
-                self.active_ws = index;
+                self.focus_workspace(index);
                 self.send_workspace_remote(
                     index,
                     crate::ipc::protocol::ClientMessage::Command(command),
@@ -5795,7 +5842,7 @@ impl App {
             WsMenuItem::OpenGit => self.open_git_tab(index), // no-op for non-repos
             WsMenuItem::OpenOrch => {
                 if index < self.workspaces.len() {
-                    self.active_ws = index;
+                    self.focus_workspace(index);
                     self.open_orch_board();
                 }
             }
@@ -6169,7 +6216,7 @@ impl App {
             }
         };
 
-        self.active_ws = wsi;
+        self.focus_workspace(wsi);
         self.workspaces[wsi].active_tab = final_tab;
         self.workspaces[wsi].tabs[final_tab].layout.focus = pane;
         self.zoomed = false;
@@ -6765,7 +6812,7 @@ impl App {
         {
             return Err(TabFocusError::PositionOutOfRange);
         }
-        self.active_ws = workspace;
+        self.focus_workspace(workspace);
         self.workspaces[workspace].active_tab = index;
         Ok(())
     }
@@ -6981,7 +7028,7 @@ impl App {
         // its cwd); otherwise open it as a tab in the currently active workspace.
         let target = self.resume_workspace_target(&s.cwd);
         if let Some(wi) = target {
-            self.active_ws = wi;
+            self.focus_workspace(wi);
             let ws = &mut self.workspaces[wi];
             ws.tabs.push(tab);
             ws.active_tab = ws.tabs.len() - 1;
@@ -6999,7 +7046,7 @@ impl App {
                 active_tab: 0,
                 remote: None,
             });
-            self.active_ws = self.workspaces.len() - 1;
+            self.focus_workspace(self.workspaces.len() - 1);
         }
         if let Some(st) = self.status.get_mut(&id) {
             st.agent = s.agent.clone();
@@ -7043,7 +7090,7 @@ impl App {
             }
         }
         if let Some((wi, ti)) = found {
-            self.active_ws = wi;
+            self.focus_workspace(wi);
             self.workspaces[wi].active_tab = ti;
             self.workspaces[wi].tabs[ti].layout.focus = id;
             if changed {
@@ -7054,6 +7101,14 @@ impl App {
     }
 
     fn cycle_workspace(&mut self, delta: isize) {
+        if self.config.layout.workspace_display == crate::config::WorkspaceDisplay::Tree {
+            let order = self.workspace_sidebar_order();
+            if let Some(position) = order.iter().position(|(i, _)| *i == self.active_ws) {
+                let next = (position as isize + delta).rem_euclid(order.len() as isize) as usize;
+                self.focus_workspace(order[next].0);
+            }
+            return;
+        }
         let n = self.workspaces.len() as isize;
         if n > 0 {
             self.active_ws = (((self.active_ws as isize + delta) % n + n) % n) as usize;

@@ -726,7 +726,7 @@ impl App {
         let Some((workspace, _)) = self.pane_location(view) else {
             return;
         };
-        self.active_ws = workspace;
+        self.focus_workspace(workspace);
         self.send_workspace_remote(workspace, ClientMessage::Command(command));
     }
 

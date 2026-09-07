@@ -470,6 +470,8 @@ fn draw_workspaces_dock(
     app: &mut App,
     t: &Theme,
 ) -> WorkspaceHits {
+    use crate::app::remote::RemoteViewState;
+    use crate::app::workspace_sidebar::{last_scroll, visible_end, WorkspaceSidebarRow};
     let cat = app.catalog;
     let cx = area.x + 2;
     let cw = area.width.saturating_sub(3);
@@ -498,41 +500,110 @@ fn draw_workspaces_dock(
     let nlist_top = area.y + 1;
     let nrows = area.height.saturating_sub(1);
     let paths_visible = app.config.layout.workspace_paths;
-    let row_stride = dock_row_stride(paths_visible);
-    let ncap = list_capacity(nrows, row_stride);
-    let ntotal = app.workspaces.len();
+    let tree = app.config.layout.workspace_display == crate::config::WorkspaceDisplay::Tree;
+    let explicit_reveal = if tree {
+        app.last_active_ws_shown == usize::MAX
+    } else {
+        app.active_ws != app.last_active_ws_shown
+    };
+    let active_changed = explicit_reveal
+        || app.workspaces.get(app.active_ws).map(|ws| ws.id.as_str())
+            != app.last_active_ws_id_shown.as_deref();
+    if active_changed {
+        app.reveal_workspace_machine(app.active_ws);
+    }
     // Draw order groups each worktree under the node it branched from (docs/18
     // WT-4), so scroll positions index into this order, not raw creation order.
-    let order = app.workspace_display_order();
+    let order = app.workspace_sidebar_rows();
+    let ntotal = order.len();
     let active_pos = order
         .iter()
-        .position(|(i, _)| *i == app.active_ws)
+        .position(|row| matches!(row, WorkspaceSidebarRow::Workspace(i, _) if *i == app.active_ws))
         .unwrap_or(0);
     let keyboard_focused = app.sidebar_focus == Some(SidebarListFocus::Workspaces);
     app.workspace_cursor = app.workspace_cursor.min(ntotal.saturating_sub(1));
     // Auto-reveal the active workspace when it changes (cycle / new / resume), without
     // fighting wheel scrolling (which never changes `active_ws`).
-    if keyboard_focused {
-        if app.workspace_cursor < app.workspaces_scroll {
-            app.workspaces_scroll = app.workspace_cursor;
-        } else if ncap > 0 && app.workspace_cursor >= app.workspaces_scroll + ncap {
-            app.workspaces_scroll = app.workspace_cursor + 1 - ncap;
-        }
-    } else if app.active_ws != app.last_active_ws_shown {
-        if active_pos < app.workspaces_scroll {
-            app.workspaces_scroll = active_pos;
-        } else if ncap > 0 && active_pos >= app.workspaces_scroll + ncap {
-            app.workspaces_scroll = active_pos + 1 - ncap;
-        }
-        app.last_active_ws_shown = app.active_ws;
+    let reveal = if keyboard_focused {
+        Some(app.workspace_cursor)
+    } else if active_changed {
+        Some(active_pos)
+    } else {
+        None
+    };
+    app.last_active_ws_shown = app.active_ws;
+    if active_changed {
+        app.last_active_ws_id_shown = app.workspaces.get(app.active_ws).map(|ws| ws.id.clone());
     }
-    app.workspaces_scroll = app.workspaces_scroll.min(ntotal.saturating_sub(ncap));
+    app.workspaces_scroll =
+        app.workspaces_scroll
+            .min(last_scroll(&order, nrows as usize, paths_visible));
+    if let Some(position) = reveal {
+        app.workspaces_scroll = app.workspaces_scroll.min(position);
+        while nrows > 0
+            && app.workspaces_scroll < position
+            && position >= visible_end(&order, app.workspaces_scroll, nrows as usize, paths_visible)
+        {
+            app.workspaces_scroll += 1;
+        }
+    }
     app.workspaces_area = Rect::new(area.x, nlist_top, area.width, nrows);
     let nscroll = app.workspaces_scroll;
-    for (vi, (i, is_member)) in order.into_iter().skip(nscroll).take(ncap).enumerate() {
-        let y = nlist_top + vi as u16 * row_stride;
-        let active = i == app.active_ws;
+    let ncap = visible_end(&order, nscroll, nrows as usize, paths_visible).saturating_sub(nscroll);
+    // Read existing transport evidence once, never probe hosts from rendering.
+    let mut machine_states = std::collections::HashMap::new();
+    if tree {
+        for view in app.views.values() {
+            if let crate::app::ViewKind::Remote(view) = view {
+                let state = machine_states
+                    .entry(view.target.host.as_str())
+                    .or_insert(RemoteViewState::Connecting);
+                if view.state == RemoteViewState::Disconnected
+                    || *state != RemoteViewState::Disconnected
+                        && view.state == RemoteViewState::Ready
+                {
+                    *state = view.state;
+                }
+            }
+        }
+    }
+    let mut y = nlist_top;
+    for (vi, row) in order.into_iter().skip(nscroll).take(ncap).enumerate() {
         let selected = keyboard_focused && nscroll + vi == app.workspace_cursor;
+        if let WorkspaceSidebarRow::Machine(host) = row {
+            let collapsed = app.collapsed_workspace_machines.contains(&host);
+            let label = host.as_deref().unwrap_or(cat.session_local);
+            let color = match host.as_deref().and_then(|host| machine_states.get(host)) {
+                Some(RemoteViewState::Ready) => t.green,
+                Some(RemoteViewState::Disconnected) => t.coral,
+                _ => t.amber,
+            };
+            let name = crate::ui::truncate(label, (cw as usize).saturating_sub(4));
+            let mut spans = vec![Span::styled(
+                format!("{} {name}", if collapsed { "▸" } else { "▾" }),
+                Style::new()
+                    .fg(if selected { t.accent } else { t.text })
+                    .bold(),
+            )];
+            if host.is_some() {
+                spans.push(Span::styled(" ●", Style::new().fg(color)));
+            }
+            line_at(f, y, Line::from(spans));
+            if selected {
+                for x in area.x..area.right().saturating_sub(1) {
+                    f.buffer_mut()[(x, y)].set_bg(t.surface1);
+                }
+            }
+            app.workspace_machine_rects
+                .push((host, Rect::new(area.x, y, area.width, 1)));
+            y += 1;
+            continue;
+        }
+        let WorkspaceSidebarRow::Workspace(i, is_member) = row else {
+            unreachable!()
+        };
+        let row_stride = dock_row_stride(paths_visible).min(area.bottom().saturating_sub(y));
+        let active = i == app.active_ws;
         ws_rects.push((i, Rect::new(area.x, y, area.width, row_stride)));
         let st = rollup(app, i);
         let ws = &app.workspaces[i];
@@ -543,19 +614,19 @@ fn draw_workspaces_dock(
             Style::new().fg(t.subtext1)
         };
         // A linked worktree is nested under its parent checkout with a connector.
-        let indent: u16 = if is_member { 2 } else { 0 };
+        let indent: u16 = (if is_member { 2 } else { 0 }) + if tree { 2 } else { 0 };
         // Row 1: state dot + workspace name + git branch (dot aligned with "WORKSPACES").
         // On a narrow sidebar the name keeps priority: it is ellipsized only when
         // it can't share the row, and the branch is fitted (then ellipsized, then
         // dropped) into whatever space is left, so the row never hard-cuts.
         let avail = (cw as usize).saturating_sub(indent as usize + 2);
         let display_name = match &ws.remote {
-            Some(remote) => {
+            Some(remote) if !tree => {
                 let tag = format!(" [{}]", remote.host);
                 let budget = avail.saturating_sub(crate::ui::display_width(&tag));
                 format!("{}{}", crate::ui::truncate(&ws.name, budget), tag)
             }
-            None => ws.name.clone(),
+            _ => ws.name.clone(),
         };
         let name_w = crate::ui::display_width(&display_name);
         let (name_disp, branch_disp) = match &ws.branch {
@@ -575,6 +646,9 @@ fn draw_workspaces_dock(
             None => (crate::ui::truncate(&display_name, avail), None),
         };
         let mut line1: Vec<Span> = Vec::new();
+        if tree {
+            line1.push(Span::raw("  "));
+        }
         if is_member {
             line1.push(Span::styled("└ ", Style::new().fg(t.overlay0)));
         }
@@ -594,7 +668,7 @@ fn draw_workspaces_dock(
             ));
         }
         line_at(f, y, Line::from(line1));
-        if paths_visible {
+        if paths_visible && row_stride > 1 {
             // Row 2: the project path, indented under the name (extra for members).
             let pad = 2 + indent as usize;
             line_at(
@@ -624,6 +698,7 @@ fn draw_workspaces_dock(
                 }
             }
         }
+        y += row_stride;
     }
     draw_scrollbar(
         f,
