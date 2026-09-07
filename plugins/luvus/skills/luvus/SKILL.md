@@ -155,6 +155,12 @@ flat sidebar. Settings → Layout → Workspace display also offers a collapsibl
 machine tree. `config.patch` can set `layout.workspace_display` to `flat` or
 `tree`; this is presentation only and does not change merge, host admission,
 workspace indices, or public pin/worktree `display_position` values.
+`layout.auto_workspace_rehome` is a separate boolean, default `false`: scanned
+process directories update pane CWD but do not create workspaces or move tabs.
+Settings → Layout → Auto-move tabs by directory or `config.patch` can explicitly
+enable it. Disabling it prevents future automatic moves, not earlier ones.
+Manual workspace/tab/pane operations are unaffected. This is owner-local:
+configure remote owners separately; merge does not copy the setting to them.
 `session merge` and registration changes refresh an already-running local
 server; no restart is needed. Disabling a host or merge removes local
 projections and disconnects their bridges without stopping remote panes.

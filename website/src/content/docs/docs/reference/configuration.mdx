@@ -36,6 +36,7 @@ cleanly across versions because unknown fields get defaults.
 | `layout.file_click` | what a plain click in the FILES dock does: `preview` (default) reuses one read-only preview pane, `tab` opens a whole tab through `layout.file_open`. Only `tab` can launch an editor. |
 | `layout.workspace_paths` | show the cwd line beneath WORKSPACES rows; defaults to `true` and can be toggled from any workspace row menu |
 | `layout.workspace_display` | `flat` (default) keeps the workspace list with hostname tags; `tree` groups workspaces and their worktrees under collapsible machine headings. Change it live in Settings → Layout → Workspace display. It does not change merge, SSH admission, or workspace indices. |
+| `layout.auto_workspace_rehome` | `false` by default, including existing configurations without this field. Settings → Layout → Auto-move tabs by directory opts into creating workspaces and moving whole tabs based on scanned process directories. When off, terminal directory and workspace branch tracking continue, but scans cannot create workspaces, move tabs, or close emptied source workspaces. Manual operations are unchanged. This is an owner-server setting; configure remote owners separately. |
 | `layout.agent_paths` | show the workspace/path detail line beneath AGENTS rows; defaults to `true` and can be toggled from any agent row menu |
 | `layout.diff_layout` | default native DIFF layout: `auto`, `split`, or `stack` |
 | `layout.diff_wrap` | wrap long diff rows instead of using horizontal navigation |

@@ -201,6 +201,9 @@ impl App {
         pane_git: &HashMap<PaneId, Option<PathBuf>>,
         candidates: &[crate::git::GitRootInfo],
     ) -> bool {
+        if !self.config.layout.auto_workspace_rehome {
+            return false;
+        }
         self.open_missing_git_workspaces(pane_git, candidates);
         let mut jobs: Vec<(PaneId, PathBuf)> = Vec::new();
         let candidates: Vec<(usize, Vec<PaneId>)> = self
@@ -251,6 +254,9 @@ impl App {
         self.workspaces
             .iter()
             .enumerate()
+            // Scanned process directories are local. An identical path on an
+            // SSH host must neither claim a local tab nor suppress its home.
+            .filter(|(_, ws)| ws.remote.is_none())
             .map(|(i, ws)| (ws.cwd.clone(), i))
             .collect()
     }
@@ -649,6 +655,7 @@ mod tests {
         let _env = crate::persist::test_env("rehome-tab-cwd");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         app.refresh_cwds();
         let home = app.ws().cwd.clone();
         let other = std::env::temp_dir();
@@ -679,6 +686,7 @@ mod tests {
         let _env = crate::persist::test_env("rehome-open-git");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         let pane = app.layout().focus;
         let spawn = app.ws().cwd.clone();
         let repo = std::env::temp_dir().join(format!(
@@ -705,6 +713,7 @@ mod tests {
         let _env = crate::persist::test_env("rehome-nested-wt");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         let pane = app.layout().focus;
         let spawn = app.ws().cwd.clone();
         let parent = std::env::temp_dir().join(format!(
@@ -747,6 +756,7 @@ mod tests {
         let _env = crate::persist::test_env("rehome-active-tab");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         let home = app.ws().cwd.clone();
         app.new_tab();
         app.new_tab();
@@ -787,6 +797,7 @@ mod tests {
         let _env = crate::persist::test_env("rehome-close-helper");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         let home = app.ws().cwd.clone();
         let home_id = app.ws().id.clone();
         let pane = app.layout().focus;
@@ -860,6 +871,7 @@ mod tests {
         let _env = crate::persist::test_env("rehome-keep-view");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         let home = app.ws().cwd.clone();
         let pane_a = app.layout().focus;
         let mid = std::env::temp_dir().join(format!(
@@ -903,6 +915,7 @@ mod tests {
         let _env = crate::persist::test_env("rehome-zoom");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         let home = app.ws().cwd.clone();
         app.new_tab();
         app.new_tab();
@@ -939,6 +952,7 @@ mod tests {
         let _env = crate::persist::test_env("rehome-split");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         app.split(crate::layout::Axis::Col);
         let leaves = app.layout().leaves();
         assert_eq!(leaves.len(), 2);
@@ -974,6 +988,7 @@ mod tests {
         let _env = crate::persist::test_env("rehome-split-stay");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         app.split(crate::layout::Axis::Col);
         let leaves = app.layout().leaves();
         assert_eq!(leaves.len(), 2);
@@ -1002,10 +1017,165 @@ mod tests {
     }
 
     #[test]
+    fn automatic_workspace_rehome_is_disabled_by_default() {
+        let _env = crate::persist::test_env("cwd-rehome-opt-in");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let workspace = app.ws().id.clone();
+        let home = app.ws().cwd.clone();
+        let other = crate::persist::config_dir().join("child-test-project");
+        let evidence = crate::platform::PaneCwdEvidence {
+            pid: 1,
+            owner_cwd: Some(home.clone()),
+            owner_git_root: Some(home),
+            descendant_git_cwd: Some(other.clone()),
+            descendant_git_root: Some(other.clone()),
+        };
+        let candidates = vec![crate::git::GitRootInfo {
+            root: other.clone(),
+            branch: None,
+            worktree: None,
+        }];
+        for _ in 0..6 {
+            app.apply_cwd_scan(
+                vec![(pane, evidence.clone())],
+                vec![(workspace.clone(), Some("updated-branch".into()))],
+                candidates.clone(),
+            );
+        }
+        assert_eq!(
+            app.workspaces.len(),
+            1,
+            "child cwd must not create a workspace by default"
+        );
+        assert_eq!(
+            app.ws().id,
+            workspace,
+            "the agent tab must stay in its workspace"
+        );
+        assert_eq!(
+            app.panes[&pane].cwd, other,
+            "live terminal cwd tracking is independent"
+        );
+        assert_eq!(app.ws().branch.as_deref(), Some("updated-branch"));
+    }
+
+    #[test]
+    fn disabling_workspace_rehome_blocks_inflight_scan_and_existing_destination() {
+        let _env = crate::persist::test_env("cwd-rehome-live-toggle");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let workspace = app.ws().id.clone();
+        let home = app.ws().cwd.clone();
+        let other = crate::persist::config_dir().join("existing-project");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(app.create_workspace_at(other.clone()));
+        let destination = app.ws().id.clone();
+        let evidence = crate::platform::PaneCwdEvidence {
+            pid: 1,
+            owner_cwd: Some(home.clone()),
+            owner_git_root: Some(home),
+            descendant_git_cwd: Some(other.clone()),
+            descendant_git_root: Some(other.clone()),
+        };
+        let patch =
+            |enabled| serde_json::json!({"patch":{"layout":{"auto_workspace_rehome":enabled}}});
+        app.dispatch("config.patch", &patch(true)).unwrap();
+        app.cwd_scan_inflight = true;
+        app.dispatch("config.patch", &patch(false)).unwrap();
+        for _ in 0..6 {
+            app.apply_cwd_scan(vec![(pane, evidence.clone())], Vec::new(), Vec::new());
+        }
+        let (wi, _, _) = app.pane_tab_home(pane).unwrap();
+        assert_eq!(
+            app.workspaces[wi].id, workspace,
+            "off blocks moves to existing workspaces too"
+        );
+        assert_eq!(app.workspaces.len(), 2);
+        assert_eq!(app.panes[&pane].cwd, other);
+
+        app.dispatch("config.patch", &patch(true)).unwrap();
+        app.flush_config_for_test(&rx);
+        assert!(crate::config::load().layout.auto_workspace_rehome);
+        for invalid in [
+            serde_json::json!("false"),
+            serde_json::json!(1),
+            serde_json::Value::Null,
+        ] {
+            let before = serde_json::to_value(&app.config).unwrap();
+            assert!(app
+                .dispatch(
+                    "config.patch",
+                    &serde_json::json!({"patch":{"layout":{"auto_workspace_rehome":invalid}}})
+                )
+                .is_err());
+            assert_eq!(serde_json::to_value(&app.config).unwrap(), before);
+        }
+        app.apply_cwd_scan(vec![(pane, evidence)], Vec::new(), Vec::new());
+        let (wi, _, _) = app.pane_tab_home(pane).unwrap();
+        assert_eq!(
+            app.workspaces[wi].id, destination,
+            "explicit opt-in restores automatic rehome"
+        );
+    }
+
+    #[test]
+    fn automatic_workspace_rehome_never_targets_a_remote_projection_with_the_same_path() {
+        let _env = crate::persist::test_env("cwd-rehome-owner-boundary");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
+        let pane = app.layout().focus;
+        let home = app.ws().cwd.clone();
+        let other = crate::persist::config_dir().join("same-path-on-two-hosts");
+        let (projection, receiver, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        app.workspaces[app.active_ws].cwd = other.clone();
+        let evidence = crate::platform::PaneCwdEvidence {
+            pid: 1,
+            owner_cwd: Some(home.clone()),
+            owner_git_root: Some(home),
+            descendant_git_cwd: Some(other.clone()),
+            descendant_git_root: Some(other.clone()),
+        };
+        let candidates = vec![crate::git::GitRootInfo {
+            root: other.clone(),
+            branch: None,
+            worktree: None,
+        }];
+        for _ in 0..6 {
+            app.apply_cwd_scan(
+                vec![(pane, evidence.clone())],
+                Vec::new(),
+                candidates.clone(),
+            );
+        }
+        let (wi, _, _) = app.pane_tab_home(pane).unwrap();
+        assert!(
+            app.workspaces[wi].remote.is_none(),
+            "local tabs must not enter remote projections"
+        );
+        assert_eq!(app.workspaces[wi].cwd, other);
+        let remote = app
+            .workspaces
+            .iter()
+            .find(|ws| ws.remote.is_some())
+            .unwrap();
+        assert_eq!(remote.tabs.len(), 1);
+        assert_eq!(remote.tabs[0].layout.leaves(), vec![projection]);
+        assert!(
+            receiver.try_recv().is_err(),
+            "CWD scanning must not send remote input"
+        );
+    }
+
+    #[test]
     fn short_lived_descendant_git_cwd_does_not_rehome() {
         let _env = crate::persist::test_env("rehome-stable-cwd");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        app.config.layout.auto_workspace_rehome = true;
         let pane = app.layout().focus;
         let home = app.ws().cwd.clone();
         let other = std::env::temp_dir().join(format!(

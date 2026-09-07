@@ -87,6 +87,7 @@ pub struct SettingsUi {
 pub enum LayoutRow {
     SidebarWidth,
     WorkspaceDisplay,
+    AutoWorkspaceRehome,
     ColGap,
     RowGap,
     Scrollback,
@@ -208,6 +209,7 @@ impl App {
         v.push(LayoutRow::SidebarWidth);
         v.push(LayoutRow::RightWidth);
         v.push(LayoutRow::WorkspaceDisplay);
+        v.push(LayoutRow::AutoWorkspaceRehome);
         for k in self.available_docks() {
             v.push(LayoutRow::Dock(k));
         }
@@ -1084,6 +1086,10 @@ impl App {
             return;
         };
         match row {
+            LayoutRow::AutoWorkspaceRehome => {
+                self.config.layout.auto_workspace_rehome ^= true;
+                self.persist_config();
+            }
             LayoutRow::WorkspaceDisplay => {
                 self.config.layout.workspace_display = match self.config.layout.workspace_display {
                     config::WorkspaceDisplay::Flat => config::WorkspaceDisplay::Tree,
@@ -1709,6 +1715,38 @@ mod tests {
         assert_eq!(right_visible, left_visible + 1);
         assert_eq!(left_width, right_visible + 1);
         assert_eq!(right_width, left_width + 1);
+    }
+
+    #[test]
+    fn auto_workspace_rehome_settings_click_and_keyboard_persist() {
+        let _env = crate::persist::test_env("auto-workspace-rehome-settings");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 50, tx).unwrap();
+        app.open_settings();
+        app.settings_set_tab(SettingsTab::Layout);
+        let row = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::AutoWorkspaceRehome))
+            .unwrap();
+        app.settings.as_mut().unwrap().cursor = row;
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 50)).unwrap();
+        term.draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let rect = app
+            .settings_ctl_rects
+            .iter()
+            .find(|(i, _)| *i == row)
+            .unwrap()
+            .1;
+        assert!(!app.config.layout.auto_workspace_rehome);
+        app.handle_settings_click(rect.x, rect.y);
+        assert!(app.config.layout.auto_workspace_rehome);
+        app.flush_config_for_test(&rx);
+        assert!(crate::config::load().layout.auto_workspace_rehome);
+        app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.flush_config_for_test(&rx);
+        assert!(!crate::config::load().layout.auto_workspace_rehome);
     }
 
     #[test]

@@ -25,6 +25,11 @@ This is the [Shaloc/luvus](https://github.com/Shaloc/luvus) fork of
 One Light themes, and managed SSH sessions with same-name session merging.
 Choose a flat workspace list or a collapsible machine tree in
 **Menu > Settings > Layout > Workspace display**.
+Tabs stay in their chosen workspace by default, even when an agent launches
+commands in another project. **Layout > Auto-move tabs by directory** opts into
+automatic workspace creation and tab movement based on scanned process directories
+(`layout.auto_workspace_rehome: true`). Terminal directory and branch tracking
+remain active with this setting off.
 
 ## Features
 

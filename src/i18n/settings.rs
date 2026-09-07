@@ -36,6 +36,7 @@ pub const KEY_REFERENCE_KEYS: &[&[&str]] = &[
 ];
 
 pub struct Catalog {
+    pub auto_workspace_rehome: &'static str,
     pub workspace_display: &'static str,
     pub workspace_flat: &'static str,
     pub workspace_tree: &'static str,
@@ -118,6 +119,7 @@ pub struct Catalog {
 }
 
 pub static EN: Catalog = Catalog {
+    auto_workspace_rehome: "Auto-move tabs by directory",
     workspace_display: "Workspace display",
     workspace_flat: "Flat",
     workspace_tree: "Tree",
@@ -284,6 +286,7 @@ pub static EN: Catalog = Catalog {
 };
 
 pub static ES: Catalog = Catalog {
+    auto_workspace_rehome: "Mover pestañas por carpeta",
     workspace_display: "Vista de espacios",
     workspace_flat: "Lista plana",
     workspace_tree: "Árbol",
@@ -321,6 +324,7 @@ pub static ES: Catalog = Catalog {
 };
 
 pub static PT: Catalog = Catalog {
+    auto_workspace_rehome: "Mover abas por pasta",
     workspace_display: "Visualização dos espaços",
     workspace_flat: "Lista plana",
     workspace_tree: "Árvore",
@@ -356,6 +360,7 @@ pub static PT: Catalog = Catalog {
 };
 
 pub static FR: Catalog = Catalog {
+    auto_workspace_rehome: "Déplacer onglets par dossier",
     workspace_display: "Vue des espaces",
     workspace_flat: "Liste à plat",
     workspace_tree: "Arborescence",
@@ -391,6 +396,7 @@ pub static FR: Catalog = Catalog {
 };
 
 pub static DE: Catalog = Catalog {
+    auto_workspace_rehome: "Tabs nach Ordner verschieben",
     workspace_display: "Arbeitsbereichsansicht",
     workspace_flat: "Flach",
     workspace_tree: "Baum",
@@ -426,6 +432,7 @@ pub static DE: Catalog = Catalog {
 };
 
 pub static ID: Catalog = Catalog {
+    auto_workspace_rehome: "Pindah tab sesuai direktori",
     workspace_display: "Tampilan ruang kerja",
     workspace_flat: "Datar",
     workspace_tree: "Pohon",
@@ -589,6 +596,7 @@ pub static ID: Catalog = Catalog {
 };
 
 pub static ZH: Catalog = Catalog {
+    auto_workspace_rehome: "自动迁移工作区",
     workspace_display: "工作区展示",
     workspace_flat: "平铺",
     workspace_tree: "树形",
@@ -748,6 +756,7 @@ pub static ZH: Catalog = Catalog {
 };
 
 pub static JA: Catalog = Catalog {
+    auto_workspace_rehome: "ディレクトリでタブを自動移動",
     workspace_display: "ワークスペース表示",
     workspace_flat: "フラット",
     workspace_tree: "ツリー",
@@ -916,6 +925,7 @@ pub static JA: Catalog = Catalog {
 };
 
 pub static KO: Catalog = Catalog {
+    auto_workspace_rehome: "디렉터리별 탭 자동 이동",
     workspace_display: "작업 공간 표시",
     workspace_flat: "평면",
     workspace_tree: "트리",

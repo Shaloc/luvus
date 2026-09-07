@@ -314,6 +314,15 @@ host tags. Other values are rejected without mutation. This presentation setting
 does not change merge, host admission, workspace indices, or public pin/worktree
 `display_position` values. Tree headers and temporary folds are not workspaces.
 
+`{"patch":{"layout":{"auto_workspace_rehome":true}}}` opts into automatic
+workspace creation and whole-tab movement based on scanned process directories.
+The default is `false`, including when upgrading an existing configuration.
+Disabling it applies to subsequent scan results, including scans already in
+flight; it does not undo earlier moves. Terminal directory and workspace branch
+tracking and explicit workspace/tab/pane operations remain available. Only JSON
+booleans are accepted. This setting belongs to each owner server; patch a remote
+owner separately rather than assuming the local merge setting changes it.
+
 `server.agent_manifests` returns the active recognized agent names and rule
 count. `server.reload_agent_manifests` reloads built-in, managed, and user
 manifests and forces a fresh detection pass. `manifest.reload` remains a
