@@ -6,19 +6,25 @@
 
 **Mission control for your AI coding agents.**
 
-[![crates.io](https://img.shields.io/crates/v/luvus.svg)](https://crates.io/crates/luvus)
-[![ci](https://github.com/RizRiyz/luvus/actions/workflows/ci.yml/badge.svg)](https://github.com/RizRiyz/luvus/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/Shaloc/luvus)](https://github.com/Shaloc/luvus/releases/latest)
+[![macOS build](https://github.com/Shaloc/luvus/actions/workflows/fork-macos-build.yml/badge.svg)](https://github.com/Shaloc/luvus/actions/workflows/fork-macos-build.yml)
 [![docs](https://img.shields.io/badge/docs-luvus.dev-c6ff1a.svg)](https://luvus.dev/docs/)
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue.svg)
 ![platforms](https://img.shields.io/badge/platforms-macOS%20·%20Linux%20·%20Windows-lightgrey.svg)
 
-**[Website](https://luvus.dev)** · **[Documentation](https://luvus.dev/docs/)** · **[Releases](https://github.com/RizRiyz/luvus/releases)**
+**[Upstream website](https://luvus.dev)** · **[Documentation](https://luvus.dev/docs/)** · **[Fork releases](https://github.com/Shaloc/luvus/releases)**
 
 <br />
 
 <a href="assets/video.mp4"><img src="assets/video.gif" alt="Luvus with split panes, a live agent sidebar, and a built-in Git dashboard" width="820" /></a>
 
 </div>
+
+This is the [Shaloc/luvus](https://github.com/Shaloc/luvus) fork of
+[RizRiyz/luvus](https://github.com/RizRiyz/luvus), with Qoder CLI, One Dark and
+One Light themes, and managed SSH sessions with same-name session merging.
+Choose a flat workspace list or a collapsible machine tree in
+**Menu > Settings > Layout > Workspace display**.
 
 ## Features
 
@@ -52,23 +58,43 @@
 - **Custom interface:** Move and resize two sidebars, remap keys and the prefix,
   use presets, select from 8 languages, and install composable local or
   community themes.
-- **Cross-platform delivery:** Install on macOS, Linux, or Windows, migrate from
-  previous releases, update with `luvus update`, and inspect the environment with
-  `luvus doctor`.
+- **Fork releases:** Download macOS Apple Silicon and Linux x86_64 binaries, and
+  inspect the environment with `luvus doctor`.
 
 ## Install
 
-```sh
-# macOS and Linux
-curl -fsSL https://luvus.dev/install.sh | sh
+Install or update this fork on **macOS Apple Silicon** or **Linux x86_64**:
 
-# Homebrew
-brew install RizRiyz/luvus/luvus
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shaloc/luvus/main/install.sh | sh
 ```
 
-```powershell
-# Windows PowerShell
-irm https://luvus.dev/install.ps1 | iex
+The installer downloads from [this fork's releases](https://github.com/Shaloc/luvus/releases/latest),
+verifies SHA-256, and installs to `~/.local/bin`. GitHub CLI and sudo are not
+required. An existing binary is backed up before replacement. Running sessions
+are left untouched.
+
+Set `LUVUS_INSTALL_DIR` to replace a binary installed elsewhere. For an update,
+check `command -v luvus` first so an older copy does not take precedence on `PATH`.
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"
+luvus --version --remote-session-protocol
+# When ready, restart all sessions on this machine to load the new binary:
+luvus server restart --all
+```
+
+Install matching releases on the local and SSH host machines for managed remote
+sessions. To upgrade, rerun the installer above; `luvus update`, the upstream
+website installers, Homebrew tap, and crates.io package still target upstream.
+Prebuilt fork releases currently cover only the two platforms listed above.
+
+To build this fork from source with a Rust toolchain:
+
+```sh
+git clone https://github.com/Shaloc/luvus.git
+cd luvus
+cargo build --release --locked --bin luvus
 ```
 
 ## Quick start
@@ -76,7 +102,6 @@ irm https://luvus.dev/install.ps1 | iex
 ```bash
 luvus          # launch or reattach to your session
 luvus doctor   # check your setup: git, gh, ssh
-luvus update   # check for and install a newer release
 ```
 
 Run Luvus in a project, split a pane, and start an agent. Luvus detects supported

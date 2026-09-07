@@ -1,15 +1,14 @@
 #!/bin/sh
-# luvus installer — downloads the right prebuilt binary for your OS/arch from the
-# GitHub releases and drops it on your PATH.
+# Luvus fork installer. Downloads a checksummed release from Shaloc/luvus.
 #
-#   curl -fsSL https://luvus.dev/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Shaloc/luvus/main/install.sh | sh
 #
 # Overrides:
-#   LUVUS_VERSION=v0.1.0   install a specific tag (default: latest release)
-#   LUVUS_INSTALL_DIR=...  where to put the binary (default: /usr/local/bin or ~/.local/bin)
+#   LUVUS_VERSION=fork-1.0.99-<commit>   install a specific fork release tag
+#   LUVUS_INSTALL_DIR=...  where to put the binary (default: ~/.local/bin)
 set -eu
 
-REPO="RizRiyz/luvus"
+REPO="Shaloc/luvus"
 BIN="luvus"
 
 err() { printf 'error: %s\n' "$1" >&2; exit 1; }
@@ -26,17 +25,15 @@ arch=$(uname -m)
 case "$os" in
   Darwin)
     case "$arch" in
-      x86_64) target="x86_64-apple-darwin" ;;
       arm64|aarch64) target="aarch64-apple-darwin" ;;
       *) err "unsupported macOS arch: $arch" ;;
     esac ;;
   Linux)
     case "$arch" in
       x86_64) target="x86_64-unknown-linux-musl" ;;
-      aarch64|arm64) target="aarch64-unknown-linux-musl" ;;
       *) err "unsupported Linux arch: $arch" ;;
     esac ;;
-  *) err "unsupported OS: $os (on Windows, download the .zip from the releases page)" ;;
+  *) err "no fork binary for OS: $os; build from source" ;;
 esac
 
 # ── resolve version ──
@@ -45,40 +42,73 @@ if [ -n "${LUVUS_VERSION:-}" ]; then
 else
   tag=$($DL "https://api.github.com/repos/$REPO/releases/latest" \
         | grep '"tag_name"' | head -1 | cut -d'"' -f4)
-  [ -n "$tag" ] || err "could not find the latest release (set LUVUS_VERSION=vX.Y.Z)"
+  [ -n "$tag" ] || err "could not find the latest fork release (set LUVUS_VERSION to a fork release tag)"
 fi
+case "$tag" in
+  *[!a-zA-Z0-9._-]*|'' ) err "invalid release tag" ;;
+  fork-*) ;;
+  *) err "expected a fork release tag, got: $tag" ;;
+esac
 
-asset="$BIN-$tag-$target.tar.gz"
+asset="$BIN-$target.tar.gz"
 url="https://github.com/$REPO/releases/download/$tag/$asset"
-printf 'Installing %s %s (%s)…\n' "$BIN" "$tag" "$target"
+printf 'Installing %s %s (%s)...\n' "$BIN" "$tag" "$target"
 
 # ── download + extract ──
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/luvus-download.XXXXXX")
+stage=""
+cleanup() {
+  # These paths are private directories created by mktemp, never user input.
+  rm -rf "$tmp"
+  if [ -n "$stage" ] && [ -f "$stage/$BIN.new" ]; then
+    rm -f "$stage/$BIN.new"
+  fi
+}
+trap cleanup EXIT
 $DLO "$tmp/$asset" "$url" || err "download failed: $url"
-tar -xzf "$tmp/$asset" -C "$tmp" || err "extract failed"
-[ -f "$tmp/$BIN" ] || err "archive did not contain '$BIN'"
-chmod +x "$tmp/$BIN"
+$DLO "$tmp/$asset.sha256" "$url.sha256" || err "checksum download failed"
+# Verify only this archive, not arbitrary filenames from the checksum file.
+expected=$(awk 'NR == 1 {print $1}' "$tmp/$asset.sha256")
+case "$expected" in *[!a-fA-F0-9]*|'') err "invalid SHA-256 checksum" ;; esac
+[ "${#expected}" -eq 64 ] || err "invalid SHA-256 checksum length"
+if have sha256sum; then actual=$(sha256sum "$tmp/$asset" | awk '{print $1}')
+elif have shasum; then actual=$(shasum -a 256 "$tmp/$asset" | awk '{print $1}')
+else err "need sha256sum or shasum"; fi
+[ "$actual" = "$expected" ] || err "SHA-256 mismatch; installation unchanged"
+# Release archives contain one versioned directory. Extract only its binary;
+# no archive path is allowed to become an installation destination.
+member=$(tar -tzf "$tmp/$asset" | awk '/^luvus-[a-zA-Z0-9._-]+\/luvus$/ {print}')
+[ -n "$member" ] || err "archive did not contain '$BIN'"
+case "$member" in *'
+'*) err "archive contains multiple binaries" ;; esac
+tar -xOzf "$tmp/$asset" "$member" > "$tmp/$BIN" || err "extract failed"
+[ -s "$tmp/$BIN" ] || err "archive contained an empty binary"
+chmod 755 "$tmp/$BIN"
 
 # ── choose an install dir on PATH ──
 if [ -n "${LUVUS_INSTALL_DIR:-}" ]; then
   dir="$LUVUS_INSTALL_DIR"
-elif [ -w /usr/local/bin ]; then
-  dir="/usr/local/bin"
 else
   dir="$HOME/.local/bin"
 fi
 mkdir -p "$dir"
-
-if mv "$tmp/$BIN" "$dir/$BIN" 2>/dev/null; then :;
-elif have sudo; then
-  printf 'Writing to %s (needs sudo)…\n' "$dir"
-  sudo mv "$tmp/$BIN" "$dir/$BIN"
-else
-  err "cannot write to $dir (set LUVUS_INSTALL_DIR to a writable dir)"
+[ -w "$dir" ] || err "cannot write to $dir (set LUVUS_INSTALL_DIR to a writable dir)"
+[ ! -L "$dir/$BIN" ] || err "refusing to replace a symlink: $dir/$BIN"
+if [ -e "$dir/$BIN" ]; then
+  [ -f "$dir/$BIN" ] || err "not a regular file: $dir/$BIN"
 fi
+stage=$(mktemp -d "$dir/.luvus-update.XXXXXX")
+cp "$tmp/$BIN" "$stage/$BIN.new"
+chmod 755 "$stage/$BIN.new"
+"$stage/$BIN.new" --version --remote-session-protocol
+if [ -f "$dir/$BIN" ]; then
+  cp -p "$dir/$BIN" "$stage/$BIN.previous"
+  printf 'Previous binary saved to %s/%s.previous\n' "$stage" "$BIN"
+fi
+# Same-filesystem rename keeps running servers on their existing executable.
+mv -f "$stage/$BIN.new" "$dir/$BIN"
 
-printf '\n✓ installed to %s/%s\n' "$dir" "$BIN"
+printf '\nInstalled to %s/%s. No servers were restarted.\n' "$dir" "$BIN"
 case ":$PATH:" in
   *":$dir:"*) printf 'Run: %s\n' "$BIN" ;;
   *) printf 'Add to PATH:  export PATH="%s:$PATH"\n' "$dir" ;;

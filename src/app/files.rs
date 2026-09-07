@@ -844,7 +844,7 @@ impl App {
                     let cwd = std::fs::canonicalize(&w.cwd).unwrap_or_else(|_| w.cwd.clone());
                     crate::platform::same_path(&cwd, &target)
                 }) {
-                    Some(i) => self.active_ws = i,
+                    Some(i) => self.focus_workspace(i),
                     None => {
                         let _ = self.create_workspace_at(menu.path);
                     }

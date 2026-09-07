@@ -1873,7 +1873,10 @@ impl App {
         } else {
             None
         };
-        match self.task_start(id, None, agent, mode, workspace_id) {
+        let started = self.with_preserved_workspace_sidebar(|app| {
+            app.task_start(id, None, agent, mode, workspace_id)
+        });
+        match started {
             Ok(_) => {
                 self.active_ws = prev_ws;
                 self.workspaces[prev_ws].active_tab = prev_tab;
@@ -2587,6 +2590,22 @@ mod tests {
                 .0,
             "already_claimed"
         );
+
+        app.config.layout.workspace_display = crate::config::WorkspaceDisplay::Tree;
+        app.toggle_workspace_machine(None);
+        let previous = app.active_ws;
+        app.last_active_ws_shown = previous;
+        app.orch
+            .add_task("second".into(), vec![], vec![], None)
+            .unwrap();
+        app.start_worker_from_board("t2", None, TaskWorkerMode::Worktree);
+        assert_eq!(
+            app.orch.task("t2").unwrap().status,
+            crate::orch::TaskStatus::Running
+        );
+        assert_eq!(app.active_ws, previous);
+        assert!(app.collapsed_workspace_machines.contains(&None));
+        assert_eq!(app.last_active_ws_shown, previous);
 
         let _ = std::fs::remove_dir_all(&base);
     }

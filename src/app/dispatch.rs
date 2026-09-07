@@ -3096,7 +3096,7 @@ impl App {
                     Some(i) => {
                         self.forget_closed_workspace_path(&path);
                         if focus {
-                            self.active_ws = i;
+                            self.focus_workspace(i);
                         }
                     }
                     None if !focus && self.automatic_workspace_open_is_suppressed(&path) => {}
@@ -3122,7 +3122,7 @@ impl App {
             "workspace.focus" | "node.focus" => {
                 if let Some(i) = self.optional_socket_workspace(p)? {
                     if i < self.workspaces.len() {
-                        self.active_ws = i;
+                        self.focus_workspace(i);
                     }
                 }
                 Ok(json!({"type":"ok"}))
@@ -7130,7 +7130,12 @@ impl App {
         for pane in self.panes.values() {
             pane.set_history_budget(history_budget);
         }
+        let workspace_display_changed =
+            self.config.layout.workspace_display != next.layout.workspace_display;
         self.config = next;
+        if workspace_display_changed {
+            self.reset_workspace_sidebar_view();
+        }
         self.changelog_rows = None;
         if let Some(patch) = persist_patch {
             self.persist_config_patch(patch);
@@ -7992,6 +7997,19 @@ fn patched_config(
     current: &crate::config::Config,
     patch: &Value,
 ) -> Result<crate::config::Config, (String, String)> {
+    // Loading a future on-disk enum is tolerant; explicit automation input must
+    // not silently turn a typo into a different presentation mode.
+    if let Some(value) = patch
+        .get("layout")
+        .and_then(|layout| layout.get("workspace_display"))
+    {
+        if !matches!(value.as_str(), Some("flat" | "tree")) {
+            return Err((
+                "invalid_request".into(),
+                "layout.workspace_display must be flat or tree".into(),
+            ));
+        }
+    }
     if !patch.is_object() {
         return Err((
             "invalid_request".to_string(),

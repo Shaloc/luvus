@@ -72,6 +72,32 @@ the display client's. Global session navigation and local Settings/Agents stay
 local. Pressing the prefix twice sends the owner's configured prefix once.
 The bottom status bar identifies the active remote host and actual session.
 
+### Flat or tree workspace sidebar
+
+Choose **Settings → Layout → Workspace display** to switch live between:
+
+- **Flat** (default): the existing workspace list with `[host]` labels.
+- **Tree**: local machine first, then SSH-alias groups. Each group keeps the
+  existing pinned-workspace and nested-worktree ordering; workspace names do
+  not repeat the hostname. Remote group dots reflect existing transport state:
+  green is connected, amber is connecting, and coral indicates a disconnected
+  projection. Only machines with workspaces in the current view are listed.
+
+Click a machine heading to fold or unfold it. With WORKSPACES keyboard focus,
+use Up/Down to navigate, Enter/Space on a heading to toggle it, Left to collapse
+it (or move from a workspace to its heading), and Right to expand it. Enter on
+a workspace still selects its owner; `a` still opens its workspace menu.
+Selecting a hidden workspace through another control reveals its machine.
+Workspace jump and next/previous shortcuts follow machine/worktree order in
+tree mode, including folded workspaces, and reveal the selected machine.
+
+The display preference is saved as `layout.workspace_display` (`flat` or
+`tree`); machine folds are temporary UI state. Both modes respect the path-row
+toggle and either dock position. This is independent of the global merge
+setting: changing the presentation does not merge sessions, connect hosts, or
+change API workspace indices. The session selector and Agents dock retain
+their owner labels.
+
 Managed remotes require the exact same modified Luvus build on both machines,
 including the remote-session transport revision. If it is absent, older, or an
 unmodified binary with the same version number, Luvus tells you to install the

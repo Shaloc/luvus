@@ -282,7 +282,7 @@ impl App {
         if self.send_workspace_remote(index, ClientMessage::Command("open_local_workspace".into()))
         {
             self.picker = None;
-            self.active_ws = index;
+            self.focus_workspace(index);
             true
         } else {
             false
@@ -311,7 +311,7 @@ impl App {
         else {
             return;
         };
-        self.active_ws = index;
+        self.focus_workspace(index);
         if menu {
             if let Some(pane) = pane.parse::<u32>().ok().map(PaneId) {
                 let view = self.workspaces[index].tabs[0].layout.focus;
@@ -1171,7 +1171,7 @@ impl App {
             return false;
         };
         self.pending_remote_navigation = None;
-        self.active_ws = index;
+        self.focus_workspace(index);
         true
     }
 

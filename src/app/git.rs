@@ -26,7 +26,7 @@ impl App {
         if wsi >= self.workspaces.len() {
             return;
         }
-        self.active_ws = wsi;
+        self.focus_workspace(wsi);
         if let Some(i) = self.workspaces[wsi].tabs.iter().position(Tab::is_git) {
             self.workspaces[wsi].active_tab = i;
             return;

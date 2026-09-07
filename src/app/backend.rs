@@ -445,13 +445,15 @@ impl App {
             .get(self.active_ws)
             .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
             .map(|tab| tab.layout.focus);
-        self.focus_pane_global(pane_id);
-        self.close_pane(pane_id);
-        if let Some(previous) = previous_focus.filter(|previous| *previous != pane_id) {
-            if self.pane_location(previous).is_some() {
-                self.focus_pane_global(previous);
+        self.with_preserved_workspace_sidebar(|app| {
+            app.focus_pane_global(pane_id);
+            app.close_pane(pane_id);
+            if let Some(previous) = previous_focus.filter(|previous| *previous != pane_id) {
+                if app.pane_location(previous).is_some() {
+                    app.focus_pane_global(previous);
+                }
             }
-        }
+        });
         Ok(executed_action_json())
     }
 
@@ -832,7 +834,7 @@ impl App {
                     self.active_ws = 0;
                 }
                 if commit.focus {
-                    self.active_ws = workspace_index;
+                    self.focus_workspace(workspace_index);
                     self.workspaces[workspace_index].active_tab = tab_index;
                 }
                 (workspace_index, tab_index)
@@ -863,7 +865,7 @@ impl App {
                 layout.focus = target;
                 layout.split_focused(Axis::Col, pane_id);
                 if commit.focus {
-                    self.active_ws = workspace_index;
+                    self.focus_workspace(workspace_index);
                     self.workspaces[workspace_index].active_tab = tab_index;
                 } else {
                     layout.focus = previous_focus;
@@ -1557,6 +1559,25 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response["result"]["type"], "terminal_backend_capture");
+    }
+
+    #[test]
+    fn backend_close_preserves_workspace_sidebar_folds() {
+        let _env = crate::persist::test_env("backend-close-sidebar");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.run_cmd(crate::app::keys::Cmd::NewTab);
+        let closing = app.layout().focus;
+        let params = locator(&app, closing);
+        let (_remote, _input, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        app.config.layout.workspace_display = crate::config::WorkspaceDisplay::Tree;
+        app.active_ws = 1;
+        app.last_active_ws_shown = 1;
+        app.toggle_workspace_machine(None);
+        app.backend_close(&params).unwrap();
+        assert_eq!(app.active_ws, 1);
+        assert!(app.collapsed_workspace_machines.contains(&None));
+        assert_eq!(app.last_active_ws_shown, 1);
     }
 
     #[test]

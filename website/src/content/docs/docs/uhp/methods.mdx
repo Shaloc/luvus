@@ -323,6 +323,12 @@ opt-in direct shortcuts, and pane history budgets live, then persists
 atomically. Unknown or invalid fields leave the current config unchanged.
 `server.reload_config` reloads the on-disk config through the same apply path.
 
+For example, `{"patch":{"layout":{"workspace_display":"tree"}}}` selects
+the machine-grouped WORKSPACES sidebar; `"flat"` restores the default list with
+host tags. Other values are rejected without mutation. This presentation setting
+does not change merge, host admission, workspace indices, or public pin/worktree
+`display_position` values. Tree headers and temporary folds are not workspaces.
+
 `server.agent_manifests` returns the active recognized agent names and rule
 count. `server.reload_agent_manifests` reloads built-in, managed, and user
 manifests and forces a fresh detection pass. `manifest.reload` remains a

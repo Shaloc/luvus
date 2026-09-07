@@ -180,7 +180,7 @@ impl App {
         if wsi >= self.workspaces.len() {
             return;
         }
-        self.active_ws = wsi;
+        self.focus_workspace(wsi);
         if self.workspaces[wsi].remote.is_some() {
             self.send_workspace_remote(
                 wsi,

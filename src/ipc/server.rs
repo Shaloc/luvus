@@ -871,7 +871,7 @@ fn apply(
                 // another client's earlier request cannot be consumed here.
                 let previous_switch = app.pending_session_switch.take();
                 let previous_detach = std::mem::take(&mut app.detach_requested);
-                let changed = app.handle_event(event);
+                let changed = app.with_preserved_workspace_sidebar(|app| app.handle_event(event));
                 bind_session_navigation_origin(app, id);
                 let requested_switch = app.pending_session_switch.take();
                 let requested_detach = std::mem::take(&mut app.detach_requested);
@@ -2611,6 +2611,33 @@ mod tests {
                 .any(|message| matches!(message, ServerMessage::SwitchSession { .. })));
             assert_eq!(owner.foreground, Some(1));
             assert!(owner.clients.contains_key(&1));
+        }
+
+        #[test]
+        fn workspace_projection_input_preserves_owner_sidebar_folds() {
+            let _env = crate::persist::test_env("projection-sidebar-folds");
+            let mut fixture = Fixture::new();
+            let first_pane = fixture.target_pane();
+            fixture.input(2, ClientInput::Command("new_tab".into()));
+            fixture.app.config.layout.workspace_display = crate::config::WorkspaceDisplay::Tree;
+            fixture.app.toggle_workspace_machine(None);
+            let previous = fixture.app.active_ws;
+            fixture.app.last_active_ws_shown = previous;
+            fixture.input(
+                2,
+                ClientInput::PrefixKey(ratatui::crossterm::event::KeyEvent::new(
+                    ratatui::crossterm::event::KeyCode::Char('1'),
+                    ratatui::crossterm::event::KeyModifiers::NONE,
+                )),
+            );
+            assert_eq!(
+                fixture.target_pane(),
+                first_pane,
+                "scoped tab input must execute"
+            );
+            fixture.assert_foreground_unchanged();
+            assert!(fixture.app.collapsed_workspace_machines.contains(&None));
+            assert_eq!(fixture.app.last_active_ws_shown, previous);
         }
 
         #[test]

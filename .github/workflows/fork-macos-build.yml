@@ -65,6 +65,7 @@ jobs:
           "$binary" help kitten
           "$binary" skill show > "$RUNNER_TEMP/luvus-skill.md"
           cmp skills/luvus/SKILL.md "$RUNNER_TEMP/luvus-skill.md"
+          python3 scripts/test-fork-installer.py "target/$TARGET/release/luvus"
           echo "name=$package" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
