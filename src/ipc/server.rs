@@ -289,6 +289,10 @@ pub fn run() -> Result<()> {
     {
         return Ok(());
     }
+    crate::session::remote::record_session_origin(
+        &state_dir,
+        crate::session::remote::view_target(),
+    )?;
     let _logging = crate::logging::init(crate::logging::Role::Server);
     crate::logging::event(
         crate::logging::EventKind::ServerStart,

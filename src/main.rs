@@ -728,11 +728,11 @@ fn remote_control_existing_only(options: &[String]) -> Result<bool> {
 
 fn managed_remote_attach(target: &session::remote::RemoteSession) -> Result<()> {
     session::remote::ensure_session(target).map_err(anyhow::Error::msg)?;
-    let name = if session::remote::load_registry().merge_enabled() {
-        target.session.clone()
-    } else {
-        target.canonical_name()
-    };
+    let name = session::remote::local_attach_name(
+        target,
+        session::remote::load_registry().merge_enabled(),
+    )
+    .map_err(anyhow::Error::msg)?;
     session::start_client_session(&name).map_err(anyhow::Error::msg)?;
     session::remote::clear_process_target();
     session::apply_explicit_name(&name).map_err(anyhow::Error::msg)?;
@@ -1095,7 +1095,7 @@ mod restart_all_tests {
 }
 
 fn server_restart_all(context: i18n::cli::Context, json: bool) -> Result<()> {
-    let inventory = session::list_sessions()?;
+    let inventory = session::list_server_sessions()?;
     let results = session::restart_running_sessions(&inventory, session::restart_session);
     let failed = results.iter().filter(|(_, result)| result.is_err()).count();
     if json {

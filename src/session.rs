@@ -316,6 +316,44 @@ pub fn session_info(name: Option<&str>) -> SessionInfo {
 
 /// List known namespaces without starting a server or retaining a watcher.
 pub fn list_sessions() -> std::io::Result<Vec<SessionInfo>> {
+    Ok(list_server_sessions()?
+        .into_iter()
+        .filter(|session| !remote::is_presentation_session(session))
+        .collect())
+}
+
+/// Check one owner without inventing the synthetic default entry returned by
+/// list_sessions. Used off-loop before merge may start an existing local owner.
+pub(crate) fn owner_session_exists(name: &str) -> Result<bool, String> {
+    let normalized = normalize_name(name)?;
+    let info = session_info(normalized.as_deref());
+    if remote::is_presentation_session(&info) {
+        return Ok(false);
+    }
+    let directory = Path::new(&info.session_dir);
+    if normalized.is_some() {
+        return match std::fs::symlink_metadata(directory) {
+            Ok(metadata) => Ok(metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.to_string()),
+        };
+    }
+    // The default namespace shares its directory with global config/registry;
+    // that directory alone is not evidence that a local default ever existed.
+    Ok(info.running
+        || [
+            "session-origin.json",
+            "session.json",
+            "server.pid",
+            "server.lock",
+        ]
+        .iter()
+        .any(|file| directory.join(file).is_file()))
+}
+
+/// Internal lifecycle inventory includes presentation servers: restart-all and
+/// config reload must still reach them, even though they are not public owners.
+pub(crate) fn list_server_sessions() -> std::io::Result<Vec<SessionInfo>> {
     let mut sessions = vec![session_info(None)];
     let sessions_dir = crate::persist::config_dir().join("sessions");
     let entries = match std::fs::read_dir(sessions_dir) {
@@ -567,6 +605,155 @@ pub(crate) fn clear_explicit_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_destination_requires_an_existing_owner_not_a_synthetic_default_or_view() {
+        let _env = crate::persist::test_env("merge-existing-owner");
+        for name in ["review", "default"] {
+            let target = remote::RemoteSession::new("build", name).unwrap();
+            assert_eq!(
+                remote::local_attach_name(&target, true).unwrap(),
+                target.canonical_name()
+            );
+            let directory = session_dir_for(normalize_name(name).unwrap().as_deref());
+            std::fs::create_dir_all(&directory).unwrap();
+            if name == "default" {
+                assert!(
+                    !owner_session_exists(name).unwrap(),
+                    "global config directory is not a local default owner"
+                );
+            }
+            remote::record_session_origin(&directory, None).unwrap();
+            assert!(owner_session_exists(name).unwrap());
+            assert_eq!(remote::local_attach_name(&target, true).unwrap(), name);
+            assert_eq!(
+                remote::local_attach_name(&target, false).unwrap(),
+                target.canonical_name()
+            );
+        }
+        let view = remote::RemoteSession::new("build", "nested").unwrap();
+        let name = view.canonical_name();
+        let directory = session_dir_for(Some(&name));
+        std::fs::create_dir_all(&directory).unwrap();
+        remote::record_session_origin(&directory, Some(&view)).unwrap();
+        assert!(
+            !owner_session_exists(&name).unwrap(),
+            "presentation namespaces are never local owners"
+        );
+    }
+
+    #[test]
+    fn remote_attach_rejects_a_presentation_name_occupied_by_a_local_owner() {
+        let _env = crate::persist::test_env("remote-attach-owner-collision");
+        let target = remote::RemoteSession::new("build", "review").unwrap();
+        let directory = session_dir_for(Some(&target.canonical_name()));
+        std::fs::create_dir_all(&directory).unwrap();
+        remote::record_session_origin(&directory, None).unwrap();
+        for merge in [true, false] {
+            let error = remote::local_attach_name(&target, merge).unwrap_err();
+            assert!(error.contains("local session"), "{error}");
+            assert!(owner_session_exists(&target.canonical_name()).unwrap());
+        }
+        // A previously opened presentation remains reusable.
+        remote::record_session_origin(&directory, Some(&target)).unwrap();
+        assert_eq!(
+            remote::local_attach_name(&target, true).unwrap(),
+            target.canonical_name()
+        );
+    }
+
+    #[test]
+    fn public_inventory_excludes_marked_remote_views_not_remote_named_owners() {
+        let _env = crate::persist::test_env("session-origin-inventory");
+        for (name, origin) in [
+            (
+                "remote-build-default",
+                serde_json::json!({"kind":"remote_view","target":{"host":"build","session":"default"}}),
+            ),
+            ("remote-build-literal", serde_json::json!({"kind":"local"})),
+            (
+                "remote-ordinary-name",
+                serde_json::json!({"kind":"future_role"}),
+            ),
+        ] {
+            let dir = session_dir_for(Some(name));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("session-origin.json"),
+                serde_json::to_vec(&origin).unwrap(),
+            )
+            .unwrap();
+        }
+        let names: Vec<_> = list_sessions()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["default", "remote-build-literal", "remote-ordinary-name"],
+            "a stopped presentation namespace is not an owner session; unknown roles stay visible"
+        );
+        assert_eq!(
+            list_server_sessions().unwrap().len(),
+            4,
+            "lifecycle inventory still owns the presentation server"
+        );
+    }
+
+    #[test]
+    fn session_origin_survives_registry_removal_and_owner_start_replaces_it() {
+        let _env = crate::persist::test_env("session-origin-lifecycle");
+        let target = remote::RemoteSession::new("build", "default").unwrap();
+        let name = target.canonical_name();
+        let dir = session_dir_for(Some(&name));
+        std::fs::create_dir_all(&dir).unwrap();
+        remote::record_session_origin(&dir, Some(&target)).unwrap();
+        assert!(
+            !remote::registry_path().exists(),
+            "origin does not require a retained registration or SSH config"
+        );
+        assert!(!list_sessions().unwrap().iter().any(|s| s.name == name));
+        assert!(list_server_sessions()
+            .unwrap()
+            .iter()
+            .any(|s| s.name == name));
+        remote::record_session_origin(&dir, None).unwrap();
+        assert!(
+            list_sessions().unwrap().iter().any(|s| s.name == name),
+            "an explicit local server remains discoverable even with a canonical-looking name"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(dir.join("session-origin.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_session_origin_cannot_hide_an_owner_namespace() {
+        let _env = crate::persist::test_env("session-origin-validation");
+        let name = "remote-build-literal";
+        let dir = session_dir_for(Some(name));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session-origin.json");
+        for contents in [
+            "not json".to_string(),
+            serde_json::json!({"kind":"remote_view","target":{"host":"build","session":"different"}}).to_string(),
+            serde_json::json!({"kind":"remote_view","target":{"host":"../build","session":"literal"}}).to_string(),
+            " ".repeat(4097),
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(list_sessions().unwrap().iter().any(|s| s.name == name));
+        }
+    }
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| part.to_string()).collect()

@@ -47,7 +47,19 @@ pub(crate) fn draw_session_menu(
         // Fill outward from whichever sidebar owns the selector. This removes
         // the dead strip left by anchoring the popup to the label itself and
         // lets a right-only layout open the same menu toward the pane area.
-        let width = 64.min(viewport.width.max(1));
+        // Size from the same labels we render: multiple owner statuses must
+        // not squeeze out the name while the viewport still has room.
+        let desired_width = app.named_session_menu.as_ref().map_or(64, |menu| {
+            menu.rows
+                .iter()
+                .map(|row| {
+                    display_width(row.display_name()) + display_width(&session_state(app, row)) + 8
+                })
+                .max()
+                .unwrap_or(64)
+                .max(64)
+        });
+        let width = desired_width.min(viewport.width.max(1) as usize) as u16;
         let on_right = anchor.x >= viewport.x.saturating_add(viewport.width / 2);
         let x = if on_right {
             viewport.right().saturating_sub(width)
@@ -153,8 +165,9 @@ pub(crate) fn draw_session_menu(
     let available = content.bottom().saturating_sub(top + 1) as usize;
     f.render_widget(
         Paragraph::new(format!(
-            " r {} · {} [{}]",
+            " r {} · d {} · {} [{}]",
             app.catalog.act_refresh,
+            app.catalog.act_delete,
             app.catalog.session_merge,
             if app.remote_merge_enabled { "✓" } else { " " }
         ))
@@ -434,36 +447,7 @@ fn draw_row(
     else {
         return;
     };
-    let mut state = if let Some(remote) = &row.remote {
-        if row.current {
-            format!(
-                "{} · {} · {}",
-                app.catalog.session_current, app.catalog.remote_session, remote.host
-            )
-        } else {
-            format!("{} · {}", app.catalog.remote_session, remote.host)
-        }
-    } else if row.current {
-        format!(
-            "{} · {}",
-            app.catalog.session_current, app.catalog.session_running
-        )
-    } else if row.running {
-        app.catalog.session_running.to_string()
-    } else {
-        app.catalog.session_stopped.to_string()
-    };
-    if row.merged && row.remote.is_none() {
-        for host in &app.remote_host_status {
-            if host
-                .sessions
-                .iter()
-                .any(|session| session.name == row.display_name())
-            {
-                state.push_str(&format!(" [{}]", host.host));
-            }
-        }
-    }
+    let state = session_state(app, row);
     let dot = if row.remote.is_some() {
         "◆"
     } else if row.running {
@@ -476,7 +460,10 @@ fn draw_row(
     } else {
         display_width(&state) + 2
     };
-    let name_width = width.saturating_sub(state_width + 4);
+    // Even a many-host status must not erase the session's identity.
+    let name_width = width
+        .saturating_sub(state_width + 4)
+        .max(width.saturating_sub(4).min(16));
     let mut spans = vec![
         Span::styled(
             format!("{arrow} {dot} "),
@@ -529,6 +516,71 @@ fn draw_row(
     }
 }
 
+fn session_state(app: &App, row: &crate::app::session_menu::NamedSessionRow) -> String {
+    let mut state = if let Some(remote) = &row.remote {
+        let status = if app
+            .remote_host_status
+            .iter()
+            .any(|host| host.host == remote.host && host.error.is_some())
+        {
+            "?"
+        } else if row.running {
+            app.catalog.session_running
+        } else {
+            app.catalog.session_stopped
+        };
+        if row.current {
+            format!(
+                "{} · {} · {} · {}",
+                app.catalog.session_current, app.catalog.remote_session, remote.host, status
+            )
+        } else {
+            format!(
+                "{} · {} · {}",
+                app.catalog.remote_session, remote.host, status
+            )
+        }
+    } else if row.current {
+        format!(
+            "{} · {}",
+            app.catalog.session_current, app.catalog.session_running
+        )
+    } else if row.running {
+        app.catalog.session_running.to_string()
+    } else {
+        app.catalog.session_stopped.to_string()
+    };
+    if row.merged && row.remote.is_none() {
+        let mut first_host = true;
+        for host in &app.remote_host_status {
+            let session = host
+                .sessions
+                .iter()
+                .find(|session| session.name == row.display_name());
+            let cached_owner = app.named_session_menu.as_ref().is_some_and(|menu| {
+                menu.remote_targets
+                    .iter()
+                    .any(|target| target.host == host.host && target.session == row.display_name())
+            });
+            if session.is_some() || (host.error.is_some() && cached_owner) {
+                if first_host {
+                    state = format!("{} · {}", app.catalog.session_local, state);
+                    first_host = false;
+                }
+                let status = if host.error.is_some() {
+                    "?"
+                } else if session.is_some_and(|session| session.running) {
+                    app.catalog.session_running
+                } else {
+                    app.catalog.session_stopped
+                };
+                state.push_str(&format!(" [{}: {}]", host.host, status));
+            }
+        }
+    }
+    state
+}
+
 fn contains(rect: Rect, x: u16, y: u16) -> bool {
     x >= rect.x && x < rect.right() && y >= rect.y && y < rect.bottom()
 }
@@ -546,6 +598,7 @@ mod tests {
     fn menu() -> NamedSessionMenu {
         NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             generation: 1,
             rows: vec![
                 NamedSessionRow {
@@ -571,6 +624,101 @@ mod tests {
             error: None,
             preparing: false,
         }
+    }
+
+    fn rendered_row(app: &App, height: u16) -> String {
+        let area = Rect::new(0, 0, 160, height);
+        let mut buffer = Buffer::empty(area);
+        super::draw_row(
+            &mut crate::ui::RenderTarget::new(&mut buffer, area),
+            area,
+            app,
+            3,
+            false,
+            false,
+            &app.theme,
+        );
+        buffer.content.iter().map(|cell| cell.symbol()).collect()
+    }
+
+    #[test]
+    fn remote_session_rows_show_running_and_stopped_on_desktop_and_mobile() {
+        let _env = crate::persist::test_env("remote-session-state-labels");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let target = crate::session::remote::RemoteSession::new("build", "review").unwrap();
+        let mut menu = menu();
+        menu.rows[1].name = target.canonical_name();
+        menu.rows[1].remote = Some(target);
+        app.named_session_menu = Some(menu);
+        for running in [false, true] {
+            app.named_session_menu.as_mut().unwrap().rows[1].running = running;
+            for height in [1, 2] {
+                let text = rendered_row(&app, height);
+                assert!(text.contains("remote · build"), "{text}");
+                assert!(
+                    text.contains(if running { "running" } else { "stopped" }),
+                    "{text}"
+                );
+                assert!(
+                    !text.contains("remote-build-review"),
+                    "only the actual session name is displayed"
+                );
+            }
+        }
+        app.remote_host_status = vec![crate::session::remote::HostStatus {
+            host: "build".into(),
+            error: Some("offline".into()),
+            sessions: Vec::new(),
+        }];
+        app.named_session_menu.as_mut().unwrap().rows[1].running = false;
+        let text = rendered_row(&app, 1);
+        assert!(text.contains("remote · build · ?"));
+        assert!(
+            !text.contains("stopped"),
+            "failed discovery is not proof that an owner stopped"
+        );
+    }
+
+    #[test]
+    fn merged_session_rows_distinguish_local_and_remote_states() {
+        let _env = crate::persist::test_env("merged-session-state-labels");
+        let mut app = crate::app::remote::tests::remote_ui_app();
+        let mut menu = menu();
+        menu.rows[1].merged = true;
+        app.named_session_menu = Some(menu);
+        app.remote_host_status = vec![crate::session::remote::HostStatus {
+            host: "build".into(),
+            error: None,
+            sessions: vec![crate::session::remote::HostSession {
+                name: "review".into(),
+                running: true,
+            }],
+        }];
+        for height in [1, 2] {
+            let text = rendered_row(&app, height);
+            assert!(
+                text.contains(&format!("{} · stopped", app.catalog.session_local)),
+                "{text}"
+            );
+            assert!(text.contains("[build: running]"), "{text}");
+        }
+        app.remote_host_status[0].sessions[0].running = false;
+        assert!(rendered_row(&app, 1).contains("[build: stopped]"));
+
+        // Discovery failures return no live inventory but retain cached targets.
+        app.named_session_menu.as_mut().unwrap().remote_targets =
+            vec![crate::session::remote::RemoteSession::new("build", "review").unwrap()];
+        app.remote_host_status[0].error = Some("offline".into());
+        app.remote_host_status[0].sessions.clear();
+        for height in [1, 2] {
+            assert!(rendered_row(&app, height).contains("[build: ?]"));
+        }
+        app.named_session_menu
+            .as_mut()
+            .unwrap()
+            .remote_targets
+            .clear();
+        assert!(!rendered_row(&app, 1).contains("[build:"));
     }
 
     #[test]

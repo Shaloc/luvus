@@ -12,6 +12,8 @@ pub(super) const NEW_SESSION_ROWS: usize = 2;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NamedSessionDiscovery {
     pub sessions: Vec<crate::session::SessionInfo>,
+    /// Public inventory includes a synthetic default; only a real owner merges.
+    pub local_default_exists: bool,
     pub remote: crate::session::remote::RemoteRegistry,
     pub hosts: Vec<String>,
     pub host_error: Option<String>,
@@ -33,6 +35,87 @@ impl NamedSessionRow {
             .as_ref()
             .map_or(&self.name, |remote| &remote.session)
     }
+}
+
+/// A context-menu action captures the actual owner, never a merged display name.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionMenuTarget {
+    pub name: String,
+    pub remote: Option<crate::session::remote::RemoteSession>,
+    pub running: bool,
+    pub current: bool,
+}
+
+impl SessionMenuTarget {
+    pub fn label(&self, catalog: &crate::i18n::Catalog) -> String {
+        let host = self
+            .remote
+            .as_ref()
+            .map_or(catalog.session_local, |r| &r.host);
+        format!("{host} · {}", self.name)
+    }
+}
+
+impl super::SessionMenu {
+    pub fn actions(&self) -> Vec<super::SessionMenuItem> {
+        use super::SessionMenuItem::*;
+        if let Some(index) = self.confirming {
+            return vec![Explanation, Cancel, ConfirmDelete(index)];
+        }
+        self.targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| {
+                if target.current {
+                    None
+                } else if target.running {
+                    Some(Stop(index))
+                } else if target.name != crate::session::DEFAULT_SESSION_NAME {
+                    Some(Delete(index))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+}
+
+fn context_targets(
+    row: &NamedSessionRow,
+    hosts: &[crate::session::remote::HostStatus],
+) -> Vec<SessionMenuTarget> {
+    let mut targets = Vec::new();
+    if row.remote.is_none() {
+        targets.push(SessionMenuTarget {
+            name: row.name.clone(),
+            remote: None,
+            running: row.running,
+            current: row.current,
+        });
+    }
+    for host in hosts.iter().filter(|host| host.error.is_none()) {
+        for session in &host.sessions {
+            let matches = row
+                .remote
+                .as_ref()
+                .map_or(row.merged && row.name == session.name, |remote| {
+                    remote.host == host.host && remote.session == session.name
+                });
+            if matches {
+                if let Ok(target) =
+                    crate::session::remote::RemoteSession::new(&host.host, &session.name)
+                {
+                    targets.push(SessionMenuTarget {
+                        name: session.name.clone(),
+                        remote: Some(target),
+                        running: session.running,
+                        current: row.remote.is_some() && row.current,
+                    });
+                }
+            }
+        }
+    }
+    targets
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +157,8 @@ pub struct NamedSessionMenu {
     pub client_id: Option<u64>,
     pub generation: u64,
     pub rows: Vec<NamedSessionRow>,
+    /// Discovered or cached owner identities, including temporarily offline hosts.
+    pub remote_targets: Vec<crate::session::remote::RemoteSession>,
     pub hosts: Vec<String>,
     pub cursor: usize,
     pub scroll: usize,
@@ -96,6 +181,122 @@ pub enum NamedSessionPreparedAction {
 }
 
 impl App {
+    pub fn open_session_menu(&mut self, index: usize, col: u16, row: u16) {
+        self.session_menu = None;
+        let Some(menu) = self.named_session_menu.as_ref() else {
+            return;
+        };
+        if menu.loading || menu.preparing || menu.prompt.is_some() {
+            return;
+        }
+        let Some(row_data) = index
+            .checked_sub(NEW_SESSION_ROWS)
+            .and_then(|i| menu.rows.get(i))
+        else {
+            return;
+        };
+        let menu = super::SessionMenu {
+            anchor: (col, row),
+            items: Vec::new(),
+            targets: context_targets(row_data, &self.remote_host_status),
+            confirming: None,
+            selected: 0,
+        };
+        if !menu.actions().is_empty() {
+            self.session_menu = Some(menu);
+        }
+    }
+
+    pub fn session_menu_action(&mut self, item: super::SessionMenuItem) {
+        use super::SessionMenuItem::*;
+        let Some(menu) = self.session_menu.as_mut() else {
+            return;
+        };
+        if !menu.actions().contains(&item) {
+            return;
+        }
+        match item {
+            Explanation => return,
+            Cancel => {
+                self.session_menu = None;
+                return;
+            }
+            Delete(index) => {
+                menu.confirming = Some(index);
+                menu.selected = 1; // Cancellation is the default confirmation action.
+                menu.items.clear();
+                self.hover = None;
+                return;
+            }
+            Stop(_) | ConfirmDelete(_) => {}
+        }
+        let (index, deleting) = match item {
+            Stop(index) => (index, false),
+            ConfirmDelete(index) => (index, true),
+            _ => unreachable!(),
+        };
+        let target = menu.targets[index].clone();
+        self.session_menu = None;
+        let Some(menu) = self.named_session_menu.as_mut() else {
+            return;
+        };
+        if menu.preparing {
+            return;
+        }
+        // Invalidate any older discovery before this explicit owner mutation.
+        self.named_session_generation = self.named_session_generation.wrapping_add(1);
+        menu.generation = self.named_session_generation;
+        menu.preparing = true;
+        menu.error = None;
+        let generation = menu.generation;
+        let verb = if deleting {
+            self.catalog.act_delete
+        } else {
+            self.catalog.menu_stop_session
+        };
+        let label = format!("{verb} · {}", target.label(self.catalog));
+        let tx = self.app_tx.clone();
+        std::thread::spawn(move || {
+            let result = match (target.remote.as_ref(), deleting) {
+                (Some(remote), true) => crate::session::remote::delete_session(remote),
+                (Some(remote), false) => crate::session::remote::stop_session(remote),
+                (None, true) => crate::session::delete_session(&target.name).map(|_| ()),
+                (None, false) => crate::session::stop_session(Some(&target.name))
+                    .map(|_| ())
+                    .map_err(|e| e.to_string()),
+            };
+            let _ = tx.send(crate::event::AppEvent::NamedSessionOperationFinished {
+                generation,
+                label,
+                result,
+            });
+        });
+    }
+
+    pub fn handle_session_menu_key(&mut self, key: KeyEvent) {
+        self.hover = None;
+        let Some(menu) = self.session_menu.as_mut() else {
+            return;
+        };
+        let actions = menu.actions();
+        let first = usize::from(menu.confirming.is_some());
+        match key.code {
+            KeyCode::Esc => self.session_menu = None,
+            KeyCode::Up | KeyCode::Char('k') => {
+                menu.selected = menu.selected.saturating_sub(1).max(first)
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
+                menu.selected = (menu.selected + 1).min(actions.len().saturating_sub(1))
+            }
+            KeyCode::Enter => {
+                if let Some(item) = actions.get(menu.selected).copied() {
+                    self.session_menu_action(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn refresh_named_sessions(&self, generation: u64) {
         let tx = self.app_tx.clone();
         std::thread::spawn(move || {
@@ -107,6 +308,9 @@ impl App {
                 };
                 Ok(NamedSessionDiscovery {
                     sessions: crate::session::list_sessions().map_err(|err| err.to_string())?,
+                    local_default_exists: crate::session::owner_session_exists(
+                        crate::session::DEFAULT_SESSION_NAME,
+                    )?,
                     remote,
                     hosts,
                     host_error,
@@ -117,58 +321,30 @@ impl App {
         });
     }
 
-    pub fn apply_named_session_stopped(
+    pub fn apply_named_session_operation_finished(
         &mut self,
         generation: u64,
-        name: String,
+        label: String,
         result: Result<(), String>,
     ) {
-        let Some(current_generation) = self.named_session_menu.as_ref().map(|menu| menu.generation)
-        else {
-            match result {
-                Ok(()) => self.show_toast(format!("stopped {name}")),
-                Err(err) => self.show_toast(format!("could not stop {name}: {err}")),
-            }
-            return;
-        };
-        if current_generation != generation {
-            match result {
-                Ok(()) => {
-                    self.show_toast(format!("stopped {name}"));
-                    self.refresh_named_sessions(current_generation);
-                }
-                Err(err) => self.show_toast(format!("could not stop {name}: {err}")),
-            }
-            return;
-        }
-        // Capture values before mutable borrow for toast.
         let toast = match &result {
-            Ok(()) => format!("stopped {name}"),
-            Err(_) => String::new(),
+            Ok(()) => format!("{label} ✓"),
+            Err(error) => format!("{label}: {error}"),
         };
-        let (gen, had_error) = {
-            let menu = self.named_session_menu.as_mut().unwrap();
-            match result {
-                Ok(()) => {
-                    if let Some(pos) = menu.rows.iter().position(|r| r.name == name) {
-                        menu.rows.remove(pos);
-                        let count = menu.rows.len() + NEW_SESSION_ROWS;
-                        if menu.cursor >= count {
-                            menu.cursor = count.saturating_sub(1);
-                        }
-                    }
-                    (menu.generation, false)
-                }
-                Err(err) => {
-                    menu.error = Some(err);
-                    (0, true)
-                }
-            }
+        self.show_toast(toast);
+        let Some(menu) = self.named_session_menu.as_mut() else {
+            return;
         };
-        if !had_error {
-            self.show_toast(toast);
-            self.refresh_named_sessions(gen);
+        if menu.generation != generation {
+            return;
         }
+        menu.preparing = false;
+        if let Err(error) = result {
+            menu.error = Some(error);
+            return;
+        }
+        menu.loading = true;
+        self.refresh_named_sessions(generation);
     }
 
     pub fn open_named_session_menu(&mut self) {
@@ -181,6 +357,7 @@ impl App {
         let generation = self.named_session_generation;
         self.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             generation,
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -216,6 +393,7 @@ impl App {
         match result {
             Ok(discovery) => {
                 menu.rows = session_rows(&discovery, &current);
+                menu.remote_targets = discovery.remote.sessions.clone();
                 menu.hosts = discovery.hosts;
                 menu.error = discovery
                     .host_error
@@ -364,6 +542,18 @@ impl App {
             .map_or(0, |menu| menu.rows.len() + NEW_SESSION_ROWS);
         match key.code {
             KeyCode::Char('r') => self.open_named_session_menu(),
+            KeyCode::Delete | KeyCode::Char('d') => {
+                if let Some(menu) = self.named_session_menu.as_ref() {
+                    let cursor = menu.cursor;
+                    let rect = self
+                        .named_session_row_rects
+                        .iter()
+                        .find(|(i, _)| *i == cursor)
+                        .map(|(_, r)| *r)
+                        .unwrap_or_default();
+                    self.open_session_menu(cursor, rect.x, rect.y);
+                }
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.close_named_session_menu(),
             KeyCode::Up | KeyCode::Char('k') => {
                 if let Some(menu) = self.named_session_menu.as_mut() {
@@ -554,7 +744,7 @@ impl App {
         std::thread::spawn(move || {
             let result = (|| {
                 if must_be_new {
-                    let sessions = crate::session::list_sessions()
+                    let sessions = crate::session::list_server_sessions()
                         .map_err(|err| NamedSessionOpenError::Failed(err.to_string()))?;
                     if sessions.iter().any(|session| session.name == name) {
                         return Err(NamedSessionOpenError::Exists);
@@ -586,6 +776,7 @@ impl App {
         let generation = menu.generation;
         let tx = self.app_tx.clone();
         std::thread::spawn(move || {
+            let mut action = NamedSessionPreparedAction::Switch(target.canonical_name());
             let result = (|| {
                 crate::session::remote::verify_remote_version(&target.host)
                     .map_err(NamedSessionOpenError::Failed)?;
@@ -607,22 +798,18 @@ impl App {
                     crate::session::remote::add_session(target.clone(), merge)
                         .map_err(NamedSessionOpenError::Failed)?;
                 }
-                if merge {
-                    crate::session::start_client_session(&target.session)
-                        .map_err(NamedSessionOpenError::Failed)?;
+                let name = crate::session::remote::local_attach_name(&target, merge)
+                    .map_err(NamedSessionOpenError::Failed)?;
+                crate::session::start_client_session(&name)
+                    .map_err(NamedSessionOpenError::Failed)?;
+                if name == target.session {
+                    action = NamedSessionPreparedAction::Merge(target.clone());
                 } else {
-                    crate::session::start_client_session(&target.canonical_name())
-                        .map_err(NamedSessionOpenError::Failed)?;
                     crate::session::remote::reload_local_session(&target.session)
                         .map_err(NamedSessionOpenError::Failed)?;
                 }
                 Ok(())
             })();
-            let action = if merge {
-                NamedSessionPreparedAction::Merge(target)
-            } else {
-                NamedSessionPreparedAction::Switch(target.canonical_name())
-            };
             let _ = tx.send(crate::event::AppEvent::NamedSessionPrepared {
                 generation,
                 action,
@@ -636,12 +823,16 @@ fn session_rows(discovery: &NamedSessionDiscovery, current: &str) -> Vec<NamedSe
     let mut rows: Vec<_> = discovery
         .sessions
         .iter()
+        // A synthetic default must not shadow a real remote owner, even with
+        // merge off: a live settings reload can change merge while this menu is open.
         .filter(|session| {
-            !discovery
-                .remote
-                .sessions
-                .iter()
-                .any(|remote| remote.canonical_name() == session.name)
+            session.name != crate::session::DEFAULT_SESSION_NAME
+                || discovery.local_default_exists
+                || !discovery
+                    .remote
+                    .sessions
+                    .iter()
+                    .any(|target| target.session == crate::session::DEFAULT_SESSION_NAME)
         })
         .map(|session| NamedSessionRow {
             current: session.name == current,
@@ -662,14 +853,13 @@ fn session_rows(discovery: &NamedSessionDiscovery, current: &str) -> Vec<NamedSe
         let name = target.canonical_name();
         rows.push(NamedSessionRow {
             current: name == current,
-            running: name == current
-                || discovery.host_status.iter().any(|host| {
-                    host.host == target.host
-                        && host
-                            .sessions
-                            .iter()
-                            .any(|session| session.name == target.session && session.running)
-                }),
+            running: discovery.host_status.iter().any(|host| {
+                host.host == target.host
+                    && host
+                        .sessions
+                        .iter()
+                        .any(|session| session.name == target.session && session.running)
+            }),
             name,
             remote: Some(target.clone()),
             merged: discovery.remote.merge_enabled(),
@@ -783,6 +973,7 @@ mod tests {
     fn discovery(sessions: Vec<crate::session::SessionInfo>) -> NamedSessionDiscovery {
         NamedSessionDiscovery {
             sessions,
+            local_default_exists: true,
             remote: crate::session::remote::RemoteRegistry::default(),
             hosts: Vec::new(),
             host_error: None,
@@ -814,12 +1005,41 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_default_does_not_hide_remote_owner_in_merge_mode() {
+        let target = crate::session::remote::RemoteSession::new("build", "default").unwrap();
+        let mut discovered = discovery(vec![info("default", false), info("api", true)]);
+        discovered.remote.sessions.push(target.clone());
+        discovered.local_default_exists = false;
+        for merge in [false, true] {
+            discovered.remote.merge = Some(merge);
+            let rows = session_rows(&discovered, "api");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1].remote.as_ref(), Some(&target));
+        }
+
+        // An actual saved default remains a merge destination.
+        discovered.local_default_exists = true;
+        let rows = session_rows(&discovered, "api");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].name, "default");
+        assert!(rows[1].remote.is_none());
+
+        // With no remote default, keep the usual local default creation entry.
+        discovered.local_default_exists = false;
+        discovered.remote.sessions.clear();
+        assert!(session_rows(&discovered, "api")
+            .iter()
+            .any(|row| row.name == "default"));
+    }
+
+    #[test]
     fn loaded_menu_selects_the_current_session_not_new() {
         let _env = crate::persist::test_env("named-session-menu-current");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             generation: 7,
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -849,6 +1069,7 @@ mod tests {
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             generation: 1,
             rows: vec![
                 NamedSessionRow {
@@ -898,6 +1119,7 @@ mod tests {
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             generation: 1,
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -929,6 +1151,7 @@ mod tests {
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             generation: 4,
             rows: Vec::new(),
             hosts: Vec::new(),
@@ -955,6 +1178,27 @@ mod tests {
     }
 
     #[test]
+    fn current_remote_row_uses_owner_status_not_presentation_liveness() {
+        let target = crate::session::remote::RemoteSession::new("build", "review").unwrap();
+        let mut discovered = discovery(Vec::new());
+        discovered.remote.sessions.push(target.clone());
+        discovered.host_status = vec![crate::session::remote::HostStatus {
+            host: "build".into(),
+            error: None,
+            sessions: vec![crate::session::remote::HostSession {
+                name: "review".into(),
+                running: false,
+            }],
+        }];
+        let rows = session_rows(&discovered, &target.canonical_name());
+        assert!(rows[0].current);
+        assert!(
+            !rows[0].running,
+            "an open presentation is not proof that the remote owner is running"
+        );
+    }
+
+    #[test]
     fn global_merge_groups_local_and_remote_default_without_a_prefixed_row() {
         let target = crate::session::remote::RemoteSession::new("dev-207", "default").unwrap();
         let mut remote = crate::session::remote::RemoteRegistry::default();
@@ -963,6 +1207,7 @@ mod tests {
         let rows = session_rows(
             &NamedSessionDiscovery {
                 sessions: vec![info("default", true)],
+                local_default_exists: true,
                 remote,
                 hosts: vec!["dev-207".into()],
                 host_error: None,
@@ -988,6 +1233,7 @@ mod tests {
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             generation: 1,
             rows: Vec::new(),
             hosts: vec!["build-box".into(), "dev-207".into()],
@@ -1023,12 +1269,13 @@ mod tests {
     }
 
     #[test]
-    fn stopped_session_refreshes_a_reopened_menu_with_its_current_generation() {
+    fn session_operation_does_not_refresh_a_replaced_menu() {
         let _env = crate::persist::test_env("named-session-stop-reopened-refresh");
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             hosts: Vec::new(),
             generation: 8,
             rows: vec![NamedSessionRow {
@@ -1046,23 +1293,26 @@ mod tests {
             preparing: false,
         });
 
-        app.apply_named_session_stopped(7, "review".into(), Ok(()));
+        app.apply_named_session_operation_finished(7, "review".into(), Ok(()));
 
         assert_eq!(
             app.named_session_menu.as_ref().unwrap().rows.len(),
             1,
             "a stale result must not edit the replacement menu directly"
         );
-        assert_eq!(loaded_generation(&rx), 8);
+        assert!(!rx
+            .try_iter()
+            .any(|event| matches!(event, crate::event::AppEvent::NamedSessionsLoaded { .. })));
     }
 
     #[test]
-    fn stopped_session_is_removed_and_refreshed_for_the_matching_menu() {
+    fn session_operation_refreshes_without_removing_other_merged_owners() {
         let _env = crate::persist::test_env("named-session-stop-current-refresh");
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             hosts: Vec::new(),
             generation: 5,
             rows: vec![NamedSessionRow {
@@ -1080,9 +1330,10 @@ mod tests {
             preparing: false,
         });
 
-        app.apply_named_session_stopped(5, "review".into(), Ok(()));
+        app.apply_named_session_operation_finished(5, "review".into(), Ok(()));
 
-        assert!(app.named_session_menu.as_ref().unwrap().rows.is_empty());
+        assert!(app.named_session_menu.as_ref().unwrap().loading);
+        assert_eq!(app.named_session_menu.as_ref().unwrap().rows.len(), 1);
         assert_eq!(loaded_generation(&rx), 5);
     }
 
@@ -1093,6 +1344,7 @@ mod tests {
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             hosts: Vec::new(),
             generation: 3,
             rows: vec![NamedSessionRow {
@@ -1110,7 +1362,7 @@ mod tests {
             preparing: false,
         });
 
-        app.apply_named_session_stopped(3, "review".into(), Err("server busy".into()));
+        app.apply_named_session_operation_finished(3, "review".into(), Err("server busy".into()));
 
         let menu = app.named_session_menu.as_ref().unwrap();
         assert_eq!(menu.rows.len(), 1);
@@ -1125,6 +1377,7 @@ mod tests {
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             hosts: Vec::new(),
             generation: 1,
             rows: vec![NamedSessionRow {
@@ -1159,9 +1412,70 @@ mod tests {
             if index < super::NEW_SESSION_ROWS as u16 {
                 assert!(app.session_menu.is_none());
             } else {
-                assert_eq!(app.session_menu.as_ref().unwrap().name, "other");
+                assert_eq!(app.session_menu.as_ref().unwrap().targets[0].name, "other");
             }
         }
+    }
+
+    #[test]
+    fn merged_context_targets_keep_owner_identity_and_exclude_unknown_hosts() {
+        use crate::session::remote::{HostSession, HostStatus};
+        let row = NamedSessionRow {
+            name: "review".into(),
+            running: false,
+            current: false,
+            remote: None,
+            merged: true,
+        };
+        let hosts = vec![
+            HostStatus {
+                host: "build".into(),
+                error: None,
+                sessions: vec![HostSession {
+                    name: "review".into(),
+                    running: false,
+                }],
+            },
+            HostStatus {
+                host: "live".into(),
+                error: None,
+                sessions: vec![HostSession {
+                    name: "review".into(),
+                    running: true,
+                }],
+            },
+            HostStatus {
+                host: "offline".into(),
+                error: Some("disconnected".into()),
+                sessions: vec![HostSession {
+                    name: "review".into(),
+                    running: false,
+                }],
+            },
+        ];
+        let targets = super::context_targets(&row, &hosts);
+        assert_eq!(targets.len(), 3);
+        assert!(targets[0].remote.is_none());
+        assert_eq!(targets[1].remote.as_ref().unwrap().host, "build");
+        assert_eq!(targets[2].remote.as_ref().unwrap().host, "live");
+        let mut menu = crate::app::SessionMenu {
+            anchor: (0, 0),
+            items: Vec::new(),
+            targets,
+            confirming: None,
+            selected: 0,
+        };
+        use crate::app::SessionMenuItem::*;
+        assert_eq!(menu.actions(), [Delete(0), Delete(1), Stop(2)]);
+        menu.confirming = Some(1);
+        assert_eq!(menu.actions(), [Explanation, Cancel, ConfirmDelete(1)]);
+        assert_eq!(menu.targets[1].name, "review");
+        let mut remote_row = row;
+        remote_row.remote =
+            Some(crate::session::remote::RemoteSession::new("build", "review").unwrap());
+        let targets = super::context_targets(&remote_row, &hosts);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].remote.as_ref().unwrap().host, "build");
     }
 
     #[test]
@@ -1171,6 +1485,7 @@ mod tests {
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
+            remote_targets: Vec::new(),
             hosts: Vec::new(),
             generation: 1,
             rows: vec![NamedSessionRow {
@@ -1187,35 +1502,43 @@ mod tests {
             error: None,
             preparing: true,
         });
-        // Right-click guard is row.running && !row.current && !menu.preparing.
-        let menu = app.named_session_menu.as_ref().unwrap();
-        let row = &menu.rows[0];
-        assert!(row.running && !row.current);
-        assert!(menu.preparing);
-        assert!(!(row.running && !row.current && !menu.preparing));
-        // Ineligible rows must clear stale menu.
-        app.session_menu = Some(crate::app::SessionMenu {
-            name: "old".into(),
-            anchor: (0, 0),
-            items: Vec::new(),
-        });
-        app.open_session_menu("current".into(), 0, 0, true, true);
+        app.open_session_menu(2, 5, 6);
         assert!(
             app.session_menu.is_none(),
-            "current row must clear stale Stop menu"
+            "preparing blocks all owner actions"
         );
-        app.session_menu = Some(crate::app::SessionMenu {
-            name: "old".into(),
-            anchor: (0, 0),
-            items: Vec::new(),
-        });
-        app.open_session_menu("stopped".into(), 0, 0, false, false);
+        app.named_session_menu.as_mut().unwrap().preparing = false;
+        app.open_session_menu(2, 5, 6);
+        assert_eq!(
+            app.session_menu.as_ref().unwrap().actions(),
+            [crate::app::SessionMenuItem::Stop(0)]
+        );
+        app.named_session_menu.as_mut().unwrap().rows[0].current = true;
+        app.open_session_menu(2, 5, 6);
         assert!(
             app.session_menu.is_none(),
-            "stopped row must clear stale Stop menu"
+            "current owner clears a stale context menu"
         );
-        app.open_session_menu("other".into(), 5, 6, true, false);
-        assert!(app.session_menu.is_some());
-        assert_eq!(app.session_menu.as_ref().unwrap().name, "other");
+        app.named_session_menu.as_mut().unwrap().rows[0].current = false;
+        app.named_session_menu.as_mut().unwrap().rows[0].running = false;
+        app.open_session_menu(2, 5, 6);
+        assert_eq!(
+            app.session_menu.as_ref().unwrap().actions(),
+            [crate::app::SessionMenuItem::Delete(0)]
+        );
+        app.session_menu_action(crate::app::SessionMenuItem::Delete(0));
+        assert_eq!(app.session_menu.as_ref().unwrap().confirming, Some(0));
+        assert_eq!(app.session_menu.as_ref().unwrap().selected, 1);
+        app.handle_session_menu_key(KeyEvent::new(
+            KeyCode::Enter,
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(
+            app.session_menu.is_none(),
+            "Enter defaults to cancel, not deletion"
+        );
+        app.named_session_menu.as_mut().unwrap().rows[0].name = "default".into();
+        app.open_session_menu(2, 5, 6);
+        assert!(app.session_menu.is_none(), "default cannot be deleted");
     }
 }

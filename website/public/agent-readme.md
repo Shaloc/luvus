@@ -218,6 +218,23 @@ do not hand over to the remote full-screen TUI. Workspace prefix suffixes
 (`?`, digits and custom bindings) use the owner's handler; global navigation
 and local Settings/Agents stay local. Double prefix sends the owner's prefix
 once. The bottom status bar identifies the remote host and actual session.
+
+Session discovery exports actual owners, not explicitly marked local remote-view
+namespaces. Do not classify a session by a `remote-` prefix alone. `stopped`
+means saved state is retained, not deleted. In merged rows, read each machine's
+state separately; `?` means unknown. With explicit human deletion authorization,
+use `luvus session delete <name>` on the owner, or
+`ssh <host> 'luvus session delete <actual-name>'` for a remote owner. The UI also
+provides per-owner Delete with confirmation from the session row's right-click
+menu (`d` / Delete opens it from the keyboard). Deletion is stopped-only,
+excludes `default`, removes saved state/logs but not project files, and never
+implies deleting all same-name owners. Do not delete/restart merely to hide a row.
+
+Merge reuses an existing same-name local owner (running or saved). Opening or
+creating a remote-only session, or toggling merge, never creates a local copy;
+use the remote presentation view instead. A synthetic default list entry or
+shared config directory is not a local owner. Do not auto-delete existing
+copies created by older versions.
 Managed CLI requests and workspace frame reads never implicitly start or
 restart an owner; opening a session, `remote add` and explicit lifecycle
 commands are the startup entry points. Settings → Remote has one global

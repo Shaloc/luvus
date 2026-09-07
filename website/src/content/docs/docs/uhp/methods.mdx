@@ -270,6 +270,14 @@ validated named session. `session.delete` supports named sessions only and
 requires `confirm:true`. Update installation, skill changes, and integration
 changes also require `confirm:true`; status and update checks are read-only.
 
+`session.list` and the session counts in `host.info` include owner namespaces,
+not explicitly marked managed-attach presentation servers. Internal lifecycle
+inventory still includes those servers for machine-local restart-all and
+configuration reload. A `stopped` owner remains listed until `session.delete`;
+deletion rechecks that it is stopped and removes saved session state/logs, not
+project files. Same-name owners on other machines are unaffected. Use an
+explicit SSH host-profile call for remote deletion, not the session API bridge.
+
 The local operating-system account is the authority boundary. Host requests
 reject an `auth` token and are not routed through the session socket or remote
 `uhp access` gateway. This prevents a delegated session token from gaining

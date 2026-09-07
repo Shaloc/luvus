@@ -4,6 +4,8 @@
 Run after cargo build: python3 scripts/test-remote-sessions.py
 Use --restart-only for the isolated server restart --all smoke test.
 Use --dimensions-only for the local split/close/resize regression.
+Use --session-discovery-only for owner inventory and session deletion regression.
+Use --remote-only-open-only for merge routing without implicit local owners.
 All homes, sockets, files and child processes are isolated below target/.
 No production server or actual SSH destination is accessed.
 """
@@ -68,7 +70,9 @@ def main():
     agent_state_only = "--agent-state-only" in sys.argv[1:]
     clipboard_only = "--clipboard-helper-only" in sys.argv[1:]
     dimensions_only = "--dimensions-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--clipboard-helper-only", "--dimensions-only")]
+    session_discovery_only = "--session-discovery-only" in sys.argv[1:]
+    remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -286,6 +290,35 @@ def main():
 
         run("session", "remote", "add", "fake-dev", "api", "--merge")
         wait_for(projected)
+        # The actual presentation server writes its own identity at startup;
+        # public inventories must not re-export it as an owner, even after stop.
+        proxy = "remote-fake-dev-api"
+        owner_generation = api("uhp.capabilities", remote=True)["server_generation"]
+        api("session.start", {"name": proxy})
+        marker = root / "local-state/sessions" / proxy / "session-origin.json"
+        assert json.loads(marker.read_text()) == {
+            "kind": "remote_view", "target": {"host": "fake-dev", "session": "api"}}
+        assert api("session.status", {"name": proxy})["session"]["running"]
+        for stopped in (False, True):
+            if stopped:
+                run("--session", proxy, "remote-server-command", "stop")
+            assert proxy not in {s["name"] for s in json.loads(run("remote-session-list").stdout)}
+            assert proxy not in {s["name"] for s in api("session.list")["sessions"]}
+            owners = api("session.list")["sessions"]
+            assert api("host.info")["sessions"] == {"total": len(owners), "running": sum(s["running"] for s in owners)}
+            assert proxy not in {s["name"] for s in json.loads(run("session", "list", "--json").stdout)["sessions"]}
+            assert marker.exists(), "stopping must retain the presentation identity"
+        literal = "remote-fake-dev-literal"
+        run("--session", literal, "remote-server-command", "start")
+        assert json.loads((root / "local-state/sessions" / literal / "session-origin.json").read_text())["kind"] == "local"
+        assert literal in {s["name"] for s in json.loads(run("remote-session-list").stdout)}
+        assert run("session", "delete", literal, okay=False).returncode, "running owner deletion must fail"
+        run("--session", literal, "remote-server-command", "stop")
+        assert not next(s for s in json.loads(run("remote-session-list").stdout) if s["name"] == literal)["running"]
+        run("session", "delete", literal)
+        assert not (root / "local-state/sessions" / literal).exists()
+        assert api("uhp.capabilities", remote=True)["server_generation"] == owner_generation
+        print("PASS: presentation startup/stop excluded from public inventories; literal remote- owner survives discovery; delete rejects running owner", flush=True)
         run("--session", "remote-fake-dev-api", "workspace", "list")
         run("--host", "fake-dev", "--session", "api", "pane", "list")
         worktrees = run("--session", "api", "worktree", "list", "--host", "fake-dev")
@@ -372,6 +405,177 @@ def main():
 
         def click(master, x, y, button=0):
             os.write(master, f"\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m".encode())
+
+        if remote_only_open_only:
+            run("session", "merge", "on")
+            # A legitimate local owner may have the presentation's internal name.
+            # Opening a remote must neither attach to it nor overwrite saved state.
+            collision = "remote-fake-dev-second"
+            collision_dir = root / "local-state/sessions" / collision
+            run("--session", collision, "remote-server-command", "start")
+            for running in (True, False):
+                if not running:
+                    run("--session", collision, "remote-server-command", "stop")
+                before = {path.name: path.read_bytes() for path in collision_dir.iterdir()
+                          if path.name in ("session-origin.json", "session.json")}
+                rejected = run("session", "attach", collision, okay=False)
+                assert rejected.returncode != 0 and "existing local session" in rejected.stderr, rejected
+                after = {path.name: path.read_bytes() for path in collision_dir.iterdir()
+                         if path.name in ("session-origin.json", "session.json")}
+                assert before == after, "remote attach changed a real owner's identity or snapshot"
+                assert api("session.status", {"name": collision})["session"]["running"] == running
+            assert "session.json" in before, "collision fixture must have saved state to protect"
+            run("session", "delete", collision)
+            print("PASS: remote view collisions reject running/stopped local owners and preserve saved layout", flush=True)
+            def no_local_owner(name):
+                if name == "default":
+                    for filename in ("session-origin.json", "session.json", "server.pid"):
+                        assert not (root / "local-state" / filename).exists(), "remote-only default created a local owner"
+                else:
+                    assert not (root / "local-state/sessions" / name).exists(), f"remote-only {name} created a local owner"
+
+            for name in ("second", "default"):
+                no_local_owner(name)
+                process, master = start_client(["session", "attach", "remote-fake-dev-" + name])
+                repaint(master)
+                no_local_owner(name)
+                assert api("ping", remote=True, session=name)["session"] == name
+                process.terminate()
+                process.wait(timeout=5)
+                os.close(master)
+                clients.pop()
+            print("PASS: merge-on CLI attach opens remote-only named/default owners without creating local copies", flush=True)
+
+            process, master = start_client(["--session", "api"])
+            repaint(master)
+            switched = bytearray()
+            def remote_opened(name):
+                switched.extend(drain(master, 0.1))
+                no_local_owner(name)
+                return ("luvus · " + name + " [remote · fake-dev]").encode() in switched
+            for name in ("default", "second"):
+                if name == "default":
+                    run("session", "merge", "off")
+                os.write(master, b"\x02t")
+                drain(master, 1.5)
+                if name == "default":
+                    # A setting reload while the selector is open must not
+                    # turn a synthetic local entry into creation authority.
+                    run("session", "merge", "on")
+                    drain(master)
+                screen = repaint(master)
+                click(master, *position(screen, name))
+                switched.clear()
+                wait_for(lambda: remote_opened(name))
+                assert b"\x1b[?1049l" not in switched
+            for enabled in ("off", "on"):
+                run("session", "merge", enabled)
+                repaint(master)
+                no_local_owner("second")
+            os.write(master, b"\x02t")
+            drain(master, 1.5)
+            os.write(master, b"\x1b[Hj\r")
+            drain(master)
+            os.write(master, b"only-created\r")
+            switched.clear()
+            wait_for(lambda: remote_opened("only-created"))
+            no_local_owner("only-created")
+            assert api("ping", remote=True, session="only-created")["session"] == "only-created"
+            assert process.poll() is None
+            print("PASS: merge-on switcher/New Remote and off/on toggle keep remote-only owners remote; thin client stays attached", flush=True)
+            return
+
+        if session_discovery_only:
+            saved = "remote-saved-review"
+            def seed(remote):
+                run("--session", saved, "remote-server-command", "start", remote=remote)
+                run("--session", saved, "remote-server-command", "stop", remote=remote)
+
+            def saved_dir(remote):
+                return root / ("remote-state" if remote else "local-state") / "sessions" / saved
+
+            for remote in (False, True):
+                seed(remote)
+            # Test the local and remote copies of the same merged row. Only
+            # the fixture's owner namespaces may be deleted, never the project.
+            run("session", "merge", "on")
+            process, master = start_client(["--session", "api"])
+            repaint(master)
+
+            def open_delete(host):
+                os.write(master, b"\x02t")
+                drain(master, 1.5)
+                screen = repaint(master)
+                click(master, *position(screen, saved), button=2)
+                screen = repaint(master)
+                label = "Delete · " + host + " · " + saved
+                click(master, *position(screen, label))
+                screen = repaint(master)
+                position(screen, "Delete saved session and logs?")
+                return label, screen
+
+            label, screen = open_delete("Local machine")
+            # Keyboard confirmation defaults to Cancel, without any deletion.
+            os.write(master, b"\r")
+            drain(master)
+            assert saved_dir(False).exists() and saved_dir(True).exists()
+            os.write(master, b"\x1b")
+            drain(master)
+            label, screen = open_delete("Local machine")
+            click(master, *position(screen, label))
+            wait_for(lambda: not saved_dir(False).exists())
+            assert saved_dir(True).exists()
+            drain(master, 1.5)
+            os.write(master, b"\x1b")
+            drain(master)
+            print("PASS: merged stopped row: right-click Delete names the local owner; default Cancel preserves both; confirmation removes local only", flush=True)
+
+            seed(False)
+            label, screen = open_delete("fake-dev")
+            # Real owner-side revalidation: the stale confirmation is not
+            # authority to stop a session that started in the meantime.
+            run("--session", saved, "remote-server-command", "start", remote=True)
+            click(master, *position(screen, label))
+            failure = bytearray()
+            def refused():
+                failure.extend(drain(master, 0.1))
+                # The bounded error row may truncate the trailing CLI advice.
+                return b"could not delete session" in failure
+            wait_for(refused)
+            assert api("session.status", {"name": saved}, remote=True)["session"]["running"]
+            assert saved_dir(False).exists() and saved_dir(True).exists()
+            run("--session", saved, "remote-server-command", "stop", remote=True)
+            os.write(master, b"\x1b")
+            drain(master)
+            label, screen = open_delete("fake-dev")
+            click(master, *position(screen, label))
+            wait_for(lambda: not saved_dir(True).exists())
+            assert saved_dir(False).exists()
+            assert (root / "project/parity.md").is_file()
+            assert api("uhp.capabilities", remote=True)["server_generation"] == owner_generation
+            assert process.poll() is None
+            print("PASS: merged remote Delete refuses a restarted owner; retry deletes exact literal remote- name; local copy, project files and active remote owner survive", flush=True)
+
+            drain(master, 1.5)
+            os.write(master, b"\x1b")
+            drain(master)
+            seed(True)
+            run("session", "merge", "off")
+            label, screen = open_delete("fake-dev")
+            # Click outside the confirmation over the terminal: dismiss only,
+            # without confirming or forwarding the click to the remote pane.
+            click(master, 119, 28)
+            drain(master)
+            assert saved_dir(False).exists() and saved_dir(True).exists()
+            os.write(master, b"\x1b")
+            drain(master)
+            label, screen = open_delete("fake-dev")
+            click(master, *position(screen, label))
+            wait_for(lambda: not saved_dir(True).exists())
+            assert saved_dir(False).exists()
+            assert api("uhp.capabilities", remote=True)["server_generation"] == owner_generation
+            print("PASS: unmerged remote stopped row: outside click cancels; confirmed Delete removes remote only", flush=True)
+            return
 
         if agent_state_only:
             run("session", "merge", "on")
@@ -799,8 +1003,14 @@ def main():
         def switch(process, master, current, target):
             inventory = json.loads(run("session", "list", "--json").stdout)
             registered = {f'remote-{s["host"]}-{s["session"]}' for s in inventory["remote_sessions"]}
-            rows = [(s["name"], False, s["running"], s["name"]) for s in inventory["sessions"]
-                    if s["name"] not in registered]
+            rows = [(s["name"], False, s["running"], s["name"]) for s in inventory["sessions"]]
+            # Public inventory retains its synthetic default contract. The UI
+            # omits that placeholder when a real remote default is available.
+            default_files = (root / "local-state" / name for name in
+                             ("session-origin.json", "session.json", "server.pid", "server.lock"))
+            if (not any(path.exists() for path in default_files)
+                    and any(s["session"] == "default" for s in inventory["remote_sessions"])):
+                rows = [row for row in rows if row[0] != "default"]
             for s in inventory["remote_sessions"]:
                 if inventory["merge"] and any(r[0] == s["session"] and not r[1] for r in rows):
                     continue
@@ -827,7 +1037,11 @@ def main():
                 # The persistent client changes its terminal title only after
                 # the prepared target handshake. Its PID/argv no longer execs.
                 return b"\x1b]0;" + title + b"\x07" in switched_screen
-            wait_for(changed)
+            try:
+                wait_for(changed)
+            except AssertionError as error:
+                raise AssertionError(f"switch {current} -> {target}: index={index}, rows={rows}, "
+                                     f"before={screen!r}, after={bytes(switched_screen)!r}") from error
             elapsed = time.monotonic() - started
             switched_screen.extend(drain(master, 1))
             print(f"session switch {current} -> {target}: {elapsed:.3f}s; "
@@ -1131,16 +1345,16 @@ def main():
         for remote in (False, True):
             # Only this fixture's two isolated homes; bypass managed-name
             # routing so a local presentation server is not mistaken for SSH.
-            inventory = json.loads(run("remote-session-list", remote=remote).stdout)
-            for session in inventory:
-                state = root / ("remote-state" if remote else "local-state")
-                name = session["name"]
-                assert name and name not in (".", "..") and "/" not in name and "\\" not in name, session
+            state = root / ("remote-state" if remote else "local-state")
+            namespaces = state / "sessions"
+            # Public inventory intentionally omits hidden presentation servers.
+            # Lifecycle cleanup must include every namespace in this fixture only.
+            names = {"default"} | ({p.name for p in namespaces.iterdir() if p.is_dir()} if namespaces.is_dir() else set())
+            for name in sorted(names):
+                assert name and name not in (".", "..") and "/" not in name and "\\" not in name, name
                 directory = state if name == "default" else state / "sessions" / name
-                assert directory.resolve().is_relative_to(state), session
-                if session["running"]:
-                    run("--session", session["name"], "remote-server-command", "stop",
-                        remote=remote, okay=False)
+                assert directory.resolve().is_relative_to(state), name
+                run("--session", name, "remote-server-command", "stop", remote=remote, okay=False)
         # Retain failure evidence; successful fixtures are disposable test data.
         if sys.exc_info()[0] is None:
             assert_isolated(env)

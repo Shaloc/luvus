@@ -42,6 +42,53 @@ pub fn view_target() -> Option<&'static RemoteSession> {
     VIEW_TARGET.get()
 }
 
+/// Durable namespace identity, separate from snapshots (views intentionally
+/// save no local workspaces). Never infer this identity from a name prefix.
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum SessionOrigin {
+    Local,
+    RemoteView { target: RemoteSession },
+}
+
+const SESSION_ORIGIN_FILE: &str = "session-origin.json";
+
+/// Called only by the winning server while holding its existing startup lock.
+/// An explicit owner-server start replaces a previous presentation identity.
+pub(crate) fn record_session_origin(
+    directory: &Path,
+    target: Option<&RemoteSession>,
+) -> io::Result<()> {
+    let origin = match target {
+        Some(target) => SessionOrigin::RemoteView {
+            target: target.clone(),
+        },
+        None => SessionOrigin::Local,
+    };
+    write_remote_state_atomic(&directory.join(SESSION_ORIGIN_FILE), &origin)
+}
+
+pub(super) fn is_presentation_session(session: &super::SessionInfo) -> bool {
+    let path = Path::new(&session.session_dir).join(SESSION_ORIGIN_FILE);
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return false;
+    };
+    // Unknown, malformed or mismatched metadata must not hide a real session.
+    if !metadata.is_file() || metadata.len() > 4096 {
+        return false;
+    }
+    let origin = fs::File::open(path)
+        .ok()
+        .and_then(|file| serde_json::from_reader::<_, SessionOrigin>(file.take(4097)).ok());
+    match origin {
+        Some(SessionOrigin::RemoteView { target }) => {
+            RemoteSession::new(&target.host, &target.session)
+                .is_ok_and(|target| target.canonical_name() == session.name)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct HostSession {
     pub name: String,
@@ -174,6 +221,24 @@ impl RemoteSession {
     }
 }
 
+/// Resolve the local display namespace for an explicit remote open. Merge is
+/// federation of existing owners, not authorization to create a local copy.
+/// May inspect the selected home/sockets, so call only off the App event loop.
+pub(crate) fn local_attach_name(target: &RemoteSession, merge: bool) -> Result<String, String> {
+    RemoteSession::new(&target.host, &target.session)?;
+    if merge && super::owner_session_exists(&target.session)? {
+        Ok(target.session.clone())
+    } else {
+        let name = target.canonical_name();
+        if super::owner_session_exists(&name)? {
+            return Err(format!(
+                "remote view `{name}` conflicts with an existing local session; choose a different remote session name"
+            ));
+        }
+        Ok(name)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RemoteRegistry {
     #[serde(default = "registry_version")]
@@ -296,7 +361,7 @@ pub fn set_merge(session: &str, enabled: bool) -> Result<RemoteRegistry, String>
 /// User-triggered global preference changes update already-running local
 /// namespaces, without starting servers or recursively contacting SSH hosts.
 pub fn reload_local_sessions(exclude: Option<&str>) -> Result<bool, String> {
-    let sessions = super::list_sessions().map_err(|error| error.to_string())?;
+    let sessions = super::list_server_sessions().map_err(|error| error.to_string())?;
     let mut applied = false;
     for session in sessions
         .into_iter()
@@ -382,11 +447,14 @@ fn mutate_registry(
 }
 
 fn write_registry_atomic(registry: &RemoteRegistry) -> io::Result<()> {
+    write_remote_state_atomic(&registry_path(), registry)
+}
+
+fn write_remote_state_atomic(path: &Path, value: &impl Serialize) -> io::Result<()> {
     static TEMP_ID: AtomicU64 = AtomicU64::new(0);
-    let path = registry_path();
     let id = TEMP_ID.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!("json.{}.{}.tmp", std::process::id(), id));
-    let bytes = serde_json::to_vec_pretty(registry).map_err(io::Error::other)?;
+    let bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -400,7 +468,7 @@ fn write_registry_atomic(registry: &RemoteRegistry) -> io::Result<()> {
         file.write_all(b"\n")?;
         file.flush()?;
         file.sync_all()?;
-        crate::platform::atomic_replace_file(&temporary, &path)
+        crate::platform::atomic_replace_file(&temporary, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -1116,20 +1184,19 @@ fn bridge_command_with_options(
     location: RemoteBinaryLocation,
     options: &[&str],
 ) -> Command {
-    let mut command = ssh_base(&target.host);
+    let mut args = vec!["--session", &target.session, role];
+    args.extend_from_slice(options);
+    command_on_host(&target.host, &args, location)
+}
+
+fn command_on_host(host: &str, args: &[&str], location: RemoteBinaryLocation) -> Command {
+    let mut command = ssh_base(host);
     match location {
         RemoteBinaryLocation::Path => {
-            command
-                .arg("luvus")
-                .arg("--session")
-                .arg(&target.session)
-                .arg(role)
-                .args(options);
+            command.arg("luvus").args(args);
         }
         RemoteBinaryLocation::StandardFallback => {
-            let mut args = vec!["--session", &target.session, role];
-            args.extend_from_slice(options);
-            command.arg(standard_binary_script(&args));
+            command.arg(standard_binary_script(args));
         }
     }
     command
@@ -1192,6 +1259,41 @@ pub fn stop_session(target: &RemoteSession) -> Result<(), String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ))
     }
+}
+
+/// A confirmed UI deletion calls the owner's existing CLI, which rechecks
+/// that the namespace is stopped. Do not select a managed namespace first:
+/// a literal owner name beginning with remote- is not another SSH hop.
+pub fn delete_session(target: &RemoteSession) -> Result<(), String> {
+    RemoteSession::new(&target.host, &target.session)?;
+    if target.session == super::DEFAULT_SESSION_NAME {
+        return Err("deleting the default session is not supported".into());
+    }
+    let location = verify_remote_version(&target.host)?;
+    let output = run_ssh_command(
+        command_on_host(
+            &target.host,
+            &["session", "delete", &target.session],
+            location,
+        ),
+        &target.host,
+        MAX_VERSION_OUTPUT_BYTES,
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "could not delete session `{}` on `{}`: {}",
+            target.session,
+            target.host,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    // Forget only this cached handle. The next explicit discovery is still the
+    // source of truth, and other same-name owners/host preferences are retained.
+    mutate_registry(|registry| {
+        registry.sessions.retain(|saved| saved != target);
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// Cancellation for one user-selected merge subscription. Killing only its
@@ -1728,6 +1830,25 @@ mod tests {
                 .len(),
             MAX_VERSION_OUTPUT_BYTES
         );
+    }
+
+    #[test]
+    fn remote_delete_argv_uses_literal_owner_name_without_managed_selector() {
+        let args = ["session", "delete", "remote-build-review"];
+        let command = command_on_host("build", &args, RemoteBinaryLocation::Path);
+        let arguments = command
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &arguments[arguments.len() - 5..],
+            ["build", "luvus", "session", "delete", "remote-build-review"]
+        );
+        assert!(!arguments.iter().any(|a| a == "--session"));
+        let command = command_on_host("build", &args, RemoteBinaryLocation::StandardFallback);
+        let script = command.get_args().last().unwrap().to_string_lossy();
+        assert!(script.contains("'session' 'delete' 'remote-build-review'"));
+        assert!(!script.contains("--session"));
     }
 
     #[test]

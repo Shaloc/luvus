@@ -1058,14 +1058,8 @@ fn session_list(args: &[String], context: crate::i18n::cli::Context) -> Result<i
             ))
         }
     };
-    let mut sessions = crate::session::list_sessions()?;
+    let sessions = crate::session::list_sessions()?;
     let (remote, hosts) = crate::session::remote::discover_hosts();
-    sessions.retain(|session| {
-        !remote
-            .sessions
-            .iter()
-            .any(|target| target.canonical_name() == session.name)
-    });
     if json {
         println!(
             "{}",

@@ -439,10 +439,14 @@ impl App {
         if let Some(name) = self.remote_merge_switch_target(crate::session::remote::view_target()) {
             let tx = self.app_tx.clone();
             std::thread::spawn(move || {
-                let result = crate::session::start_client_session(&name).and_then(|_| {
+                let result = (|| {
+                    if !crate::session::owner_session_exists(&name)? {
+                        return Ok(None);
+                    }
+                    crate::session::start_client_session(&name)?;
                     crate::session::remote::reload_local_session(&name)?;
                     Ok(Some(name))
-                });
+                })();
                 let _ = tx.send(AppEvent::RemoteMergeChanged { generation, result });
             });
         }

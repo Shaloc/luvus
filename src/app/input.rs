@@ -664,12 +664,12 @@ impl App {
                 self.apply_remote_effect(effect);
                 return true;
             }
-            AppEvent::NamedSessionStopped {
+            AppEvent::NamedSessionOperationFinished {
                 generation,
-                name,
+                label,
                 result,
             } => {
-                self.apply_named_session_stopped(generation, name, result);
+                self.apply_named_session_operation_finished(generation, label, result);
                 return true;
             }
             other => other,
@@ -1335,7 +1335,7 @@ impl App {
             | AppEvent::RemoteEffect { .. } => unreachable!(),
             AppEvent::NamedSessionsLoaded { .. }
             | AppEvent::NamedSessionPrepared { .. }
-            | AppEvent::NamedSessionStopped { .. } => {
+            | AppEvent::NamedSessionOperationFinished { .. } => {
                 unreachable!()
             }
         }
@@ -1738,35 +1738,7 @@ impl App {
                             })
                             .map(|(i, _)| *i)
                         {
-                            if idx >= super::session_menu::NEW_SESSION_ROWS {
-                                // Keep `menu` bound here so `menu.preparing` is in scope.
-                                // The previous `.and_then(|menu| menu.rows.get(..))` moves
-                                // `menu` into the closure, so a naive `&& !menu.preparing`
-                                // at the row check would not compile.
-                                if let Some(menu) = self.named_session_menu.as_ref() {
-                                    if let Some(row) =
-                                        menu.rows.get(idx - super::session_menu::NEW_SESSION_ROWS)
-                                    {
-                                        if row.running && !row.current && !menu.preparing {
-                                            self.open_session_menu(
-                                                row.name.clone(),
-                                                m.column,
-                                                m.row,
-                                                row.running,
-                                                row.current,
-                                            );
-                                        } else {
-                                            self.session_menu = None;
-                                        }
-                                    } else {
-                                        self.session_menu = None;
-                                    }
-                                } else {
-                                    self.session_menu = None;
-                                }
-                            } else {
-                                self.session_menu = None;
-                            }
+                            self.open_session_menu(idx, m.column, m.row);
                         } else if !self.session_menu.as_ref().is_some_and(|menu| {
                             menu.items.iter().any(|(_, r)| {
                                 m.column >= r.x
@@ -1779,7 +1751,14 @@ impl App {
                         }
                     }
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                        let _ = self.menu_scroll.wheel(m.column, m.row, 0);
+                        // Move keyboard selection with the wheel so render_popup
+                        // reveals the same row instead of pinning scroll at zero.
+                        let code = if m.kind == MouseEventKind::ScrollUp {
+                            KeyCode::Up
+                        } else {
+                            KeyCode::Down
+                        };
+                        self.handle_session_menu_key(KeyEvent::new(code, KeyModifiers::NONE));
                     }
                     _ => {}
                 }
@@ -1790,7 +1769,7 @@ impl App {
                     self.named_session_click(m.column, m.row)
                 }
                 MouseEventKind::Down(MouseButton::Right) => {
-                    // Right-click on a row → open Stop menu for running sessions only.
+                    // Resolve per-owner Stop/Delete actions, including merged rows.
                     if let Some(idx) = self
                         .named_session_row_rects
                         .iter()
@@ -1802,25 +1781,7 @@ impl App {
                         })
                         .map(|(i, _)| *i)
                     {
-                        if idx >= super::session_menu::NEW_SESSION_ROWS {
-                            // Same reason as the guard above: bind `menu` first so
-                            // `!menu.preparing` is available (`.and_then` would hide it).
-                            if let Some(menu) = self.named_session_menu.as_ref() {
-                                if let Some(row) =
-                                    menu.rows.get(idx - super::session_menu::NEW_SESSION_ROWS)
-                                {
-                                    if row.running && !row.current && !menu.preparing {
-                                        self.open_session_menu(
-                                            row.name.clone(),
-                                            m.column,
-                                            m.row,
-                                            row.running,
-                                            row.current,
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        self.open_session_menu(idx, m.column, m.row);
                     }
                 }
                 MouseEventKind::ScrollUp => self.move_named_session_cursor(-1),

@@ -72,6 +72,44 @@ the display client's. Global session navigation and local Settings/Agents stay
 local. Pressing the prefix twice sends the owner's configured prefix once.
 The bottom status bar identifies the active remote host and actual session.
 
+Merge uses an existing same-name local owner (running or saved); it never
+creates a local session merely because you opened or created a remote one.
+If that name exists only remotely, the switcher and CLI attach keep using the
+remote presentation view. Turning merge off and on follows the same rule.
+The implicit `default` list entry and a global configuration directory alone
+do not count as an existing local owner. Existing local records are preserved;
+this does not automatically remove copies created by older versions.
+
+### Stop versus delete
+
+Stopping a session ends its server but retains its saved state and logs, so a
+`stopped` row remains available to reopen. Remote rows show their owner's
+`running`/`stopped` state. In merge mode, the row labels the local machine and
+each remote separately; a local `stopped` does not mean every remote is stopped.
+A `?` means discovery failed, not proof that the owner stopped.
+
+Right-click a session row (or select it and press `d` / Delete) to open its
+owner actions. Running non-current owners offer **Stop**; stopped named owners
+offer **Delete**. A merged row lists each eligible machine separately. Deletion
+requires a second confirmation naming the machine and actual session; Cancel
+is selected by default. It removes that owner's saved session and logs, not
+project directories or other machines' same-name sessions. The owner rechecks
+that the session is stopped before deleting. The `default` session cannot be
+deleted. Unknown/unreachable owners do not offer destructive actions.
+
+The equivalent commands, run only after choosing the owner, are:
+
+```sh
+luvus session delete review
+ssh devbox 'luvus session delete review'
+```
+
+Public CLI/UHP session inventories export owner namespaces, not the local
+presentation servers used by managed attaches. Presentation identity is saved
+independently of workspaces and survives stop or remote-registration removal.
+Literal owner names beginning with `remote-` remain valid and discoverable.
+Unmarked legacy namespaces are not guessed from their names or deleted.
+
 ### Flat or tree workspace sidebar
 
 Choose **Settings → Layout → Workspace display** to switch live between:

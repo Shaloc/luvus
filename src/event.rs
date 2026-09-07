@@ -168,10 +168,10 @@ pub enum AppEvent {
         generation: String,
         result: Result<Vec<crate::git::model::Worktree>, String>,
     },
-    /// A stop request for a named session finished (from the session-menu context menu).
-    NamedSessionStopped {
+    /// An explicit owner stop/delete from the session context menu finished.
+    NamedSessionOperationFinished {
         generation: u64,
-        name: String,
+        label: String,
         result: Result<(), String>,
     },
     /// A selected named session is ready for this client to attach.

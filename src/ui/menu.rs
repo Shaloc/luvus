@@ -541,11 +541,33 @@ pub(super) fn draw_session_menu(
         return;
     };
     let anchor = menu.anchor;
-    let rows: Vec<MenuRow> = vec![MenuRow {
-        text: cat.menu_stop_session.to_string(),
-        divider: false,
-        destructive: true,
-    }];
+    let actions = menu.actions();
+    let selected = menu.selected;
+    let rows: Vec<MenuRow> = actions
+        .iter()
+        .map(|item| {
+            use crate::app::SessionMenuItem::*;
+            let text = match *item {
+                Stop(index) => format!(
+                    "{} · {}",
+                    cat.menu_stop_session,
+                    menu.targets[index].label(cat)
+                ),
+                Delete(index) | ConfirmDelete(index) => format!(
+                    "{} · {}",
+                    cap_first(cat.act_delete),
+                    menu.targets[index].label(cat)
+                ),
+                Cancel => cap_first(cat.act_cancel),
+                Explanation => cat.session_delete_confirm.to_string(),
+            };
+            MenuRow {
+                text,
+                divider: false,
+                destructive: matches!(item, Stop(_) | Delete(_) | ConfirmDelete(_)),
+            }
+        })
+        .collect();
     let rects = render_popup(
         f,
         area,
@@ -554,14 +576,14 @@ pub(super) fn draw_session_menu(
         t,
         PopupCtx {
             hover: app.hover,
-            selected: None,
+            selected: app.hover.is_none().then_some(selected),
             mobile: app.compact,
             id: PopupId::Session,
             scroll: &mut app.menu_scroll,
         },
     );
     if let Some(menu) = app.session_menu.as_mut() {
-        menu.items = vec![(crate::app::SessionMenuItem::Stop, rects[0])];
+        menu.items = actions.into_iter().zip(rects).collect();
     }
 }
 
@@ -986,6 +1008,61 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
+
+    #[test]
+    fn session_delete_confirmation_clicks_stay_inside_desktop_and_mobile_viewports() {
+        use crate::app::{SessionMenu, SessionMenuItem};
+        let _env = crate::persist::test_env("session-delete-popup-geometry");
+        for compact in [false, true] {
+            let mut app = crate::app::remote::tests::remote_ui_app();
+            app.compact = compact;
+            let area = Rect::new(7, 3, 100, 18);
+            app.session_menu = Some(SessionMenu {
+                anchor: (area.right() - 1, area.bottom() - 1),
+                items: Vec::new(),
+                selected: 1,
+                confirming: Some(0),
+                targets: vec![crate::app::session_menu::SessionMenuTarget {
+                    name: "saved".into(),
+                    remote: Some(
+                        crate::session::remote::RemoteSession::new("build", "saved").unwrap(),
+                    ),
+                    running: false,
+                    current: false,
+                }],
+            });
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            let theme = app.theme.clone();
+            let catalog = app.catalog;
+            draw_session_menu(
+                &mut RenderTarget::new(&mut buffer, area),
+                area,
+                &mut app,
+                catalog,
+                &theme,
+            );
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(text.contains("Delete · build · saved"));
+            assert!(text.contains("Project files are kept."));
+            let menu = app.session_menu.as_ref().unwrap();
+            for (_, rect) in &menu.items {
+                assert!(rect.x >= area.x && rect.right() <= area.right());
+                assert!(rect.y >= area.y && rect.bottom() <= area.bottom());
+                assert_eq!(rect.height, if compact { 2 } else { 1 });
+            }
+            let cancel = menu
+                .items
+                .iter()
+                .find(|(item, _)| *item == SessionMenuItem::Cancel)
+                .unwrap()
+                .1;
+            app.session_menu_click(cancel.x, cancel.bottom() - 1);
+            assert!(
+                app.session_menu.is_none(),
+                "both rows of the compact Cancel target are actionable"
+            );
+        }
+    }
 
     /// A FILES menu with two editors is ten rows, which does not fit a ten-row
     /// terminal — the shape that used to lose its last rows outright.
