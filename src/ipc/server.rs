@@ -2645,6 +2645,113 @@ mod tests {
         }
 
         #[test]
+        fn remote_agent_focus_publishes_the_owner_focus_change() {
+            let _env = crate::persist::test_env("remote-agent-focus-event");
+            let mut fixture = Fixture::new();
+            let first = fixture.target_pane();
+            fixture.input(2, ClientInput::Command("new_tab".into()));
+            let sequence = crate::ipc::api::current_sequence(&fixture.app.events);
+            fixture.input(
+                2,
+                ClientInput::Command(format!("remote_agent_focus {}", first.0)),
+            );
+            assert_eq!(fixture.target_pane(), first);
+            fixture.assert_foreground_unchanged();
+            let snapshot = fixture.app.runtime_snapshot();
+            let workspace = snapshot["workspaces"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|workspace| workspace["id"] == fixture.workspace_id)
+                .unwrap();
+            assert_eq!(workspace["tabs"][0]["panes"][0]["workspace_focused"], true);
+            let events = crate::ipc::api::replayed_events_after(&fixture.app.events, sequence);
+            let expected_pane = first.0.to_string();
+            assert!(
+                events.iter().any(|event| event["event"] == "pane.focused"
+                    && event["data"]["pane"].as_str() == Some(expected_pane.as_str())),
+                "owner focus is correct but subscribers never learn the change: {events:?}"
+            );
+        }
+
+        #[test]
+        fn projection_focus_events_cover_tabs_prefix_mouse_api_and_noops() {
+            use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+            let _env = crate::persist::test_env("projection-focus-routes");
+            let mut fixture = Fixture::new();
+            let first = fixture.target_pane();
+            fixture.input(2, ClientInput::Command("new_tab".into()));
+            let second = fixture.target_pane();
+            let focus_events = |app: &App, sequence| {
+                crate::ipc::api::replayed_events_after(&app.events, sequence)
+                    .into_iter()
+                    .filter(|event| event["event"] == "pane.focused")
+                    .map(|event| event["data"]["pane"].as_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
+            };
+            for (input, expected) in [
+                (ClientInput::Command("prev_tab".into()), first),
+                (
+                    ClientInput::PrefixKey(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE)),
+                    second,
+                ),
+                (
+                    ClientInput::Command(format!("remote_agent_focus {}", first.0)),
+                    first,
+                ),
+            ] {
+                let sequence = crate::ipc::api::current_sequence(&fixture.app.events);
+                fixture.input(2, input);
+                assert_eq!(fixture.target_pane(), expected);
+                assert_eq!(
+                    focus_events(&fixture.app, sequence),
+                    [expected.0.to_string()]
+                );
+                fixture.assert_foreground_unchanged();
+            }
+            let second_tab = fixture
+                .app
+                .tab_rects
+                .iter()
+                .find(|(index, _)| *index == 1)
+                .unwrap()
+                .1;
+            let sequence = crate::ipc::api::current_sequence(&fixture.app.events);
+            fixture.input(
+                2,
+                ClientInput::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: second_tab.x + 1,
+                    row: second_tab.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            );
+            assert_eq!(fixture.target_pane(), second);
+            assert_eq!(focus_events(&fixture.app, sequence), [second.0.to_string()]);
+            fixture.assert_foreground_unchanged();
+
+            // Api -> dispatch nests inside the event handler: emit exactly once.
+            let sequence = crate::ipc::api::current_sequence(&fixture.app.events);
+            fixture.api(
+                "pane.focus",
+                serde_json::json!({"pane": first.0.to_string()}),
+            );
+            assert_eq!(focus_events(&fixture.app, sequence), [first.0.to_string()]);
+            let sequence = crate::ipc::api::current_sequence(&fixture.app.events);
+            fixture.api(
+                "pane.focus",
+                serde_json::json!({"pane": first.0.to_string()}),
+            );
+            fixture.api("ping", serde_json::json!({}));
+            fixture.input(2, ClientInput::Resize(100, 30));
+            fixture.render();
+            assert!(
+                focus_events(&fixture.app, sequence).is_empty(),
+                "no focus event for no-op/read/resize/render"
+            );
+        }
+
+        #[test]
         fn workspace_projection_new_tab_resizes_before_another_input() {
             let _env = crate::persist::test_env("projection-new-tab-geometry");
             let mut fixture = Fixture::new();

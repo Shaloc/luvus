@@ -2410,6 +2410,10 @@ impl App {
 
     /// Validate and execute one bounded local API method against server-owned state.
     pub(crate) fn dispatch(&mut self, method: &str, p: &Value) -> Result<Value, (String, String)> {
+        self.with_focus_events(|app| app.dispatch_inner(method, p))
+    }
+
+    fn dispatch_inner(&mut self, method: &str, p: &Value) -> Result<Value, (String, String)> {
         self.check_remote_workspace_request(method, p)?;
         if Self::is_automation_mutation(method) && self.automation_admission_full() {
             return Err((
@@ -3461,7 +3465,6 @@ impl App {
                         )
                     })?;
                 self.focus_pane_global(next);
-                self.emit_event("pane.focused", json!({"pane":next.0.to_string()}));
                 Ok(json!({"type":"pane_focus","pane":next.0.to_string()}))
             }
             "pane.resize" => {

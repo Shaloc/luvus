@@ -57,10 +57,78 @@ mod tests {
     }
 
     fn render(app: &mut App) -> String {
+        render_buffer(app)
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    fn render_buffer(app: &mut App) -> ratatui::buffer::Buffer {
         let area = ratatui::layout::Rect::new(0, 0, 160, 60);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         crate::ui::render_into(&mut crate::ui::RenderTarget::new(&mut buffer, area), app);
-        buffer.content.iter().map(|cell| cell.symbol()).collect()
+        buffer
+    }
+
+    #[test]
+    fn remote_agent_mouse_selection_clears_keyboard_cursor_and_highlights_owner_identity() {
+        use crate::event::AppEvent;
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("remote-agent-selected-highlight");
+        for paths in [false, true] {
+            let mut app = remote_ui_app();
+            app.config.layout.agent_paths = paths;
+            app.agents_active_only = true;
+            let (view, input, _) = add_remote_workspace(&mut app);
+            remote_view(&mut app, view).agents = vec![agent(7, false), agent(8, false)];
+            remote_view(&mut app, view).agents[0].focused = true;
+            app.focus_agents_dock();
+            render(&mut app);
+            let hit = app
+                .remote_agent_rects
+                .iter()
+                .find(|(_, pane, _)| pane == "8")
+                .unwrap()
+                .2;
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x + 3,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert_eq!(
+                app.sidebar_focus, None,
+                "mouse selection must retire the old keyboard row"
+            );
+            assert!(
+                matches!(input.try_recv().unwrap(), ClientMessage::Command(command)
+                if command == "remote_agent_focus 8")
+            );
+            // Apply the owner's acknowledged focus, then reorder equal-name
+            // agents: the highlight must follow pane identity, not list index.
+            for agent in &mut remote_view(&mut app, view).agents {
+                agent.focused = agent.pane == "8";
+            }
+            for reorder in [false, true] {
+                if reorder {
+                    remote_view(&mut app, view).agents.swap(0, 1);
+                }
+                let buffer = render_buffer(&mut app);
+                for (_, pane, rect) in &app.remote_agent_rects {
+                    assert_eq!(
+                        buffer[(rect.x + 3, rect.y)].bg == app.theme.sel_bg,
+                        pane == "8",
+                        "highlight must identify owner pane {pane}"
+                    );
+                }
+            }
+            app.active_ws = 0;
+            let buffer = render_buffer(&mut app);
+            for (_, _, rect) in &app.remote_agent_rects {
+                assert_ne!(buffer[(rect.x + 3, rect.y)].bg, app.theme.sel_bg);
+            }
+        }
     }
 
     #[test]

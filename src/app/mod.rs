@@ -2445,6 +2445,9 @@ pub struct App {
     pub named_session_close_rect: Option<Rect>,
     pub named_session_row_rects: Vec<(usize, Rect)>,
     named_session_generation: u64,
+    /// Input may call API dispatch (and dispatch may call another method).
+    /// Publish one final focus change for that operation, not intermediate hops.
+    focus_event_scope: bool,
     /// One event-driven topology subscription per merged SSH session. Entries
     /// are added only by explicit startup/menu merge discovery and removed when
     /// that bounded worker exits; there is no idle polling.
@@ -3061,6 +3064,7 @@ impl App {
             named_session_close_rect: None,
             named_session_row_rects: Vec::new(),
             named_session_generation: 0,
+            focus_event_scope: false,
             remote_session_watchers: std::collections::HashMap::new(),
             remote_mouse_capture: None,
             pending_remote_navigation: None,
@@ -3739,6 +3743,7 @@ impl App {
             named_session_close_rect: None,
             named_session_row_rects: Vec::new(),
             named_session_generation: 0,
+            focus_event_scope: false,
             remote_session_watchers: std::collections::HashMap::new(),
             remote_mouse_capture: None,
             pending_remote_navigation: None,
@@ -7231,6 +7236,31 @@ impl App {
         self.preview_views.iter().copied().find(|id| {
             self.views.contains_key(id) && workspace.tabs.iter().any(|tab| tab.layout.contains(*id))
         })
+    }
+
+    fn focused_leaf(&self) -> Option<PaneId> {
+        let workspace = self.workspaces.get(self.active_ws)?;
+        Some(workspace.tabs.get(workspace.active_tab)?.layout.focus)
+    }
+
+    /// Reuse the existing focus event for all user/API mutation paths. This is
+    /// O(1), including for workspace-scoped remote input: the server restores
+    /// another client's workspace only after this operation returns.
+    fn with_focus_events<T>(&mut self, action: impl FnOnce(&mut Self) -> T) -> T {
+        if self.focus_event_scope {
+            return action(self);
+        }
+        let before = self.focused_leaf();
+        self.focus_event_scope = true;
+        let result = action(self);
+        self.focus_event_scope = false;
+        let after = self.focused_leaf();
+        if after != before {
+            if let Some(pane) = after {
+                self.emit_event("pane.focused", json!({"pane": pane.0.to_string()}));
+            }
+        }
+        result
     }
 
     fn focus_pane_global(&mut self, id: PaneId) {

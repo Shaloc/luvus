@@ -72,6 +72,11 @@ the display client's. Global session navigation and local Settings/Agents stay
 local. Pressing the prefix twice sends the owner's configured prefix once.
 The bottom status bar identifies the active remote host and actual session.
 
+The Agents highlight follows the pane selected on the workspace's owner, not
+the agent's working/idle state. Mouse, tab, prefix and CLI/API focus changes
+update it through the existing event subscription without periodic polling.
+Clicking an agent also leaves keyboard list navigation, matching local rows.
+
 Merge uses an existing same-name local owner (running or saved); it never
 creates a local session merely because you opened or created a remote one.
 If that name exists only remotely, the switcher and CLI attach keep using the

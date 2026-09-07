@@ -6,6 +6,7 @@ Use --restart-only for the isolated server restart --all smoke test.
 Use --dimensions-only for the local split/close/resize regression.
 Use --session-discovery-only for owner inventory and session deletion regression.
 Use --remote-only-open-only for merge routing without implicit local owners.
+Use --agent-focus-only for Agents highlight and owner focus synchronization.
 All homes, sockets, files and child processes are isolated below target/.
 No production server or actual SSH destination is accessed.
 """
@@ -16,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import select
+import socket
 import shlex
 import shutil
 import subprocess
@@ -68,11 +70,12 @@ def main():
     repo = Path(__file__).resolve().parent.parent
     restart_only = "--restart-only" in sys.argv[1:]
     agent_state_only = "--agent-state-only" in sys.argv[1:]
+    agent_focus_only = "--agent-focus-only" in sys.argv[1:]
     clipboard_only = "--clipboard-helper-only" in sys.argv[1:]
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -575,6 +578,77 @@ def main():
             assert saved_dir(False).exists()
             assert api("uhp.capabilities", remote=True)["server_generation"] == owner_generation
             print("PASS: unmerged remote stopped row: outside click cancels; confirmed Delete removes remote only", flush=True)
+            return
+
+        if agent_focus_only:
+            first = pane
+            api("tab.new", remote=True)
+            second = next(p["pane"] for p in api("pane.list", remote=True)["panes"] if p["focused"])
+            for owner_pane, status in ((first, "idle"), (second, "working")):
+                api("agent.report", {"pane": owner_pane, "source": "smoke/focus", "agent": "qodercli",
+                                     "status": status, "ttl_s": 300}, remote=True)
+            for mode in ("direct-remote", "merge", "merge-tree"):
+                merged = mode != "direct-remote"
+                api("pane.focus", {"pane": second}, remote=True)
+                run("session", "merge", "on" if merged else "off")
+                api("config.patch", {"patch": {"layout": {
+                    "workspace_display": "tree" if mode == "merge-tree" else "flat"}}})
+                if merged:
+                    wait_for(projected)
+                    workspace = next(w for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
+                    api("workspace.focus", {"workspace": workspace["workspace"]})
+                process, master = start_client(["--session", "api"] if merged else
+                                               ["session", "attach", "remote-fake-dev-api"])
+                # Read the presentation's own API, not the --host CLI route
+                # that intentionally bypasses presentation and reaches its owner.
+                selected = "api" if merged else "remote-fake-dev-api"
+                info = api("session.status", {"name": selected})["session"]
+                assert Path(info["session_dir"]).resolve() == root / "local-state/sessions" / selected
+                def highlighted():
+                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                        connection.settimeout(2)
+                        connection.connect(info["socket_path"])
+                        connection.sendall(b'{"id":"focus","method":"agent.list","params":{}}\n')
+                        with connection.makefile("rb") as reader:
+                            response = json.loads(reader.readline(1024 * 1024))
+                    return [a["owner_pane"] for a in response["result"]["agents"]
+                            if a.get("host") == "fake-dev" and a["focused"]]
+                def synchronized(expected):
+                    wait_for(lambda: any(p["pane"] == expected and p["focused"]
+                                         for p in api("pane.list", remote=True)["panes"]))
+                    try:
+                        wait_for(lambda: highlighted() == [expected])
+                    except AssertionError as error:
+                        raise AssertionError(f"{mode}: Agents highlight {highlighted()} differs from selected owner pane {expected}") from error
+                synchronized(second)
+                drain(master, 2)
+                screen = repaint(master)
+                click(master, *position(screen, "idle", before_column=25))
+                synchronized(first)
+                os.write(master, b"\x022")
+                synchronized(second)
+                api("pane.focus", {"pane": first}, remote=True)
+                synchronized(first)
+                screen = repaint(master)
+                click(master, *position(screen, "2", after_column=27, before_row=2))
+                synchronized(second)
+                third = host_cli("pane", "split", second)["pane"]
+                api("agent.report", {"pane": third, "source": "smoke/focus", "agent": "qodercli",
+                                     "status": "done", "ttl_s": 300}, remote=True)
+                api("pane.focus", {"pane": second}, remote=True)
+                synchronized(second)
+                repaint(master)
+                click(master, 100, 12)  # Right split within the fixed 120-column fixture.
+                synchronized(third)
+                click(master, 40, 12)   # Left split, still inside remote content.
+                synchronized(second)
+                host_cli("pane", "close", third)
+                assert process.poll() is None
+                process.terminate()
+                process.wait(timeout=5)
+                os.close(master)
+                clients.pop()
+                print(f"PASS: {mode}: Agents click/prefix/API/tab/split-pane clicks highlight the selected owner pane", flush=True)
             return
 
         if agent_state_only:

@@ -427,6 +427,11 @@ seconds), and `starting`; inspect that owner's `automation.get` for details.
 Terminal rows add `agent_pinned` and `workspace_focused`. The latter means the
 pane is selected in its own workspace's active tab, independently of which
 workspace another attached client is currently viewing.
+Actual focus changes publish the existing `pane.focused` event for the final
+selected leaf, including mouse, prefix and CLI/API operations in a projected
+workspace. No-op selections, reads, passive renders and resize alone do not
+publish focus changes. Consumers can reconcile `workspace_focused` from the
+next snapshot rather than polling or inferring focus from agent status.
 Use `config.get` / `config.patch` with the `remote_hosts` string array to inspect
 or change the same managed-host selection exposed in Settings → Remote. The
 default is empty. Configuration changes reconcile active merge projections;

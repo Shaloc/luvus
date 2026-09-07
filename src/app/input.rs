@@ -424,6 +424,10 @@ impl App {
     /// changes when the pane echoes (a separate `PtyData` event), so we don't waste
     /// a full render per keystroke.
     pub fn handle_event(&mut self, ev: AppEvent) -> bool {
+        self.with_focus_events(|app| app.handle_event_inner(ev))
+    }
+
+    fn handle_event_inner(&mut self, ev: AppEvent) -> bool {
         // A pending owner-menu focus may not follow the user after they leave
         // its source workspace. This is an O(1) pane/generation check only.
         self.discard_stale_remote_navigation();

@@ -318,6 +318,7 @@ impl App {
                 self.open_agent_menu(super::AgentTarget::RemoteLive { view, pane }, 2, 2);
             }
         } else {
+            self.sidebar_focus = None;
             self.send_workspace_remote(
                 index,
                 ClientMessage::Command(format!("remote_agent_focus {pane}")),
