@@ -598,6 +598,18 @@ fn draw_content(
                     V::Ctl(i) => *i,
                 };
                 match &rows[i] {
+                    LayoutRow::AutoWorkspaceRehome => {
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.settings.auto_workspace_rehome,
+                            toggle(l.auto_workspace_rehome, t),
+                            t,
+                        ));
+                    }
                     LayoutRow::WorkspaceDisplay => {
                         let value = match app.config.layout.workspace_display {
                             crate::config::WorkspaceDisplay::Flat => cat.settings.workspace_flat,

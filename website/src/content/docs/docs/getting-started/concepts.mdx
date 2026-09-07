@@ -71,6 +71,11 @@ Session         normally contains one or more workspaces
   project `cwd` stays fixed, while its displayed terminal path follows the
   focused pane's live cwd. With several splits, focusing a different pane shows
   that pane's path, and every pane keeps its own working directory.
+  Tabs stay in their chosen workspace by default, including when background
+  agent commands run in another Git checkout. Settings → Layout → Auto-move
+  tabs by directory can opt into automatic grouping by scanned process
+  directories. Turning it off prevents new automatic moves, without undoing
+  previous ones or disabling directory and branch tracking.
 - **Tabs** hold split layouts. Two special tabs exist: the
   [git tab](/docs/guides/git/) and the
   [orchestration board](/docs/guides/orchestration/).

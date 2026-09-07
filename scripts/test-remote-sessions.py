@@ -3,6 +3,7 @@
 
 Run after cargo build: python3 scripts/test-remote-sessions.py
 Use --restart-only for the isolated server restart --all smoke test.
+Use --dimensions-only for the local split/close/resize regression.
 All homes, sockets, files and child processes are isolated below target/.
 No production server or actual SSH destination is accessed.
 """
@@ -66,7 +67,8 @@ def main():
     restart_only = "--restart-only" in sys.argv[1:]
     agent_state_only = "--agent-state-only" in sys.argv[1:]
     clipboard_only = "--clipboard-helper-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--clipboard-helper-only")]
+    dimensions_only = "--dimensions-only" in sys.argv[1:]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--clipboard-helper-only", "--dimensions-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -254,6 +256,13 @@ def main():
         run("--session", "api", "server", "start", remote=True)
         run("--session", "second", "server", "start", remote=True)
         run("--session", "api", "server", "start")
+        for remote in (False, True):
+            assert api("config.get", remote=remote)["config"]["layout"]["auto_workspace_rehome"] is False
+        api("config.patch", {"patch": {"layout": {"auto_workspace_rehome": True}}})
+        assert api("config.get")["config"]["layout"]["auto_workspace_rehome"] is True
+        assert api("config.get", remote=True)["config"]["layout"]["auto_workspace_rehome"] is False
+        api("config.patch", {"patch": {"layout": {"auto_workspace_rehome": False}}})
+        print("PASS: automatic workspace rehome defaults off on both owners; live settings stay owner-local", flush=True)
         api("config.patch", {"patch": {"remote_hosts": ["fake-dev", "fake-old"]}})
         missing = run("--host", "fake-dev", "--session", "search-stopped", "workspace", "list", okay=False)
         assert missing.returncode, "remote CLI must not start a stopped owner"
@@ -554,6 +563,11 @@ def main():
                     pattern = re.compile(rf"(?:^|\n){marker}_(\d+)_(\d+)(?:\r?\n|$)")
                     match = wait_for(lambda: pattern.search(owner("pane.read", {"pane": temp_pane})["text"]))
                     return tuple(map(int, match.groups()))
+                # Consume the display after the split/close API sequence.
+                # Those calls confirm logical topology, not a rendered frame.
+                # Let the display consume pending frames and the asynchronous
+                # PTY resize settle before sampling the unsplit baseline.
+                drain(master)
                 before = size("before")
                 assert 10 <= before[0] <= 30 and 40 <= before[1] <= 120, before
                 if mode != "local":
@@ -568,6 +582,8 @@ def main():
                 assert size("restored") == before
 
             row("display resize reaches actual owner PTY; grow and restore", dimensions)
+            if dimensions_only:
+                return
 
             def prefix_help():
                 drain(master)
@@ -824,6 +840,8 @@ def main():
             remote_view = args[0] == "session"
             drain(master, 2)
             owner_matrix(master, "direct-remote" if remote_view else "local")
+            if dimensions_only:
+                return
             # Real context-menu click -> owner-side Git choices -> selection.
             os.write(master, b"\x1b[<2;8;4M\x1b[<2;8;4m")
             menu_screen = drain(master)

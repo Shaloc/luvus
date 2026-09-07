@@ -241,6 +241,10 @@ pub struct LayoutConfig {
     /// Flat keeps hostname tags; tree groups the same workspaces by machine.
     #[serde(default)]
     pub workspace_display: WorkspaceDisplay,
+    /// Allow scanned process directories to create workspaces and move tabs.
+    /// Opt-in: background agent commands must not reorganize the sidebar.
+    #[serde(default)]
+    pub auto_workspace_rehome: bool,
     /// Show the workspace/path detail line beneath each AGENTS entry. On by
     /// default; the row context menu can hide it for a denser one-row list.
     #[serde(default = "yes")]
@@ -515,6 +519,7 @@ impl Default for LayoutConfig {
             agent_title: false,
             workspace_paths: true,
             workspace_display: WorkspaceDisplay::Flat,
+            auto_workspace_rehome: false,
             agent_paths: true,
             resume_in_new_workspace: true,
             new_pane_to_workspace_root: false,
@@ -877,6 +882,24 @@ fn apply_delta(target: &mut Value, delta: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_workspace_rehome_defaults_off_and_roundtrips() {
+        assert!(!LayoutConfig::default().auto_workspace_rehome);
+        for source in ["{}", r#"{"layout":{}}"#] {
+            let config: Config = serde_json::from_str(source).unwrap();
+            assert!(!config.layout.auto_workspace_rehome);
+        }
+        for enabled in [false, true] {
+            let value = serde_json::json!({"layout":{"auto_workspace_rehome":enabled}});
+            let config: Config = serde_json::from_value(value).unwrap();
+            assert_eq!(config.layout.auto_workspace_rehome, enabled);
+            assert_eq!(
+                serde_json::to_value(config).unwrap()["layout"]["auto_workspace_rehome"],
+                enabled
+            );
+        }
+    }
 
     #[test]
     fn workspace_display_defaults_roundtrips_and_tolerates_future_disk_values() {
