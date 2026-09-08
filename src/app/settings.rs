@@ -348,7 +348,7 @@ impl App {
                 .as_ref()
                 .and_then(|ui| ui.remote_hosts.as_ref())
                 .and_then(|result| result.as_ref().ok())
-                .map_or(1, |hosts| hosts.len() + 1),
+                .map_or(2, |hosts| hosts.len() + 2),
         }
     }
 
@@ -597,12 +597,23 @@ impl App {
             self.toggle_remote_merge();
             return;
         }
+        if cursor == 1 {
+            self.config.remote_auto_install = !self.config.remote_auto_install;
+            self.persist_config_patch(
+                &serde_json::json!({"remote_auto_install": self.config.remote_auto_install}),
+            );
+            if !self.config.remote_auto_install {
+                self.pending_remote_installs.clear();
+            }
+            self.emit_event("config.changed", serde_json::json!({}));
+            return;
+        }
         let Some(host) = self
             .settings
             .as_ref()
             .and_then(|ui| ui.remote_hosts.as_ref())
             .and_then(|result| result.as_ref().ok())
-            .and_then(|hosts| hosts.get(cursor - 1))
+            .and_then(|hosts| hosts.get(cursor - 2))
             .cloned()
         else {
             return;
@@ -612,6 +623,9 @@ impl App {
                 .remote_hosts
                 .retain(|candidate| candidate != &host);
         } else {
+            if self.config.remote_auto_install {
+                self.pending_remote_installs.insert(host.clone());
+            }
             self.config.remote_hosts.push(host);
             self.config.remote_hosts.sort();
         }
@@ -1044,8 +1058,16 @@ impl App {
     }
 
     pub(crate) fn apply_theme(&mut self, name: &str) {
+        if self.apply_theme_locally(name) {
+            self.sync_theme_to_connected_hosts();
+        }
+    }
+
+    /// Inbound config patches stay owner-local and never rebroadcast to SSH
+    /// peers. UI/CLI theme selection uses `apply_theme` above.
+    pub(super) fn apply_theme_locally(&mut self, name: &str) -> bool {
         let Some(selected) = self.theme_registry.theme(name) else {
-            return;
+            return false;
         };
         self.config.theme = theme::canonical(name).to_string();
         self.theme_selection_revision = self.theme_selection_revision.wrapping_add(1);
@@ -1053,6 +1075,7 @@ impl App {
         self.set_effective_theme(&theme_id, selected);
         self.changelog_rows = None;
         self.persist_config_patch(&serde_json::json!({"theme": theme_id}));
+        true
     }
 
     /// Swap the server's in-memory registry after an off-loop scan. A missing
@@ -1073,7 +1096,13 @@ impl App {
 
     /// Swap the UI language live + persist (docs/21) — mirrors `apply_theme`.
     fn apply_language(&mut self, code: &str) {
+        self.apply_language_locally(code);
+        self.sync_language_to_connected_hosts();
+    }
+
+    pub(super) fn apply_language_locally(&mut self, code: &str) {
         self.config.language = code.to_string();
+        self.remote_language_sync.revision = self.remote_language_sync.revision.wrapping_add(1);
         self.catalog = crate::i18n::by_code(code);
         self.persist_config_patch(&serde_json::json!({"language": code}));
     }
@@ -1592,6 +1621,54 @@ mod tests {
     }
 
     #[test]
+    fn remote_auto_install_requires_explicit_selection_and_defaults_off() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let _env = crate::persist::test_env("settings-remote-install");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        assert!(!app.config.remote_auto_install);
+        app.open_settings();
+        app.settings.as_mut().unwrap().tab = super::SettingsTab::Remote;
+        app.settings.as_mut().unwrap().remote_hosts = Some(Ok(vec!["fixture".into()]));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let policy_rect = app
+            .settings_ctl_rects
+            .iter()
+            .find(|(row, _)| *row == 1)
+            .unwrap()
+            .1;
+        let host_rect = app
+            .settings_ctl_rects
+            .iter()
+            .find(|(row, _)| *row == 2)
+            .unwrap()
+            .1;
+        assert!(policy_rect.bottom() <= host_rect.y);
+        let generation = app.remote_registry_generation;
+        app.handle_settings_click(policy_rect.x, policy_rect.y);
+        assert!(app.config.remote_auto_install);
+        assert_eq!(app.remote_registry_generation, generation);
+        assert!(app.pending_remote_installs.is_empty());
+        app.flush_config_for_test(&rx);
+        assert!(crate::config::load().remote_auto_install);
+        app.handle_settings_click(host_rect.x, host_rect.y);
+        assert!(app.pending_remote_installs.contains("fixture"));
+        assert!(app.remote_config_refresh_pending);
+        // Turning the policy off before persistence completes revokes the queued
+        // installation. No SSH install is launched from this unit test.
+        app.settings_activate(1);
+        assert!(!app.config.remote_auto_install);
+        assert!(app.pending_remote_installs.is_empty());
+        app.settings_activate(2);
+        app.flush_config_for_test(&rx);
+        assert!(crate::config::load().remote_hosts.is_empty());
+        assert!(!crate::config::load().remote_auto_install);
+    }
+
+    #[test]
     fn remote_host_selection_persists_and_ignores_closed_settings_results() {
         let _env = crate::persist::test_env("settings-remote-hosts");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1608,7 +1685,7 @@ mod tests {
             Ok(vec!["dev-a".into(), "dev-b".into()]),
         );
         app.settings.as_mut().unwrap().tab = super::SettingsTab::Remote;
-        app.settings_activate(2);
+        app.settings_activate(3);
         assert!(app.remote_config_refresh_pending);
         assert!(
             app.remote_host_status.is_empty(),
@@ -1622,7 +1699,7 @@ mod tests {
             app.remote_host_status[0].sessions.is_empty(),
             "discovery is asynchronous"
         );
-        app.settings_activate(2);
+        app.settings_activate(3);
         app.flush_config_for_test(&rx);
         assert!(crate::config::load().remote_hosts.is_empty());
     }

@@ -336,20 +336,30 @@ fn draw_content(
                 toggle(app.remote_merge_enabled, t),
                 t,
             ));
+            ctls.push(ctl_row(
+                f,
+                area,
+                area.y + 1,
+                1,
+                cursor,
+                cat.settings.remote_auto_install,
+                toggle(app.config.remote_auto_install, t),
+                t,
+            ));
             f.render_widget(
                 Paragraph::new(cat.settings.remote_hosts_hint).style(Style::new().fg(t.overlay1)),
                 Rect::new(
                     area.x,
-                    area.y + 1,
+                    area.y + 2,
                     area.width,
-                    area.height.saturating_sub(1).min(2),
+                    area.height.saturating_sub(2).min(2),
                 ),
             );
             let content = Rect::new(
                 area.x,
-                area.y + area.height.min(3),
+                area.y + area.height.min(4),
                 area.width,
-                area.height.saturating_sub(3),
+                area.height.saturating_sub(4),
             );
             let result = app
                 .settings
@@ -362,7 +372,7 @@ fn draw_content(
             if let Some(hosts) = hosts {
                 let avail = content.height as usize;
                 let scroll = cursor
-                    .saturating_sub(1)
+                    .saturating_sub(2)
                     .saturating_sub(avail.saturating_sub(1));
                 for (index, host) in hosts.iter().enumerate().skip(scroll).take(avail) {
                     let selected = app.config.remote_hosts.contains(host);
@@ -370,7 +380,7 @@ fn draw_content(
                         f,
                         content,
                         content.y + (index - scroll) as u16,
-                        index + 1,
+                        index + 2,
                         cursor,
                         host,
                         Line::from(Span::styled(

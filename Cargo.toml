@@ -19,6 +19,7 @@ categories = ["command-line-utilities", "development-tools"]
 # notes, previews, or CI/packaging files. `/changelog` is deliberately NOT
 # excluded — `build.rs` embeds those notes into the binary for the in-app
 # changelog modal, so they must be present when the crate is built anywhere.
+# The SSH host bootstrap embeds install.sh; it must also ship in source packages.
 exclude = [
     "/docs",
     "/.github",
@@ -31,7 +32,6 @@ exclude = [
     "/examples",
     "/CONTRIBUTING.md",
     "/SECURITY.md",
-    "/install.sh",
     "/install.ps1",
     "/RELEASING.md",
     "/scripts",

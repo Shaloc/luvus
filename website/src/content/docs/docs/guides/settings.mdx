@@ -12,6 +12,13 @@ If storage is busy or a write fails, Luvus retains the changes for retry and
 reports the failure. Socket-based config reload waits for pending saves rather
 than replacing the live settings with an older disk copy.
 
+Theme and language selection additionally synchronize to all running sessions
+on currently connected selected SSH hosts, including from a merged remote
+workspace. Other preferences remain owner-local. Incoming `config.patch`
+requests never rebroadcast; disconnected/stopped owners are not started or
+updated on reconnect. See [theme synchronization](/docs/guides/themes/#connected-remote-machines)
+for scope, custom-theme requirements, and failure behavior.
+
 | Tab | What's there |
 |---|---|
 | **General** | **Open files with** (read-only or an editor you have installed) and **File click behavior** (**Preview**, the default, or **Open in tab**), see [Browsing & Opening Files](/docs/guides/files/), then a **Notify** section with Retro, Soft, and Pulse sound styles, separate done and blocked toggles, and a test row for each cue |
@@ -21,6 +28,14 @@ than replacing the live settings with an older disk copy.
 | **Modules** | installed extensions: enable/disable, action counts, load warnings |
 | **Integrations** | install/uninstall the per-agent session hook (Claude · Copilot · Codex · Antigravity · opencode · Kimi · Qoder CLI · Grok · Hermes · OMP) |
 | **Language** | the UI and human CLI information in 9 languages (en · es · pt · fr · de · id · zh · ja · ko), swapped live; command syntax, JSON, and UHP remain canonical |
+| **Remote** | selected SSH hosts, global same-name merge, and **Auto-install Luvus when selecting a host** (off by default) |
+
+The automatic-install checkbox applies to subsequent explicit host selections,
+not to every SSH config entry or an already selected host. Enable it before
+checking a host; for a previously failed selection, deselect and select again.
+It installs a missing/incompatible fork binary on macOS ARM64 or Linux x86_64,
+using checksummed `Shaloc/luvus` releases. Compatible installations are skipped.
+It does not restart servers. See [remote host setup](/docs/guides/remote/#managed-remote-sessions).
 
 These docs run on the same palettes: the picker in the header (or in the menu
 on a phone) repaints this site with the theme you are curious about, so you can

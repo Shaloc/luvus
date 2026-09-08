@@ -15,8 +15,8 @@ err() { printf 'error: %s\n' "$1" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # ── pick a downloader ──
-if have curl; then DL="curl -fsSL"; DLO="curl -fsSL -o"
-elif have wget; then DL="wget -qO-"; DLO="wget -qO"
+if have curl; then DL="curl -fsSL --connect-timeout 10 --max-time 60"; DLO="curl -fsSL --connect-timeout 10 --max-time 60 -o"
+elif have wget; then DL="wget --timeout=60 --tries=1 -qO-"; DLO="wget --timeout=60 --tries=1 -qO"
 else err "need curl or wget"; fi
 
 # ── detect target triple ──
@@ -40,8 +40,14 @@ esac
 if [ -n "${LUVUS_VERSION:-}" ]; then
   tag="$LUVUS_VERSION"
 else
-  tag=$($DL "https://api.github.com/repos/$REPO/releases/latest" \
-        | grep '"tag_name"' | head -1 | cut -d'"' -f4)
+  metadata=$($DL "https://api.github.com/repos/$REPO/releases/latest") || metadata=""
+  tag=$(printf '%s\n' "$metadata" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  # Anonymous API requests can be rate-limited while public release redirects
+  # still work. Accept only a tag redirect belonging to this exact fork.
+  if [ -z "$tag" ] && have curl; then
+    latest=$(curl -fsSL --connect-timeout 10 --max-time 30 -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest") || latest=""
+    case "$latest" in "https://github.com/$REPO/releases/tag/"*) tag=${latest##*/} ;; esac
+  fi
   [ -n "$tag" ] || err "could not find the latest fork release (set LUVUS_VERSION to a fork release tag)"
 fi
 case "$tag" in
@@ -100,7 +106,12 @@ fi
 stage=$(mktemp -d "$dir/.luvus-update.XXXXXX")
 cp "$tmp/$BIN" "$stage/$BIN.new"
 chmod 755 "$stage/$BIN.new"
-"$stage/$BIN.new" --version --remote-session-protocol
+version=$("$stage/$BIN.new" --version --remote-session-protocol) || err "downloaded binary cannot run"
+printf '%s\n' "$version"
+case "$version" in
+  "luvus "*" remote-session=2 transport=9"|"luvus "*" remote-session=2 transport=10") ;;
+  *) err "downloaded binary is not a compatible modified remote-session build" ;;
+esac
 if [ -f "$dir/$BIN" ]; then
   cp -p "$dir/$BIN" "$stage/$BIN.previous"
   printf 'Previous binary saved to %s/%s.previous\n' "$stage" "$BIN"

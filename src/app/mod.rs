@@ -46,6 +46,7 @@ mod picker;
 mod preview;
 pub(crate) mod remote;
 pub(crate) mod remote_agents;
+mod remote_settings;
 mod search;
 pub(crate) mod session_menu;
 mod settings;
@@ -2459,7 +2460,11 @@ pub struct App {
     pending_remote_navigation: Option<remote::PendingRemoteNavigation>,
     remote_registry_generation: u64,
     remote_config_refresh_pending: bool,
+    remote_discovery_inflight: Option<u64>,
+    pending_remote_installs: std::collections::HashSet<String>,
     pub(crate) remote_host_status: Vec<crate::session::remote::HostStatus>,
+    remote_theme_sync: remote_settings::RemotePreferenceSync,
+    remote_language_sync: remote_settings::RemotePreferenceSync,
     pub(crate) remote_merge_enabled: bool,
     remote_watcher_generation: u64,
     closed_remote_workspaces: std::collections::HashSet<remote::RemoteWorkspaceRef>,
@@ -3072,7 +3077,11 @@ impl App {
             pending_remote_navigation: None,
             remote_registry_generation: 0,
             remote_config_refresh_pending: false,
+            remote_discovery_inflight: None,
+            pending_remote_installs: std::collections::HashSet::new(),
             remote_host_status: Vec::new(),
+            remote_theme_sync: remote_settings::RemotePreferenceSync::default(),
+            remote_language_sync: remote_settings::RemotePreferenceSync::default(),
             remote_merge_enabled: crate::session::remote::load_registry().merge_enabled(),
             remote_watcher_generation: 0,
             closed_remote_workspaces: std::collections::HashSet::new(),
@@ -3752,7 +3761,11 @@ impl App {
             pending_remote_navigation: None,
             remote_registry_generation: 0,
             remote_config_refresh_pending: false,
+            remote_discovery_inflight: None,
+            pending_remote_installs: std::collections::HashSet::new(),
             remote_host_status: Vec::new(),
+            remote_theme_sync: remote_settings::RemotePreferenceSync::default(),
+            remote_language_sync: remote_settings::RemotePreferenceSync::default(),
             remote_merge_enabled: crate::session::remote::load_registry().merge_enabled(),
             remote_watcher_generation: 0,
             closed_remote_workspaces: std::collections::HashSet::new(),

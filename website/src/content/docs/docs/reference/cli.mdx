@@ -136,7 +136,7 @@ themes:
   theme init <id> [--extends <id>]   write an editable TOML starter
   theme validate <path> [--strict] [--json]   validate without installing
   theme install <source> [--yes]     install a local file, HTTPS URL, GitHub repo, or community/<id>
-  theme use <id>            select and persist a registered theme
+  theme use <id>            select theme; sync connected SSH hosts
   theme uninstall <id>      remove an inactive local theme
   theme reload              rescan installed themes in the selected server
 
@@ -281,6 +281,8 @@ sessions:
                              toggle global same-name session merging
 
 remote:
+  host add <ssh-alias> [--install] [--json]
+                             enable and connect; --install allows fork installation
   --host <ssh-alias> [--session <name>] <command>
                              run server-backed CLI controls against the selected
                              session on a literal Host from ~/.ssh/config

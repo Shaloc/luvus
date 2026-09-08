@@ -137,6 +137,18 @@ or bypass a disabled host with raw SSH. Selecting a host connects and discovers
 its sessions. Opening the switcher (or pressing `r`) refreshes discovery;
 there is no idle polling. Newly created remote sessions need no registration.
 
+`luvus host add <alias> [--install] [--json]` selects a human-specified SSH
+config alias locally and discovers sessions without starting an owner. Use
+`--install` only with installation authorization. The saved
+`remote_auto_install` policy (Settings → Remote, default `false`) also allows
+installation on subsequent explicit host selection or `host add`; enabling
+policy alone, listing, config reload, and reconnect never install. Installation
+uses checksummed `Shaloc/luvus` releases for macOS ARM64 or Linux x86_64,
+backs up and atomically replaces the user-local binary, skips compatible builds,
+and never restarts servers. Authentication/host-key errors are not permission
+to install or bypass SSH checks. A failed admission remains selected for retry.
+`host add` is client-local, not a `--host`-routable or UHP installation method.
+
 ```sh
 luvus session remote list
 luvus session remote add <host> <actual-session-name> [--merge]
@@ -558,6 +570,14 @@ surface:
   clear authorization.
 - Validate theme sources before installing them. Do not uninstall the active
   theme or fetch a remote theme without explicit authorization.
+- `theme use <id>` on a running server also synchronizes that ID to running
+  sessions on its currently connected selected SSH hosts. Require that scope
+  to match the user's request; use `config.patch` with `{"patch":{"theme":"one-dark"}}`
+  for an owner-only change. Remote sync is asynchronous, does not start stopped
+  owners or install missing themes, and reports failures in the local UI.
+  Incoming patches and reconnects do not rebroadcast or trigger synchronization.
+  Settings language selection uses the same scope, independently of theme edits;
+  `config.patch {"patch":{"language":"zh"}}` remains owner-local.
 - CLI widget commands use `luvus bar ...`; the UHP method family is
   `ui.bar.*`. Inspect widgets and docks before changing placement or content.
   The optional `core:focused-pane` widget shows the focused owner's tab

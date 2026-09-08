@@ -88,6 +88,7 @@ pub fn is_cli(args: &[String]) -> bool {
                 | "update"
                 | "skill"
                 | "session"
+                | "host"
         )
     )
 }
@@ -121,6 +122,7 @@ Commands:
   bar          Publish and arrange top and bottom status widgets
   ui           Configure sidebars, docks, and notifications
   session      Manage local, remote, and merged server sessions
+  host         Enable and connect SSH hosts
   server       Inspect and manage the selected background server
   integration  Manage agent session-resume integrations
   skill        Enable, inspect, show, or remove the bundled agent skill
@@ -246,7 +248,7 @@ themes:
   theme init <id> [--extends <id>]   write an editable TOML starter
   theme validate <path> [--strict] [--json]   validate without installing
   theme install <source> [--yes]     install a local file, HTTPS URL, GitHub repo, or community/<id>
-  theme use <id>            select and persist a registered theme
+  theme use <id>            select theme; sync connected SSH hosts
   theme uninstall <id>      remove an inactive local theme
   theme reload              rescan installed themes in the selected server
 
@@ -391,6 +393,8 @@ sessions:
                              toggle global same-name session merging
 
 remote:
+  host add <ssh-alias> [--install] [--json]
+                             enable and connect; --install allows fork installation
   --host <ssh-alias> [--session <name>] <command>
                              run server-backed CLI controls against the selected
                              session on a literal Host from ~/.ssh/config
@@ -500,6 +504,9 @@ fn run_inner(args: &[String]) -> Result<i32> {
             &args[2.min(args.len())..],
             crate::i18n::cli::Context::configured(),
         );
+    }
+    if args.get(1).map(String::as_str) == Some("host") {
+        return host_cmd(&args[2..], crate::i18n::cli::Context::configured());
     }
     if args.get(1).map(String::as_str) == Some("uhp")
         && args.get(2).map(String::as_str) == Some("access")
@@ -680,6 +687,7 @@ fn help_topic_has_subcommands(topic: &str) -> bool {
             | "bar"
             | "ui"
             | "session"
+            | "host"
             | "server"
             | "integration"
             | "skill"
@@ -693,8 +701,8 @@ fn normalize_help_topic(topic: &str) -> Option<&str> {
     match topic {
         "workspace" | "tab" | "pane" | "agent" | "files" | "git" | "mission" | "worktree"
         | "task" | "lease" | "automation" | "module" | "theme" | "bar" | "ui" | "session"
-        | "server" | "integration" | "diff" | "skill" | "wait" | "search" | "events" | "uhp"
-        | "ping" | "doctor" | "kitten" | "update" | "attach" => Some(topic),
+        | "host" | "server" | "integration" | "diff" | "skill" | "wait" | "search" | "events"
+        | "uhp" | "ping" | "doctor" | "kitten" | "update" | "attach" => Some(topic),
         "node" => Some("pane"),
         "remote" | "--remote" => Some("remote"),
         _ => None,
@@ -887,6 +895,10 @@ fn write_topic_help_english(
             "luvus [--session <name>] --remote <host> [ssh args]",
             detailed_section("remote:\n", "\nserver:\n"),
         ),
+        "host" => (
+            "luvus host add <ssh-alias> [--install] [--json]",
+            "  host add <ssh-alias> [--install] [--json]\n                             enable and connect; --install allows fork installation\n",
+        ),
         "server" => (
             "luvus [--session <name>] server <command>",
             detailed_section_to_end("server:\n"),
@@ -986,6 +998,52 @@ fn detailed_section_to_end(start: &str) -> &'static str {
         .find(start)
         .expect("help section start must exist");
     &DETAILED_USAGE[start..]
+}
+
+fn parse_host_add(args: &[String]) -> Result<(&str, bool, bool)> {
+    const USAGE: &str = "usage: luvus host add <ssh-alias> [--install] [--json]";
+    if args.first().map(String::as_str) != Some("add") {
+        return Err(anyhow!(USAGE));
+    }
+    let host = args.get(1).ok_or_else(|| anyhow!(USAGE))?;
+    crate::session::remote::validate_host_alias(host).map_err(anyhow::Error::msg)?;
+    let mut install = false;
+    let mut json = false;
+    for arg in &args[2..] {
+        match arg.as_str() {
+            "--install" if !install => install = true,
+            "--json" if !json => json = true,
+            _ => return Err(anyhow!(USAGE)),
+        }
+    }
+    Ok((host, install, json))
+}
+
+fn host_cmd(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
+    let (host, install, json_output) = parse_host_add(args)?;
+    if crate::session::remote::process_target().is_some() {
+        return session_error(
+            "invalid_request",
+            "host add configures local SSH admission; omit --host",
+            json_output,
+        );
+    }
+    match crate::session::remote::bootstrap::add_host(host, install) {
+        Ok(status) => {
+            if json_output {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &json!({"type":"host_added", "host":status.host,"sessions":status.sessions})
+                    )?
+                );
+            } else {
+                println!("{} {}", context.text("connected SSH host"), host);
+            }
+            Ok(0)
+        }
+        Err(error) => session_error("host_add_failed", &error, json_output),
+    }
 }
 
 fn session_cmd(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
@@ -4446,6 +4504,35 @@ mod tests {
     use std::io::BufRead;
 
     #[test]
+    fn host_add_parser_and_help_reject_ambiguous_admission() {
+        assert!(is_cli(&argv("luvus host add dev --install")));
+        assert_eq!(
+            parse_host_add(&argv("add dev --json --install")).unwrap(),
+            ("dev", true, true)
+        );
+        assert_eq!(
+            parse_host_add(&argv("add dev")).unwrap(),
+            ("dev", false, false)
+        );
+        for args in [
+            "",
+            "add",
+            "remove dev",
+            "add dev extra",
+            "add --install",
+            "add dev --install --install",
+            "add dev --json --json",
+            "add dev --yes",
+            "add user@host",
+            "add dev;true",
+        ] {
+            assert!(parse_host_add(&argv(args)).is_err(), "{args}");
+        }
+        assert!(rendered_topic_help("host", None).contains("host add <ssh-alias>"));
+        assert!(rendered_topic_help("host", Some("add")).contains("--install"));
+    }
+
+    #[test]
     fn kitten_cli_help_and_invalid_flags_are_local_and_non_mutating() {
         let _env = crate::persist::test_env("cli-kitten");
         assert!(is_cli(&argv("luvus kitten status")));
@@ -4559,6 +4646,7 @@ mod tests {
                             | "task"
                             | "automation"
                             | "integration"
+                            | "host"
                     )
                 ) && !trimmed.contains("  ");
                 if trimmed.is_empty()

@@ -453,6 +453,14 @@ It includes the current event sequence, so a consumer can subscribe first and
 reconcile later events without a snapshot race. Neither method reads terminal
 text or starts a process.
 
+`config.remote_auto_install` is a boolean, default `false`. Changing it through
+`config.patch` only saves owner-local policy and never installs a binary.
+Installation is admitted by a later explicit Settings host selection or local
+`luvus host add <alias> [--install]`; it is not a remote UHP operation.
+Local Settings language and theme changes fan out to connected hosts' running
+owners through surgical `config.patch` requests. Incoming language/theme patches
+apply live and persist without rebroadcast or remote discovery.
+
 `pane.processes` returns the already-cached executable names from Luvus's shared
 off-loop process scan. Full argument vectors are never exposed because they can
 contain prompts, credentials, or tokens. `scan:"unavailable"` is uncertainty,
@@ -910,6 +918,14 @@ mutation. `theme.reload` scans and parses the home-level `themes/` directory on
 the API connection worker, then sends one validated registry to the
 single-writer app loop. If the configured theme disappeared, Luvus falls back
 visually but preserves its configured ID and reports `selected_available:false`.
+
+In this fork, `theme.use` also queues theme-only patches to running owners on
+currently connected selected SSH hosts. Its response acknowledges the local
+selection, not completion of the asynchronous fanout; remote failures appear
+as UI toasts. For an owner-local change use `config.patch` with
+`{"patch":{"theme":"one-dark"}}`. Incoming patches and reloads do not
+rebroadcast; offline CLI selection, initial connections, and reconnections
+do not queue synchronization. Remote custom themes must be preinstalled.
 
 ## Sidebar docks
 

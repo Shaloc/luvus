@@ -48,6 +48,42 @@ the session count or connection error. Opening the session switcher, or pressing
 `r` there, refreshes the list, including sessions created independently on the
 remote host. There is no idle polling and no connection to unselected hosts.
 
+Local **Settings → Theme** and **Settings → Language** changes synchronize
+the selected value to all running
+sessions on connected selected hosts, including when the focused workspace is
+remote. No other configuration is copied, and received patches do not fan out
+again. See [theme synchronization](/docs/guides/themes/#connected-remote-machines).
+
+You can also select and connect a configured SSH alias from the CLI:
+
+```sh
+luvus host add devbox
+luvus host add devbox --install --json
+```
+
+`host add` saves the alias in the local managed-host selection and discovers
+existing remote sessions; it does not create a session. `--install` permits
+installation only if the compatible fork binary is missing. Alternatively,
+enable **Settings → Remote → Auto-install Luvus when selecting a host** before
+selecting a host (or running `host add`). This policy defaults to **off**;
+changing it alone never starts installation. A failed host remains selected
+so its connection error can be inspected and retried.
+
+Installation runs the bundled fork installer via SSH. It detects the remote
+platform, supports **macOS arm64/aarch64** and **Linux x86_64**, verifies SHA-256,
+and atomically replaces `~/.local/bin/luvus` with a backup of any previous
+regular file. It downloads only from `Shaloc/luvus` releases, needs remote
+`curl` or `wget`, and does not need `gh`, `sudo`, SCP, or a remote build.
+Windows and other architectures fail without replacing the installation.
+An already compatible binary is left alone; this is not automatic updating.
+
+SSH authentication/host-key failures never trigger installation or bypass
+verification. Once installation has started it is bounded but disconnecting
+does not roll it back. **No server is started, stopped, or restarted** by host
+installation; an older running server may still need a user-triggered restart.
+Ordinary discovery, config reload, and background reconnect never install.
+`host add` is a local setup command, not a `--host`-routable UHP method.
+
 ```sh
 luvus session remote add devbox api
 # registered name: remote-devbox-api

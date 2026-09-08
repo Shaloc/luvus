@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod bootstrap;
 mod input;
 pub use input::RemoteInput;
 
@@ -108,6 +109,14 @@ pub struct HostStatus {
 /// User-triggered, bounded host discovery. Use the existing SSH preflight and
 /// local named-session inventory, never recursive remote discovery or SCP.
 pub fn discover_hosts() -> (RemoteRegistry, Vec<HostStatus>) {
+    discover_hosts_with_install(&HashSet::new())
+}
+
+/// Only explicit host admission passes install candidates. Read-only inventory
+/// and reconnection retain `discover_hosts`, which cannot install anything.
+pub(crate) fn discover_hosts_with_install(
+    install_hosts: &HashSet<String>,
+) -> (RemoteRegistry, Vec<HostStatus>) {
     let mut registry = load_registry();
     let hosts = crate::config::load().remote_hosts;
     registry
@@ -120,17 +129,23 @@ pub fn discover_hosts() -> (RemoteRegistry, Vec<HostStatus>) {
                 let jobs: Vec<_> = hosts
                     .iter()
                     .map(|host| {
-                        scope.spawn(move || match list_host_sessions(host) {
-                            Ok(sessions) => HostStatus {
-                                host: host.clone(),
-                                sessions,
-                                error: None,
-                            },
-                            Err(error) => HostStatus {
-                                host: host.clone(),
-                                sessions: vec![],
-                                error: Some(error),
-                            },
+                        scope.spawn(move || {
+                            match if install_hosts.contains(host) {
+                                bootstrap::connect_host(host, true).map(|status| status.sessions)
+                            } else {
+                                list_host_sessions(host)
+                            } {
+                                Ok(sessions) => HostStatus {
+                                    host: host.clone(),
+                                    sessions,
+                                    error: None,
+                                },
+                                Err(error) => HostStatus {
+                                    host: host.clone(),
+                                    sessions: vec![],
+                                    error: Some(error),
+                                },
+                            }
                         })
                     })
                     .collect();
@@ -953,11 +968,23 @@ pub enum RemoteBinaryLocation {
 }
 
 pub fn verify_remote_version(host: &str) -> Result<RemoteBinaryLocation, String> {
+    match inspect_remote_build(host)? {
+        RemoteBuild::Compatible(location) => Ok(location),
+        RemoteBuild::NeedsInstall(message) => Err(message),
+    }
+}
+
+enum RemoteBuild {
+    Compatible(RemoteBinaryLocation),
+    NeedsInstall(String),
+}
+
+fn inspect_remote_build(host: &str) -> Result<RemoteBuild, String> {
     require_enabled_host(host)?;
     let primary = run_version_command(version_command(host, false), host)?;
     let primary_result = verified_version_output(host, &primary);
     if let Ok(Some(location)) = primary_result.as_ref() {
-        return Ok(*location);
+        return Ok(RemoteBuild::Compatible(*location));
     }
     if !primary.status.success() && primary.status.code() != Some(127) {
         return Err(primary_result
@@ -968,16 +995,17 @@ pub fn verify_remote_version(host: &str) -> Result<RemoteBinaryLocation, String>
     // A stale PATH entry must not hide a matching official user install. Try
     // the same bounded standard-path fallback used by the bridge itself.
     let fallback = run_version_command(version_command(host, true), host)?;
+    if !fallback.status.success() && fallback.status.code() != Some(127) {
+        return Err(remote_version_probe_failed(host, &fallback));
+    }
     let fallback_result = verified_version_output(host, &fallback);
     if let Ok(Some(location)) = fallback_result.as_ref() {
-        return Ok(*location);
+        return Ok(RemoteBuild::Compatible(*location));
     }
-    fallback_result?;
-    primary_result?;
-    Err(format!(
-        "Luvus {} is required on SSH host `{host}`; install this modified version there (Luvus will not copy it automatically)",
+    Ok(RemoteBuild::NeedsInstall(fallback_result.err().or_else(|| primary_result.err()).unwrap_or_else(|| format!(
+        "Luvus {} is required on SSH host `{host}`; install this modified version there or use `luvus host add {host} --install`",
         env!("CARGO_PKG_VERSION")
-    ))
+    ))))
 }
 
 struct VersionOutput {
@@ -990,10 +1018,15 @@ fn run_version_command(command: Command, host: &str) -> Result<VersionOutput, St
     run_ssh_command(command, host, MAX_VERSION_OUTPUT_BYTES)
 }
 
-fn run_ssh_command(
+fn run_ssh_command(command: Command, host: &str, limit: usize) -> Result<VersionOutput, String> {
+    run_ssh_command_with_timeout(command, host, limit, VERSION_CHECK_TIMEOUT)
+}
+
+fn run_ssh_command_with_timeout(
     mut command: Command,
     host: &str,
     limit: usize,
+    timeout: Duration,
 ) -> Result<VersionOutput, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
@@ -1011,7 +1044,7 @@ fn run_ssh_command(
     };
     let stdout_reader = thread::spawn(move || drain_bounded(stdout, limit));
     let stderr_reader = thread::spawn(move || drain_bounded(stderr, MAX_VERSION_OUTPUT_BYTES));
-    let deadline = Instant::now() + VERSION_CHECK_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -1021,7 +1054,7 @@ fn run_ssh_command(
                 let _ = child.wait();
                 break Err(format!(
                     "timed out checking Luvus on SSH host `{host}` after {} seconds",
-                    VERSION_CHECK_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ));
             }
             Err(error) => {
@@ -1092,7 +1125,7 @@ fn verified_version_output(
     });
     if !remote_protocol || !transport_protocol {
         return Err(format!(
-            "SSH host `{host}` has Luvus {version}, but it is not a compatible modified remote-session build; install a build supporting remote-session=2 and transport 9 or {} there (nothing will be installed automatically)",
+            "SSH host `{host}` has Luvus {version}, but it is not a compatible modified remote-session build; install a build supporting remote-session=2 and transport 9 or {} there, or use `luvus host add {host} --install`",
             crate::ipc::protocol::PROTOCOL_VERSION
         ));
     }
@@ -1483,6 +1516,28 @@ pub(crate) fn request_control(
     timeout: Duration,
     response_limit: usize,
 ) -> Result<serde_json::Value, String> {
+    request_control_in_scope(
+        target,
+        method,
+        params,
+        timeout,
+        response_limit,
+        Arc::new(ConnectionScope::default()),
+    )
+}
+
+/// The same existing-only request, cancellable by its owning user operation.
+pub(crate) fn request_control_in_scope(
+    target: &RemoteSession,
+    method: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+    response_limit: usize,
+    scope: Arc<ConnectionScope>,
+) -> Result<serde_json::Value, String> {
+    if !scope.wait_for_retry(Duration::ZERO) {
+        return Err("remote request cancelled".into());
+    }
     let location = verify_remote_version(&target.host)?;
     let connection = spawn_control(bridge_command_with_options(
         target,
@@ -1490,9 +1545,10 @@ pub(crate) fn request_control(
         location,
         &["--existing"],
     ))?;
-    request_on_control(connection, method, params, timeout, response_limit)
+    request_on_control_in_scope(connection, method, params, timeout, response_limit, scope)
 }
 
+#[cfg(test)]
 fn request_on_control(
     connection: ControlConnection,
     method: &str,
@@ -1500,10 +1556,28 @@ fn request_on_control(
     timeout: Duration,
     response_limit: usize,
 ) -> Result<serde_json::Value, String> {
+    request_on_control_in_scope(
+        connection,
+        method,
+        params,
+        timeout,
+        response_limit,
+        Arc::new(ConnectionScope::default()),
+    )
+}
+
+fn request_on_control_in_scope(
+    connection: ControlConnection,
+    method: &str,
+    params: serde_json::Value,
+    timeout: Duration,
+    response_limit: usize,
+    scope: Arc<ConnectionScope>,
+) -> Result<serde_json::Value, String> {
     use std::io::BufRead;
 
-    let scope = Arc::new(ConnectionScope::default());
     let mut connection = connection.in_scope(&scope)?;
+    let child = Arc::clone(&connection.child);
     let request = serde_json::json!({"id":"remote-request","method":method,"params":params});
     let wire = format!("{request}\n");
     if wire.len() > response_limit {
@@ -1535,7 +1609,12 @@ fn request_on_control(
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(_) => {
-            scope.cancel();
+            // A deadline belongs to this request, not the whole user operation:
+            // subsequent owners on the same host must remain reachable. Explicit
+            // deselection still kills all registered children through the scope.
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+            }
             Err("remote control request timed out".into())
         }
     }
@@ -1702,16 +1781,52 @@ mod tests {
     #[test]
     fn one_shot_remote_control_deadline_cancels_only_its_connection() {
         let connection = fixture_control("IFS= read -r request; exec sleep 10");
+        let scope = Arc::new(ConnectionScope::default());
         let started = Instant::now();
-        let result = request_on_control(
+        let result = request_on_control_in_scope(
             connection,
             "ping",
             serde_json::json!({}),
             Duration::from_millis(20),
             1024,
+            Arc::clone(&scope),
         );
         assert!(result.unwrap_err().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(scope.wait_for_retry(Duration::ZERO));
+        let connection =
+            fixture_control("IFS= read -r request; printf '%s\\n' '{\"result\":{\"ok\":true}}'");
+        let result = request_on_control_in_scope(
+            connection,
+            "ping",
+            serde_json::json!({}),
+            Duration::from_secs(1),
+            1024,
+            scope,
+        )
+        .unwrap();
+        assert_eq!(result["result"]["ok"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_remote_control_cancelled_scope_rejects_before_request() {
+        let connection = fixture_control("IFS= read -r request; exec sleep 10");
+        let child = Arc::clone(&connection.child);
+        let scope = Arc::new(ConnectionScope::default());
+        scope.cancel();
+        let started = Instant::now();
+        let result = request_on_control_in_scope(
+            connection,
+            "config.patch",
+            serde_json::json!({"patch":{"theme":"one-dark"}}),
+            Duration::from_secs(3),
+            1024,
+            scope,
+        );
+        assert!(result.unwrap_err().contains("closed"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(child.lock().unwrap().try_wait().unwrap().is_some());
     }
 
     #[cfg(unix)]

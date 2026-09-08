@@ -800,6 +800,7 @@ fn managed_remote_local_only_command(args: &[String]) -> Option<&str> {
     let local_only = matches!(
         command,
         "session"
+            | "host"
             | "theme"
             | "skill"
             | "doctor"

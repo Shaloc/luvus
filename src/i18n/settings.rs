@@ -36,6 +36,11 @@ pub const KEY_REFERENCE_KEYS: &[&[&str]] = &[
 ];
 
 pub struct Catalog {
+    pub language_sync_done: &'static str,
+    pub language_sync_failed: &'static str,
+    pub remote_auto_install: &'static str,
+    pub theme_sync_done: &'static str,
+    pub theme_sync_failed: &'static str,
     pub focused_pane_metadata: &'static str,
     pub auto_workspace_rehome: &'static str,
     pub workspace_display: &'static str,
@@ -120,6 +125,11 @@ pub struct Catalog {
 }
 
 pub static EN: Catalog = Catalog {
+    language_sync_done: "Language synchronized: {hosts}",
+    language_sync_failed: "Language sync failed: {error}",
+    remote_auto_install: "Auto-install Luvus when selecting a host",
+    theme_sync_done: "Theme synchronized: {hosts}",
+    theme_sync_failed: "Theme sync failed: {error}",
     focused_pane_metadata: "Current tab / pane",
     auto_workspace_rehome: "Auto-move tabs by directory",
     workspace_display: "Workspace display",
@@ -288,6 +298,11 @@ pub static EN: Catalog = Catalog {
 };
 
 pub static ES: Catalog = Catalog {
+    language_sync_done: "Idioma sincronizado: {hosts}",
+    language_sync_failed: "Error al sincronizar el idioma: {error}",
+    remote_auto_install: "Instalar Luvus al seleccionar un host",
+    theme_sync_done: "Tema sincronizado: {hosts}",
+    theme_sync_failed: "Error al sincronizar el tema: {error}",
     focused_pane_metadata: "Pestaña / panel actual",
     auto_workspace_rehome: "Mover pestañas por carpeta",
     workspace_display: "Vista de espacios",
@@ -327,6 +342,11 @@ pub static ES: Catalog = Catalog {
 };
 
 pub static PT: Catalog = Catalog {
+    language_sync_done: "Idioma sincronizado: {hosts}",
+    language_sync_failed: "Falha ao sincronizar o idioma: {error}",
+    remote_auto_install: "Instalar Luvus ao selecionar um host",
+    theme_sync_done: "Tema sincronizado: {hosts}",
+    theme_sync_failed: "Falha ao sincronizar o tema: {error}",
     focused_pane_metadata: "Aba / painel atual",
     auto_workspace_rehome: "Mover abas por pasta",
     workspace_display: "Visualização dos espaços",
@@ -364,6 +384,11 @@ pub static PT: Catalog = Catalog {
 };
 
 pub static FR: Catalog = Catalog {
+    language_sync_done: "Langue synchronisée : {hosts}",
+    language_sync_failed: "Échec de la synchronisation de la langue : {error}",
+    remote_auto_install: "Installer Luvus à la sélection d’un hôte",
+    theme_sync_done: "Thème synchronisé : {hosts}",
+    theme_sync_failed: "Échec de la synchronisation du thème : {error}",
     focused_pane_metadata: "Onglet / panneau actif",
     auto_workspace_rehome: "Déplacer onglets par dossier",
     workspace_display: "Vue des espaces",
@@ -401,6 +426,11 @@ pub static FR: Catalog = Catalog {
 };
 
 pub static DE: Catalog = Catalog {
+    language_sync_done: "Sprache synchronisiert: {hosts}",
+    language_sync_failed: "Sprachsynchronisierung fehlgeschlagen: {error}",
+    remote_auto_install: "Luvus bei Host-Auswahl installieren",
+    theme_sync_done: "Design synchronisiert: {hosts}",
+    theme_sync_failed: "Design-Synchronisierung fehlgeschlagen: {error}",
     focused_pane_metadata: "Aktueller Tab / Bereich",
     auto_workspace_rehome: "Tabs nach Ordner verschieben",
     workspace_display: "Arbeitsbereichsansicht",
@@ -438,6 +468,11 @@ pub static DE: Catalog = Catalog {
 };
 
 pub static ID: Catalog = Catalog {
+    language_sync_done: "Bahasa disinkronkan: {hosts}",
+    language_sync_failed: "Sinkronisasi bahasa gagal: {error}",
+    remote_auto_install: "Instal Luvus saat memilih host",
+    theme_sync_done: "Tema disinkronkan: {hosts}",
+    theme_sync_failed: "Sinkronisasi tema gagal: {error}",
     focused_pane_metadata: "Tab / panel aktif",
     auto_workspace_rehome: "Pindah tab sesuai direktori",
     workspace_display: "Tampilan ruang kerja",
@@ -603,6 +638,11 @@ pub static ID: Catalog = Catalog {
 };
 
 pub static ZH: Catalog = Catalog {
+    language_sync_done: "语言已同步：{hosts}",
+    language_sync_failed: "语言同步失败：{error}",
+    remote_auto_install: "选择主机时自动安装 Luvus",
+    theme_sync_done: "主题已同步：{hosts}",
+    theme_sync_failed: "主题同步失败：{error}",
     focused_pane_metadata: "当前标签页 / 窗格",
     auto_workspace_rehome: "自动迁移工作区",
     workspace_display: "工作区展示",
@@ -764,6 +804,11 @@ pub static ZH: Catalog = Catalog {
 };
 
 pub static JA: Catalog = Catalog {
+    language_sync_done: "言語を同期しました：{hosts}",
+    language_sync_failed: "言語の同期に失敗しました：{error}",
+    remote_auto_install: "ホスト選択時に Luvus を自動インストール",
+    theme_sync_done: "テーマを同期しました：{hosts}",
+    theme_sync_failed: "テーマの同期に失敗しました：{error}",
     focused_pane_metadata: "現在のタブ / ペイン",
     auto_workspace_rehome: "ディレクトリでタブを自動移動",
     workspace_display: "ワークスペース表示",
@@ -934,6 +979,11 @@ pub static JA: Catalog = Catalog {
 };
 
 pub static KO: Catalog = Catalog {
+    language_sync_done: "언어 동기화 완료: {hosts}",
+    language_sync_failed: "언어 동기화 실패: {error}",
+    remote_auto_install: "호스트 선택 시 Luvus 자동 설치",
+    theme_sync_done: "테마 동기화 완료: {hosts}",
+    theme_sync_failed: "테마 동기화 실패: {error}",
     focused_pane_metadata: "현재 탭 / 창",
     auto_workspace_rehome: "디렉터리별 탭 자동 이동",
     workspace_display: "작업 공간 표시",

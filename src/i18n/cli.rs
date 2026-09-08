@@ -133,6 +133,39 @@ macro_rules! tr {
 /// suffix, so canonical syntax at the start of a row is never rewritten.
 static HELP: &[Translation] = &[
     tr!(
+        "Enable and connect SSH hosts",
+        "Habilitar y conectar hosts SSH",
+        "Habilitar e conectar hosts SSH",
+        "Activer et connecter des hôtes SSH",
+        "SSH-Hosts aktivieren und verbinden",
+        "Aktifkan dan hubungkan host SSH",
+        "启用并连接 SSH 主机",
+        "SSH ホストを有効化して接続",
+        "SSH 호스트 활성화 및 연결"
+    ),
+    tr!(
+        "enable and connect; --install allows fork installation",
+        "habilitar y conectar; --install permite instalar el fork",
+        "habilitar e conectar; --install permite instalar o fork",
+        "activer et connecter ; --install autorise l'installation du fork",
+        "aktivieren und verbinden; --install erlaubt die Fork-Installation",
+        "aktifkan dan hubungkan; --install mengizinkan instalasi fork",
+        "启用并连接；--install 允许安装 fork 版本",
+        "有効化して接続；--install でフォーク版のインストールを許可",
+        "활성화 및 연결; --install로 포크 설치 허용"
+    ),
+    tr!(
+        "connected SSH host",
+        "host SSH conectado",
+        "host SSH conectado",
+        "hôte SSH connecté",
+        "SSH-Host verbunden",
+        "host SSH terhubung",
+        "已连接 SSH 主机",
+        "SSH ホストに接続しました",
+        "SSH 호스트 연결됨"
+    ),
+    tr!(
         "restart all running sessions on this host",
         "reiniciar todas las sesiones en ejecución de este host",
         "reiniciar todas as sessões em execução neste host",
@@ -1829,15 +1862,15 @@ static HELP: &[Translation] = &[
         "로컬 파일, HTTPS URL, GitHub 저장소, 또는 community/<id> 설치"
     ),
     tr!(
-        "select and persist a registered theme",
-        "seleccionar y guardar un tema registrado",
-        "selecionar e salvar um tema registrado",
-        "sélectionner et conserver un thème enregistré",
-        "registriertes Theme auswählen und speichern",
-        "pilih dan simpan tema terdaftar",
-        "选择并保存已注册主题",
-        "登録済みテーマを選択して保存",
-        "등록된 테마 선택 및 저장"
+        "select theme; sync connected SSH hosts",
+        "seleccionar tema; sincronizar hosts SSH conectados",
+        "selecionar tema; sincronizar hosts SSH conectados",
+        "choisir le thème ; synchroniser les hôtes SSH connectés",
+        "Theme wählen; verbundene SSH-Hosts synchronisieren",
+        "pilih tema; sinkronkan host SSH yang terhubung",
+        "选择主题并同步到已连接的 SSH 主机",
+        "テーマを選択し、接続中の SSH ホストに同期",
+        "테마 선택 및 연결된 SSH 호스트 동기화"
     ),
     tr!(
         "remove an inactive local theme",

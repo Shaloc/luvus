@@ -97,6 +97,12 @@ sessions. To upgrade, rerun the installer above; `luvus update`, the upstream
 website installers, Homebrew tap, and crates.io package still target upstream.
 Prebuilt fork releases currently cover only the two platforms listed above.
 
+After configuring an SSH alias, `luvus host add devbox --install` enables it
+and installs a missing/incompatible fork binary on that host without restarting
+servers. Settings → Remote also offers **Auto-install Luvus when selecting a
+host**, off by default. It applies only to subsequent explicit host selections;
+discovery and reconnect never install. See [remote setup](https://github.com/Shaloc/luvus/blob/main/website/src/content/docs/docs/guides/remote.mdx).
+
 To build this fork from source with a Rust toolchain:
 
 ```sh

@@ -505,6 +505,7 @@ impl App {
     }
 
     pub(crate) fn start_merged_remote_sessions(&mut self) {
+        self.cancel_unselected_preference_sync();
         if crate::session::remote::process_target().is_some() {
             return;
         }
@@ -513,13 +514,15 @@ impl App {
         // Revocation follows the in-memory selection immediately, including
         // while a save is pending or failing. Only new admission waits for disk.
         let enabled_hosts = self.config.remote_hosts.clone();
+        self.pending_remote_installs
+            .retain(|host| enabled_hosts.contains(host) && self.config.remote_auto_install);
         self.retain_remote_sessions(|host, _| enabled_hosts.iter().any(|item| item == host));
         self.remote_host_status
             .retain(|status| enabled_hosts.contains(&status.host));
         // SSH admission and discovery read the saved configuration. Settings
         // now saves asynchronously; fence older results and defer discovery
         // until the existing save completion has persisted the latest choices.
-        if self.config_save_pending() {
+        if self.config_save_pending() || self.remote_discovery_inflight.is_some() {
             self.remote_config_refresh_pending = true;
             return;
         }
@@ -535,25 +538,47 @@ impl App {
             );
             return;
         }
-        self.remote_host_status = self
-            .config
-            .remote_hosts
-            .iter()
-            .map(|host| crate::session::remote::HostStatus {
-                host: host.clone(),
-                sessions: vec![],
-                error: None,
-            })
-            .collect();
+        // Refreshing an inventory does not disconnect already connected owners.
+        // Preserve their evidence for explicit theme/language fanout while a new
+        // host is being installed or discovered.
+        for host in &self.config.remote_hosts {
+            if !self
+                .remote_host_status
+                .iter()
+                .any(|status| status.host == *host)
+            {
+                self.remote_host_status
+                    .push(crate::session::remote::HostStatus {
+                        host: host.clone(),
+                        sessions: vec![],
+                        error: None,
+                    });
+            }
+        }
         let tx = self.app_tx.clone();
+        let install_hosts = std::mem::take(&mut self.pending_remote_installs);
+        // Serialize discovery/bootstrap batches. A new selection fences old UI
+        // results but must not lose an in-progress install's completion or launch
+        // a duplicate installer. On completion, re-probe the latest saved choice.
+        self.remote_discovery_inflight = Some(generation);
         std::thread::spawn(move || {
-            let (registry, hosts) = crate::session::remote::discover_hosts();
+            let (registry, hosts) =
+                crate::session::remote::discover_hosts_with_install(&install_hosts);
             let _ = tx.send(AppEvent::RemoteRegistryLoaded {
                 generation,
                 registry,
                 hosts,
             });
         });
+    }
+
+    pub(super) fn finish_remote_discovery(&mut self, generation: u64) {
+        if self.remote_discovery_inflight == Some(generation) {
+            self.remote_discovery_inflight = None;
+            if generation != self.remote_registry_generation {
+                self.remote_config_refresh_pending = true;
+            }
+        }
     }
 
     pub(crate) fn apply_remote_registry_loaded(
@@ -657,7 +682,10 @@ impl App {
     }
 
     pub(super) fn finish_remote_config_refresh(&mut self) -> bool {
-        if self.remote_config_refresh_pending && !self.config_save_pending() {
+        if self.remote_config_refresh_pending
+            && !self.config_save_pending()
+            && self.remote_discovery_inflight.is_none()
+        {
             self.start_merged_remote_sessions();
             true
         } else {
@@ -4772,6 +4800,55 @@ pub(crate) mod tests {
             .workspaces
             .iter()
             .all(|workspace| workspace.remote.is_none()));
+    }
+
+    #[test]
+    fn host_selection_during_bootstrap_preserves_pending_admission_and_connection_evidence() {
+        let _env = crate::persist::test_env("remote-bootstrap-refresh");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.config.remote_hosts = vec!["existing".into(), "install-a".into()];
+        app.config.remote_auto_install = true;
+        let connected = crate::session::remote::HostStatus {
+            host: "existing".into(),
+            sessions: vec![crate::session::remote::HostSession {
+                name: "default".into(),
+                running: true,
+            }],
+            error: None,
+        };
+        app.remote_host_status = vec![connected.clone()];
+        // Model a slow, already-admitted A installation without any network IO.
+        app.remote_registry_generation = 10;
+        app.remote_discovery_inflight = Some(10);
+        app.config.remote_hosts.push("install-b".into());
+        app.pending_remote_installs.insert("install-b".into());
+        app.start_merged_remote_sessions();
+        assert_eq!(app.remote_discovery_inflight, Some(10));
+        assert!(app.remote_config_refresh_pending);
+        assert!(app.pending_remote_installs.contains("install-b"));
+        assert_eq!(app.remote_host_status, [connected]);
+        assert!(
+            !app.finish_remote_config_refresh(),
+            "must not start a competing installer"
+        );
+        app.finish_remote_discovery(9);
+        assert_eq!(app.remote_discovery_inflight, Some(10));
+        app.finish_remote_discovery(10);
+        assert!(app.remote_discovery_inflight.is_none());
+        assert!(
+            app.remote_config_refresh_pending,
+            "stale completion must trigger latest read-only discovery"
+        );
+        assert!(
+            !app.pending_remote_installs.contains("install-a"),
+            "do not install A twice"
+        );
+        // Revoking B before the next batch also revokes its queued installation.
+        app.config.remote_hosts.clear();
+        app.start_merged_remote_sessions();
+        assert!(app.pending_remote_installs.is_empty());
+        assert!(app.remote_discovery_inflight.is_none());
     }
 
     #[test]

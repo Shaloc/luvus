@@ -8,6 +8,7 @@ Use --session-discovery-only for owner inventory and session deletion regression
 Use --remote-only-open-only for merge routing without implicit local owners.
 Use --agent-focus-only for Agents highlight and owner focus synchronization.
 Use --agent-seen-only for native Done acknowledgement after remote owner restart.
+Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
 Use --reconnect-only for remote owner restart and automatic reconnection.
 That mode uses a real VT decoder: uv run --with pyte==0.8.2 scripts/test-remote-sessions.py target/debug/luvus --reconnect-only
 All homes, sockets, files and child processes are isolated below target/.
@@ -78,6 +79,7 @@ def main():
     agent_focus_only = "--agent-focus-only" in sys.argv[1:]
     agent_seen_only = "--agent-seen-only" in sys.argv[1:]
     reconnect_only = "--reconnect-only" in sys.argv[1:]
+    theme_sync_only = "--theme-sync-only" in sys.argv[1:]
     if reconnect_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
@@ -87,7 +89,7 @@ def main():
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -382,7 +384,9 @@ def main():
             clients.append((process, master))
             screen = bytearray()
             deadline = time.monotonic() + 4
-            while time.monotonic() < deadline and b"luvus" not in screen.lower():
+            while time.monotonic() < deadline and (
+                    b"luvus" not in screen.lower()
+                    or (theme_sync_only and not re.search(rb"\x1b\[\d+;\d+H", screen))):
                 if select.select([master], [], [], 0.1)[0]:
                     screen.extend(os.read(master, 65536))
             assert process.poll() is None and b"luvus" in screen.lower(), screen[-1000:]
@@ -446,6 +450,122 @@ def main():
 
         def click(master, x, y, button=0):
             os.write(master, f"\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m".encode())
+
+        if theme_sync_only:
+            process, master = start_client(["--session", "api"])
+            # A new owner created after discovery must be included too.
+            run("--session", "theme-fresh", "server", "start", remote=True)
+            owners = ("api", "second", "theme-fresh")
+            before = {name: api("config.get", remote=True, session=name)["config"] for name in owners}
+            generations = {name: api("uhp.capabilities", remote=True, session=name)["server_generation"]
+                           for name in owners}
+
+            def synced(theme):
+                return all(api("config.get", remote=True, session=name)["config"]["theme"] == theme
+                           for name in owners)
+
+            # Choose through the real local settings UI, not just a config write.
+            os.write(master, b"\x02=")
+            settings_screen = drain(master)
+            click(master, *position(settings_screen + repaint(master), "Theme"))
+            themes_screen = drain(master)
+            click(master, *position(themes_screen + repaint(master), "one-light"))
+            wait_for(lambda: synced("one-light"))
+            assert api("config.get")["config"]["theme"] == "one-light"
+            os.write(master, b"\x1b")
+            drain(master)
+            print("PASS: local Settings theme click updates every running remote owner without restart", flush=True)
+
+            run("session", "merge", "on")
+            wait_for(projected)
+            remote_workspace = next(w["workspace"] for w in api("workspace.list")["workspaces"]
+                                    if w.get("host") == "fake-dev")
+            api("workspace.focus", {"workspace": remote_workspace})
+            drain(master)
+            os.write(master, b"\x02=")
+            settings_screen = drain(master)
+            click(master, *position(settings_screen + repaint(master), "Theme"))
+            themes_screen = drain(master)
+            click(master, *position(themes_screen + repaint(master), "one-dark"))
+            wait_for(lambda: synced("one-dark"))
+            assert api("config.get")["config"]["theme"] == "one-dark"
+            os.write(master, b"\x1b")
+            drain(master)
+            print("PASS: Settings remains local while a merged remote workspace is focused; all owner themes follow", flush=True)
+
+            # Language uses the same bounded preference fanout, including while
+            # a merged remote workspace owns the displayed terminal.
+            os.write(master, b"\x02=")
+            settings_screen = drain(master)
+            click(master, *position(settings_screen + repaint(master), "Language"))
+            language_screen = drain(master)
+            # Wide glyphs may be emitted in separate cursor-addressed runs;
+            # the canonical language code is one contiguous clickable token.
+            click(master, *position(language_screen + repaint(master), "zh"))
+            wait_for(lambda: all(api("config.get", remote=True, session=name)["config"]["language"] == "zh"
+                                for name in owners))
+            assert api("config.get")["config"]["language"] == "zh"
+            assert synced("one-dark"), "language overwrote the theme"
+            language_screen = drain(master)
+            click(master, *position(language_screen + repaint(master), "English"))
+            wait_for(lambda: all(api("config.get", remote=True, session=name)["config"]["language"] == "en"
+                                for name in owners))
+            os.write(master, b"\x1b")
+            drain(master)
+            print("PASS: merged remote Settings language follows local selection on all running owners", flush=True)
+
+            # Selecting another local theme must not inherit any remote config.
+            run("--session", "api", "theme", "use", "one-dark")
+            run("--session", "api", "theme", "use", "one-light")
+            run("--session", "api", "theme", "use", "noir")
+            wait_for(lambda: synced("noir"))
+            for name in owners:
+                current = api("config.get", remote=True, session=name)["config"]
+                assert current == dict(before[name], theme="noir"), (name, current)
+                assert api("uhp.capabilities", remote=True, session=name)["server_generation"] == generations[name]
+            wait_for(lambda: json.loads((root / "remote-state/config.json").read_text())["theme"] == "noir")
+            assert not (root / "remote-state/sessions/search-stopped/server.pid").exists()
+            assert not (root / "remote-state/server.pid").exists(), "theme sync started a default owner"
+            print("PASS: rapid CLI selections converge; only theme changes; stopped owners remain stopped", flush=True)
+
+            # The low-level patch stays owner-local, including when used locally.
+            api("config.patch", {"patch": {"theme": "one-light"}}, remote=True)
+            assert api("config.get")["config"]["theme"] == "noir"
+            assert api("config.get", remote=True, session="second")["config"]["theme"] == "noir"
+            api("config.patch", {"patch": {"theme": "gruvbox-light"}})
+            time.sleep(0.4)
+            assert api("config.get", remote=True)["config"]["theme"] == "one-light"
+            print("PASS: inbound and direct config patches do not rebroadcast or overwrite other preferences", flush=True)
+
+            source = root / "project/sync-local-only.toml"
+            run("theme", "init", "sync-local-only")
+            run("--session", "api", "theme", "install", str(source), "--yes")
+            run("--session", "api", "theme", "use", "sync-local-only")
+            failed = bytearray()
+            def sync_failure():
+                failed.extend(drain(master, 0.2))
+                return b"Theme sync failed" in failed and b"fake-dev" in failed
+            wait_for(sync_failure)
+            assert not list((root / "remote-state/themes").glob("*sync-local-only*"))
+            assert api("config.get", remote=True)["config"]["theme"] == "one-light"
+            print("PASS: missing remote custom theme is reported and never copied or installed", flush=True)
+
+            # Only second refreshes its in-memory theme registry. api sorts first
+            # and still rejects this theme; healthy later owners must not be skipped.
+            run("--session", "second", "theme", "install", str(source), "--yes", remote=True)
+            run("--session", "api", "theme", "use", "sync-local-only")
+            wait_for(lambda: api("config.get", remote=True, session="second")["config"]["theme"] == "sync-local-only")
+            assert api("config.get", remote=True, session="api")["config"]["theme"] == "one-light"
+            print("PASS: a rejecting first owner does not block later healthy owners on the same host", flush=True)
+
+            api("config.patch", {"patch": {"remote_hosts": []}})
+            wait_for(lambda: not projected())
+            run("--session", "api", "theme", "use", "one-dark")
+            time.sleep(0.4)
+            assert api("config.get", remote=True)["config"]["theme"] == "one-light"
+            assert process.poll() is None
+            print("PASS: deselected host receives no theme writes; local client stays alive", flush=True)
+            return
 
         if remote_only_open_only:
             run("session", "merge", "on")

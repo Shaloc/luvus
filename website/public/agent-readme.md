@@ -186,6 +186,14 @@ screen because it validates changes, applies supported settings live, and
 writes the file. Hand edits are loaded on restart. Preserve unknown keys and do
 not rewrite the file just to change one setting.
 
+Local Settings theme selection and `theme use <id>` on a running server also
+queue that theme ID to running sessions on currently connected selected SSH
+hosts. Other preferences are preserved; remote failures appear as local UI
+toasts. Use `config.patch` with `{"patch":{"theme":"one-dark"}}` when only
+the addressed owner should change. Incoming patches/reloads do not rebroadcast.
+Synchronization never starts stopped owners, installs missing custom themes,
+or overwrites themes merely because a host connects or reconnects.
+
 The default session stores runtime files directly under the state root. Named
 sessions keep their server-specific runtime files under
 `~/.luvus/sessions/<name>/`, while preferences, skill ownership, manifests,
@@ -215,6 +223,17 @@ are allowed; the default list is empty. Never enable or connect every SSH
 config entry. Merge toggles and registration changes refresh a running local
 session, and disabling a host disconnects its projections without stopping
 remote panes.
+For an explicitly requested host, `luvus host add <alias> [--install] [--json]`
+selects the SSH config alias and discovers its sessions without starting an
+owner. `--install`, or the saved `remote_auto_install` policy (default false),
+permits installing a missing/incompatible fork binary during that explicit
+admission. It uses checksummed `Shaloc/luvus` releases for macOS ARM64 and Linux
+x86_64, preserves a backup, skips compatible builds, and never restarts a
+server. Treat installation authorization separately from connecting; do not
+enable the policy automatically. Listing, reload and reconnect never install.
+Settings language changes synchronize to connected hosts' running sessions
+just like theme selection. Incoming `config.patch` requests remain owner-local
+and never rebroadcast either preference.
 Managed connections support transport 9 fallback and negotiated transport 10
 projection features, independent of package-version equality. Optional
 `remote_display` data in `session.snapshot` and `uhp.capabilities` advertises

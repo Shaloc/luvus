@@ -20,6 +20,29 @@ before the virtual **Terminal** theme. Moving through the list previews each
 palette immediately. Each installed row also has a remove action on its right;
 bundled and virtual themes do not.
 
+## Connected remote machines
+
+Changing **Settings → Theme**, or running `luvus theme use <id>` against a
+running local server, also sends that theme ID to every running session on
+the currently connected, selected SSH hosts. It updates their live palettes
+and saved theme without restarting servers. Other settings are preserved.
+This affects other clients viewing those remote owners too.
+Language selection in Settings follows the same scope in an independent queue;
+theme synchronization does not change the selected language.
+
+Synchronization is asynchronous; rapid previews coalesce to the latest
+selection. Local selection succeeds independently; a toast reports remote
+success or failure. Offline and deselected hosts are excluded, stopped owners
+are never started, and connecting or reconnecting alone does not overwrite
+the remote theme. Select the theme again to retry a failed host.
+
+Custom themes must already be installed on each destination. Luvus sends only
+the ID, not theme files. The virtual `terminal` ID uses each owner's available
+client-derived terminal palette. For an owner-only change, use
+`config.patch` with `{"patch":{"theme":"one-dark"}}`; incoming patches and
+config reloads never rebroadcast. An offline CLI selection is saved locally
+only, with no deferred remote synchronization.
+
 ## Install a reviewed community theme
 
 Themes accepted into `community/themes/` in the Luvus repository have a stable

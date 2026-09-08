@@ -7158,6 +7158,27 @@ impl App {
                 format!("theme `{}` is not installed", next.theme),
             ));
         }
+        if persist_patch
+            .and_then(Value::as_object)
+            .is_some_and(|patch| {
+                !patch.is_empty()
+                    && patch
+                        .keys()
+                        .all(|key| matches!(key.as_str(), "theme" | "language"))
+            })
+        {
+            // A remote preference change must not reset scroll/layout, rediscover
+            // this owner's SSH hosts, or propagate back to the sender.
+            let patch = persist_patch.expect("preference patch");
+            if patch.get("theme").is_some() {
+                self.apply_theme_locally(&next.theme);
+            }
+            if patch.get("language").is_some() {
+                self.apply_language_locally(&next.language);
+            }
+            self.emit_event("config.changed", json!({}));
+            return Ok(());
+        }
         let theme = self.theme_registry.theme_or_default(&next.theme);
         let sidebars = Sidebars::from_config(&next.sidebars());
         let keymap = keys::build_keymap(&next.keybindings);

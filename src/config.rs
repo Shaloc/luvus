@@ -78,6 +78,10 @@ pub struct Config {
     /// alias connects and discovers sessions; attach and merge remain explicit.
     #[serde(default)]
     pub remote_hosts: Vec<String>,
+    /// Explicit host selection may install the fork release if no compatible
+    /// remote binary exists. Discovery/reconnection alone never installs.
+    #[serde(default)]
+    pub remote_auto_install: bool,
     /// Custom keybindings: command id → key string (overrides the defaults).
     /// An empty value means the command is explicitly unbound.
     #[serde(default)]
@@ -501,6 +505,7 @@ impl Default for Config {
             agents_active_only: false,
             agents_this_workspace: false,
             remote_hosts: Vec::new(),
+            remote_auto_install: false,
             keybindings: std::collections::HashMap::new(),
             direct_keybindings: std::collections::HashMap::new(),
             prefix: default_prefix(),

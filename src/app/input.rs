@@ -599,10 +599,12 @@ impl App {
                 registry,
                 hosts,
             } => {
+                self.finish_remote_discovery(generation);
                 if generation == self.remote_registry_generation {
                     self.remote_host_status = hosts;
                 }
                 self.apply_remote_registry_loaded(generation, registry);
+                self.finish_remote_config_refresh();
                 return true;
             }
             AppEvent::RemoteMergeChanged { generation, result } => {
