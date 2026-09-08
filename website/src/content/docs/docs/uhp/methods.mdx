@@ -417,6 +417,14 @@ limits. `session.snapshot` returns every workspace, tab, terminal pane, native
 view, stable terminal identity, root process, and agent state in one response.
 Merged remote workspace rows also include their SSH Host alias in `host`; local
 workspace rows use `host:null`.
+Both responses optionally advertise `remote_display`, with `transport`,
+`compatible_transports` and `capabilities`. The modified build accepts transport
+9 and 10. Managed clients use transport 10's `projection.v1` only when advertised;
+otherwise they use the frozen transport-9 display. This negotiation is independent
+of the package version. Generation, selection epoch, viewport and focused pane
+travel with negotiated frames. Hidden workspace frames pause while owner metadata
+events continue. Viewing a current frame acknowledges a native Done completion
+through the existing agent-status event; it never overrides external agent reports.
 Owned workspace snapshots also publish cached `agent_history` and
 `scheduled_agents` rows. History entries contain `agent`, `cwd`, and a 32-byte
 opaque `key` used to revalidate UI history actions; it is not a native session
@@ -432,6 +440,10 @@ selected leaf, including mouse, prefix and CLI/API operations in a projected
 workspace. No-op selections, reads, passive renders and resize alone do not
 publish focus changes. Consumers can reconcile `workspace_focused` from the
 next snapshot rather than polling or inferring focus from agent status.
+Managed presentation connections recover a previously connected owner after a
+restart by requesting a fresh snapshot and subscribing from its event sequence.
+They never replay mutations or start an absent owner. This background recovery
+does not add automatic retries to bounded CLI/UHP mutation requests.
 Use `config.get` / `config.patch` with the `remote_hosts` string array to inspect
 or change the same managed-host selection exposed in Settings → Remote. The
 default is empty. Configuration changes reconcile active merge projections;

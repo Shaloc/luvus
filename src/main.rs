@@ -126,6 +126,15 @@ fn main() -> Result<()> {
     match args.get(1).map(String::as_str) {
         Some("remote-server-command") => return server_cmd(&args),
         Some("remote-session-start") => {
+            // Opening a managed session may start an absent owner, but must
+            // not demand replacement of an already running compatible owner.
+            if server_runtime_with_timeout(SERVER_CONTROL_TIMEOUT).is_ok_and(|runtime| {
+                runtime
+                    .transport_protocol
+                    .is_some_and(ipc::protocol::supports_version)
+            }) {
+                return Ok(());
+            }
             ensure_server_ready(&persist::client_socket_path())?;
             return Ok(());
         }

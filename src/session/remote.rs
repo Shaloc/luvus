@@ -3,7 +3,7 @@
 //! Raw `--remote` remains the compatibility escape hatch. Managed remote
 //! sessions and `--host` deliberately accept only literal `Host` aliases found
 //! in the user's OpenSSH config, persist the alias (never its resolved
-//! `HostName`), and require the exact local Luvus version before opening a
+//! `HostName`), and require a compatible managed-session protocol before opening a
 //! control or display bridge.
 
 use std::collections::{BTreeSet, HashSet};
@@ -13,12 +13,15 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+
+mod input;
+pub use input::RemoteInput;
 
 pub const REMOTE_HOST_ENV_VAR: &str = "LUVUS_REMOTE_HOST";
 pub const REMOTE_SESSION_ENV_VAR: &str = "LUVUS_REMOTE_SESSION";
@@ -942,8 +945,9 @@ fn wildcard_match(pattern: &str, value: &str) -> bool {
     inner(pattern.as_bytes(), value.as_bytes())
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RemoteBinaryLocation {
+    #[default]
     Path,
     StandardFallback,
 }
@@ -1042,7 +1046,7 @@ fn run_ssh_command(
     })
 }
 
-fn drain_bounded(mut reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn drain_bounded(mut reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
     let mut kept = Vec::new();
     let mut buffer = [0u8; 4096];
     loop {
@@ -1079,19 +1083,17 @@ fn verified_version_output(
     let Some(version) = fields.next() else {
         return Ok(None);
     };
-    if version != env!("CARGO_PKG_VERSION") {
-        return Err(format!(
-            "SSH host `{host}` has Luvus {version}, but this client requires exactly {}; install the matching modified version there",
-            env!("CARGO_PKG_VERSION")
-        ));
-    }
     let remote_protocol = fields.clone().any(|field| field == "remote-session=2");
-    let transport = format!("transport={}", crate::ipc::protocol::PROTOCOL_VERSION);
-    let transport_protocol = fields.any(|field| field == transport.as_str());
+    let transport_protocol = fields.any(|field| {
+        field
+            .strip_prefix("transport=")
+            .and_then(|version| version.parse().ok())
+            .is_some_and(crate::ipc::protocol::supports_version)
+    });
     if !remote_protocol || !transport_protocol {
         return Err(format!(
-            "SSH host `{host}` has Luvus {version}, but it is not this modified remote-session build; install the matching Luvus {} binary there",
-            env!("CARGO_PKG_VERSION")
+            "SSH host `{host}` has Luvus {version}, but it is not a compatible modified remote-session build; install a build supporting remote-session=2 and transport 9 or {} there (nothing will be installed automatically)",
+            crate::ipc::protocol::PROTOCOL_VERSION
         ));
     }
     let fallback = String::from_utf8_lossy(&output.stderr).contains("LUVUS_STANDARD_FALLBACK");
@@ -1120,6 +1122,12 @@ fn ssh_base(host: &str) -> Command {
     command
         .arg("-T")
         .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("NumberOfPasswordPrompts=0")
+        .arg("-o")
+        .arg("StrictHostKeyChecking=yes")
+        .arg("-o")
         .arg(format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECONDS}"))
         .arg("-o")
         .arg("ServerAliveInterval=15")
@@ -1127,6 +1135,67 @@ fn ssh_base(host: &str) -> Command {
         .arg("ServerAliveCountMax=3")
         .arg(host);
     command
+}
+
+/// Only failures that background work can repair belong in the retry loop.
+/// SSH owns authentication and host-key approval; never answer either prompt.
+pub(crate) fn failure_needs_attention(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "permission denied",
+        "host key verification failed",
+        "remote host identification has changed",
+        "no matching host key",
+        "no supported authentication",
+        "too many authentication failures",
+        "not a compatible modified",
+        "protocol version mismatch",
+        "projection protocol mismatch",
+        "unsupported remote display",
+        "install this modified",
+        "not found in ssh config",
+        "settings > remote",
+    ]
+    .iter()
+    .any(|reason| error.contains(reason))
+}
+
+/// Bounded capture shared by control and display bridges. Keep draining after
+/// the limit so verbose SSH diagnostics cannot deadlock either transport.
+pub(crate) struct BridgeDiagnostics {
+    done: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+}
+
+impl BridgeDiagnostics {
+    pub(crate) fn capture(stderr: impl Read + Send + 'static) -> Self {
+        let (tx, done) = std::sync::mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = tx.send(drain_bounded(stderr, MAX_VERSION_OUTPUT_BYTES));
+        });
+        Self { done }
+    }
+
+    pub(crate) fn failure(&self, fallback: impl std::fmt::Display) -> String {
+        // EOF on stdout and stderr can be observed in either order. This is
+        // failure-path worker IO only, never an app-loop wait.
+        let detail = self
+            .done
+            .recv_timeout(Duration::from_millis(200))
+            .ok()
+            .and_then(Result::ok)
+            .map(|bytes| {
+                String::from_utf8_lossy(&bytes)
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        if detail.trim().is_empty() {
+            fallback.to_string()
+        } else {
+            format!("SSH connection failed: {}", detail.trim())
+        }
+    }
 }
 
 fn version_command(host: &str, fallback: bool) -> Command {
@@ -1204,7 +1273,7 @@ fn command_on_host(host: &str, args: &[&str], location: RemoteBinaryLocation) ->
 
 /// Run one validated server-lifecycle command on the managed host. These
 /// commands cannot travel through the control bridge they may stop, so they use
-/// the same exact-version preflight and SSH policy as the bridge itself.
+/// the same protocol-compatibility preflight and SSH policy as the bridge itself.
 pub fn server_command(
     target: &RemoteSession,
     subcommand: &str,
@@ -1301,12 +1370,14 @@ pub fn delete_session(target: &RemoteSession) -> Result<(), String> {
 #[derive(Default)]
 pub(crate) struct ConnectionScope {
     state: Mutex<(bool, Vec<Weak<Mutex<Child>>>)>,
+    cancelled: Condvar,
 }
 
 impl ConnectionScope {
     pub(crate) fn cancel(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.0 = true;
+            self.cancelled.notify_all();
             for child in state.1.drain(..).filter_map(|child| child.upgrade()) {
                 if let Ok(mut child) = child.lock() {
                     let _ = child.kill();
@@ -1315,7 +1386,17 @@ impl ConnectionScope {
         }
     }
 
-    fn register(&self, child: &Arc<Mutex<Child>>) -> Result<(), String> {
+    /// Wait only after a connection failure; cancellation wakes a pending retry.
+    pub(crate) fn wait_for_retry(&self, delay: Duration) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        self.cancelled
+            .wait_timeout_while(state, delay, |state| !state.0)
+            .is_ok_and(|(state, _)| !state.0)
+    }
+
+    pub(crate) fn register(&self, child: &Arc<Mutex<Child>>) -> Result<(), String> {
         let mut state = self
             .state
             .lock()
@@ -1333,11 +1414,21 @@ pub struct ControlConnection {
     child: Arc<Mutex<Child>>,
     stdin: Option<ChildStdin>,
     stdout: ChildStdout,
+    diagnostics: BridgeDiagnostics,
 }
 
 impl Read for ControlConnection {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        self.stdout.read(buffer)
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        match self.stdout.read(buffer) {
+            Ok(0) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                self.diagnostics.failure("SSH control bridge closed"),
+            )),
+            result => result,
+        }
     }
 }
 
@@ -1461,7 +1552,7 @@ fn spawn_control(mut command: Command) -> Result<ControlConnection, String> {
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::piped());
     let mut child = command
         .spawn()
         .map_err(|error| format!("could not open SSH control bridge: {error}"))?;
@@ -1476,16 +1567,74 @@ fn spawn_control(mut command: Command) -> Result<ControlConnection, String> {
         let _ = child.wait();
         return Err("SSH control bridge has no stdout".to_string());
     };
+    let stderr = child.stderr.take().expect("piped SSH stderr");
     Ok(ControlConnection {
         child: Arc::new(Mutex::new(child)),
         stdin: Some(stdin),
         stdout,
+        diagnostics: BridgeDiagnostics::capture(stderr),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_connection_failures_separate_attention_from_transient_outages() {
+        for error in [
+            "Permission denied (publickey)",
+            "Host key verification failed.",
+            "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+            "protocol version mismatch",
+            "remote projection protocol mismatch: missing server generation",
+            "not a compatible modified remote-session build",
+        ] {
+            assert!(failure_needs_attention(error), "{error}");
+        }
+        for error in [
+            "Connection reset by peer",
+            "Connection refused",
+            "SSH bridge closed",
+            "SSH display input write timed out",
+            "remote server shut down",
+        ] {
+            assert!(!failure_needs_attention(error), "{error}");
+        }
+    }
+
+    #[test]
+    fn remote_bridge_diagnostics_preserve_actionable_ssh_error_without_control_bytes() {
+        let diagnostics = BridgeDiagnostics::capture(io::Cursor::new(
+            b"\x1b[31mPermission denied (publickey)\n\x07",
+        ));
+        let error = diagnostics.failure("EOF");
+        assert!(error.contains("Permission denied (publickey)"));
+        assert!(!error.contains('\x1b') && !error.contains('\x07'));
+        assert!(failure_needs_attention(&error));
+        let empty = BridgeDiagnostics::capture(io::empty());
+        assert_eq!(empty.failure("Connection reset"), "Connection reset");
+    }
+
+    #[test]
+    fn remote_retry_wait_is_woken_by_scope_cancellation() {
+        let scope = Arc::new(ConnectionScope::default());
+        assert!(scope.wait_for_retry(Duration::ZERO));
+        let (started, ready) = std::sync::mpsc::channel();
+        let (finished, result) = std::sync::mpsc::channel();
+        let waiting = scope.clone();
+        let worker = thread::spawn(move || {
+            started.send(()).unwrap();
+            finished
+                .send(waiting.wait_for_retry(Duration::from_secs(10)))
+                .unwrap();
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        scope.cancel();
+        assert!(!result.recv_timeout(Duration::from_secs(1)).unwrap());
+        worker.join().unwrap();
+        assert!(!scope.wait_for_retry(Duration::ZERO));
+    }
 
     #[test]
     fn managed_bridge_factories_have_no_implicit_server_lifecycle() {
@@ -1524,6 +1673,7 @@ mod tests {
             child: Arc::new(Mutex::new(child)),
             stdin,
             stdout,
+            diagnostics: BridgeDiagnostics::capture(io::empty()),
         }
     }
 
@@ -1776,7 +1926,42 @@ mod tests {
     }
 
     #[test]
-    fn version_probe_requires_an_exact_version_and_marks_fallbacks() {
+    fn compatible_remote_release_does_not_require_identical_package_version() {
+        for transport in [9, crate::ipc::protocol::PROTOCOL_VERSION] {
+            let output = VersionOutput {
+                status: exit_status(0),
+                stdout: format!("luvus 1.1.0 remote-session=2 transport={transport}\n")
+                    .into_bytes(),
+                stderr: Vec::new(),
+            };
+            assert_eq!(
+                verified_version_output("build", &output).unwrap(),
+                Some(RemoteBinaryLocation::Path)
+            );
+        }
+    }
+
+    #[test]
+    fn managed_ssh_never_prompts_or_accepts_an_unknown_host_key() {
+        let command = ssh_base("build");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy())
+            .collect();
+        for option in [
+            "BatchMode=yes",
+            "NumberOfPasswordPrompts=0",
+            "StrictHostKeyChecking=yes",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == option),
+                "missing {option}: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_probe_requires_compatible_protocols_and_marks_fallbacks() {
         let matching_output = format!(
             "luvus {} remote-session=2 transport={}\n",
             env!("CARGO_PKG_VERSION"),
@@ -1809,7 +1994,7 @@ mod tests {
         };
         assert!(verified_version_output("dev-207", &stale)
             .unwrap_err()
-            .contains("requires exactly"));
+            .contains("not a compatible modified"));
 
         let unmodified = VersionOutput {
             status: exit_status(0),
@@ -1818,7 +2003,7 @@ mod tests {
         };
         assert!(verified_version_output("dev-207", &unmodified)
             .unwrap_err()
-            .contains("not this modified remote-session build"));
+            .contains("not a compatible modified"));
     }
 
     #[test]

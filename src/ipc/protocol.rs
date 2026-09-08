@@ -13,7 +13,14 @@ use serde::{Deserialize, Serialize};
 use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::TerminalColors;
 
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
+pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
+
+/// Transport 9 is frozen. New projection messages are opt-in on transport 10;
+/// old clients continue receiving only the existing generation-9 messages.
+pub fn supports_version(version: u32) -> bool {
+    matches!(version, LEGACY_PROTOCOL_VERSION | PROTOCOL_VERSION)
+}
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -24,8 +31,8 @@ pub enum ClientMessage {
         rows: u16,
     },
     /// A managed merge client requests one stable workspace projection instead
-    /// of the whole remote session chrome. Managed callers perform an exact
-    /// package-version and transport-protocol preflight before sending it.
+    /// of the whole remote session chrome. The frozen transport-9 fallback is
+    /// used after a compatible modified-build and transport preflight.
     HelloWorkspace {
         version: u32,
         cols: u16,
@@ -51,6 +58,21 @@ pub enum ClientMessage {
     ClipboardHelperResult {
         generation: String,
         result: crate::terminal::clipboard::kitten::Outcome,
+    },
+    /// Transport 10, selected only after the owner advertises projection.v1.
+    HelloProjection {
+        version: u32,
+        workspace_id: String,
+    },
+    ProjectionInterest {
+        epoch: u64,
+        active: bool,
+        cols: u16,
+        rows: u16,
+    },
+    ProjectionPresented {
+        epoch: u64,
+        event_sequence: u64,
     },
 }
 
@@ -100,6 +122,32 @@ pub enum ServerMessage {
         workspace_id: String,
     },
     ClipboardHelper(crate::terminal::clipboard::kitten::Request),
+    ProjectionFrame {
+        state: ProjectionState,
+        frame: FrameData,
+    },
+    ProjectionDiff {
+        state: ProjectionState,
+        frame: FrameDiff,
+    },
+}
+
+/// State and geometry travel in the same frame, rather than being correlated
+/// by arrival time across the independent topology and display SSH streams.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectionState {
+    pub server_generation: String,
+    pub epoch: u64,
+    pub event_sequence: u64,
+    pub workspace_id: String,
+    pub focused_pane: Option<String>,
+}
+
+pub const PROJECTION_CAPABILITY: &str = "projection.v1";
+
+pub fn remote_display_capabilities() -> serde_json::Value {
+    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION],
+        "capabilities":[PROJECTION_CAPABILITY]})
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -450,6 +498,83 @@ fn sq(x: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transport_nine_wire_discriminants_remain_frozen() {
+        for (message, expected) in [
+            (
+                ClientMessage::Hello {
+                    version: 9,
+                    cols: 80,
+                    rows: 24,
+                },
+                vec![0, 9, 80, 24],
+            ),
+            (
+                ClientMessage::HelloWorkspace {
+                    version: 9,
+                    cols: 80,
+                    rows: 24,
+                    workspace_id: "w".into(),
+                },
+                vec![1, 9, 80, 24, 1, b'w'],
+            ),
+            (ClientMessage::Command("x".into()), vec![6, 1, b'x']),
+            (
+                ClientMessage::Resize { cols: 80, rows: 24 },
+                vec![7, 80, 24],
+            ),
+            (ClientMessage::Detach, vec![8]),
+        ] {
+            let encoded =
+                bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+            assert_eq!(encoded, expected);
+        }
+        assert_eq!(
+            bincode::serde::encode_to_vec(
+                ServerMessage::Welcome {
+                    version: 9,
+                    error: None
+                },
+                bincode::config::standard()
+            )
+            .unwrap(),
+            vec![0, 9, 0]
+        );
+        assert!(supports_version(9));
+        assert!(supports_version(10));
+        assert!(!supports_version(8));
+        assert!(!supports_version(11));
+    }
+
+    #[test]
+    fn projection_frame_roundtrip_keeps_identity_and_geometry_together() {
+        let frame = frame_from_buffer(
+            &Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24)),
+            Some((2, 3)),
+            true,
+        );
+        let state = ProjectionState {
+            server_generation: "boot".into(),
+            epoch: 3,
+            event_sequence: 42,
+            workspace_id: "w".into(),
+            focused_pane: Some("7".into()),
+        };
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &ServerMessage::ProjectionFrame { state, frame }).unwrap();
+        let ServerMessage::ProjectionFrame { state, frame } =
+            read_message::<_, ServerMessage>(&mut bytes.as_slice()).unwrap()
+        else {
+            panic!("projection frame")
+        };
+        assert_eq!(
+            (state.epoch, state.event_sequence, frame.width, frame.height),
+            (3, 42, 80, 24)
+        );
+        assert_eq!(state.server_generation, "boot");
+        assert_eq!(state.focused_pane.as_deref(), Some("7"));
+    }
 
     #[test]
     fn message_roundtrip() {

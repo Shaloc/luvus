@@ -77,6 +77,30 @@ the agent's working/idle state. Mouse, tab, prefix and CLI/API focus changes
 update it through the existing event subscription without periodic polling.
 Clicking an agent also leaves keyboard list navigation, matching local rows.
 
+After a connected owner restarts or an SSH bridge fails, the local presentation
+automatically reconnects both its display and event subscription. Retries back
+off from 250 ms to 10 seconds, only while disconnected; healthy sessions do not
+poll. The last frame stays visible with a connection notice, and recovery reads
+a fresh owner snapshot before restoring workspace input, size and agent state.
+Keys typed while disconnected are not queued or replayed. Reconnection uses
+existing-only bridges: it never starts a stopped owner, installs a binary or
+bypasses the managed-host/version checks. A stopped owner remains stopped until
+you start it. Deselecting its host or removing its merge connection cancels retries.
+An initial open that fails before connecting still reports its setup error.
+Authentication, host-key and incompatible-protocol errors stop automatic retries
+and retain their SSH diagnostic. Fix SSH access or explicitly update the owner,
+then refresh the session selector. Background bridges never answer prompts or
+accept an unknown host key.
+
+When both ends support `projection.v1`, hidden workspaces keep their metadata
+and agent event subscriptions but pause terminal frames. Switching or resizing
+waits for a frame matching the owner generation, activation epoch and viewport
+before forwarding pane input. The Agents focus marker comes from that frame.
+Viewing it clears a native Done notification on the owner; it does not change
+working/blocked states or override an external agent status report. The display
+input queue is bounded by message count and bytes; a stalled write disconnects
+that owner connection rather than retaining an unbounded paste/input backlog.
+
 Merge uses an existing same-name local owner (running or saved); it never
 creates a local session merely because you opened or created a remote one.
 If that name exists only remotely, the switcher and CLI attach keep using the
@@ -141,10 +165,18 @@ setting: changing the presentation does not merge sessions, connect hosts, or
 change API workspace indices. The session selector and Agents dock retain
 their owner labels.
 
-Managed remotes require the exact same modified Luvus build on both machines,
-including the remote-session transport revision. If it is absent, older, or an
-unmodified binary with the same version number, Luvus tells you to install the
-matching build. It never copies a binary with `scp`.
+Hiding a sidebar while viewing a remote workspace retains a local reopen
+chevron. Its navigation row is outside the owner viewport, so expanding it
+cannot click a remote tab or terminal. The row disappears when no sidebar
+needs reopening; mouse coordinates and PTY dimensions follow the updated area.
+
+Managed remotes require compatible modified Luvus protocols, not identical
+package versions. Transport 9 remains available as a legacy fallback. Transport
+10 owners advertise the optional `projection.v1` feature in `remote_display`
+within `session.snapshot` and `uhp.capabilities`; older owners retain their
+existing display behavior without the new presentation guarantees or pause
+optimization. An absent, incompatible or unmodified binary produces an install
+diagnostic. Luvus never copies a binary with `scp`.
 
 Use `--host` to send server-backed CLI commands directly to that host. The
 selector works with workspace, tab, pane, agent, files, Git, DIFF, worktree,
@@ -675,5 +707,5 @@ run the upstream release scripts or installer to distribute the custom binary.
 On Apple Silicon, verify the downloaded `.tar.gz.sha256` with `shasum -a 256 -c`,
 extract the archive, and install its binary into your chosen PATH directory.
 Check `luvus --version --remote-session-protocol` on each host: managed remote
-connections need matching fork and transport versions. Installing a binary does
+connections need compatible fork protocols. Installing a binary does
 not restart any existing server; restart is a separate, explicit operation.

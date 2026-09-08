@@ -12,17 +12,18 @@ pub(super) type TabHits = (
     Option<Rect>,
 );
 
-pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) -> TabHits {
-    // Tab bar background = pane background (the sidebar is the lighter one).
-    f.render_widget(Block::new().style(Style::new().bg(t.mantle)), area);
-
+pub(super) fn draw_sidebar_reopen(
+    f: &mut RenderTarget,
+    area: Rect,
+    app: &mut App,
+    t: &Theme,
+) -> (u16, u16) {
     // When the sidebar is hidden its brand `«` toggle is gone, so surface a
     // `»` (expand) at the tab-bar's left edge to bring the sidebar back. Tabs
     // start after it. (When the sidebar is shown, its header owns the toggle.)
     // The left sidebar's `«` collapse lives in its header; when it's hidden but
     // still has docks to restore, surface a `»` (expand) at the tab-bar's left
     // edge. (The right sidebar reopens via ⌃Space B or Settings.)
-    app.switcher_button_rect = None;
     let left_hidden = !app.sidebars.left.visible && !app.sidebars.left.docks.is_empty();
     let tog_w = if !left_hidden {
         0
@@ -60,6 +61,14 @@ pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
         app.right_sidebar_toggle_rect = Some(r);
         3u16
     };
+    (tog_w, right_tog_w)
+}
+
+pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) -> TabHits {
+    // Tab bar background = pane background (the sidebar is the lighter one).
+    f.render_widget(Block::new().style(Style::new().bg(t.mantle)), area);
+    app.switcher_button_rect = None;
+    let (tog_w, right_tog_w) = draw_sidebar_reopen(f, area, app, t);
 
     // Preserve one active tab plus the fixed arrows/new-tab allowance, then let
     // Luvus Bar use the remaining lane up to its 100-column cap. Extra tabs use

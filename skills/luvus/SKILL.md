@@ -146,8 +146,12 @@ luvus --host <host> --session <actual-session-name> worktree list
 luvus session merge on|off
 ```
 
-`remote add` starts or reuses the remote session and requires the exact same remote-session-enabled Luvus build
-on the host. Report its install/update diagnostic as returned. Never copy or
+`remote add` starts or reuses the remote session and requires a compatible
+remote-session-enabled Luvus build, not an identical package version. Transport 9
+remains a fallback; transport 10 advertises optional `projection.v1` through
+`session.snapshot.remote_display` and `uhp.capabilities.remote_display`.
+Report install, authentication and host-key diagnostics as returned; background
+reconnection cannot answer SSH prompts. Never copy or
 install the binary on the host unless the human separately authorizes that
 action. Merge mode displays the local session and all discovered same-name
 remote workspaces; a `[host]` tag identifies each remote owner in the default
@@ -189,6 +193,12 @@ copies created by older versions.
 Managed CLI requests and workspace frame reads require an already-running
 owner and never start/restart it implicitly. Opening a session, `remote add`,
 and explicit server lifecycle commands can start it.
+Previously connected owners reconnect automatically after transient failures;
+outage input and failed CLI mutations are not replayed. Authentication, host-key
+and incompatible-protocol failures need user action instead of endless retries.
+Negotiated viewers pause hidden workspace frames while keeping agent events
+live. A matching visible frame acknowledges a native Done latch; working/blocked
+states and explicit external status reports are not overwritten by viewing.
 Settings → Remote has one global merge toggle:
 when enabled, every same-name local/remote session group merges automatically.
 The CLI `session merge on|off` controls the same global preference. This is

@@ -22,6 +22,16 @@ pub enum ClientInput {
     ClipboardImage(crate::terminal::clipboard::ClipboardImage),
     Command(String),
     Resize(u16, u16),
+    ProjectionInterest {
+        epoch: u64,
+        active: bool,
+        cols: u16,
+        rows: u16,
+    },
+    ProjectionPresented {
+        epoch: u64,
+        event_sequence: u64,
+    },
 }
 
 pub enum AppEvent {
@@ -96,6 +106,7 @@ pub enum AppEvent {
         /// `Some(id)` is a host-owned workspace projection used by a managed
         /// merge client. It never competes for whole-session foreground state.
         workspace_id: Option<String>,
+        managed_projection: bool,
     },
     /// A binary client detached.
     ClientDetach {
@@ -205,7 +216,7 @@ pub enum AppEvent {
     RemoteProjectionReady {
         pane: PaneId,
         generation: u64,
-        input: std::sync::mpsc::Sender<crate::ipc::protocol::ClientMessage>,
+        input: crate::session::remote::RemoteInput,
     },
     /// Coalesced newest full frame for a remote workspace is available.
     RemoteFrameAvailable {

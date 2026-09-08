@@ -2252,31 +2252,7 @@ impl App {
             // consumer that patches rows from both must not see the name change
             // shape (it used to be the cwd basename here, so renaming a node made
             // the label alternate between the two).
-            let cwd = self
-                .panes
-                .get(&id)
-                .map(|p| p.cwd.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let (project, branch) = self
-                .workspace_of_pane(id)
-                .map(|ws| (ws.name.clone(), ws.branch.clone()))
-                .unwrap_or_default();
-            self.emit_event(
-                "pane.agent_status_changed",
-                json!({
-                    "pane": id.0.to_string(), "status": state_str(st), "agent": agent,
-                    "cwd": cwd, "project": project, "branch": branch,
-                    "authority":self.status.get(&id).map(|status| status.identity_source),
-                    "state_source":self.status.get(&id).map(|status| status.state_source),
-                }),
-            );
-            let blocked_hint = self
-                .status
-                .get(&id)
-                .and_then(|status| status.blocked_hint.clone());
-            self.sync_automation_pane_state(id, st, blocked_hint);
-            self.wake_active_agent_automations(id);
-            self.check_agent_waits(id);
+            self.publish_agent_state(id, st, &agent);
             // Optional sound cues (off by default). A plain shell going
             // quiet or blocking is not an agent, so it stays silent either way.
             let is_agent_pane = self.manifests.is_agent(&agent)
@@ -2308,6 +2284,62 @@ impl App {
             );
         }
         repaired_location || changed
+    }
+
+    /// A real viewer acknowledged this pane, not merely a background render or
+    /// the owner's restored active-workspace index. Reuse the native Done latch;
+    /// integration reports remain authoritative and are never rewritten here.
+    pub(crate) fn acknowledge_agent_view(&mut self, id: PaneId) -> bool {
+        let Some(status) = self.status.get_mut(&id) else {
+            return false;
+        };
+        status.seen = true;
+        status.notify_armed = true;
+        if status.agent_report.is_some() || !status.done || status.state != State::Done {
+            return false;
+        }
+        status.done = false;
+        status.state = State::Idle;
+        status.candidate = State::Idle;
+        status.candidate_since = Instant::now();
+        let agent = status.agent.clone();
+        log_agent_state(id, &agent, State::Done, State::Idle);
+        self.publish_agent_state(id, State::Idle, &agent);
+        true
+    }
+
+    pub(crate) fn agent_observation(&self, id: PaneId) -> Option<(Instant, State)> {
+        self.status
+            .get(&id)
+            .map(|status| (status.candidate_since, status.state))
+    }
+
+    fn publish_agent_state(&mut self, id: PaneId, state: State, agent: &str) {
+        let cwd = self
+            .panes
+            .get(&id)
+            .map(|pane| pane.cwd.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let (project, branch) = self
+            .workspace_of_pane(id)
+            .map(|ws| (ws.name.clone(), ws.branch.clone()))
+            .unwrap_or_default();
+        self.emit_event(
+            "pane.agent_status_changed",
+            json!({
+                "pane":id.0.to_string(), "status":state_str(state), "agent":agent,
+                "cwd":cwd, "project":project, "branch":branch,
+                "authority":self.status.get(&id).map(|status| status.identity_source),
+                "state_source":self.status.get(&id).map(|status| status.state_source),
+            }),
+        );
+        let hint = self
+            .status
+            .get(&id)
+            .and_then(|status| status.blocked_hint.clone());
+        self.sync_automation_pane_state(id, state, hint);
+        self.wake_active_agent_automations(id);
+        self.check_agent_waits(id);
     }
 
     // ── api dispatch ──────────────────────────────────────────────────────────
@@ -5906,6 +5938,7 @@ impl App {
             "session":crate::session::display_name(),
             "server_generation":self.backend_server_generation,
             "event_sequence":crate::ipc::api::current_sequence(&self.events),
+            "remote_display":crate::ipc::protocol::remote_display_capabilities(),
             "workspaces":workspaces,
         })
     }

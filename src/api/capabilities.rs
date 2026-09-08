@@ -381,6 +381,7 @@ pub fn capabilities(event_sequence: u64) -> Value {
             "minor":super::PROTOCOL_MINOR,
         },
         "event_sequence":event_sequence,
+        "remote_display":crate::ipc::protocol::remote_display_capabilities(),
         "methods":METHODS,
         "method_contracts":method_contracts_for(METHODS.iter().copied()),
         "limits":{

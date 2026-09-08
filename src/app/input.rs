@@ -2097,7 +2097,7 @@ impl App {
         }
         // The complete two-row mobile header is chrome. Only MENU acts; every
         // other header tap is consumed instead of leaking into a mouse-aware PTY.
-        if self.compact && m.row < self.last_pane_area.y {
+        if self.compact && self.ws().remote.is_none() && m.row < self.last_pane_area.y {
             return;
         }
         // The new-worktree prompt: the ⏎/esc footer buttons act as those keys,

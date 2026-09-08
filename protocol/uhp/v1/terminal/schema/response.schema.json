@@ -7,7 +7,21 @@
     "result":{
       "type":"object",
       "oneOf":[
-        {"properties":{"type":{"const":"uhp_capabilities"},"protocol":{"type":"object"},"server_generation":{"type":"string","pattern":"^[0-9a-f]{32}$"},"session":{"type":"string"},"event_sequence":{"type":"integer","minimum":0},"methods":{"type":"array","items":{"type":"string"},"uniqueItems":true},"method_contracts":{"type":"array"},"limits":{"type":"object"},"terminal":{"type":"object","required":["capabilities","limits"]}},"required":["type","protocol","server_generation","session","event_sequence","methods","method_contracts","limits","terminal"],"additionalProperties":false},
+        {"properties":{
+          "type":{"const":"uhp_capabilities"},"protocol":{"type":"object"},
+          "server_generation":{"type":"string","pattern":"^[0-9a-f]{32}$"},
+          "session":{"type":"string"},"event_sequence":{"type":"integer","minimum":0},
+          "methods":{"type":"array","items":{"type":"string"},"uniqueItems":true},
+          "method_contracts":{"type":"array"},
+          "remote_display":{
+            "type":"object","properties":{
+              "transport":{"type":"integer","minimum":1},
+              "compatible_transports":{"type":"array","items":{"type":"integer","minimum":1}},
+              "capabilities":{"type":"array","items":{"type":"string"}}
+            },"required":["transport","compatible_transports","capabilities"],"additionalProperties":false
+          },
+          "limits":{"type":"object"},"terminal":{"type":"object","required":["capabilities","limits"]}
+        },"required":["type","protocol","server_generation","session","event_sequence","methods","method_contracts","limits","terminal"],"additionalProperties":false},
         {"properties":{"type":{"const":"terminal_backend_inventory"},"server_generation":{"type":"string","pattern":"^[0-9a-f]{32}$"},"terminals":{"type":"array","maxItems":1024},"truncated":{"type":"boolean"}},"required":["type","server_generation","terminals","truncated"],"additionalProperties":false},
         {"properties":{"type":{"const":"terminal_backend_validation"},"state":{"enum":["alive","gone","unknown"]}},"required":["type","state"],"additionalProperties":false},
         {"properties":{"type":{"const":"terminal_backend_processes"},"server_generation":{"type":"string","pattern":"^[0-9a-f]{32}$"},"terminal_id":{"type":"string","pattern":"^[0-9a-f]{32}$"},"pane_id":{"type":"string","pattern":"^[1-9][0-9]{0,9}$"},"root_process":{"type":"object"},"scan":{"enum":["observed","unavailable"]},"executables":{"type":"array","maxItems":256,"items":{"type":"string","maxLength":512},"uniqueItems":true},"arguments_exposed":{"const":false}},"required":["type","server_generation","terminal_id","pane_id","root_process","scan","executables","arguments_exposed"],"additionalProperties":false},

@@ -7,6 +7,9 @@ Use --dimensions-only for the local split/close/resize regression.
 Use --session-discovery-only for owner inventory and session deletion regression.
 Use --remote-only-open-only for merge routing without implicit local owners.
 Use --agent-focus-only for Agents highlight and owner focus synchronization.
+Use --agent-seen-only for native Done acknowledgement after remote owner restart.
+Use --reconnect-only for remote owner restart and automatic reconnection.
+That mode uses a real VT decoder: uv run --with pyte==0.8.2 scripts/test-remote-sessions.py target/debug/luvus --reconnect-only
 All homes, sockets, files and child processes are isolated below target/.
 No production server or actual SSH destination is accessed.
 """
@@ -63,7 +66,9 @@ def ssh_substitute():
                         ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
         os.environ[key] = str(root / "remote-home" / suffix)
     assert command and Path(command[0]).name == "luvus", command
-    os.execv(os.environ["LUVUS_SMOKE_BINARY"], command)
+    binary = Path(os.environ.get("LUVUS_SMOKE_REMOTE_BINARY", os.environ["LUVUS_SMOKE_BINARY"])).resolve()
+    assert binary.is_relative_to(Path(__file__).resolve().parent.parent / "target") and binary.is_file(), binary
+    os.execv(str(binary), command)
 
 
 def main():
@@ -71,18 +76,28 @@ def main():
     restart_only = "--restart-only" in sys.argv[1:]
     agent_state_only = "--agent-state-only" in sys.argv[1:]
     agent_focus_only = "--agent-focus-only" in sys.argv[1:]
+    agent_seen_only = "--agent-seen-only" in sys.argv[1:]
+    reconnect_only = "--reconnect-only" in sys.argv[1:]
+    if reconnect_only:
+        # Full and sparse ANSI updates must be applied to one retained screen.
+        # Looking for contiguous output bytes misses unchanged cells reused from
+        # before the restart. This dependency is test-only, not part of Luvus.
+        import pyte
     clipboard_only = "--clipboard-helper-only" in sys.argv[1:]
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
     assert binary.is_relative_to(repo / "target"), "test only a checkout build, never an installed binary"
+    remote_binary = Path(os.environ.get("LUVUS_SMOKE_REMOTE_BINARY", str(binary))).resolve()
+    assert remote_binary.is_relative_to(repo / "target") and remote_binary.is_file(), remote_binary
     root = Path(tempfile.mkdtemp(prefix="remote-smoke-", dir=repo / "target"))
     (root / ".isolated-smoke").write_text(str(root))
     clients = []
+    client_terminals = {}
     env = {key: value for key, value in os.environ.items() if not key.startswith("LUVUS_")}
     for directory in ("local-home/.ssh", "local-home/picker-local", "local-state", "remote-home",
                       "remote-state", "bin", "project/picker-remote", "second"):
@@ -113,7 +128,8 @@ def main():
         }))
     env.update(HOME=str(root / "local-home"), LUVUS_HOME=str(root / "local-state"),
                PATH=str(root / "bin") + ":" + env.get("PATH", ""), TERM="xterm-256color",
-               LUVUS_SMOKE_ROOT=str(root), LUVUS_SMOKE_BINARY=str(binary), DISPLAY=":smoke")
+               LUVUS_SMOKE_ROOT=str(root), LUVUS_SMOKE_BINARY=str(binary),
+               LUVUS_SMOKE_REMOTE_BINARY=str(remote_binary), DISPLAY=":smoke")
     env.pop("WAYLAND_DISPLAY", None)
     if clipboard_only:
         helper = Path(os.environ["LUVUS_TEST_KITTEN"]).resolve()
@@ -140,7 +156,7 @@ def main():
 
     def run(*args, remote=False, input_text=None, okay=True):
         assert_isolated(remote_env if remote else env)
-        result = subprocess.run([str(binary), *args], env=remote_env if remote else env,
+        result = subprocess.run([str(remote_binary if remote else binary), *args], env=remote_env if remote else env,
                                 cwd=root / "project", input=input_text, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
         if okay and result.returncode:
@@ -158,6 +174,21 @@ def main():
         value = json.loads(run("--host", "fake-dev", "--session", "api", *args).stdout)
         assert "error" not in value, (args, value)
         return value.get("result", value)
+
+    def presentation_api(method, params=None, session="api"):
+        # Canonical --session CLI routing deliberately bypasses presentation.
+        # Resolve and validate its private socket before reading the local UI.
+        info = api("session.status", {"name": session})["session"]
+        assert Path(info["session_dir"]).resolve() == root / "local-state/sessions" / session
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(info["socket_path"])
+            connection.sendall((json.dumps({"id": "presentation", "method": method,
+                                           "params": params or {}}) + "\n").encode())
+            with connection.makefile("rb") as reader:
+                response = json.loads(reader.readline(1024 * 1024))
+        assert "result" in response, response
+        return response["result"]
 
     def case(label, check):
         try:
@@ -356,6 +387,11 @@ def main():
                     screen.extend(os.read(master, 65536))
             assert process.poll() is None and b"luvus" in screen.lower(), screen[-1000:]
             assert b"\x1b[?1049h" in screen, "the fixture must observe the initial alternate-screen entry"
+            if reconnect_only:
+                terminal = pyte.Screen(120, 30)
+                decoder = pyte.ByteStream(terminal)
+                decoder.feed(bytes(screen))
+                client_terminals[master] = (terminal, decoder)
             return process, master
 
         def drain(master, duration=0.5):
@@ -364,6 +400,8 @@ def main():
             while time.monotonic() < deadline:
                 if select.select([master], [], [], 0.05)[0]:
                     screen.extend(os.read(master, 65536))
+            if master in client_terminals:
+                client_terminals[master][1].feed(bytes(screen))
             return screen
 
         def repaint(master):
@@ -580,6 +618,103 @@ def main():
             print("PASS: unmerged remote stopped row: outside click cancels; confirmed Delete removes remote only", flush=True)
             return
 
+        if reconnect_only:
+            local_generation = api("uhp.capabilities")["server_generation"]
+            for mode in ("direct-remote", "merge", "merge-tree"):
+                merged = mode != "direct-remote"
+                run("session", "merge", "on" if merged else "off")
+                api("config.patch", {"patch": {"layout": {
+                    "workspace_display": "tree" if mode == "merge-tree" else "flat"}}})
+                if merged:
+                    wait_for(projected)
+                    workspace = next(w for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
+                    api("workspace.focus", {"workspace": workspace["workspace"]})
+                process, master = start_client(["--session", "api"] if merged else
+                                               ["session", "attach", "remote-fake-dev-api"])
+                drain(master, 1)
+                selected = "api" if merged else "remote-fake-dev-api"
+                def owner_size(owner_pane, token):
+                    api("pane.run", {"pane": owner_pane, "command": "printf 'RECONNECT_SIZE_%s ' " + token + "; stty size"}, remote=True)
+                    pattern = re.compile(r"RECONNECT_SIZE_" + token + r" (\d+) (\d+)")
+                    return wait_for(lambda: pattern.search(api("pane.read", {"pane": owner_pane}, remote=True)["text"])).groups()
+                initial_pane = next(p["pane"] for p in api("pane.list", remote=True)["panes"] if p["focused"])
+                initial_size = owner_size(initial_pane, mode.replace("-", "_") + "_before")
+                for delayed in (False, True):
+                    before = api("uhp.capabilities", remote=True)["server_generation"]
+                    if delayed:
+                        run("--session", "api", "server", "stop", remote=True)
+                        # Observe a real outage across several retry delays.
+                        # Neither restart nor discarded input may be synthesized.
+                        offline = drain(master, 4)
+                        assert b"Connecting" in re.sub(rb"\x1b\[[0-9;]*m", b"", offline), offline[-1500:]
+                        assert not (root / "remote-state/sessions/api/server.pid").exists()
+                        os.write(master, b"printf 'OFFLINE_SHOULD_NOT_%s\\n' REPLAY\r")
+                        drain(master)
+                        run("--session", "api", "server", "start", remote=True)
+                    else:
+                        run("--session", "api", "server", "restart", remote=True)
+                    assert api("uhp.capabilities", remote=True)["server_generation"] != before
+                    selected_pane = next(p["pane"] for p in api("pane.list", remote=True)["panes"] if p["focused"])
+                    suffix = mode.replace("-", "_") + ("_delayed" if delayed else "_restart")
+                    output_marker = "RECONNECT_OUTPUT_" + suffix
+                    api("pane.run", {"pane": selected_pane, "command": "printf '%s\\n' " + shlex.quote(output_marker)}, remote=True)
+                    screen = bytearray()
+                    def recovered_output():
+                        screen.extend(drain(master, 0.1))
+                        return output_marker in "\n".join(client_terminals[master][0].display)
+                    try:
+                        wait_for(recovered_output)
+                    except AssertionError as error:
+                        raise AssertionError(f"{mode}: remote server restarted, but its output never returned to the existing client; "
+                                             f"screen={bytes(screen[-16000:])!r}; owner={api('pane.read', {'pane':selected_pane}, remote=True)}; "
+                                             f"display={presentation_api('session.snapshot', session=selected)}") from error
+                    input_marker = "RECONNECT_INPUT_" + suffix
+                    os.write(master, ("printf 'RECONNECT_INPUT_%s\\n' " + shlex.quote(suffix) + "\r").encode())
+                    wait_for(lambda: input_marker in api("pane.read", {"pane": selected_pane}, remote=True)["text"])
+                    assert "OFFLINE_SHOULD_NOT_REPLAY" not in api("pane.read", {"pane": selected_pane}, remote=True)["text"]
+                    # A new report after recovery must traverse the new event
+                    # subscription, rather than remain a stale pre-restart row.
+                    for status in ("working", "blocked"):
+                        api("agent.report", {"pane": selected_pane, "source": "smoke/reconnect",
+                                             "agent": "qodercli", "status": status, "ttl_s": 120}, remote=True)
+                        wait_for(lambda: any(a.get("owner_pane") == selected_pane and a["status"] == status
+                                             for a in presentation_api("agent.list", session=selected)["agents"]))
+                    assert owner_size(selected_pane, suffix) == initial_size, "reconnect changed the owner's actual PTY size"
+                    payload = ("RECONNECT_CLIPBOARD_" + suffix).encode()
+                    encoded = base64.b64encode(payload).decode()
+                    drain(master)
+                    api("pane.run", {"pane": selected_pane, "command": "printf '\\033]52;c;" + encoded + "\\007'"}, remote=True)
+                    copied = bytearray()
+                    def clipboard_recovered():
+                        copied.extend(drain(master, 0.1))
+                        return any(base64.b64decode(value) == payload for value in
+                                   re.findall(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)", copied))
+                    wait_for(clipboard_recovered)
+                    assert (root / "clipboard-copy").read_bytes() == payload
+                    tab_count = len(api("tab.list", remote=True)["tabs"])
+                    os.write(master, b"\x02c")
+                    wait_for(lambda: len(api("tab.list", remote=True)["tabs"]) == tab_count + 1)
+                    assert b"\x1b[?1049l" not in screen, "reconnect must not detach the local terminal"
+                if mode == "merge-tree":
+                    run("--session", "api", "server", "stop", remote=True)
+                    drain(master, 1)
+                    api("config.patch", {"patch": {"remote_hosts": []}})
+                    wait_for(lambda: not projected())
+                    # Restart explicitly after deselection: pending retries or
+                    # stale callbacks must not recreate any disabled projection.
+                    run("--session", "api", "server", "start", remote=True)
+                    drain(master, 2)
+                    assert not projected()
+                    print("PASS: deselecting a reconnecting host cancels recovery; owner restart does not resurrect its projections", flush=True)
+                assert process.poll() is None
+                assert api("uhp.capabilities")["server_generation"] == local_generation
+                process.terminate()
+                process.wait(timeout=5)
+                os.close(master)
+                clients.pop()
+                print(f"PASS: {mode}: restart and stopped-owner recovery restore output/input/prefix/Agents/PTY size/clipboard without local restart or input replay", flush=True)
+            return
+
         if agent_focus_only:
             first = pane
             api("tab.new", remote=True)
@@ -602,16 +737,8 @@ def main():
                 # Read the presentation's own API, not the --host CLI route
                 # that intentionally bypasses presentation and reaches its owner.
                 selected = "api" if merged else "remote-fake-dev-api"
-                info = api("session.status", {"name": selected})["session"]
-                assert Path(info["session_dir"]).resolve() == root / "local-state/sessions" / selected
                 def highlighted():
-                    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                        connection.settimeout(2)
-                        connection.connect(info["socket_path"])
-                        connection.sendall(b'{"id":"focus","method":"agent.list","params":{}}\n')
-                        with connection.makefile("rb") as reader:
-                            response = json.loads(reader.readline(1024 * 1024))
-                    return [a["owner_pane"] for a in response["result"]["agents"]
+                    return [a["owner_pane"] for a in presentation_api("agent.list", session=selected)["agents"]
                             if a.get("host") == "fake-dev" and a["focused"]]
                 def synchronized(expected):
                     wait_for(lambda: any(p["pane"] == expected and p["focused"]
@@ -651,6 +778,45 @@ def main():
                 print(f"PASS: {mode}: Agents click/prefix/API/tab/split-pane clicks highlight the selected owner pane", flush=True)
             return
 
+        if agent_seen_only:
+            run("session", "merge", "on")
+            wait_for(projected)
+            process, master = start_client(["--session", "api"])
+            drain(master)
+            # Restart only the isolated owner; the existing local client stays alive.
+            run("--session", "api", "server", "restart", remote=True)
+            wait_for(projected)
+            pane = api("pane.list", remote=True)["panes"][0]["pane"]
+            target = api("workspace.list", remote=True)["workspaces"][0]
+            api("workspace.new", {"path": str(root / "second")}, remote=True)
+            command = "exec -a qodercli " + shlex.join([sys.executable, str(Path(__file__).resolve()), "--qoder-fixture"])
+            api("pane.run", {"pane":pane, "command":"bash -c " + shlex.quote(command)}, remote=True)
+            wait_for(lambda: "QODER_FIXTURE_READY" in api("pane.read", {"pane":pane}, remote=True)["text"])
+            def status(remote):
+                drain(master, 0.1)
+                return next((a["status"] for a in api("agent.list", remote=remote)["agents"]
+                             if a.get("owner_pane" if not remote else "pane") == pane
+                             and a["agent"] == "qodercli"), None)
+            for expected, text in [("working", "Generating answer (esc to cancel, 12s)"),
+                                   ("done", "Ready for your next task")]:
+                api("pane.run", {"pane":pane, "command":text}, remote=True)
+                wait_for(lambda: status(True) == expected)
+                try:
+                    wait_for(lambda: status(False) == expected)
+                except AssertionError as error:
+                    raise AssertionError(f"native {expected}: owner={api('agent.list', remote=True)} display={api('agent.list')} "
+                                         f"terminal={api('pane.read', {'pane':pane}, remote=True)}") from error
+            assert status(True) == "done", "hidden metadata must not acknowledge completion"
+            projection = next(w for w in api("workspace.list")["workspaces"]
+                              if w.get("host") == "fake-dev" and w["cwd"] == target["cwd"])
+            api("workspace.focus", {"workspace":projection["workspace"]})
+            # No keypress in the pane: rendering the matching frame is sufficient.
+            wait_for(lambda: status(True) == "idle")
+            wait_for(lambda: status(False) == "idle")
+            assert process.poll() is None
+            print("PASS: after owner restart, hidden native Done stays Done; viewing its frame clears Done on both owner and display without input", flush=True)
+            return
+
         if agent_state_only:
             run("session", "merge", "on")
             wait_for(projected)
@@ -659,6 +825,7 @@ def main():
             command = "exec -a qodercli " + shlex.join([sys.executable, str(Path(__file__).resolve()), "--qoder-fixture"])
             run("--host", "fake-dev", "--session", "api", "pane", "run", pane,
                 "bash -c " + shlex.quote(command))
+            wait_for(lambda: "QODER_FIXTURE_READY" in api("pane.read", {"pane":pane}, remote=True)["text"])
             # Native Qoder screen evidence, not agent.report. No local click,
             # resize or API mutation may be needed to refresh a remote row.
             for expected, text in (("idle", "Ready for your next task"),
@@ -862,6 +1029,18 @@ def main():
             row("display resize reaches actual owner PTY; grow and restore", dimensions)
             if dimensions_only:
                 return
+
+            def sidebar_reopen():
+                tabs_before = owner("tab.list")["tabs"]
+                screen = repaint(master)
+                click(master, *position(screen, "«", before_column=4, before_row=2))
+                screen = repaint(master)
+                click(master, *position(screen, "»", before_column=4, before_row=2))
+                screen = repaint(master)
+                position(screen, "«", before_column=4, before_row=2)
+                assert owner("tab.list")["tabs"] == tabs_before, "reopen must not click an owner tab"
+
+            row("sidebar collapse/reopen remains visible and does not click remote tabs", sidebar_reopen)
 
             def prefix_help():
                 drain(master)
@@ -1410,7 +1589,7 @@ def main():
         assert any(s["host"] == "fake-dev" and s["session"] == "api" for s in discovered["sessions"])
         assert api("ping", remote=True)["session"] == "api"
         assert "unselected" not in (root / "ssh-calls").read_text().splitlines()
-        print("PASS: select=connect, discovery, nested names, exact build check, --host CLI, local/remote worktree picker clicks, New Remote form, PTY round trips, prefix mismatch, Ctrl+V owner bytes, merge, live topology, remote process survival")
+        print("PASS: select=connect, discovery, nested names, compatible build check, --host CLI, local/remote worktree picker clicks, New Remote form, PTY round trips, prefix mismatch, Ctrl+V owner bytes, merge, live topology, remote process survival")
     finally:
         for process, master in clients:
             process.terminate()
@@ -1455,6 +1634,7 @@ if __name__ == "__main__":
             shutil.copyfile(root / "official-kitten", destination)
     elif "--qoder-fixture" in sys.argv:
         fixture_root()
+        print("QODER_FIXTURE_READY", flush=True)
         for line in sys.stdin:
             print("\033[2J\033[999;1H\033]0;Qoder CLI\007" + line.strip(), flush=True)
     elif Path(sys.argv[0]).name in ("xclip", "xsel", "wl-copy", "pbcopy"):

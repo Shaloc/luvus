@@ -230,6 +230,16 @@ struct ClientState {
     /// normal whole-session client and is the only kind eligible for foreground
     /// ownership.
     workspace_id: Option<String>,
+    projection: Option<ProjectionSubscription>,
+}
+
+#[derive(Default)]
+struct ProjectionSubscription {
+    active: bool,
+    epoch: u64,
+    seen_frame: Option<(u64, crate::ids::PaneId, (Instant, crate::ui::theme::State))>,
+    last_focus: Option<crate::ids::PaneId>,
+    last_observation: Option<(Instant, crate::ui::theme::State)>,
 }
 
 #[derive(Default)]
@@ -262,7 +272,14 @@ impl ClientState {
             retained_ready: false,
             last_activity,
             workspace_id,
+            projection: None,
         }
+    }
+
+    fn surface_active(&self) -> bool {
+        self.projection
+            .as_ref()
+            .is_none_or(|projection| projection.active)
     }
 
     fn send_control(&self, msg: ServerMessage) -> Result<(), ()> {
@@ -646,7 +663,9 @@ pub fn run() -> Result<()> {
         // A forced redraw (resize / focus-regained / external damage) must render
         // even if nothing else changed this tick — and so must a client that is
         // waiting on its full-frame resync (see `needs_render`).
-        let any_behind = clients.values().any(|client| client.behind);
+        let any_behind = clients
+            .values()
+            .any(|client| client.surface_active() && client.behind);
         if app.force_redraw {
             render_request.record(RenderCause::ForcedRepair);
         }
@@ -745,6 +764,7 @@ fn apply(
             rows,
             terminal_colors,
             workspace_id,
+            managed_projection,
         } => {
             crate::logging::event(
                 crate::logging::EventKind::ServerClientAttach,
@@ -771,7 +791,12 @@ fn apply(
                     workspace_id.clone(),
                 ),
             );
-            if workspace_id.is_none() {
+            if managed_projection {
+                if let Some(client) = clients.get_mut(&id) {
+                    client.projection = Some(ProjectionSubscription::default());
+                }
+            }
+            if workspace_id.is_none() && !managed_projection {
                 *foreground = Some(id);
                 apply_foreground_theme(app, clients, *foreground);
             }
@@ -797,6 +822,63 @@ fn apply(
             was_foreground || was_projection
         }
         AppEvent::ClientInput { id, input } => {
+            if let ClientInput::ProjectionInterest {
+                epoch,
+                active,
+                cols,
+                rows,
+            } = input
+            {
+                let Some(client) = clients.get_mut(&id) else {
+                    return false;
+                };
+                let Some(projection) = client.projection.as_mut() else {
+                    return false;
+                };
+                if epoch <= projection.epoch {
+                    return false;
+                }
+                projection.epoch = epoch;
+                projection.active = active;
+                projection.seen_frame = None;
+                client.size = (cols.max(1), rows.max(1));
+                client.force_full = true;
+                client.retained_ready = false;
+                if active {
+                    client.last_activity = *next_activity;
+                    *next_activity = next_activity.saturating_add(1);
+                }
+                return true;
+            }
+            if let ClientInput::ProjectionPresented {
+                epoch,
+                event_sequence,
+            } = input
+            {
+                let Some(projection) = clients
+                    .get_mut(&id)
+                    .and_then(|client| client.projection.as_mut())
+                else {
+                    return false;
+                };
+                if !projection.active || projection.epoch != epoch {
+                    return false;
+                }
+                let Some((sequence, pane, observation)) = projection.seen_frame else {
+                    return false;
+                };
+                if sequence != event_sequence || app.agent_observation(pane) != Some(observation) {
+                    return false;
+                }
+                projection.seen_frame = None;
+                return app.acknowledge_agent_view(pane);
+            }
+            if clients
+                .get(&id)
+                .is_some_and(|client| !client.surface_active())
+            {
+                return false;
+            }
             if let ClientInput::Resize(cols, rows) = input {
                 let owns_size = clients
                     .get(&id)
@@ -868,7 +950,9 @@ fn apply(
                     ClientInput::Paste(text) => AppEvent::Paste(text),
                     ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                     ClientInput::Command(command) => AppEvent::ClientCommand(command),
-                    ClientInput::Resize(..) => unreachable!("handled above"),
+                    ClientInput::Resize(..)
+                    | ClientInput::ProjectionInterest { .. }
+                    | ClientInput::ProjectionPresented { .. } => unreachable!("handled above"),
                 };
                 // These flags normally target whole-session foreground in the
                 // loop. Isolate only effects created by this scoped input so
@@ -876,6 +960,13 @@ fn apply(
                 let previous_switch = app.pending_session_switch.take();
                 let previous_detach = std::mem::take(&mut app.detach_requested);
                 let changed = app.with_preserved_workspace_sidebar(|app| app.handle_event(event));
+                // Legacy viewers have no presentation acknowledgement. Actual
+                // scoped input is still evidence of viewing; a passive render is not.
+                let changed = if client.projection.is_none() && !app.workspaces.is_empty() {
+                    app.acknowledge_agent_view(app.layout().focus) || changed
+                } else {
+                    changed
+                };
                 bind_session_navigation_origin(app, id);
                 let requested_switch = app.pending_session_switch.take();
                 let requested_detach = std::mem::take(&mut app.detach_requested);
@@ -960,7 +1051,9 @@ fn apply(
                 ClientInput::Paste(text) => AppEvent::Paste(text),
                 ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                 ClientInput::Command(command) => AppEvent::ClientCommand(command),
-                ClientInput::Resize(..) => unreachable!("handled above"),
+                ClientInput::Resize(..)
+                | ClientInput::ProjectionInterest { .. }
+                | ClientInput::ProjectionPresented { .. } => unreachable!("handled above"),
             };
             let changed = app.handle_event(event);
             bind_session_navigation_origin(app, id);
@@ -1042,7 +1135,7 @@ fn broadcast(clients: &mut Clients, msg: ServerMessage) {
 fn latest_client(clients: &Clients) -> Option<u64> {
     clients
         .iter()
-        .filter(|(_, client)| client.workspace_id.is_none())
+        .filter(|(_, client)| client.workspace_id.is_none() && client.projection.is_none())
         .max_by_key(|(_, client)| client.last_activity)
         .map(|(&id, _)| id)
 }
@@ -1059,6 +1152,7 @@ fn workspace_size_owner(
     let active_workspace = app.workspaces.get(app.active_ws).map(|ws| ws.id.as_str());
     clients
         .iter()
+        .filter(|(_, client)| client.surface_active())
         .filter(|(id, client)| match client.workspace_id.as_deref() {
             Some(projected) => projected == workspace_id,
             None => foreground == Some(**id) && active_workspace == Some(workspace_id),
@@ -1107,15 +1201,18 @@ fn event_render_source(app: &App, clients: &Clients, event: &AppEvent) -> EventR
 
 fn pane_visible_to_any_client(app: &App, clients: &Clients, pane: crate::ids::PaneId) -> bool {
     app.pane_is_visible(pane)
-        || clients.values().any(|client| {
-            client.workspace_id.as_deref().is_some_and(|workspace_id| {
-                app.workspaces
-                    .iter()
-                    .find(|workspace| workspace.id == workspace_id)
-                    .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
-                    .is_some_and(|tab| tab.layout.contains(pane))
+        || clients
+            .values()
+            .filter(|client| client.surface_active())
+            .any(|client| {
+                client.workspace_id.as_deref().is_some_and(|workspace_id| {
+                    app.workspaces
+                        .iter()
+                        .find(|workspace| workspace.id == workspace_id)
+                        .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
+                        .is_some_and(|tab| tab.layout.contains(pane))
+                })
             })
-        })
 }
 
 fn rearm_pty_notify_by_visibility(app: &App, clients: &Clients) -> (bool, bool, bool) {
@@ -1193,20 +1290,25 @@ fn render_clients(
             .all(|snapshot| snapshot.kind == crate::terminal::vt::DamageKind::Partial);
 
     scratch.order.clear();
-    scratch.order.extend(clients.iter().map(|(&id, client)| {
-        let interactive = *foreground == Some(id);
-        let workspace_id = client.workspace_id.as_deref().or_else(|| {
-            if interactive {
-                app.workspaces.get(app.active_ws).map(|ws| ws.id.as_str())
-            } else {
-                None
-            }
-        });
-        let owns_size = workspace_id.is_some_and(|workspace_id| {
-            workspace_size_owner(app, clients, *foreground, workspace_id) == Some(id)
-        });
-        (id, owns_size)
-    }));
+    scratch.order.extend(
+        clients
+            .iter()
+            .filter(|(_, client)| client.surface_active())
+            .map(|(&id, client)| {
+                let interactive = *foreground == Some(id);
+                let workspace_id = client.workspace_id.as_deref().or_else(|| {
+                    if interactive {
+                        app.workspaces.get(app.active_ws).map(|ws| ws.id.as_str())
+                    } else {
+                        None
+                    }
+                });
+                let owns_size = workspace_id.is_some_and(|workspace_id| {
+                    workspace_size_owner(app, clients, *foreground, workspace_id) == Some(id)
+                });
+                (id, owns_size)
+            }),
+    );
     scratch
         .order
         .sort_unstable_by_key(|(id, owns_size)| (!owns_size, *foreground != Some(*id), *id));
@@ -1307,6 +1409,7 @@ fn visible_terminal_panes(app: &App, clients: &Clients) -> Vec<crate::ids::PaneI
     }
     for workspace_id in clients
         .values()
+        .filter(|client| client.surface_active())
         .filter_map(|client| client.workspace_id.as_deref())
     {
         let Some(workspace) = app
@@ -1369,6 +1472,9 @@ fn render_client(
     partial_pass: bool,
     damage: &HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
 ) -> RenderClientOutcome {
+    if !client.surface_active() {
+        return RenderClientOutcome::default();
+    }
     CLIENT_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
     let area = Rect::new(0, 0, client.size.0, client.size.1);
     if client.render_buf.area != area {
@@ -1413,6 +1519,7 @@ fn render_client(
             if owns_size {
                 ui::render_into(&mut target, app);
                 app.resize_active_remote_projection();
+                app.acknowledge_presented_remote_projection();
             } else {
                 ui::render_into_without_pane_resize(&mut target, app);
             }
@@ -1427,7 +1534,27 @@ fn render_client(
         (target.cursor(), target.cursor_visible())
     };
 
-    let full = force_all
+    let projected_pane = client.projection.as_ref().and_then(|_| {
+        client
+            .workspace_id
+            .as_ref()
+            .and_then(|id| app.workspaces.iter().find(|workspace| &workspace.id == id))
+            .or_else(|| {
+                if client.workspace_id.is_none() {
+                    app.workspaces.get(app.active_ws)
+                } else {
+                    None
+                }
+            })
+            .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
+            .map(|tab| tab.layout.focus)
+    });
+    let observation = projected_pane.and_then(|pane| app.agent_observation(pane));
+    let state_changed = client.projection.as_ref().is_some_and(|projection| {
+        projection.last_focus != projected_pane || projection.last_observation != observation
+    });
+    let full = state_changed
+        || force_all
         || client.force_full
         || client.behind
         || client.last_frame.as_ref().is_none_or(|previous| {
@@ -1462,10 +1589,30 @@ fn render_client(
         }
     };
 
-    let Some(message) = message else {
+    let Some(mut message) = message else {
         UNCHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
         return RenderClientOutcome::default();
     };
+    if let Some(projection) = client.projection.as_mut() {
+        let pane = projected_pane;
+        projection.last_focus = pane;
+        projection.last_observation = observation;
+        let sequence = api::current_sequence(&app.events);
+        let state = protocol::ProjectionState {
+            server_generation: app.backend_server_generation.clone(),
+            epoch: projection.epoch,
+            event_sequence: sequence,
+            workspace_id: client.workspace_id.clone().unwrap_or_default(),
+            focused_pane: pane.map(|pane| pane.0.to_string()),
+        };
+        projection.seen_frame =
+            pane.and_then(|pane| app.agent_observation(pane).map(|at| (sequence, pane, at)));
+        message = match message {
+            ServerMessage::Frame(frame) => ServerMessage::ProjectionFrame { state, frame },
+            ServerMessage::FrameDiff(frame) => ServerMessage::ProjectionDiff { state, frame },
+            _ => unreachable!("rendered frame"),
+        };
+    }
     CHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
     match client.sender.try_send_frame(message) {
         Ok(()) => {
@@ -1540,66 +1687,89 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
     let mut reader = BufReader::new(stream.clone());
     let mut writer = stream;
 
-    let (cols, rows, workspace_id) = match protocol::read_message::<_, ClientMessage>(&mut reader) {
-        Ok(ClientMessage::Hello {
-            version,
-            cols,
-            rows,
-        }) => {
-            if version != protocol::PROTOCOL_VERSION {
-                crate::logging::event(
-                    crate::logging::EventKind::ServerClientHandshakeRejected,
-                    &[
-                        crate::logging::Field::Reason(crate::logging::Reason::VersionMismatch),
-                        crate::logging::Field::ProtocolVersion(u64::from(version)),
-                    ],
-                );
-                let _ = protocol::write_message(
-                    &mut writer,
-                    &ServerMessage::Welcome {
-                        version: protocol::PROTOCOL_VERSION,
-                        error: Some("protocol version mismatch".into()),
-                    },
-                );
-                return;
+    let (version, cols, rows, workspace_id, managed_projection) =
+        match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::Hello {
+                version,
+                cols,
+                rows,
+            }) => {
+                if !protocol::supports_version(version) {
+                    crate::logging::event(
+                        crate::logging::EventKind::ServerClientHandshakeRejected,
+                        &[
+                            crate::logging::Field::Reason(crate::logging::Reason::VersionMismatch),
+                            crate::logging::Field::ProtocolVersion(u64::from(version)),
+                        ],
+                    );
+                    let _ = protocol::write_message(
+                        &mut writer,
+                        &ServerMessage::Welcome {
+                            version: protocol::PROTOCOL_VERSION,
+                            error: Some("protocol version mismatch".into()),
+                        },
+                    );
+                    return;
+                }
+                (version, cols, rows, None, false)
             }
-            (cols, rows, None)
-        }
-        Ok(ClientMessage::HelloWorkspace {
-            version,
-            cols,
-            rows,
-            workspace_id,
-        }) => {
-            if version != protocol::PROTOCOL_VERSION {
-                let _ = protocol::write_message(
-                    &mut writer,
-                    &ServerMessage::Welcome {
-                        version: protocol::PROTOCOL_VERSION,
-                        error: Some("protocol version mismatch".into()),
-                    },
-                );
-                return;
+            Ok(ClientMessage::HelloWorkspace {
+                version,
+                cols,
+                rows,
+                workspace_id,
+            }) => {
+                if !protocol::supports_version(version) {
+                    let _ = protocol::write_message(
+                        &mut writer,
+                        &ServerMessage::Welcome {
+                            version: protocol::PROTOCOL_VERSION,
+                            error: Some("protocol version mismatch".into()),
+                        },
+                    );
+                    return;
+                }
+                if workspace_id.len() > 128 || workspace_id.is_empty() {
+                    let _ = protocol::write_message(
+                        &mut writer,
+                        &ServerMessage::Welcome {
+                            version: protocol::PROTOCOL_VERSION,
+                            error: Some("invalid workspace projection".into()),
+                        },
+                    );
+                    return;
+                }
+                (version, cols, rows, Some(workspace_id), false)
             }
-            if workspace_id.len() > 128 || workspace_id.is_empty() {
-                let _ = protocol::write_message(
-                    &mut writer,
-                    &ServerMessage::Welcome {
-                        version: protocol::PROTOCOL_VERSION,
-                        error: Some("invalid workspace projection".into()),
-                    },
-                );
-                return;
+            Ok(ClientMessage::HelloProjection {
+                version,
+                workspace_id,
+            }) => {
+                if version != protocol::PROTOCOL_VERSION || workspace_id.len() > 128 {
+                    let _ = protocol::write_message(
+                        &mut writer,
+                        &ServerMessage::Welcome {
+                            version: protocol::PROTOCOL_VERSION,
+                            error: Some("unsupported remote display".into()),
+                        },
+                    );
+                    return;
+                }
+                (
+                    version,
+                    80,
+                    24,
+                    (!workspace_id.is_empty()).then_some(workspace_id),
+                    true,
+                )
             }
-            (cols, rows, Some(workspace_id))
-        }
-        _ => return,
-    };
+            _ => return,
+        };
 
     if protocol::write_message(
         &mut writer,
         &ServerMessage::Welcome {
-            version: protocol::PROTOCOL_VERSION,
+            version,
             error: None,
         },
     )
@@ -1608,7 +1778,8 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
         return;
     }
 
-    let probe_terminal = workspace_id.is_none() && terminal_theme.load(Ordering::Relaxed);
+    let probe_terminal =
+        !managed_projection && workspace_id.is_none() && terminal_theme.load(Ordering::Relaxed);
     if protocol::write_message(&mut writer, &ServerMessage::Ready { probe_terminal }).is_err() {
         return;
     }
@@ -1629,6 +1800,8 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             let frame_stats = match &msg {
                 ServerMessage::Frame(_) => Some((true, 0usize)),
                 ServerMessage::FrameDiff(frame) => Some((false, frame.runs.len())),
+                ServerMessage::ProjectionFrame { .. } => Some((true, 0)),
+                ServerMessage::ProjectionDiff { frame, .. } => Some((false, frame.runs.len())),
                 _ => None,
             };
             if frame_stats.is_some() {
@@ -1668,6 +1841,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             rows,
             terminal_colors,
             workspace_id,
+            managed_projection,
         })
         .is_err()
     {
@@ -1676,6 +1850,44 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
 
     loop {
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::ProjectionInterest {
+                epoch,
+                active,
+                cols,
+                rows,
+            }) if managed_projection => {
+                if app_tx
+                    .send(AppEvent::ClientInput {
+                        id,
+                        input: ClientInput::ProjectionInterest {
+                            epoch,
+                            active,
+                            cols,
+                            rows,
+                        },
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ClientMessage::ProjectionPresented {
+                epoch,
+                event_sequence,
+            }) if managed_projection => {
+                if app_tx
+                    .send(AppEvent::ClientInput {
+                        id,
+                        input: ClientInput::ProjectionPresented {
+                            epoch,
+                            event_sequence,
+                        },
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Ok(ClientMessage::ClipboardHelperResult { generation, result }) => {
                 let valid = generation.len() <= 128
                     && match &result {
@@ -1783,6 +1995,9 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             Ok(
                 ClientMessage::Hello { .. }
                 | ClientMessage::HelloWorkspace { .. }
+                | ClientMessage::HelloProjection { .. }
+                | ClientMessage::ProjectionInterest { .. }
+                | ClientMessage::ProjectionPresented { .. }
                 | ClientMessage::TerminalColors(_),
             ) => {}
         }
@@ -2130,6 +2345,201 @@ mod tests {
     #[cfg(unix)]
     mod projection_geometry {
         use super::*;
+
+        #[test]
+        fn managed_projection_seen_requires_current_presented_frame() {
+            use crate::ui::theme::State;
+            let _env = crate::persist::test_env("projection-presented-seen");
+            let mut fixture = Fixture::new();
+            fixture.clients.get_mut(&2).unwrap().projection = Some(Default::default());
+            let pane = fixture.target_pane();
+            fixture.api("agent.report", serde_json::json!({
+                "pane":pane.0.to_string(), "source":"test/seen", "agent":"codex", "status":"done"
+            }));
+            fixture.app.status.get_mut(&pane).unwrap().agent_report = None;
+            fixture.input(
+                2,
+                ClientInput::ProjectionInterest {
+                    epoch: 1,
+                    active: true,
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            fixture.render();
+            assert_eq!(
+                fixture.app.status[&pane].state,
+                State::Done,
+                "rendering alone is not viewing"
+            );
+            let sequence = fixture.clients[&2]
+                .projection
+                .as_ref()
+                .unwrap()
+                .seen_frame
+                .unwrap()
+                .0;
+            fixture.input(
+                2,
+                ClientInput::ProjectionPresented {
+                    epoch: 0,
+                    event_sequence: sequence,
+                },
+            );
+            assert_eq!(fixture.app.status[&pane].state, State::Done);
+            // A completion that arrived after this frame must not be consumed by its ack.
+            fixture.api("agent.report", serde_json::json!({
+                "pane":pane.0.to_string(), "source":"test/seen", "agent":"codex", "status":"working"
+            }));
+            fixture.api("agent.report", serde_json::json!({
+                "pane":pane.0.to_string(), "source":"test/seen", "agent":"codex", "status":"done"
+            }));
+            fixture.app.status.get_mut(&pane).unwrap().agent_report = None;
+            fixture.input(
+                2,
+                ClientInput::ProjectionPresented {
+                    epoch: 1,
+                    event_sequence: sequence,
+                },
+            );
+            assert_eq!(fixture.app.status[&pane].state, State::Done);
+            fixture.render();
+            let sequence = fixture.clients[&2]
+                .projection
+                .as_ref()
+                .unwrap()
+                .seen_frame
+                .unwrap()
+                .0;
+            fixture.input(
+                2,
+                ClientInput::ProjectionPresented {
+                    epoch: 1,
+                    event_sequence: sequence,
+                },
+            );
+            assert_eq!(fixture.app.status[&pane].state, State::Idle);
+            assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
+            assert!(
+                crate::ipc::api::current_sequence(&fixture.app.events) > sequence,
+                "view acknowledgement must publish an owner state event"
+            );
+        }
+
+        #[test]
+        fn hidden_managed_projection_has_no_frames_input_or_seen_ack() {
+            use crate::ui::theme::State;
+            let _env = crate::persist::test_env("projection-hidden-interest");
+            let mut fixture = Fixture::new();
+            fixture.clients.get_mut(&2).unwrap().projection = Some(Default::default());
+            let pane = fixture.target_pane();
+            fixture.api("agent.report", serde_json::json!({
+                "pane":pane.0.to_string(), "source":"test/hidden", "agent":"codex", "status":"done"
+            }));
+            fixture.app.status.get_mut(&pane).unwrap().agent_report = None;
+            fixture.input(
+                2,
+                ClientInput::ProjectionInterest {
+                    epoch: 1,
+                    active: true,
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            fixture.render();
+            let sequence = fixture.clients[&2]
+                .projection
+                .as_ref()
+                .unwrap()
+                .seen_frame
+                .unwrap()
+                .0;
+            while fixture._client_receivers[1].try_recv().is_ok() {}
+            fixture.input(
+                2,
+                ClientInput::ProjectionInterest {
+                    epoch: 2,
+                    active: false,
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            fixture.input(2, ClientInput::Command("new_tab".into()));
+            fixture.input(
+                2,
+                ClientInput::ProjectionPresented {
+                    epoch: 1,
+                    event_sequence: sequence,
+                },
+            );
+            fixture.render();
+            assert!(fixture._client_receivers[1].try_recv().is_err());
+            assert_eq!(fixture.app.workspaces[fixture.target_index()].tabs.len(), 1);
+            assert_eq!(fixture.app.status[&pane].state, State::Done);
+            fixture.input(
+                2,
+                ClientInput::ProjectionInterest {
+                    epoch: 3,
+                    active: true,
+                    cols: 95,
+                    rows: 31,
+                },
+            );
+            fixture.render();
+            assert!(matches!(fixture._client_receivers[1].try_recv().unwrap(),
+                ServerMessage::ProjectionFrame { state, frame } if state.epoch == 3 && frame.width == 95 && frame.height == 31));
+        }
+
+        #[test]
+        fn remote_view_ack_does_not_override_reported_or_busy_states() {
+            use crate::ui::theme::State;
+            let _env = crate::persist::test_env("projection-seen-authority");
+            let mut fixture = Fixture::new();
+            let pane = fixture.target_pane();
+            for (name, state) in [
+                ("done", State::Done),
+                ("working", State::Working),
+                ("blocked", State::Blocked),
+            ] {
+                fixture.api("agent.report", serde_json::json!({
+                    "pane":pane.0.to_string(), "source":"test/authority", "agent":"codex", "status":name
+                }));
+                assert!(!fixture.app.acknowledge_agent_view(pane));
+                assert_eq!(fixture.app.status[&pane].state, state);
+                if state != State::Done {
+                    fixture.app.status.get_mut(&pane).unwrap().agent_report = None;
+                    assert!(!fixture.app.acknowledge_agent_view(pane));
+                    assert_eq!(fixture.app.status[&pane].state, state);
+                }
+            }
+        }
+
+        #[test]
+        fn viewing_remote_done_agent_acknowledges_completion_without_stealing_local_focus() {
+            let _env = crate::persist::test_env("projection-done-seen");
+            let mut fixture = Fixture::new();
+            let pane = fixture.app.workspaces[fixture.target_index()].tabs[0]
+                .layout
+                .focus;
+            fixture.app.dispatch("agent.report", &serde_json::json!({
+                "pane": pane.0.to_string(), "source": "test/seen", "agent": "codex", "status": "done"
+            })).unwrap();
+            // A restored/native completion latch, with no external report overriding detection.
+            fixture.app.status.get_mut(&pane).unwrap().agent_report = None;
+            fixture.input(
+                2,
+                ClientInput::Command(format!("remote_agent_focus {}", pane.0)),
+            );
+            let now = std::time::Instant::now();
+            fixture.app.detect_tick(now + Duration::from_secs(1));
+            fixture.app.detect_tick(now + Duration::from_secs(5));
+            assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
+            assert_eq!(
+                fixture.app.status[&pane].state,
+                crate::ui::theme::State::Idle,
+                "viewing a projected agent must clear its native Done latch"
+            );
+        }
 
         struct Fixture {
             app: App,
@@ -3058,6 +3468,7 @@ mod tests {
                 rows: 24,
                 terminal_colors: None,
                 workspace_id: Some(workspace_id),
+                managed_projection: false,
             },
             &mut app,
             &mut clients,

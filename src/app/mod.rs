@@ -2448,10 +2448,11 @@ pub struct App {
     /// Input may call API dispatch (and dispatch may call another method).
     /// Publish one final focus change for that operation, not intermediate hops.
     focus_event_scope: bool,
-    /// One event-driven topology subscription per merged SSH session. Entries
-    /// are added only by explicit startup/menu merge discovery and removed when
-    /// that bounded worker exits; there is no idle polling.
+    /// One event-driven subscription per selected SSH session. Previously live
+    /// owners reconnect with cancellable backoff only after a connection fails;
+    /// there is no idle session discovery polling.
     remote_session_watchers: std::collections::HashMap<String, remote::RemoteWatcher>,
+    remote_display_pane: Option<PaneId>,
     /// A pointer gesture begun in a remote frame must release on that same
     /// owner even when it crosses the local sidebar or the workspace changes.
     remote_mouse_capture: Option<(PaneId, Rect, ratatui::crossterm::event::MouseButton)>,
@@ -3066,6 +3067,7 @@ impl App {
             named_session_generation: 0,
             focus_event_scope: false,
             remote_session_watchers: std::collections::HashMap::new(),
+            remote_display_pane: None,
             remote_mouse_capture: None,
             pending_remote_navigation: None,
             remote_registry_generation: 0,
@@ -3745,6 +3747,7 @@ impl App {
             named_session_generation: 0,
             focus_event_scope: false,
             remote_session_watchers: std::collections::HashMap::new(),
+            remote_display_pane: None,
             remote_mouse_capture: None,
             pending_remote_navigation: None,
             remote_registry_generation: 0,

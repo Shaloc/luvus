@@ -201,7 +201,7 @@ applies only on that enabled host; local batches do not restart remote owners.
 Managed SSH remotes are local projections backed by one literal `Host`
 alias from `~/.ssh/config`. Their canonical names are
 `remote-<host>-<actual-session-name>`. `luvus session remote add <host> <name>`
-requires the exact same remote-session-enabled Luvus build on that host and
+requires a compatible remote-session-enabled Luvus build on that host and
 never copies it there. Use `--host <host> --session <name>` on every related
 server-backed command; place both selectors before prompt text or pass-through
 arguments. Merge mode keeps workspace ownership on its original server and
@@ -211,6 +211,15 @@ are allowed; the default list is empty. Never enable or connect every SSH
 config entry. Merge toggles and registration changes refresh a running local
 session, and disabling a host disconnects its projections without stopping
 remote panes.
+Managed connections support transport 9 fallback and negotiated transport 10
+projection features, independent of package-version equality. Optional
+`remote_display` data in `session.snapshot` and `uhp.capabilities` advertises
+the running owner's support. Hidden projections stop sending frames while
+agent events continue. Viewing a matching frame acknowledges native Done
+without changing working/blocked states or explicit external reports.
+Transient disconnects reconnect automatically; authentication, host-key and
+protocol errors require user action. No outage input or CLI mutation is replayed,
+and reconnect never installs a binary or restarts a server.
 Selecting a host connects and discovers existing sessions. Opening the local
 switcher or pressing `r` refreshes new sessions without registration or idle
 polling. Managed attaches retain the local prefix and session switcher; they

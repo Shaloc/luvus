@@ -724,7 +724,15 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     let merged_remote = !workspace_only && app.ws().remote.is_some();
     let mobile_layout = (!merged_remote && app.compact).then(|| mobile::compute_layout(content));
     let (tabbar, pane_area) = if merged_remote {
-        (Rect::ZERO, content)
+        // The owner supplies the tab bar, but cannot reopen this display's
+        // sidebars. Reserve a local navigation row only while one is hidden;
+        // never paint a local hit target over an owner's tab or terminal cell.
+        let [navigation, remote] = Layout::vertical([
+            Constraint::Length(app.remote_sidebar_reopen_height()),
+            Constraint::Min(0),
+        ])
+        .areas(content);
+        (navigation, remote)
     } else if let Some(layout) = mobile_layout {
         (layout.header, layout.content)
     } else {
@@ -817,6 +825,9 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
         }
     }
     let (tab_rects, tab_close_rects, tab_prev, tab_next) = if merged_remote {
+        if tabbar.height > 0 {
+            tabbar::draw_sidebar_reopen(f, tabbar, app, &t);
+        }
         (Vec::new(), Vec::new(), None, None)
     } else if let Some(layout) = mobile_layout {
         app.sidebar_toggle_rect = None;

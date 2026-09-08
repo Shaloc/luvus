@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -18,15 +19,21 @@ use crate::event::AppEvent;
 use crate::ids::PaneId;
 use crate::ipc::protocol::{self, ClientMessage, FrameData, ServerMessage};
 use crate::layout::TileLayout;
-use crate::session::remote::{RemoteBinaryLocation, RemoteSession};
+use crate::session::remote::{RemoteBinaryLocation, RemoteInput, RemoteSession};
+
+const REMOTE_RETRY_INITIAL: Duration = Duration::from_millis(250);
+const REMOTE_RETRY_MAX: Duration = Duration::from_secs(10);
 
 pub(super) struct RemoteWatcher {
     target: RemoteSession,
     generation: u64,
     scope: Arc<crate::session::remote::ConnectionScope>,
-    /// Only the first snapshot after an explicit discovery may reconnect an
-    /// existing projection. Subsequent owner events never become idle retries.
+    /// Reconcile projections once after explicit discovery or a failed connection.
     refresh_projections: bool,
+    /// None until this owner has connected successfully. Failed initial opens
+    /// still report their install/configuration error without an idle retry loop.
+    retry_delay: Option<Duration>,
+    retry_pending: bool,
 }
 
 impl Drop for RemoteWatcher {
@@ -135,9 +142,26 @@ pub struct RemoteWorkspaceMeta {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteSessionSnapshot {
-    pub location: RemoteBinaryLocation,
     pub event_sequence: u64,
     pub workspaces: Vec<RemoteWorkspaceMeta>,
+    pub display: RemoteDisplay,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RemoteDisplay {
+    pub location: RemoteBinaryLocation,
+    pub server_generation: Option<String>,
+    pub projection: bool,
+}
+
+#[derive(Default)]
+pub struct RemoteProjection {
+    display: RemoteDisplay,
+    epoch: u64,
+    active: bool,
+    frame_state: Option<protocol::ProjectionState>,
+    desired_pane: Option<String>,
+    presented: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,8 +209,9 @@ pub struct RemoteView {
     pub error: Option<String>,
     pub frame: Option<FrameData>,
     pub generation: u64,
-    pub input: Option<mpsc::Sender<ClientMessage>>,
+    pub input: Option<RemoteInput>,
     pub last_size: (u16, u16),
+    pub projection: Box<RemoteProjection>,
     effect_leader: Arc<AtomicBool>,
 }
 
@@ -199,19 +224,21 @@ impl Drop for RemoteView {
 }
 
 pub struct RemoteFrameSlot {
-    latest: Mutex<Option<FrameData>>,
+    latest: Mutex<Option<(FrameData, Option<protocol::ProjectionState>)>>,
     pending: AtomicBool,
 }
 
 /// Reap the SSH bridge on every return path, including handshake and frame
 /// decode failures. The input writer owns only the child's stdin pipe, so
 /// terminating the process also lets that short-lived thread exit promptly.
-struct RemoteChild(Child);
+struct RemoteChild(Arc<Mutex<Child>>);
 
 impl Drop for RemoteChild {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if let Ok(mut child) = self.0.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -230,8 +257,19 @@ impl RemoteFrameSlot {
         frame: FrameData,
         tx: &mpsc::Sender<AppEvent>,
     ) {
+        self.publish_with_state(pane, generation, frame, None, tx);
+    }
+
+    fn publish_with_state(
+        self: &Arc<Self>,
+        pane: PaneId,
+        generation: u64,
+        frame: FrameData,
+        state: Option<protocol::ProjectionState>,
+        tx: &mpsc::Sender<AppEvent>,
+    ) {
         if let Ok(mut latest) = self.latest.lock() {
-            *latest = Some(frame);
+            *latest = Some((frame, state));
         }
         if self
             .pending
@@ -246,7 +284,7 @@ impl RemoteFrameSlot {
         }
     }
 
-    pub(crate) fn take(&self) -> Option<FrameData> {
+    pub(crate) fn take(&self) -> Option<(FrameData, Option<protocol::ProjectionState>)> {
         // Clear first. A concurrent publisher then either queues a fresh event,
         // or its newer frame is the one taken below; an update cannot be stranded.
         self.pending.store(false, Ordering::Release);
@@ -273,12 +311,13 @@ impl App {
                 self.remote_workspace_view(index).is_some_and(|view| {
                     view.target.host == target.host
                         && view.target.session == target.session
-                        && view.state == RemoteViewState::Ready
+                        && view.input.is_some()
                 })
             })
         else {
             return false;
         };
+        self.focus_workspace(index);
         if self.send_workspace_remote(index, ClientMessage::Command("open_local_workspace".into()))
         {
             self.picker = None;
@@ -319,6 +358,14 @@ impl App {
             }
         } else {
             self.sidebar_focus = None;
+            if let Some(ViewKind::Remote(view)) = self
+                .views
+                .get_mut(&self.workspaces[index].tabs[0].layout.focus)
+            {
+                if view.projection.display.projection {
+                    view.projection.desired_pane = Some(pane.to_string());
+                }
+            }
             self.send_workspace_remote(
                 index,
                 ClientMessage::Command(format!("remote_agent_focus {pane}")),
@@ -354,6 +401,7 @@ impl App {
                 generation: u64::from(pane.0),
                 input: None,
                 last_size: (0, 0),
+                projection: Box::default(),
                 effect_leader: Arc::new(AtomicBool::new(false)),
             }),
         );
@@ -599,7 +647,26 @@ impl App {
         // User-triggered refresh also replaces a healthy topology watcher when
         // its independent display bridge failed. Dropping it cancels its I/O;
         // the new generation fences any snapshot already queued by that watcher.
+        self.start_remote_watcher(target, None);
+    }
+
+    fn start_remote_watcher(&mut self, target: RemoteSession, retry: Option<Duration>) {
+        let key = target.canonical_name();
         self.remote_session_watchers.remove(&key);
+        // Replacing the session scope also closes its display bridges. Fence
+        // their queued frames even when this is a healthy, explicit refresh.
+        for view in self.views.values_mut() {
+            if let ViewKind::Remote(view) = view {
+                if view.target.host == target.host && view.target.session == target.session {
+                    if let Some(input) = view.input.take() {
+                        let _ = input.send(ClientMessage::Detach);
+                    }
+                    view.generation = view.generation.wrapping_add(1);
+                    view.state = RemoteViewState::Connecting;
+                }
+            }
+        }
+        self.discard_stale_remote_navigation();
         self.remote_watcher_generation = self.remote_watcher_generation.wrapping_add(1);
         let generation = self.remote_watcher_generation;
         let scope = Arc::new(crate::session::remote::ConnectionScope::default());
@@ -610,10 +677,15 @@ impl App {
                 generation,
                 scope: scope.clone(),
                 refresh_projections: true,
+                retry_delay: retry.map(|delay| (delay * 2).min(REMOTE_RETRY_MAX)),
+                retry_pending: retry.is_some(),
             },
         );
         let tx = self.app_tx.clone();
         std::thread::spawn(move || {
+            if retry.is_some_and(|delay| !scope.wait_for_retry(delay)) {
+                return;
+            }
             let result = remote_snapshot(&target, &scope);
             let Ok(snapshot) = result else {
                 let _ = tx.send(AppEvent::RemoteSessionDiscovered {
@@ -624,7 +696,7 @@ impl App {
                 return;
             };
             let sequence = snapshot.event_sequence;
-            let location = snapshot.location;
+            let location = snapshot.display.location;
             if tx
                 .send(AppEvent::RemoteSessionDiscovered {
                     generation,
@@ -647,6 +719,40 @@ impl App {
         });
     }
 
+    /// One retry per selected session, shared by topology and display failures.
+    /// A fresh scope cancels both old streams; the existing generations reject
+    /// already queued frames/snapshots before any owner-local pane ID is reused.
+    fn retry_remote_session(&mut self, target: &RemoteSession, error: &str) -> bool {
+        if crate::session::remote::failure_needs_attention(error) {
+            return false;
+        }
+        if !self.config.remote_hosts.contains(&target.host) {
+            return false;
+        }
+        let Some(watcher) = self.remote_session_watchers.get(&target.canonical_name()) else {
+            return false;
+        };
+        if watcher.retry_pending {
+            return true;
+        }
+        let Some(delay) = watcher.retry_delay else {
+            return false;
+        };
+        for view in self.views.values_mut() {
+            if let ViewKind::Remote(view) = view {
+                if view.target.host == target.host && view.target.session == target.session {
+                    view.error = Some(error.to_string());
+                    for agent in &mut view.agents {
+                        agent.state = crate::ui::theme::State::Unknown;
+                    }
+                }
+            }
+        }
+        self.start_remote_watcher(target.clone(), Some(delay));
+        self.rebalance_remote_effect_leaders();
+        true
+    }
+
     pub(crate) fn remote_watcher_is_current(
         &self,
         target: &RemoteSession,
@@ -663,9 +769,18 @@ impl App {
         result: Result<RemoteSessionSnapshot, String>,
     ) {
         self.discard_stale_remote_navigation();
+        if let Some(watcher) = self
+            .remote_session_watchers
+            .get_mut(&target.canonical_name())
+        {
+            watcher.retry_pending = false;
+        }
         let snapshot = match result {
             Ok(snapshot) => snapshot,
             Err(error) => {
+                if self.retry_remote_session(&target, &error) {
+                    return;
+                }
                 if let Some(picker) = self.picker.as_mut() {
                     if let Some(choices) = picker
                         .hosts
@@ -699,7 +814,10 @@ impl App {
         let refresh_projections = self
             .remote_session_watchers
             .get_mut(&target.canonical_name())
-            .is_some_and(|watcher| std::mem::take(&mut watcher.refresh_projections));
+            .is_some_and(|watcher| {
+                watcher.retry_delay.get_or_insert(REMOTE_RETRY_INITIAL);
+                std::mem::take(&mut watcher.refresh_projections)
+            });
         let mut reconnect = Vec::new();
         let mut metadata = snapshot.workspaces;
         // A live session may have no workspace. Keep a native empty-session
@@ -749,19 +867,30 @@ impl App {
                 if let Some(pane) = workspace.tabs.first().map(|tab| tab.layout.focus) {
                     if let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) {
                         view.agents = meta.agents;
+                        // Focus belongs to the displayed frame. The topology
+                        // stream can arrive before or after that frame.
+                        if let Some(state) = &view.projection.frame_state {
+                            for agent in &mut view.agents {
+                                agent.focused = Some(&agent.pane) == state.focused_pane.as_ref();
+                            }
+                        }
                         view.history = meta.history;
                         view.scheduled = meta.scheduled;
-                        if refresh_projections && view.state == RemoteViewState::Disconnected {
+                        if refresh_projections && view.state != RemoteViewState::Ready {
                             if let Some(input) = view.input.take() {
                                 let _ = input.send(ClientMessage::Detach);
                             }
                             view.generation = view.generation.wrapping_add(1);
                             view.state = RemoteViewState::Connecting;
+                            *view.projection = RemoteProjection {
+                                display: snapshot.display.clone(),
+                                ..Default::default()
+                            };
                             view.error = None;
                             reconnect.push((
                                 pane,
                                 view.generation,
-                                remote.workspace_id.clone(),
+                                remote.clone(),
                                 view.effect_leader.clone(),
                             ));
                         }
@@ -791,17 +920,17 @@ impl App {
             })
         });
         for meta in metadata {
-            self.add_remote_workspace(&target, meta, snapshot.location);
+            self.add_remote_workspace(&target, meta, snapshot.display.clone());
         }
-        for (pane, generation, workspace_id, effect_leader) in reconnect {
+        for (pane, generation, remote, effect_leader) in reconnect {
             spawn_projection(
                 pane,
                 generation,
-                target.clone(),
-                workspace_id,
-                snapshot.location,
+                remote,
+                snapshot.display.clone(),
                 effect_leader,
                 self.app_tx.clone(),
+                self.remote_connection_scope(&target),
             );
         }
         if self.workspaces.iter().any(|workspace| {
@@ -838,6 +967,9 @@ impl App {
         target: RemoteSession,
         error: String,
     ) {
+        if self.retry_remote_session(&target, &error) {
+            return;
+        }
         if self
             .pending_remote_navigation
             .as_ref()
@@ -869,7 +1001,7 @@ impl App {
         &mut self,
         target: &RemoteSession,
         meta: RemoteWorkspaceMeta,
-        location: RemoteBinaryLocation,
+        display: RemoteDisplay,
     ) {
         let pane = PaneId::alloc();
         let generation = u64::from(pane.0);
@@ -892,6 +1024,10 @@ impl App {
                 generation,
                 input: None,
                 last_size: (80, 24),
+                projection: Box::new(RemoteProjection {
+                    display: display.clone(),
+                    ..Default::default()
+                }),
                 effect_leader: effect_leader.clone(),
             }),
         );
@@ -910,12 +1046,22 @@ impl App {
         spawn_projection(
             pane,
             generation,
-            target.clone(),
-            remote.workspace_id,
-            location,
+            remote,
+            display,
             effect_leader,
             self.app_tx.clone(),
+            self.remote_connection_scope(target),
         );
+    }
+
+    fn remote_connection_scope(
+        &self,
+        target: &RemoteSession,
+    ) -> Arc<crate::session::remote::ConnectionScope> {
+        self.remote_session_watchers
+            .get(&target.canonical_name())
+            .map(|watcher| watcher.scope.clone())
+            .unwrap_or_default()
     }
 
     fn rebalance_remote_effect_leader(&mut self, target: &RemoteSession) {
@@ -992,7 +1138,7 @@ impl App {
         &mut self,
         pane: PaneId,
         generation: u64,
-        input: mpsc::Sender<ClientMessage>,
+        input: RemoteInput,
     ) {
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
@@ -1001,12 +1147,32 @@ impl App {
             return;
         }
         view.input = Some(input);
-        view.state = RemoteViewState::Ready;
+        view.state = if view.projection.display.projection {
+            RemoteViewState::Connecting
+        } else {
+            RemoteViewState::Ready
+        };
         view.error = None;
         // The new owner connection starts at its handshake viewport. A render
         // while connecting may already have cached our desired size without
         // an input sender, so force it to be sent after this handshake.
         view.last_size = (0, 0);
+        let target = RemoteSession {
+            host: view.target.host.clone(),
+            session: view.target.session.clone(),
+        };
+        if self.views.values().all(|view| {
+            !matches!(view, ViewKind::Remote(view)
+            if view.target.host == target.host && view.target.session == target.session
+                && view.input.is_none())
+        }) {
+            if let Some(watcher) = self
+                .remote_session_watchers
+                .get_mut(&target.canonical_name())
+            {
+                watcher.retry_delay = Some(REMOTE_RETRY_INITIAL);
+            }
+        }
         self.rebalance_remote_effect_leaders();
     }
 
@@ -1016,13 +1182,37 @@ impl App {
         generation: u64,
         slot: &RemoteFrameSlot,
     ) {
-        let Some(frame) = slot.take() else {
+        let Some((frame, state)) = slot.take() else {
             return;
         };
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
         if view.generation == generation {
+            if view.projection.display.projection {
+                let Some(state) = state else {
+                    return;
+                };
+                if !view.projection.active
+                    || state.epoch != view.projection.epoch
+                    || Some(&state.server_generation)
+                        != view.projection.display.server_generation.as_ref()
+                    || state.workspace_id != view.target.workspace_id
+                    || (frame.width, frame.height) != view.last_size
+                    || view
+                        .projection
+                        .desired_pane
+                        .as_ref()
+                        .is_some_and(|pane| Some(pane) != state.focused_pane.as_ref())
+                {
+                    return;
+                }
+                for agent in &mut view.agents {
+                    agent.focused = Some(&agent.pane) == state.focused_pane.as_ref();
+                }
+                view.projection.desired_pane = None;
+                view.projection.frame_state = Some(state);
+            }
             view.frame = Some(frame);
             view.state = RemoteViewState::Ready;
             view.error = None;
@@ -1038,11 +1228,17 @@ impl App {
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
-        if view.generation == generation {
-            view.state = RemoteViewState::Disconnected;
-            view.input = None;
-            view.error = Some(error);
+        if view.generation != generation {
+            return;
         }
+        view.state = RemoteViewState::Disconnected;
+        view.input = None;
+        view.error = Some(error.clone());
+        let target = RemoteSession {
+            host: view.target.host.clone(),
+            session: view.target.session.clone(),
+        };
+        self.retry_remote_session(&target, &error);
         self.discard_stale_remote_navigation();
         self.rebalance_remote_effect_leaders();
     }
@@ -1193,13 +1389,22 @@ impl App {
         self.active_remote_pane()
             .and_then(|pane| self.views.get(&pane))
             .and_then(|view| match view {
-                ViewKind::Remote(view) => view.input.as_ref(),
+                ViewKind::Remote(view) if view.state == RemoteViewState::Ready => {
+                    view.input.as_ref()
+                }
                 _ => None,
             })
             .is_some_and(|input| input.send(message).is_ok())
     }
 
-    pub(crate) fn send_workspace_remote(&self, index: usize, message: ClientMessage) -> bool {
+    pub(crate) fn send_workspace_remote(&mut self, index: usize, message: ClientMessage) -> bool {
+        if index == self.active_ws
+            && self
+                .remote_workspace_view(index)
+                .is_some_and(|view| view.projection.display.projection)
+        {
+            self.resize_active_remote_projection();
+        }
         self.workspaces
             .get(index)
             .and_then(|ws| ws.tabs.get(ws.active_tab))
@@ -1214,8 +1419,29 @@ impl App {
     /// Map an outer menu's click into the selected owner's display viewport.
     /// Sidebar anchors sit outside that viewport and clamp to its nearest edge.
     pub(crate) fn remote_menu_anchor(&self, workspace: usize, anchor: (u16, u16)) -> (u16, u16) {
-        let rect = self
-            .workspaces
+        let rect = self.remote_workspace_rect(workspace);
+        (
+            anchor
+                .0
+                .saturating_sub(rect.x)
+                .min(rect.width.saturating_sub(1)),
+            anchor
+                .1
+                .saturating_sub(rect.y)
+                .min(rect.height.saturating_sub(1)),
+        )
+    }
+
+    pub(crate) fn remote_sidebar_reopen_height(&self) -> u16 {
+        u16::from(
+            [&self.sidebars.left, &self.sidebars.right]
+                .iter()
+                .any(|side| !side.visible && !side.docks.is_empty()),
+        )
+    }
+
+    fn remote_workspace_rect(&self, workspace: usize) -> ratatui::layout::Rect {
+        self.workspaces
             .get(workspace)
             .filter(|workspace| workspace.remote.is_some())
             .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
@@ -1232,18 +1458,14 @@ impl App {
                 let main = self.last_main_area;
                 let left = self.left_seam.map_or(main.x, |seam| seam.right());
                 let right = self.right_seam.map_or(main.right(), |seam| seam.x);
-                ratatui::layout::Rect::new(left, main.y, right.saturating_sub(left), main.height)
-            });
-        (
-            anchor
-                .0
-                .saturating_sub(rect.x)
-                .min(rect.width.saturating_sub(1)),
-            anchor
-                .1
-                .saturating_sub(rect.y)
-                .min(rect.height.saturating_sub(1)),
-        )
+                let navigation = self.remote_sidebar_reopen_height().min(main.height);
+                ratatui::layout::Rect::new(
+                    left,
+                    main.y + navigation,
+                    right.saturating_sub(left),
+                    main.height - navigation,
+                )
+            })
     }
 
     pub(crate) fn owner_menu_coordinates<'a>(
@@ -1388,20 +1610,53 @@ impl App {
     }
 
     pub(crate) fn resize_active_remote_projection(&mut self) {
-        let Some(pane) = self.active_remote_pane() else {
+        let active = self.active_remote_pane();
+        if self.remote_display_pane != active {
+            if let Some(previous) = self.remote_display_pane {
+                if let Some(ViewKind::Remote(view)) = self.views.get_mut(&previous) {
+                    if view.projection.display.projection && view.projection.active {
+                        view.projection.active = false;
+                        view.projection.epoch = view.projection.epoch.saturating_add(1);
+                        view.projection.frame_state = None;
+                        if let Some(input) = &view.input {
+                            let _ = input.send(ClientMessage::ProjectionInterest {
+                                epoch: view.projection.epoch,
+                                active: false,
+                                cols: view.last_size.0,
+                                rows: view.last_size.1,
+                            });
+                        }
+                    }
+                }
+            }
+            self.remote_display_pane = active;
+        }
+        let Some(pane) = active else {
             return;
         };
-        let Some(rect) = self
-            .pane_content_rects
-            .iter()
-            .find_map(|(candidate, rect)| (*candidate == pane).then_some(*rect))
-        else {
-            return;
-        };
+        let rect = self.remote_workspace_rect(self.active_ws);
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
         let size = (rect.width.max(1), rect.height.max(1));
+        if view.projection.display.projection {
+            if let Some(input) = &view.input {
+                if !view.projection.active || size != view.last_size {
+                    view.projection.active = true;
+                    view.projection.epoch = view.projection.epoch.saturating_add(1);
+                    view.projection.frame_state = None;
+                    view.state = RemoteViewState::Connecting;
+                    view.last_size = size;
+                    let _ = input.send(ClientMessage::ProjectionInterest {
+                        epoch: view.projection.epoch,
+                        active: true,
+                        cols: size.0,
+                        rows: size.1,
+                    });
+                }
+            }
+            return;
+        }
         if size == view.last_size {
             return;
         }
@@ -1411,6 +1666,33 @@ impl App {
                 cols: size.0,
                 rows: size.1,
             });
+        }
+    }
+
+    /// Called only by the interactive display render, never by command routing
+    /// or metadata discovery. An activation request is not evidence of viewing.
+    pub(crate) fn acknowledge_presented_remote_projection(&mut self) {
+        let Some(pane) = self.active_remote_pane() else {
+            return;
+        };
+        let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
+            return;
+        };
+        if !view.projection.active || view.state != RemoteViewState::Ready {
+            return;
+        }
+        if let (Some(input), Some(state)) = (&view.input, &view.projection.frame_state) {
+            let token = (state.epoch, state.event_sequence);
+            if view.projection.presented != Some(token)
+                && input
+                    .send(ClientMessage::ProjectionPresented {
+                        epoch: token.0,
+                        event_sequence: token.1,
+                    })
+                    .is_ok()
+            {
+                view.projection.presented = Some(token);
+            }
         }
     }
 }
@@ -1542,11 +1824,43 @@ pub(super) fn parse_remote_snapshot(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(RemoteSessionSnapshot {
-        location,
+    let snapshot = RemoteSessionSnapshot {
+        display: RemoteDisplay {
+            location,
+            server_generation: response
+                .get("result")
+                .and_then(|result| result.get("server_generation"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            projection: response
+                .get("result")
+                .and_then(|result| result.get("remote_display"))
+                .is_some_and(|display| {
+                    display.get("transport").and_then(Value::as_u64)
+                        == Some(u64::from(protocol::PROTOCOL_VERSION))
+                        && display
+                            .get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter().any(|cap| {
+                                    cap.as_str() == Some(protocol::PROJECTION_CAPABILITY)
+                                })
+                            })
+                }),
+        },
         event_sequence,
         workspaces,
-    })
+    };
+    if snapshot.display.projection
+        && snapshot
+            .display
+            .server_generation
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err("remote projection protocol mismatch: missing server generation".into());
+    }
+    Ok(snapshot)
 }
 
 fn watch_remote_session(
@@ -1660,21 +1974,21 @@ fn watch_remote_session(
 fn spawn_projection(
     pane: PaneId,
     generation: u64,
-    target: RemoteSession,
-    workspace_id: String,
-    location: RemoteBinaryLocation,
+    target: RemoteWorkspaceRef,
+    display: RemoteDisplay,
     effect_leader: Arc<AtomicBool>,
     app_tx: mpsc::Sender<AppEvent>,
+    scope: Arc<crate::session::remote::ConnectionScope>,
 ) {
     std::thread::spawn(move || {
         let result = run_projection(
             pane,
             generation,
             &target,
-            &workspace_id,
-            location,
+            display,
             effect_leader,
             &app_tx,
+            &scope,
         );
         let error = result
             .err()
@@ -1690,158 +2004,205 @@ fn spawn_projection(
 fn run_projection(
     pane: PaneId,
     generation: u64,
-    target: &RemoteSession,
-    workspace_id: &str,
-    location: RemoteBinaryLocation,
+    target: &RemoteWorkspaceRef,
+    display: RemoteDisplay,
     effect_leader: Arc<AtomicBool>,
     app_tx: &mpsc::Sender<AppEvent>,
+    scope: &crate::session::remote::ConnectionScope,
 ) -> Result<(), String> {
+    let owner = RemoteSession {
+        host: target.host.clone(),
+        session: target.session.clone(),
+    };
     let mut command =
-        crate::session::remote::bridge_command(target, "remote-client-bridge", location);
+        crate::session::remote::bridge_command(&owner, "remote-client-bridge", display.location);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = RemoteChild(command.spawn().map_err(|error| error.to_string())?);
-    let mut input = child
-        .0
-        .stdin
-        .take()
-        .ok_or_else(|| "SSH bridge has no stdin".to_string())?;
-    let output = child
-        .0
-        .stdout
-        .take()
-        .ok_or_else(|| "SSH bridge has no stdout".to_string())?;
-    protocol::write_message(
-        &mut input,
-        &if workspace_id.is_empty() {
-            ClientMessage::Hello {
-                version: protocol::PROTOCOL_VERSION,
-                cols: 80,
-                rows: 24,
-            }
-        } else {
-            ClientMessage::HelloWorkspace {
-                version: protocol::PROTOCOL_VERSION,
-                cols: 80,
-                rows: 24,
-                workspace_id: workspace_id.to_string(),
-            }
-        },
-    )
-    .map_err(|error| error.to_string())?;
-    let mut output = BufReader::new(output);
-    match protocol::read_message::<_, ServerMessage>(&mut output)
-        .map_err(|error| error.to_string())?
-    {
-        ServerMessage::Welcome { error: None, .. } => {}
-        ServerMessage::Welcome {
-            error: Some(error), ..
-        } => return Err(error),
-        _ => return Err("unexpected remote projection handshake".to_string()),
-    }
-    let probe_terminal = match protocol::read_message::<_, ServerMessage>(&mut output)
-        .map_err(|error| error.to_string())?
-    {
-        ServerMessage::Ready { probe_terminal } => probe_terminal,
-        _ => return Err("unexpected remote projection negotiation".to_string()),
+        .stderr(Stdio::piped());
+    let child = RemoteChild(Arc::new(Mutex::new(
+        command.spawn().map_err(|error| error.to_string())?,
+    )));
+    scope.register(&child.0)?;
+    let (mut input, output, stderr) = {
+        let mut process = child
+            .0
+            .lock()
+            .map_err(|_| "SSH bridge closed".to_string())?;
+        (
+            process
+                .stdin
+                .take()
+                .ok_or_else(|| "SSH bridge has no stdin".to_string())?,
+            process
+                .stdout
+                .take()
+                .ok_or_else(|| "SSH bridge has no stdout".to_string())?,
+            process
+                .stderr
+                .take()
+                .ok_or_else(|| "SSH bridge has no stderr".to_string())?,
+        )
     };
-    if probe_terminal {
-        protocol::write_message(&mut input, &ClientMessage::TerminalColors(None))
-            .map_err(|error| error.to_string())?;
-    }
+    let diagnostics = crate::session::remote::BridgeDiagnostics::capture(stderr);
+    let run = || -> Result<(), String> {
+        protocol::write_message(
+            &mut input,
+            &if display.projection {
+                ClientMessage::HelloProjection {
+                    version: protocol::PROTOCOL_VERSION,
+                    workspace_id: target.workspace_id.clone(),
+                }
+            } else if target.workspace_id.is_empty() {
+                ClientMessage::Hello {
+                    version: protocol::LEGACY_PROTOCOL_VERSION,
+                    cols: 80,
+                    rows: 24,
+                }
+            } else {
+                ClientMessage::HelloWorkspace {
+                    version: protocol::LEGACY_PROTOCOL_VERSION,
+                    cols: 80,
+                    rows: 24,
+                    workspace_id: target.workspace_id.clone(),
+                }
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        let mut output = BufReader::new(output);
+        match protocol::read_message::<_, ServerMessage>(&mut output)
+            .map_err(|error| error.to_string())?
+        {
+            ServerMessage::Welcome { error: None, .. } => {}
+            ServerMessage::Welcome {
+                error: Some(error), ..
+            } => return Err(error),
+            _ => return Err("unexpected remote projection handshake".to_string()),
+        }
+        let probe_terminal = match protocol::read_message::<_, ServerMessage>(&mut output)
+            .map_err(|error| error.to_string())?
+        {
+            ServerMessage::Ready { probe_terminal } => probe_terminal,
+            _ => return Err("unexpected remote projection negotiation".to_string()),
+        };
+        if probe_terminal {
+            protocol::write_message(&mut input, &ClientMessage::TerminalColors(None))
+                .map_err(|error| error.to_string())?;
+        }
 
-    let (input_tx, input_rx) = mpsc::channel::<ClientMessage>();
-    app_tx
-        .send(AppEvent::RemoteProjectionReady {
-            pane,
-            generation,
-            input: input_tx,
-        })
-        .map_err(|_| "local session closed".to_string())?;
-    std::thread::spawn(move || {
-        for message in input_rx {
-            let detach = matches!(message, ClientMessage::Detach);
-            if protocol::write_message(&mut input, &message).is_err() || detach {
-                break;
+        let failed = app_tx.clone();
+        let input_tx = RemoteInput::spawn(input, child.0.clone(), move |error| {
+            let _ = failed.send(AppEvent::RemoteProjectionClosed {
+                pane,
+                generation,
+                error,
+            });
+        });
+        app_tx
+            .send(AppEvent::RemoteProjectionReady {
+                pane,
+                generation,
+                input: input_tx,
+            })
+            .map_err(|_| "local session closed".to_string())?;
+
+        let slot = Arc::new(RemoteFrameSlot::new());
+        let mut frame = None;
+        loop {
+            match protocol::read_message::<_, ServerMessage>(&mut output) {
+                Ok(ServerMessage::ProjectionFrame { state, frame: next }) => {
+                    if !display.projection {
+                        return Err("unexpected remote projection codec".into());
+                    }
+                    frame = Some(next.clone());
+                    slot.publish_with_state(pane, generation, next, Some(state), app_tx);
+                }
+                Ok(ServerMessage::ProjectionDiff { state, frame: diff }) => {
+                    if !display.projection {
+                        return Err("unexpected remote projection codec".into());
+                    }
+                    let Some(current) = frame.as_mut() else {
+                        return Err("remote projection sent a diff before its full frame".into());
+                    };
+                    if current.width != diff.width || current.height != diff.height {
+                        return Err("remote projection diff size mismatch".into());
+                    }
+                    protocol::apply_diff(current, &diff);
+                    slot.publish_with_state(pane, generation, current.clone(), Some(state), app_tx);
+                }
+                Ok(ServerMessage::Frame(next)) => {
+                    frame = Some(next.clone());
+                    slot.publish(pane, generation, next, app_tx);
+                }
+                Ok(ServerMessage::FrameDiff(diff)) => {
+                    let Some(current) = frame.as_mut() else {
+                        return Err(
+                            "remote projection sent a diff before its full frame".to_string()
+                        );
+                    };
+                    protocol::apply_diff(current, &diff);
+                    slot.publish(pane, generation, current.clone(), app_tx);
+                }
+                Ok(ServerMessage::Notify(message)) => {
+                    if effect_leader.load(Ordering::Acquire) {
+                        let _ = app_tx.send(AppEvent::RemoteEffect {
+                            effect: RemoteEffect::Notify(message),
+                        });
+                    }
+                }
+                Ok(ServerMessage::Sound(signal)) => {
+                    if effect_leader.load(Ordering::Acquire) {
+                        let _ = app_tx.send(AppEvent::RemoteEffect {
+                            effect: RemoteEffect::Sound(signal),
+                        });
+                    }
+                }
+                Ok(ServerMessage::Clipboard(text)) => {
+                    if effect_leader.load(Ordering::Acquire) {
+                        let _ = app_tx.send(AppEvent::RemoteEffect {
+                            effect: RemoteEffect::Clipboard(text),
+                        });
+                    }
+                }
+                Ok(ServerMessage::OpenUrl(url)) => {
+                    if effect_leader.load(Ordering::Acquire) {
+                        let _ = app_tx.send(AppEvent::RemoteEffect {
+                            effect: RemoteEffect::OpenUrl(url),
+                        });
+                    }
+                }
+                Ok(ServerMessage::FocusWorkspace { workspace_id }) => {
+                    let _ = app_tx.send(AppEvent::RemoteEffect {
+                        effect: RemoteEffect::Workspace {
+                            pane,
+                            generation,
+                            workspace_id,
+                        },
+                    });
+                }
+                Ok(ServerMessage::SwitchSession { name }) => {
+                    let _ = app_tx.send(AppEvent::RemoteEffect {
+                        effect: RemoteEffect::Session {
+                            pane,
+                            generation,
+                            name,
+                        },
+                    });
+                }
+                Ok(ServerMessage::Detach) => {
+                    let _ = app_tx.send(AppEvent::RemoteEffect {
+                        effect: RemoteEffect::Detach { pane, generation },
+                    });
+                    break;
+                }
+                Ok(ServerMessage::ServerShutdown { .. }) => break,
+                Ok(_) => {}
+                Err(error) => return Err(error.to_string()),
             }
         }
-    });
-
-    let slot = Arc::new(RemoteFrameSlot::new());
-    let mut frame = None;
-    loop {
-        match protocol::read_message::<_, ServerMessage>(&mut output) {
-            Ok(ServerMessage::Frame(next)) => {
-                frame = Some(next.clone());
-                slot.publish(pane, generation, next, app_tx);
-            }
-            Ok(ServerMessage::FrameDiff(diff)) => {
-                let Some(current) = frame.as_mut() else {
-                    return Err("remote projection sent a diff before its full frame".to_string());
-                };
-                protocol::apply_diff(current, &diff);
-                slot.publish(pane, generation, current.clone(), app_tx);
-            }
-            Ok(ServerMessage::Notify(message)) => {
-                if effect_leader.load(Ordering::Acquire) {
-                    let _ = app_tx.send(AppEvent::RemoteEffect {
-                        effect: RemoteEffect::Notify(message),
-                    });
-                }
-            }
-            Ok(ServerMessage::Sound(signal)) => {
-                if effect_leader.load(Ordering::Acquire) {
-                    let _ = app_tx.send(AppEvent::RemoteEffect {
-                        effect: RemoteEffect::Sound(signal),
-                    });
-                }
-            }
-            Ok(ServerMessage::Clipboard(text)) => {
-                if effect_leader.load(Ordering::Acquire) {
-                    let _ = app_tx.send(AppEvent::RemoteEffect {
-                        effect: RemoteEffect::Clipboard(text),
-                    });
-                }
-            }
-            Ok(ServerMessage::OpenUrl(url)) => {
-                if effect_leader.load(Ordering::Acquire) {
-                    let _ = app_tx.send(AppEvent::RemoteEffect {
-                        effect: RemoteEffect::OpenUrl(url),
-                    });
-                }
-            }
-            Ok(ServerMessage::FocusWorkspace { workspace_id }) => {
-                let _ = app_tx.send(AppEvent::RemoteEffect {
-                    effect: RemoteEffect::Workspace {
-                        pane,
-                        generation,
-                        workspace_id,
-                    },
-                });
-            }
-            Ok(ServerMessage::SwitchSession { name }) => {
-                let _ = app_tx.send(AppEvent::RemoteEffect {
-                    effect: RemoteEffect::Session {
-                        pane,
-                        generation,
-                        name,
-                    },
-                });
-            }
-            Ok(ServerMessage::Detach) => {
-                let _ = app_tx.send(AppEvent::RemoteEffect {
-                    effect: RemoteEffect::Detach { pane, generation },
-                });
-                break;
-            }
-            Ok(ServerMessage::ServerShutdown { .. }) => break,
-            Ok(_) => {}
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-    Ok(())
+        Ok(())
+    };
+    run().map_err(|error| diagnostics.failure(error))
 }
 
 #[cfg(test)]
@@ -1863,6 +2224,128 @@ pub(crate) mod tests {
             cursor: None,
             cursor_visible: false,
         }
+    }
+
+    #[test]
+    fn negotiated_remote_frame_rejects_old_boot_selection_focus_and_geometry() {
+        let _env = crate::persist::test_env("remote-coherent-frame");
+        let mut app = remote_ui_app();
+        let (pane, receiver, _) = add_remote_workspace(&mut app);
+        app.pane_content_rects = vec![(pane, Rect::new(30, 2, 1, 1))];
+        let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+            unreachable!()
+        };
+        view.projection.display.projection = true;
+        view.projection.display.server_generation = Some("boot-b".into());
+        view.projection.desired_pane = Some("7".into());
+        app.resize_active_remote_projection();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientMessage::ProjectionInterest {
+                epoch: 1,
+                active: true,
+                ..
+            }
+        ));
+        let state = protocol::ProjectionState {
+            server_generation: "boot-b".into(),
+            epoch: 1,
+            event_sequence: 42,
+            workspace_id: "workspace_remote".into(),
+            focused_pane: Some("7".into()),
+        };
+        let (tx, _rx) = mpsc::channel();
+        let slot = Arc::new(RemoteFrameSlot::new());
+        for invalid in 0..6 {
+            let mut stale = state.clone();
+            let mut stale_frame = frame("stale");
+            let mut generation = 1;
+            match invalid {
+                0 => stale.server_generation = "boot-a".into(),
+                1 => stale.epoch = 0,
+                2 => stale.workspace_id = "another-workspace".into(),
+                3 => stale.focused_pane = Some("8".into()),
+                4 => stale_frame.width = 2,
+                _ => generation = 0,
+            }
+            slot.publish_with_state(pane, generation, stale_frame, Some(stale), &tx);
+            app.apply_remote_frame(pane, generation, &slot);
+            assert_eq!(
+                app.remote_workspace_view(app.active_ws).unwrap().state,
+                RemoteViewState::Connecting
+            );
+        }
+        slot.publish_with_state(pane, 1, frame("fresh"), Some(state.clone()), &tx);
+        app.apply_remote_frame(pane, 1, &slot);
+        assert_eq!(
+            app.remote_workspace_view(app.active_ws).unwrap().state,
+            RemoteViewState::Ready
+        );
+        app.resize_active_remote_projection();
+        assert!(
+            receiver.try_recv().is_err(),
+            "activation/resize is not presentation"
+        );
+        app.acknowledge_presented_remote_projection();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientMessage::ProjectionPresented {
+                epoch: 1,
+                event_sequence: 42
+            }
+        ));
+        app.acknowledge_presented_remote_projection();
+        assert!(receiver.try_recv().is_err());
+        app.active_ws = 0;
+        app.resize_active_remote_projection();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientMessage::ProjectionInterest {
+                epoch: 2,
+                active: false,
+                ..
+            }
+        ));
+        app.active_ws = 1;
+        app.resize_active_remote_projection();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientMessage::ProjectionInterest {
+                epoch: 3,
+                active: true,
+                ..
+            }
+        ));
+        slot.publish_with_state(pane, 1, frame("old-selection"), Some(state), &tx);
+        app.apply_remote_frame(pane, 1, &slot);
+        assert_eq!(
+            app.remote_workspace_view(app.active_ws).unwrap().state,
+            RemoteViewState::Connecting
+        );
+    }
+
+    #[test]
+    fn remote_projection_capability_requires_server_generation() {
+        let mut response = json!({"result":{"workspaces":[], "event_sequence":0,
+            "remote_display":protocol::remote_display_capabilities()}});
+        assert!(parse_remote_snapshot(&response, RemoteBinaryLocation::Path).is_err());
+        response["result"]["server_generation"] = json!("boot");
+        assert!(
+            parse_remote_snapshot(&response, RemoteBinaryLocation::Path)
+                .unwrap()
+                .display
+                .projection
+        );
+        response["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("remote_display");
+        assert!(
+            !parse_remote_snapshot(&response, RemoteBinaryLocation::Path)
+                .unwrap()
+                .display
+                .projection
+        );
     }
 
     #[test]
@@ -1932,7 +2415,8 @@ pub(crate) mod tests {
                 error: None,
                 frame: Some(frame("r")),
                 generation: 1,
-                input: Some(input),
+                input: Some(input.into()),
+                projection: Box::default(),
                 last_size: (80, 24),
                 effect_leader: Arc::new(AtomicBool::new(true)),
             }),
@@ -1983,6 +2467,49 @@ pub(crate) mod tests {
         app.workspaces[0].tabs[0].name = Some("remote-tab".into());
         assert!(app.panes.is_empty());
         app
+    }
+
+    #[test]
+    fn remote_hidden_sidebar_reopen_is_visible_clickable_and_outside_owner() {
+        use ratatui::crossterm::event::MouseButton;
+        let _env = crate::persist::test_env("remote-sidebar-reopen");
+        for size in [(140, 40), (48, 22)] {
+            for side in [super::super::Side::Left, super::super::Side::Right] {
+                let mut app = remote_ui_app();
+                let (_, receiver, _) = add_remote_workspace(&mut app);
+                if side == super::super::Side::Right {
+                    app.sidebars.right.docks = vec![super::super::DockKind::Agents];
+                }
+                app.sidebars.get_mut(side).visible = false;
+                remote_ui_buffer(&mut app, size);
+                let toggle = match side {
+                    super::super::Side::Left => app.sidebar_toggle_rect,
+                    super::super::Side::Right => app.right_sidebar_toggle_rect,
+                }
+                .expect("hidden remote sidebar must retain a reopen button");
+                assert!(!app.pane_content_rects[0]
+                    .1
+                    .contains((toggle.x, toggle.y).into()));
+                for kind in [
+                    MouseEventKind::Down(MouseButton::Left),
+                    MouseEventKind::Up(MouseButton::Left),
+                ] {
+                    app.handle_event(AppEvent::Mouse(MouseEvent {
+                        kind,
+                        column: toggle.x + 1,
+                        row: toggle.y,
+                        modifiers: KeyModifiers::NONE,
+                    }));
+                }
+                assert!(app.sidebars.get(side).visible);
+                assert!(
+                    receiver.try_recv().is_err(),
+                    "reopen click cannot reach remote tabs"
+                );
+                remote_ui_buffer(&mut app, size);
+                assert!(app.pane_content_rects[0].1.height > 0);
+            }
+        }
     }
 
     fn navigation_projection(
@@ -2104,7 +2631,7 @@ pub(crate) mod tests {
         app.apply_remote_session_discovered(
             owner,
             Ok(RemoteSessionSnapshot {
-                location: RemoteBinaryLocation::Path,
+                display: RemoteDisplay::default(),
                 event_sequence: 20,
                 workspaces: metadata,
             }),
@@ -3330,11 +3857,11 @@ pub(crate) mod tests {
                 if event_pane == pane
         ));
         assert!(rx.try_recv().is_err());
-        assert!(slot.take().is_some_and(|next| next == frame("b")));
+        assert!(slot.take().is_some_and(|next| next.0 == frame("b")));
 
         slot.publish(pane, 1, frame("c"), &tx);
         assert!(rx.recv().is_ok());
-        assert!(slot.take().is_some_and(|next| next == frame("c")));
+        assert!(slot.take().is_some_and(|next| next.0 == frame("c")));
     }
 
     #[test]
@@ -3389,7 +3916,7 @@ pub(crate) mod tests {
         app.apply_remote_session_discovered(
             RemoteSession::new("dev-207", "api").unwrap(),
             Ok(RemoteSessionSnapshot {
-                location: RemoteBinaryLocation::Path,
+                display: RemoteDisplay::default(),
                 event_sequence: 2,
                 workspaces: vec![RemoteWorkspaceMeta {
                     agents: Vec::new(),
@@ -3420,7 +3947,7 @@ pub(crate) mod tests {
         app.apply_remote_session_discovered(
             target.clone(),
             Ok(RemoteSessionSnapshot {
-                location: RemoteBinaryLocation::Path,
+                display: RemoteDisplay::default(),
                 event_sequence: 4,
                 workspaces: vec![RemoteWorkspaceMeta {
                     agents: Vec::new(),
@@ -3446,7 +3973,7 @@ pub(crate) mod tests {
         app.apply_remote_session_discovered(
             target,
             Ok(RemoteSessionSnapshot {
-                location: RemoteBinaryLocation::Path,
+                display: RemoteDisplay::default(),
                 event_sequence: 5,
                 workspaces: Vec::new(),
             }),
@@ -3494,10 +4021,12 @@ pub(crate) mod tests {
                 generation: 5,
                 scope: Arc::new(Default::default()),
                 refresh_projections: true,
+                retry_delay: None,
+                retry_pending: false,
             },
         );
         let snapshot = RemoteSessionSnapshot {
-            location: RemoteBinaryLocation::Path,
+            display: RemoteDisplay::default(),
             event_sequence: 9,
             workspaces: vec![RemoteWorkspaceMeta {
                 agents: Vec::new(),
@@ -3545,12 +4074,115 @@ pub(crate) mod tests {
             }
         }
 
-        // Ordinary owner events must not turn this explicit retry into an
-        // automatic retry loop after another failure.
+        // Without an enabled host, ordinary owner events cannot retry a
+        // disconnected display. Explicit refresh remains available.
         app.apply_remote_session_discovered(target, Ok(snapshot));
         let view = app.remote_workspace_view(app.active_ws).unwrap();
         assert_eq!(view.state, RemoteViewState::Disconnected);
         assert_eq!(view.generation, 2);
+    }
+
+    #[test]
+    fn remote_retry_coalesces_failures_backs_off_and_cancels_with_the_owner() {
+        let _env = crate::persist::test_env("remote-retry-lifecycle");
+        let mut app = remote_ui_app();
+        let (pane, input, _) = add_remote_workspace(&mut app);
+        let target = RemoteSession::new("dev-207", "api").unwrap();
+        app.config.remote_hosts.push(target.host.clone());
+        app.remote_watcher_generation = 5;
+        let old_scope = Arc::new(crate::session::remote::ConnectionScope::default());
+        app.remote_session_watchers.insert(
+            target.canonical_name(),
+            RemoteWatcher {
+                target: target.clone(),
+                generation: 5,
+                scope: old_scope.clone(),
+                refresh_projections: false,
+                retry_delay: Some(REMOTE_RETRY_INITIAL),
+                retry_pending: false,
+            },
+        );
+        app.apply_remote_session_watcher_closed(target.clone(), "bridge closed".into());
+        assert!(!old_scope.wait_for_retry(Duration::ZERO));
+        assert!(matches!(input.try_recv().unwrap(), ClientMessage::Detach));
+        assert!(app.remote_watcher_is_current(&target, 6));
+        assert!(app.remote_session_watchers[&target.canonical_name()].retry_pending);
+        assert!(!app.send_active_remote(ClientMessage::Command("new_tab".into())));
+        let view = app.remote_workspace_view(app.active_ws).unwrap();
+        assert_eq!(view.state, RemoteViewState::Connecting);
+        assert!(
+            view.frame.is_some(),
+            "keep the last frame beneath the reconnect notice"
+        );
+        let projection_generation = view.generation;
+        // Both streams can fail for one restart. Neither the late watcher nor
+        // old frame/ready/close messages may replace this pending attempt.
+        app.handle_event(AppEvent::RemoteSessionWatcherClosed {
+            target: target.clone(),
+            generation: 5,
+            error: "old watcher closed".into(),
+        });
+        app.apply_remote_projection_closed(pane, 1, "old display closed".into());
+        let (sender, receiver) = mpsc::channel();
+        app.apply_remote_projection_ready(pane, 1, sender.into());
+        assert!(receiver.recv().is_err());
+        assert!(app.remote_watcher_is_current(&target, 6));
+        assert_eq!(
+            app.remote_workspace_view(app.active_ws).unwrap().generation,
+            projection_generation
+        );
+        assert!(app.retry_remote_session(&target, "duplicate failure"));
+        assert!(app.remote_watcher_is_current(&target, 6));
+
+        for expected in [1000, 2000, 4000, 8000, 10000, 10000] {
+            let previous = app.remote_session_watchers[&target.canonical_name()]
+                .scope
+                .clone();
+            app.apply_remote_session_discovered(target.clone(), Err("owner still stopped".into()));
+            assert!(!previous.wait_for_retry(Duration::ZERO));
+            let watcher = &app.remote_session_watchers[&target.canonical_name()];
+            assert_eq!(watcher.retry_delay, Some(Duration::from_millis(expected)));
+            assert!(watcher.retry_pending);
+        }
+        let pending = app.remote_session_watchers[&target.canonical_name()]
+            .scope
+            .clone();
+        app.config.remote_hosts.clear();
+        app.retain_remote_sessions(|_, _| false);
+        assert!(!pending.wait_for_retry(Duration::ZERO));
+        assert!(!app.retry_remote_session(&target, "late failure"));
+        assert!(app.remote_session_watchers.is_empty());
+        assert!(app
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.remote.is_none()));
+    }
+
+    #[test]
+    fn remote_initial_open_failure_does_not_create_an_automatic_retry() {
+        let _env = crate::persist::test_env("remote-initial-failure");
+        let mut app = remote_ui_app();
+        let (pane, _, _) = add_remote_workspace(&mut app);
+        let target = RemoteSession::new("dev-207", "api").unwrap();
+        app.config.remote_hosts.push(target.host.clone());
+        app.remote_session_watchers.insert(
+            target.canonical_name(),
+            RemoteWatcher {
+                target: target.clone(),
+                generation: 1,
+                scope: Arc::new(Default::default()),
+                refresh_projections: true,
+                retry_delay: None,
+                retry_pending: false,
+            },
+        );
+        app.apply_remote_session_discovered(
+            target,
+            Err("modified remote-session build required".into()),
+        );
+        assert!(app.remote_session_watchers.is_empty());
+        assert!(matches!(&app.views[&pane], ViewKind::Remote(view)
+            if view.state == RemoteViewState::Disconnected));
     }
 
     #[test]
@@ -3569,6 +4201,8 @@ pub(crate) mod tests {
                 generation: 4,
                 scope: Arc::new(Default::default()),
                 refresh_projections: false,
+                retry_delay: None,
+                retry_pending: false,
             },
         );
         app.discover_remote_session(target.clone());
@@ -3632,7 +4266,7 @@ pub(crate) mod tests {
             view.last_size = (91, 27);
         }
         app.pane_content_rects = vec![(pane, Rect::new(9, 2, 91, 27))];
-        app.apply_remote_projection_ready(pane, 1, input);
+        app.apply_remote_projection_ready(pane, 1, input.into());
         app.resize_active_remote_projection();
         assert!(matches!(
             messages.try_recv().unwrap(),
@@ -3673,7 +4307,8 @@ pub(crate) mod tests {
                 error: None,
                 frame: Some(frame("s")),
                 generation: 2,
-                input: Some(input),
+                input: Some(input.into()),
+                projection: Box::default(),
                 last_size: (80, 24),
                 effect_leader: second_leader.clone(),
             }),
@@ -3731,6 +4366,8 @@ pub(crate) mod tests {
                 generation: 5,
                 scope: Arc::new(Default::default()),
                 refresh_projections: true,
+                retry_delay: None,
+                retry_pending: false,
             },
         );
         app.config.remote_hosts.clear();
@@ -3745,7 +4382,7 @@ pub(crate) mod tests {
             target,
             generation: 5,
             result: Ok(RemoteSessionSnapshot {
-                location: RemoteBinaryLocation::Path,
+                display: RemoteDisplay::default(),
                 event_sequence: 7,
                 workspaces: vec![RemoteWorkspaceMeta {
                     agents: Vec::new(),
@@ -3786,6 +4423,8 @@ pub(crate) mod tests {
                     generation: 5,
                     scope: Arc::new(Default::default()),
                     refresh_projections: false,
+                    retry_delay: None,
+                    retry_pending: false,
                 },
             );
         }

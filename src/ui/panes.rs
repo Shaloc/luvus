@@ -608,14 +608,24 @@ fn draw_remote_view(
             cell.modifier = crate::ipc::protocol::unpack_mods(source.mods);
         }
     }
-    if view.state == crate::app::remote::RemoteViewState::Disconnected {
-        let message = format!(
-            "{}: {}",
-            catalog.remote_workspace_unavailable,
-            view.error
-                .as_deref()
-                .unwrap_or(catalog.remote_workspace_waiting)
-        );
+    if view.state != crate::app::remote::RemoteViewState::Ready {
+        let message = if view.state == crate::app::remote::RemoteViewState::Connecting {
+            format!(
+                "{} {} / {}… {}",
+                catalog.remote_connecting,
+                view.target.host,
+                view.target.session,
+                view.error.as_deref().unwrap_or_default()
+            )
+        } else {
+            format!(
+                "{}: {}",
+                catalog.remote_workspace_unavailable,
+                view.error
+                    .as_deref()
+                    .unwrap_or(catalog.remote_workspace_waiting)
+            )
+        };
         f.render_widget(
             Paragraph::new(crate::ui::truncate(&message, area.width as usize))
                 .style(Style::new().fg(t.coral).bg(t.mantle)),
