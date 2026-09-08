@@ -5,7 +5,7 @@ description: Place compact module status and actions beside the tabs or in the b
 
 **Luvus Bar** is a compact extension surface built into Luvus. It gives the
 app and installed modules a safe place to show status, progress, badges, and
-small actions without adding another row or changing pane and PTY dimensions.
+small actions in the existing local tab and status rows.
 
 You do not install the Bar itself. A module declares one or more Bar widgets,
 and Luvus owns their placement, validation, theming, width, and rendering.
@@ -17,6 +17,11 @@ and Luvus owns their placement, validation, theming, width, and rendering.
 | **Top** | To the right of the tabs | Active tab, tab arrows, new-tab button, and sidebar controls |
 | **Bottom** | In the middle of the status row | Prefix/key hint on the left and the clickable version on the right |
 | **Off** | Hidden | The declaration and saved preference remain available |
+
+For managed remote workspaces, **Top** uses a display-side navigation row above
+the owner's tabs. This reserves one row from the remote viewport and resizes
+its PTY accordingly, so local widgets never cover remote tabs or input cells.
+**Bottom** continues to use the existing status row.
 
 The built-in **Runtime status** widget starts at the bottom and shows a compact
 summary such as `NORMAL · 1 pane · tab 2/4`. It can be moved or hidden like a
