@@ -128,8 +128,59 @@ fn parse_remote_agents(workspace: &Value) -> Vec<RemoteAgentMeta> {
         .collect()
 }
 
+/// Extend the existing topology projection with only the active layout leaf;
+/// no extra discovery, timer, or terminal-screen parsing is needed.
+fn parse_focused_pane_metadata(workspace: &Value) -> Option<crate::bar::FocusedPaneMetadata> {
+    let tabs = workspace.get("tabs")?.as_array()?;
+    let tab = tabs
+        .iter()
+        .find(|tab| tab.get("active").and_then(Value::as_bool) == Some(true))?;
+    if tab
+        .get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != "panes")
+    {
+        return None;
+    }
+    let panes = tab.get("panes")?.as_array()?;
+    let pane = panes
+        .iter()
+        .find(|pane| {
+            pane.get("workspace_focused")
+                .or_else(|| pane.get("focused"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        })
+        .or_else(|| (panes.len() == 1).then(|| &panes[0]))?;
+    let state = match pane.get("agent_status").and_then(Value::as_str) {
+        Some("working") => crate::ui::theme::State::Working,
+        Some("blocked") => crate::ui::theme::State::Blocked,
+        Some("done") => crate::ui::theme::State::Done,
+        Some("idle") => crate::ui::theme::State::Idle,
+        _ => crate::ui::theme::State::Unknown,
+    };
+    let agent = (pane.get("is_agent").and_then(Value::as_bool) == Some(true)
+        || pane
+            .get("agent_session")
+            .is_some_and(|session| !session.is_null()))
+    .then(|| {
+        pane.get("agent")
+            .and_then(Value::as_str)
+            .map(|agent| (agent.to_string(), state))
+    })
+    .flatten();
+    Some(crate::bar::FocusedPaneMetadata {
+        tab: usize::try_from(tab.get("index")?.as_u64()?)
+            .ok()
+            .filter(|index| *index > 0)?,
+        pane: pane.get("pane_id")?.as_str()?.to_string(),
+        agent,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteWorkspaceMeta {
+    pub focused_pane: Option<crate::bar::FocusedPaneMetadata>,
     pub agents: Vec<RemoteAgentMeta>,
     pub history: Vec<super::remote_agents::AgentHistoryRow>,
     pub scheduled: Vec<super::remote_agents::ScheduledAgentRow>,
@@ -160,7 +211,6 @@ pub struct RemoteProjection {
     epoch: u64,
     active: bool,
     frame_state: Option<protocol::ProjectionState>,
-    desired_pane: Option<String>,
     presented: Option<(u64, u64)>,
 }
 
@@ -197,10 +247,12 @@ pub enum RemoteEffect {
 pub(super) struct PendingRemoteNavigation {
     pane: PaneId,
     generation: u64,
+    refresh_generation: Option<u64>,
     target: RemoteWorkspaceRef,
 }
 
 pub struct RemoteView {
+    pub focused_pane: Option<crate::bar::FocusedPaneMetadata>,
     pub agents: Vec<RemoteAgentMeta>,
     pub history: Vec<super::remote_agents::AgentHistoryRow>,
     pub scheduled: Vec<super::remote_agents::ScheduledAgentRow>,
@@ -220,6 +272,22 @@ impl Drop for RemoteView {
         if let Some(input) = &self.input {
             let _ = input.send(ClientMessage::Detach);
         }
+    }
+}
+
+impl RemoteView {
+    pub(crate) fn focused_pane_metadata(&self) -> Option<&crate::bar::FocusedPaneMetadata> {
+        if self.state != RemoteViewState::Ready {
+            return None;
+        }
+        let metadata = self.focused_pane.as_ref()?;
+        if self.projection.display.projection {
+            let frame = self.projection.frame_state.as_ref()?;
+            if frame.focused_pane.as_ref() != Some(&metadata.pane) {
+                return None;
+            }
+        }
+        Some(metadata)
     }
 }
 
@@ -358,18 +426,33 @@ impl App {
             }
         } else {
             self.sidebar_focus = None;
-            if let Some(ViewKind::Remote(view)) = self
-                .views
-                .get_mut(&self.workspaces[index].tabs[0].layout.focus)
-            {
-                if view.projection.display.projection {
-                    view.projection.desired_pane = Some(pane.to_string());
-                }
-            }
-            self.send_workspace_remote(
+            let sent = self.send_workspace_remote(
                 index,
                 ClientMessage::Command(format!("remote_agent_focus {pane}")),
             );
+            if sent {
+                if let Some(ViewKind::Remote(view)) = self
+                    .views
+                    .get_mut(&self.workspaces[index].tabs[0].layout.focus)
+                {
+                    if view.projection.display.projection {
+                        // This epoch is queued AFTER the focus command. Its frame
+                        // reflects the actual owner result, even if the target was
+                        // closed or another client changed focus in the same tick.
+                        view.projection.epoch = view.projection.epoch.saturating_add(1);
+                        view.projection.frame_state = None;
+                        view.state = RemoteViewState::Connecting;
+                        if let Some(input) = &view.input {
+                            let _ = input.send(ClientMessage::ProjectionInterest {
+                                epoch: view.projection.epoch,
+                                active: true,
+                                cols: view.last_size.0,
+                                rows: view.last_size.1,
+                            });
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -391,6 +474,7 @@ impl App {
         self.views.insert(
             pane,
             ViewKind::Remote(RemoteView {
+                focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
                 scheduled: Vec::new(),
@@ -832,6 +916,7 @@ impl App {
                     == Some(&target))
         {
             metadata.push(RemoteWorkspaceMeta {
+                focused_pane: None,
                 id: String::new(),
                 name: target.session.clone(),
                 cwd: String::new(),
@@ -867,6 +952,7 @@ impl App {
                 if let Some(pane) = workspace.tabs.first().map(|tab| tab.layout.focus) {
                     if let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) {
                         view.agents = meta.agents;
+                        view.focused_pane = meta.focused_pane;
                         // Focus belongs to the displayed frame. The topology
                         // stream can arrive before or after that frame.
                         if let Some(state) = &view.projection.frame_state {
@@ -1014,6 +1100,7 @@ impl App {
         self.views.insert(
             pane,
             ViewKind::Remote(RemoteView {
+                focused_pane: meta.focused_pane,
                 agents: meta.agents,
                 history: meta.history,
                 scheduled: meta.scheduled,
@@ -1199,18 +1286,12 @@ impl App {
                         != view.projection.display.server_generation.as_ref()
                     || state.workspace_id != view.target.workspace_id
                     || (frame.width, frame.height) != view.last_size
-                    || view
-                        .projection
-                        .desired_pane
-                        .as_ref()
-                        .is_some_and(|pane| Some(pane) != state.focused_pane.as_ref())
                 {
                     return;
                 }
                 for agent in &mut view.agents {
                     agent.focused = Some(&agent.pane) == state.focused_pane.as_ref();
                 }
-                view.projection.desired_pane = None;
                 view.projection.frame_state = Some(state);
             }
             view.frame = Some(frame);
@@ -1261,7 +1342,17 @@ impl App {
                     // focusing an existing owner workspace need not emit a new
                     // topology event. Reuse one explicit discovery, replacing
                     // its old watcher instead of waiting indefinitely or polling.
-                    self.discover_remote_session_with_refresh(target, true);
+                    let pending = self.pending_remote_navigation.take();
+                    self.discover_remote_session_with_refresh(target.clone(), true);
+                    if let (Some(mut pending), Some(watcher)) = (
+                        pending,
+                        self.remote_session_watchers.get(&target.canonical_name()),
+                    ) {
+                        // This accepted choice itself replaced the source bridge.
+                        // Bind only to that refresh, never to a later retry or open.
+                        pending.refresh_generation = Some(watcher.generation);
+                        self.pending_remote_navigation = Some(pending);
+                    }
                 }
             }
             RemoteEffect::Session {
@@ -1320,6 +1411,16 @@ impl App {
             .pending_remote_navigation
             .as_ref()
             .is_some_and(|pending| {
+                if let Some(generation) = pending.refresh_generation {
+                    let owner = RemoteSession {
+                        host: pending.target.host.clone(), session: pending.target.session.clone(),
+                    };
+                    return self.active_remote_pane() != Some(pending.pane)
+                        || !self.remote_watcher_is_current(&owner, generation)
+                        || !matches!(self.views.get(&pending.pane), Some(ViewKind::Remote(view))
+                            if view.target.host == owner.host && view.target.session == owner.session
+                                && view.state != RemoteViewState::Disconnected);
+                }
                 self.remote_navigation_source(pending.pane, pending.generation)
                     .is_none()
             })
@@ -1350,6 +1451,7 @@ impl App {
         self.pending_remote_navigation = Some(PendingRemoteNavigation {
             pane,
             generation,
+            refresh_generation: None,
             target,
         });
         if self.finish_remote_navigation() {
@@ -1432,11 +1534,18 @@ impl App {
         )
     }
 
-    pub(crate) fn remote_sidebar_reopen_height(&self) -> u16 {
+    pub(crate) fn remote_navigation_height(&self) -> u16 {
         u16::from(
             [&self.sidebars.left, &self.sidebars.right]
                 .iter()
-                .any(|side| !side.visible && !side.docks.is_empty()),
+                .any(|side| !side.visible && !side.docks.is_empty())
+                // Placement, not live metadata, reserves this row. Otherwise
+                // waiting for a resized frame could repeatedly remove/re-add
+                // the row, changing the projection size it is waiting for.
+                || self.bar.declarations.iter().any(|(key, declaration)| {
+                    self.config.bars.region_for(key, declaration.region)
+                        == Some(crate::bar::BarRegion::TopRight)
+                }),
         )
     }
 
@@ -1458,7 +1567,7 @@ impl App {
                 let main = self.last_main_area;
                 let left = self.left_seam.map_or(main.x, |seam| seam.right());
                 let right = self.right_seam.map_or(main.right(), |seam| seam.x);
-                let navigation = self.remote_sidebar_reopen_height().min(main.height);
+                let navigation = self.remote_navigation_height().min(main.height);
                 ratatui::layout::Rect::new(
                     left,
                     main.y + navigation,
@@ -1772,6 +1881,7 @@ pub(super) fn parse_remote_snapshot(
         .filter(|workspace| workspace.get("host").is_none_or(Value::is_null))
         .map(|workspace| {
             Ok(RemoteWorkspaceMeta {
+                focused_pane: parse_focused_pane_metadata(workspace),
                 agents: parse_remote_agents(workspace),
                 history: serde_json::from_value(
                     workspace
@@ -2211,6 +2321,57 @@ pub(crate) mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
     use ratatui::layout::Rect;
 
+    #[test]
+    fn focused_pane_metadata_tracks_snapshot_and_requires_matching_frame() {
+        let mut workspace = json!({"tabs": [
+            {"index": 1, "active": false, "panes": [{"pane_id":"3", "focused":false}]},
+            {"index": 2, "active": true, "kind":"panes", "panes": [
+                {"pane_id":"7", "workspace_focused":true, "focused":false,
+                 "is_agent":true, "agent":"qodercli", "agent_status":"working"},
+                {"pane_id":"8", "workspace_focused":false, "is_agent":false, "agent":"zsh"}
+            ]}
+        ]});
+        let parsed = parse_focused_pane_metadata(&workspace).unwrap();
+        assert_eq!(parsed.tab, 2);
+        assert_eq!(parsed.pane, "7");
+        assert_eq!(
+            parsed.agent,
+            Some(("qodercli".into(), crate::ui::theme::State::Working))
+        );
+        let _env = crate::persist::test_env("focused-pane-metadata-frame");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let (pane, _input, _) = add_remote_workspace(&mut app);
+        set_presentable_projection(&mut app, pane, 42);
+        let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+            unreachable!()
+        };
+        view.focused_pane = Some(parsed.clone());
+        assert_eq!(view.focused_pane_metadata(), Some(&parsed));
+        view.projection.frame_state.as_mut().unwrap().focused_pane = Some("8".into());
+        assert!(
+            view.focused_pane_metadata().is_none(),
+            "old topology must not label a new focus"
+        );
+        workspace["tabs"][1]["panes"][0]["workspace_focused"] = json!(false);
+        workspace["tabs"][1]["panes"][1]["workspace_focused"] = json!(true);
+        view.focused_pane = parse_focused_pane_metadata(&workspace);
+        let current = view.focused_pane_metadata().unwrap();
+        assert_eq!(current.pane, "8");
+        assert!(current.agent.is_none());
+        view.projection.frame_state = None;
+        assert!(view.focused_pane_metadata().is_none());
+        view.projection.display.projection = false;
+        assert!(
+            view.focused_pane_metadata().is_some(),
+            "legacy owners use their topology focus"
+        );
+        view.state = RemoteViewState::Disconnected;
+        assert!(view.focused_pane_metadata().is_none());
+        workspace["tabs"][1]["kind"] = json!("mission_control");
+        assert!(parse_focused_pane_metadata(&workspace).is_none());
+    }
+
     fn frame(symbol: &str) -> FrameData {
         FrameData {
             width: 1,
@@ -2226,8 +2387,128 @@ pub(crate) mod tests {
         }
     }
 
+    /// Prepare an owner frame for IPC display/backpressure tests without SSH.
+    pub(crate) fn set_presentable_projection(app: &mut App, pane: PaneId, sequence: u64) {
+        remote_ui_buffer(app, (120, 40));
+        let rect = app.remote_workspace_rect(app.active_ws);
+        app.remote_display_pane = Some(pane);
+        let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+            unreachable!()
+        };
+        view.last_size = (rect.width, rect.height);
+        view.state = RemoteViewState::Ready;
+        view.projection.display.projection = true;
+        view.projection.display.server_generation = Some("boot".into());
+        view.projection.active = true;
+        view.projection.epoch = 1;
+        view.projection.frame_state = Some(protocol::ProjectionState {
+            server_generation: "boot".into(),
+            epoch: 1,
+            event_sequence: sequence,
+            workspace_id: view.target.workspace_id.clone(),
+            focused_pane: Some("7".into()),
+        });
+    }
+
     #[test]
-    fn negotiated_remote_frame_rejects_old_boot_selection_focus_and_geometry() {
+    fn remote_agent_click_before_handshake_does_not_poison_the_next_frame() {
+        let _env = crate::persist::test_env("remote-focus-before-ready");
+        let mut app = remote_ui_app();
+        let (pane, _old_rx, _) = add_remote_workspace(&mut app);
+        app.pane_content_rects = vec![(pane, Rect::new(30, 2, 1, 1))];
+        let target = {
+            let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+                unreachable!()
+            };
+            view.projection.display.projection = true;
+            view.projection.display.server_generation = Some("boot".into());
+            view.input = None;
+            view.state = RemoteViewState::Connecting;
+            view.target.clone()
+        };
+        app.activate_remote_agent(&target, "missing-agent", false);
+        let (input, receiver) = mpsc::channel();
+        app.apply_remote_projection_ready(pane, 1, input.into());
+        app.resize_active_remote_projection();
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientMessage::ProjectionInterest { epoch: 1, .. }
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "do not replay the disconnected click"
+        );
+        let slot = Arc::new(RemoteFrameSlot::new());
+        let (tx, _rx) = mpsc::channel();
+        slot.publish_with_state(
+            pane,
+            1,
+            frame("actual"),
+            Some(protocol::ProjectionState {
+                server_generation: "boot".into(),
+                epoch: 1,
+                event_sequence: 42,
+                workspace_id: target.workspace_id,
+                focused_pane: Some("8".into()),
+            }),
+            &tx,
+        );
+        app.apply_remote_frame(pane, 1, &slot);
+        assert_eq!(
+            app.remote_workspace_view(app.active_ws).unwrap().state,
+            RemoteViewState::Ready
+        );
+    }
+
+    #[test]
+    fn remote_agent_focus_accepts_the_owner_result_after_a_command_barrier() {
+        let _env = crate::persist::test_env("remote-focus-barrier");
+        let mut app = remote_ui_app();
+        let (pane, receiver, _) = add_remote_workspace(&mut app);
+        app.pane_content_rects = vec![(pane, Rect::new(30, 2, 1, 1))];
+        let target = {
+            let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+                unreachable!()
+            };
+            view.projection.display.projection = true;
+            view.projection.display.server_generation = Some("boot".into());
+            view.target.clone()
+        };
+        app.activate_remote_agent(&target, "7", false);
+        let messages: Vec<_> = receiver.try_iter().collect();
+        assert!(
+            matches!(messages.as_slice(), [ClientMessage::ProjectionInterest { epoch: 1, .. },
+            ClientMessage::Command(command), ClientMessage::ProjectionInterest { epoch: 2, .. }]
+            if command == "remote_agent_focus 7")
+        );
+        let (tx, _rx) = mpsc::channel();
+        let slot = Arc::new(RemoteFrameSlot::new());
+        for (epoch, ready) in [(1, false), (2, true)] {
+            // The target was closed/moved, or another client focused pane 8.
+            // Accept the owner's actual result, never wait forever for pane 7.
+            slot.publish_with_state(
+                pane,
+                1,
+                frame("actual"),
+                Some(protocol::ProjectionState {
+                    server_generation: "boot".into(),
+                    epoch,
+                    event_sequence: 42,
+                    workspace_id: target.workspace_id.clone(),
+                    focused_pane: Some("8".into()),
+                }),
+                &tx,
+            );
+            app.apply_remote_frame(pane, 1, &slot);
+            assert_eq!(
+                app.remote_workspace_view(app.active_ws).unwrap().state == RemoteViewState::Ready,
+                ready
+            );
+        }
+    }
+
+    #[test]
+    fn negotiated_remote_frame_rejects_old_boot_selection_and_geometry() {
         let _env = crate::persist::test_env("remote-coherent-frame");
         let mut app = remote_ui_app();
         let (pane, receiver, _) = add_remote_workspace(&mut app);
@@ -2237,7 +2518,6 @@ pub(crate) mod tests {
         };
         view.projection.display.projection = true;
         view.projection.display.server_generation = Some("boot-b".into());
-        view.projection.desired_pane = Some("7".into());
         app.resize_active_remote_projection();
         assert!(matches!(
             receiver.try_recv().unwrap(),
@@ -2256,7 +2536,7 @@ pub(crate) mod tests {
         };
         let (tx, _rx) = mpsc::channel();
         let slot = Arc::new(RemoteFrameSlot::new());
-        for invalid in 0..6 {
+        for invalid in 0..5 {
             let mut stale = state.clone();
             let mut stale_frame = frame("stale");
             let mut generation = 1;
@@ -2264,8 +2544,7 @@ pub(crate) mod tests {
                 0 => stale.server_generation = "boot-a".into(),
                 1 => stale.epoch = 0,
                 2 => stale.workspace_id = "another-workspace".into(),
-                3 => stale.focused_pane = Some("8".into()),
-                4 => stale_frame.width = 2,
+                3 => stale_frame.width = 2,
                 _ => generation = 0,
             }
             slot.publish_with_state(pane, generation, stale_frame, Some(stale), &tx);
@@ -2407,6 +2686,7 @@ pub(crate) mod tests {
         app.views.insert(
             pane,
             ViewKind::Remote(RemoteView {
+                focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
                 scheduled: Vec::new(),
@@ -2535,6 +2815,92 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_navigation_refresh_is_cancelled_by_leaving_or_another_generation() {
+        let _env = crate::persist::test_env("remote-navigation-refresh-fence");
+        for leave in [false, true] {
+            let mut app = remote_ui_app();
+            app.config.remote_hosts = vec!["fake-dev".into()];
+            let (source, _input) = navigation_projection(&mut app, "fake-dev", "api", "source");
+            let owner = RemoteSession::new("fake-dev", "api").unwrap();
+            app.apply_remote_effect(RemoteEffect::Workspace {
+                pane: source,
+                generation: 1,
+                workspace_id: "destination".into(),
+            });
+            assert!(app.pending_remote_navigation.is_some());
+            app.handle_event(AppEvent::RemoteSessionDiscovered {
+                generation: 0,
+                target: owner.clone(),
+                result: Err("stale".into()),
+            });
+            assert!(
+                app.pending_remote_navigation.is_some(),
+                "stale discovery cannot consume a newer choice"
+            );
+            if leave {
+                app.focus_workspace(0);
+            } else {
+                app.start_remote_watcher(owner, None);
+            }
+            app.discard_stale_remote_navigation();
+            assert!(app.pending_remote_navigation.is_none());
+        }
+    }
+
+    #[test]
+    fn remote_navigation_refresh_retains_accepted_hidden_workspace_choice() {
+        let _env = crate::persist::test_env("remote-navigation-refresh-choice");
+        let mut app = remote_ui_app();
+        // Only the in-memory UI selection is enabled. The isolated disk config
+        // has no hosts, so any worker fails preflight without opening SSH.
+        app.config.remote_hosts = vec!["fake-dev".into()];
+        let (source, _input) = navigation_projection(&mut app, "fake-dev", "api", "source");
+        let source_index = app.active_ws;
+        let owner = RemoteSession::new("fake-dev", "api").unwrap();
+        app.apply_remote_effect(RemoteEffect::Workspace {
+            pane: source,
+            generation: 1,
+            workspace_id: "destination".into(),
+        });
+        assert_eq!(
+            app.pending_remote_navigation
+                .as_ref()
+                .map(|pending| pending.target.workspace_id.as_str()),
+            Some("destination")
+        );
+        let generation = app.remote_session_watchers[&owner.canonical_name()].generation;
+        let (_, _destination_input) =
+            navigation_projection(&mut app, "fake-dev", "api", "destination");
+        let destination_index = app.active_ws;
+        app.active_ws = source_index;
+        let metadata = ["source", "destination"]
+            .into_iter()
+            .map(|id| RemoteWorkspaceMeta {
+                focused_pane: None,
+                agents: Vec::new(),
+                history: Vec::new(),
+                scheduled: Vec::new(),
+                worktree: None,
+                id: id.into(),
+                name: id.into(),
+                cwd: "/srv/api".into(),
+                branch: None,
+            })
+            .collect();
+        app.handle_event(AppEvent::RemoteSessionDiscovered {
+            generation,
+            target: owner,
+            result: Ok(RemoteSessionSnapshot {
+                display: RemoteDisplay::default(),
+                event_sequence: 20,
+                workspaces: metadata,
+            }),
+        });
+        assert_eq!(app.active_ws, destination_index);
+        assert!(app.pending_remote_navigation.is_none());
+    }
+
+    #[test]
     fn remote_navigation_workspace_resolves_exact_owner_without_touching_other_projections() {
         let _env = crate::persist::test_env("remote-navigation-owner");
         let mut app = remote_ui_app();
@@ -2618,6 +2984,7 @@ pub(crate) mod tests {
         let metadata = ["source", "destination"]
             .into_iter()
             .map(|id| RemoteWorkspaceMeta {
+                focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
                 scheduled: Vec::new(),
@@ -3348,7 +3715,7 @@ pub(crate) mod tests {
         );
         owner.handle_event(AppEvent::ClientCommand(command));
         assert_eq!(owner.picker.as_ref().unwrap().path, root);
-        assert!(owner.picker.as_ref().unwrap().worktrees.is_none());
+        assert!(owner.worktree_open.is_none());
 
         for (size, target) in [
             ((140, 38), "remote-child"),
@@ -3919,6 +4286,7 @@ pub(crate) mod tests {
                 display: RemoteDisplay::default(),
                 event_sequence: 2,
                 workspaces: vec![RemoteWorkspaceMeta {
+                    focused_pane: None,
                     agents: Vec::new(),
                     history: Vec::new(),
                     scheduled: Vec::new(),
@@ -3950,6 +4318,7 @@ pub(crate) mod tests {
                 display: RemoteDisplay::default(),
                 event_sequence: 4,
                 workspaces: vec![RemoteWorkspaceMeta {
+                    focused_pane: None,
                     agents: Vec::new(),
                     history: Vec::new(),
                     scheduled: Vec::new(),
@@ -4029,6 +4398,7 @@ pub(crate) mod tests {
             display: RemoteDisplay::default(),
             event_sequence: 9,
             workspaces: vec![RemoteWorkspaceMeta {
+                focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
                 scheduled: Vec::new(),
@@ -4295,6 +4665,7 @@ pub(crate) mod tests {
         app.views.insert(
             second,
             ViewKind::Remote(RemoteView {
+                focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
                 scheduled: Vec::new(),
@@ -4385,6 +4756,7 @@ pub(crate) mod tests {
                 display: RemoteDisplay::default(),
                 event_sequence: 7,
                 workspaces: vec![RemoteWorkspaceMeta {
+                    focused_pane: None,
                     agents: Vec::new(),
                     history: Vec::new(),
                     scheduled: Vec::new(),

@@ -725,6 +725,8 @@ mod tests {
             Side::Left,
             vec![DockRow {
                 text: "OWNER ROW".into(),
+                tone: None,
+                spans: Vec::new(),
                 dot: None,
                 action: Some("proof".into()),
                 value: None,

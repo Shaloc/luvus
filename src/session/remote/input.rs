@@ -31,6 +31,7 @@ struct WriteState {
     deadline: Mutex<(bool, Option<Instant>)>,
     wake: Condvar,
     failed: AtomicBool,
+    closing: AtomicBool,
 }
 
 impl WriteState {
@@ -112,31 +113,37 @@ impl RemoteInput {
         let writing = state.clone();
         let write_failed = failure.clone();
         std::thread::spawn(move || {
+            let mut detached = false;
             for queued in receiver {
-                if writing.failed.load(Ordering::Acquire) {
+                if writing.closing.load(Ordering::Acquire) || writing.failed.load(Ordering::Acquire)
+                {
                     break;
                 }
-                if let Ok(mut state) = writing.deadline.lock() {
-                    if state.0 {
-                        break;
-                    }
-                    state.1 = Some(Instant::now() + timeout);
-                    writing.wake.notify_all();
-                }
-                let result = protocol::write_message(&mut writer, &queued.message);
-                if let Ok(mut state) = writing.deadline.lock() {
-                    state.1 = None;
-                    writing.wake.notify_all();
-                }
-                if let Err(error) = result {
-                    if !writing.failed.swap(true, Ordering::AcqRel) {
-                        write_failed(format!("SSH display input failed: {error}"));
-                    }
+                if !write_bounded(
+                    &mut writer,
+                    &queued.message,
+                    &writing,
+                    timeout,
+                    &write_failed,
+                ) {
                     break;
                 }
                 if matches!(queued.message, ClientMessage::Detach) {
+                    detached = true;
                     break;
                 }
+            }
+            // Dropping a view (including a stale Ready result) must detach its
+            // owner. Discard queued ordinary input, but keep the write deadline
+            // alive for an in-flight write and this final Detach.
+            if !detached && !writing.failed.load(Ordering::Acquire) {
+                write_bounded(
+                    &mut writer,
+                    &ClientMessage::Detach,
+                    &writing,
+                    timeout,
+                    &write_failed,
+                );
             }
             writing.stop();
         });
@@ -213,8 +220,36 @@ impl RemoteInput {
 
 impl Drop for RemoteInput {
     fn drop(&mut self) {
-        self.state.stop();
+        self.state.closing.store(true, Ordering::Release);
     }
+}
+
+fn write_bounded(
+    writer: &mut impl Write,
+    message: &ClientMessage,
+    state: &WriteState,
+    timeout: Duration,
+    failure: &Failure,
+) -> bool {
+    if let Ok(mut deadline) = state.deadline.lock() {
+        if deadline.0 || state.failed.load(Ordering::Acquire) {
+            return false;
+        }
+        deadline.1 = Some(Instant::now() + timeout);
+        state.wake.notify_all();
+    }
+    let result = protocol::write_message(writer, message);
+    if let Ok(mut deadline) = state.deadline.lock() {
+        deadline.1 = None;
+        state.wake.notify_all();
+    }
+    if let Err(error) = result {
+        if !state.failed.swap(true, Ordering::AcqRel) {
+            failure(format!("SSH display input failed: {error}"));
+        }
+        return false;
+    }
+    !state.failed.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
@@ -234,6 +269,118 @@ impl From<mpsc::Sender<ClientMessage>> for RemoteInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_idle_input_emits_detach_even_without_a_view() {
+        struct Capture(mpsc::Sender<Vec<u8>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.send(bytes.to_vec()).unwrap();
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (tx, rx) = mpsc::channel();
+        let input = RemoteInput::with_writer(Capture(tx), WRITE_TIMEOUT, |_| {});
+        drop(input);
+        let mut bytes = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drop must detach the owner");
+        bytes.extend(rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(matches!(
+            protocol::read_message::<_, ClientMessage>(&mut bytes.as_slice()).unwrap(),
+            ClientMessage::Detach
+        ));
+    }
+
+    #[test]
+    fn dropping_input_discards_queued_keys_but_finishes_a_bounded_detach() {
+        struct Gated {
+            started: mpsc::Sender<()>,
+            release: Option<mpsc::Receiver<()>>,
+            done: mpsc::Sender<Vec<u8>>,
+            bytes: Vec<u8>,
+        }
+        impl Write for Gated {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(release) = self.release.take() {
+                    self.started.send(()).unwrap();
+                    release.recv().unwrap();
+                }
+                self.bytes.extend(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl Drop for Gated {
+            fn drop(&mut self) {
+                let _ = self.done.send(std::mem::take(&mut self.bytes));
+            }
+        }
+        let (started, ready) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (done, result) = mpsc::channel();
+        let input = RemoteInput::with_writer(
+            Gated {
+                started,
+                release: Some(blocked),
+                done,
+                bytes: Vec::new(),
+            },
+            WRITE_TIMEOUT,
+            |_| {},
+        );
+        input
+            .send(ClientMessage::Paste("in flight".into()))
+            .unwrap();
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        input
+            .send(ClientMessage::Paste("queued, must not replay".into()))
+            .unwrap();
+        drop(input);
+        release.send(()).unwrap();
+        let bytes = result.recv_timeout(Duration::from_secs(1)).unwrap();
+        let mut bytes = bytes.as_slice();
+        assert!(
+            matches!(protocol::read_message::<_, ClientMessage>(&mut bytes).unwrap(), ClientMessage::Paste(text) if text == "in flight")
+        );
+        assert!(matches!(
+            protocol::read_message::<_, ClientMessage>(&mut bytes).unwrap(),
+            ClientMessage::Detach
+        ));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn dropping_input_keeps_the_stalled_write_deadline_alive() {
+        struct Stalled(mpsc::Receiver<()>);
+        impl Write for Stalled {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                let _ = self.0.recv();
+                Err(io::ErrorKind::BrokenPipe.into())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let (release, blocked) = mpsc::channel();
+        let (failure, failed) = mpsc::channel();
+        let input =
+            RemoteInput::with_writer(Stalled(blocked), Duration::from_millis(30), move |error| {
+                let _ = failure.send(error);
+            });
+        // Even a final Detach can stall. Teardown must still cancel its child.
+        drop(input);
+        assert!(failed
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .contains("timed out"));
+        drop(release);
+    }
 
     #[test]
     fn remote_input_queue_is_bounded_and_never_flushes_queued_input_after_failure() {

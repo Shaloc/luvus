@@ -177,7 +177,11 @@ another or copy state between them unless the human requests a migration.
 
 User preferences live in `config.json`, not TOML. It contains the theme,
 language, shell, layout, notifications, prefix keybindings, opt-in direct
-keybindings, sidebars, and Luvus Bar placement. Prefer the in-app Settings
+keybindings, sidebars, and Luvus Bar placement. The optional
+`core:focused-pane` widget shows the current owner's 1-based tab position,
+opaque pane ID, and agent type/state. It defaults off; use
+`luvus bar move --id core:focused-pane --region bottom-right` on the
+display server when requested. Prefer the in-app Settings
 screen because it validates changes, applies supported settings live, and
 writes the file. Hand edits are loaded on restart. Preserve unknown keys and do
 not rewrite the file just to change one setting.
@@ -260,7 +264,9 @@ Layout → Auto-move tabs by directory or a boolean `config.patch` opts in.
 Disabling it prevents future automatic moves without undoing earlier ones;
 manual workspace/tab/pane operations are unaffected. Configure remote owners
 separately; this is an owner-server preference, not a merge-wide override.
-Open worktree lists branches and paths on the workspace owner. Ctrl+V image
+Open worktree asynchronously lists every checkout's branch and path on the
+workspace owner, marking already-open checkouts and focusing one when selected.
+Use Open Workspace to browse an arbitrary folder. Ctrl+V image
 paste sends client clipboard bytes to that owner and pastes its private path;
 headless clients in Kitty can use the optional official `kitten clipboard`
 helper on the display-client host, subject to Kitty's clipboard permission.

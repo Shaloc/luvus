@@ -290,6 +290,14 @@ fn render_projection_preserving_state(
     let bar_hits = std::mem::take(&mut app.bar.hits);
     let bar_overflow_hits = std::mem::take(&mut app.bar.overflow_hits);
     let bar_overflow = app.bar.overflow.clone();
+    // Core content is viewport/focus-specific just like hit geometry. Move the
+    // bounded built-ins aside so a passive owner cannot relabel ui.bar.list.
+    let core_widgets = [
+        crate::bar::CORE_RUNTIME,
+        crate::bar::CORE_AGENTS,
+        crate::bar::CORE_FOCUSED_PANE,
+    ]
+    .map(|key| (key, app.bar.widgets.remove(key)));
     let search_rects = app
         .search
         .as_mut()
@@ -441,6 +449,12 @@ fn render_projection_preserving_state(
     app.bar.hits = bar_hits;
     app.bar.overflow_hits = bar_overflow_hits;
     app.bar.overflow = bar_overflow;
+    for (key, widget) in core_widgets {
+        app.bar.widgets.remove(key);
+        if let Some(widget) = widget {
+            app.bar.widgets.insert(key.to_string(), widget);
+        }
+    }
     app.named_session_button_rect = named_session_button_rect;
     app.named_session_menu_rect = named_session_menu_rect;
     app.named_session_close_rect = named_session_close_rect;
@@ -530,6 +544,7 @@ pub(crate) fn retained_pty_eligible(app: &App) -> bool {
         && !app.changelog_open
         && app.cmd_inspect.is_none()
         && app.worktree_prompt.is_none()
+        && app.worktree_open.is_none()
         && app.tab_rename.is_none()
         && app.tab_menu.is_none()
         && app.ws_rename.is_none()
@@ -725,10 +740,10 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     let mobile_layout = (!merged_remote && app.compact).then(|| mobile::compute_layout(content));
     let (tabbar, pane_area) = if merged_remote {
         // The owner supplies the tab bar, but cannot reopen this display's
-        // sidebars. Reserve a local navigation row only while one is hidden;
+        // sidebars or display widgets. Reserve a local navigation row for them;
         // never paint a local hit target over an owner's tab or terminal cell.
         let [navigation, remote] = Layout::vertical([
-            Constraint::Length(app.remote_sidebar_reopen_height()),
+            Constraint::Length(app.remote_navigation_height()),
             Constraint::Min(0),
         ])
         .areas(content);
@@ -826,7 +841,19 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     }
     let (tab_rects, tab_close_rects, tab_prev, tab_next) = if merged_remote {
         if tabbar.height > 0 {
-            tabbar::draw_sidebar_reopen(f, tabbar, app, &t);
+            f.render_widget(Block::new().style(Style::new().bg(t.mantle)), tabbar);
+            let (left, right) = tabbar::draw_sidebar_reopen(f, tabbar, app, &t);
+            tabbar::draw_top_widgets(
+                f,
+                Rect::new(
+                    tabbar.x + left,
+                    tabbar.y,
+                    tabbar.width.saturating_sub(left + right),
+                    1,
+                ),
+                app,
+                &t,
+            );
         }
         (Vec::new(), Vec::new(), None, None)
     } else if let Some(layout) = mobile_layout {
@@ -1519,6 +1546,82 @@ mod retained_render_tests {
 
     use crate::terminal::appearance::PaneAppearance;
     use crate::terminal::vt::{create_engine, VtEngineKind};
+
+    #[test]
+    fn focused_pane_bar_survives_other_workspace_projection() {
+        let _env = crate::persist::test_env("focused-pane-projection-cache");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(200, 40, tx).unwrap();
+        app.config.bars.place(
+            crate::bar::CORE_FOCUSED_PANE,
+            Some(crate::bar::BarRegion::BottomRight),
+        );
+        let local = app.layout().focus;
+        let (projection, _input, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        let destination = app.ws().id.clone();
+        let crate::app::ViewKind::Remote(view) = app.views.get_mut(&projection).unwrap() else {
+            unreachable!()
+        };
+        view.focused_pane = Some(crate::bar::FocusedPaneMetadata {
+            tab: 4,
+            pane: "owner-27".into(),
+            agent: None,
+        });
+        app.active_ws = 0;
+        let area = Rect::new(0, 0, 200, 40);
+        let mut buffer = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut buffer, area);
+        render_into(&mut target, &mut app);
+        let before = app.dispatch("ui.bar.list", &serde_json::json!({})).unwrap();
+        let cached = app.bar.widgets[crate::bar::CORE_FOCUSED_PANE].clone();
+        assert!(before.to_string().contains(&format!("pane {}", local.0)));
+        render_workspace_projection(&mut target, &mut app, &destination);
+        assert_eq!(app.active_ws, 0);
+        assert_eq!(app.bar.widgets[crate::bar::CORE_FOCUSED_PANE], cached);
+        assert_eq!(
+            app.dispatch("ui.bar.list", &serde_json::json!({})).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn focused_pane_bar_top_bottom_off_render_for_remote_workspaces() {
+        let _env = crate::persist::test_env("focused-pane-remote-placement");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(200, 40, tx).unwrap();
+        let (projection, _input, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        let crate::app::ViewKind::Remote(view) = app.views.get_mut(&projection).unwrap() else {
+            unreachable!()
+        };
+        view.focused_pane = Some(crate::bar::FocusedPaneMetadata {
+            tab: 4,
+            pane: "owner-27".into(),
+            agent: None,
+        });
+        let area = Rect::new(0, 0, 200, 40);
+        for region in [
+            Some(crate::bar::BarRegion::TopRight),
+            Some(crate::bar::BarRegion::BottomRight),
+            None,
+        ] {
+            app.config.bars.place(crate::bar::CORE_FOCUSED_PANE, region);
+            let mut buffer = Buffer::empty(area);
+            let mut target = RenderTarget::new(&mut buffer, area);
+            render_into(&mut target, &mut app);
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert_eq!(
+                text.contains("owner-27"),
+                region.is_some(),
+                "{region:?}: {text}"
+            );
+            if region == Some(crate::bar::BarRegion::TopRight) {
+                assert_eq!(
+                    app.last_pane_area.y, 1,
+                    "local widgets must not overlap owner tabs"
+                );
+            }
+        }
+    }
 
     #[test]
     fn damaged_rows_match_a_forced_full_projection() {

@@ -206,8 +206,9 @@ display federation, not Git merge.
 With `--host`, `--session` is always the actual remote name, including names
 that themselves start with `remote-`. Without `--host`, use the canonical name.
 
-The workspace menu's Open worktree lists branches and owner-host paths before
-offering manual folder browsing. Ctrl+V reads an available image on the display
+The workspace menu's Open worktree asynchronously lists branches, owner-host
+paths and already-open checkouts; selecting an open checkout focuses it. Use
+Open Workspace for arbitrary folder browsing. Ctrl+V reads an available image on the display
 client, sends its bytes to the pane owner, and pastes an owner-local private file
 path. It never pastes a client-only path into a remote pane. A headless SSH
 client in Kitty can use the optional official `kitten clipboard` executable
@@ -559,6 +560,11 @@ surface:
   theme or fetch a remote theme without explicit authorization.
 - CLI widget commands use `luvus bar ...`; the UHP method family is
   `ui.bar.*`. Inspect widgets and docks before changing placement or content.
+  The optional `core:focused-pane` widget shows the focused owner's tab
+  position (1-based), opaque pane ID, and agent type/state; it defaults off.
+  Enable it on the display server with `luvus bar move
+  --id core:focused-pane --region bottom-right`, not on a projected owner via
+  `--host`. Local Settings controls the same placement in merge mode.
   Avoid sidebar, dock, notification, toast, bar, or focus changes unless they
   serve the user's request.
 - Open Mission Control directly with `luvus mission open [<workspace>]` when

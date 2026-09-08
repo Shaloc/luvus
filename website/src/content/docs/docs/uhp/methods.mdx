@@ -966,6 +966,12 @@ from stdin).
 
 ## Luvus Bar
 
+The opt-in built-in `core:focused-pane` shows the focused owner's tab position,
+pane ID, and agent type/state. Its default placement is off (`null` in
+`ui.bar.list`). Enable it using `ui.bar.move` with `owner: "core"`,
+`id: "focused-pane"`, and `region: "bottom-right"` on the display server.
+This uses the existing bar methods and requires no additional capability.
+
 Luvus Bar is the bounded single-row extension surface beside tabs and between
 the fixed bottom guidance and version control. Modules declare widget ownership
 with `[[bars]]`, then publish structured segments. Luvus validates, caches,

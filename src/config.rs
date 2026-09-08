@@ -158,6 +158,9 @@ impl BarConfig {
             Some(crate::bar::BarRegion::TopRight)
         } else if self.bottom_right.iter().any(|candidate| candidate == key) {
             Some(crate::bar::BarRegion::BottomRight)
+        } else if key == crate::bar::CORE_FOCUSED_PANE {
+            // This built-in is opt-in even for an existing serialized BarConfig.
+            None
         } else {
             Some(fallback)
         }

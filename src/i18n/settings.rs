@@ -36,6 +36,7 @@ pub const KEY_REFERENCE_KEYS: &[&[&str]] = &[
 ];
 
 pub struct Catalog {
+    pub focused_pane_metadata: &'static str,
     pub auto_workspace_rehome: &'static str,
     pub workspace_display: &'static str,
     pub workspace_flat: &'static str,
@@ -119,6 +120,7 @@ pub struct Catalog {
 }
 
 pub static EN: Catalog = Catalog {
+    focused_pane_metadata: "Current tab / pane",
     auto_workspace_rehome: "Auto-move tabs by directory",
     workspace_display: "Workspace display",
     workspace_flat: "Flat",
@@ -286,6 +288,7 @@ pub static EN: Catalog = Catalog {
 };
 
 pub static ES: Catalog = Catalog {
+    focused_pane_metadata: "Pestaña / panel actual",
     auto_workspace_rehome: "Mover pestañas por carpeta",
     workspace_display: "Vista de espacios",
     workspace_flat: "Lista plana",
@@ -324,6 +327,7 @@ pub static ES: Catalog = Catalog {
 };
 
 pub static PT: Catalog = Catalog {
+    focused_pane_metadata: "Aba / painel atual",
     auto_workspace_rehome: "Mover abas por pasta",
     workspace_display: "Visualização dos espaços",
     workspace_flat: "Lista plana",
@@ -360,6 +364,7 @@ pub static PT: Catalog = Catalog {
 };
 
 pub static FR: Catalog = Catalog {
+    focused_pane_metadata: "Onglet / panneau actif",
     auto_workspace_rehome: "Déplacer onglets par dossier",
     workspace_display: "Vue des espaces",
     workspace_flat: "Liste à plat",
@@ -396,6 +401,7 @@ pub static FR: Catalog = Catalog {
 };
 
 pub static DE: Catalog = Catalog {
+    focused_pane_metadata: "Aktueller Tab / Bereich",
     auto_workspace_rehome: "Tabs nach Ordner verschieben",
     workspace_display: "Arbeitsbereichsansicht",
     workspace_flat: "Flach",
@@ -432,6 +438,7 @@ pub static DE: Catalog = Catalog {
 };
 
 pub static ID: Catalog = Catalog {
+    focused_pane_metadata: "Tab / panel aktif",
     auto_workspace_rehome: "Pindah tab sesuai direktori",
     workspace_display: "Tampilan ruang kerja",
     workspace_flat: "Datar",
@@ -596,6 +603,7 @@ pub static ID: Catalog = Catalog {
 };
 
 pub static ZH: Catalog = Catalog {
+    focused_pane_metadata: "当前标签页 / 窗格",
     auto_workspace_rehome: "自动迁移工作区",
     workspace_display: "工作区展示",
     workspace_flat: "平铺",
@@ -756,6 +764,7 @@ pub static ZH: Catalog = Catalog {
 };
 
 pub static JA: Catalog = Catalog {
+    focused_pane_metadata: "現在のタブ / ペイン",
     auto_workspace_rehome: "ディレクトリでタブを自動移動",
     workspace_display: "ワークスペース表示",
     workspace_flat: "フラット",
@@ -925,6 +934,7 @@ pub static JA: Catalog = Catalog {
 };
 
 pub static KO: Catalog = Catalog {
+    focused_pane_metadata: "현재 탭 / 창",
     auto_workspace_rehome: "디렉터리별 탭 자동 이동",
     workspace_display: "작업 공간 표시",
     workspace_flat: "평면",

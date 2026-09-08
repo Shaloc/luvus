@@ -1753,7 +1753,11 @@ fn bar_row(
         fill_bg(f, row, t.sel_bg);
     }
     let declaration = app.bar.declaration(key);
-    let title = declaration.map_or(key, |declaration| declaration.title.as_str());
+    let title = if key == crate::bar::CORE_FOCUSED_PANE {
+        app.catalog.settings.focused_pane_metadata
+    } else {
+        declaration.map_or(key, |declaration| declaration.title.as_str())
+    };
     let fallback = declaration.map_or(crate::bar::BarRegion::BottomRight, |declaration| {
         declaration.region
     });

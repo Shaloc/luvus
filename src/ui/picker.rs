@@ -19,11 +19,7 @@ pub(super) fn draw_picker(
 ) -> Vec<(PickerHit, Rect)> {
     dim_backdrop(f, area, t);
 
-    let w = area
-        .width
-        .saturating_sub(6)
-        .clamp(46, if p.worktrees.is_some() { 110 } else { 76 })
-        .min(area.width);
+    let w = area.width.saturating_sub(6).clamp(46, 76).min(area.width);
     let h = area.height.saturating_sub(4).clamp(14, 26).min(area.height);
     let modal = if mobile {
         super::mobile::sheets::full_screen(area)
@@ -41,14 +37,7 @@ pub(super) fn draw_picker(
     // Title + the path being browsed.
     f.render_widget(
         Paragraph::new(Span::styled(
-            format!(
-                " {}",
-                if p.worktrees.is_some() {
-                    cat.menu_open_worktree
-                } else {
-                    cat.open_workspace
-                }
-            ),
+            format!(" {}", cat.open_workspace),
             Style::new().fg(t.text).bold(),
         )),
         Rect::new(inner.x, inner.y, inner.width, 1),
@@ -140,13 +129,6 @@ pub(super) fn draw_picker(
                 ("⏎", cat.act_select, KeyCode::Enter),
                 ("esc", cat.act_cancel, KeyCode::Esc),
             ]
-        } else if p.worktrees.is_some() {
-            vec![
-                ("↑↓", cat.act_move, KeyCode::Down),
-                ("⏎", cat.act_select, KeyCode::Enter),
-                ("r", cat.act_refresh, KeyCode::Char('r')),
-                ("esc", cat.act_cancel, KeyCode::Esc),
-            ]
         } else {
             vec![
                 ("g", cat.act_go_to, KeyCode::Char('g')),
@@ -213,49 +195,18 @@ pub(super) fn draw_picker(
         inner.width.saturating_sub(2),
         divider_y.saturating_sub(inner.y + 3),
     );
-    let row_height = if p.worktrees.is_some() { 2 } else { 1 };
-    let avail = (list.height / row_height).max(1) as usize;
+    let avail = list.height.max(1) as usize;
     let scroll = p.cursor.saturating_sub(avail.saturating_sub(1));
     let mut rects = Vec::new();
     for (vi, i) in (scroll..p.row_count()).take(avail).enumerate() {
-        let y = list.y + vi as u16 * row_height;
-        let row_rect = Rect::new(list.x, y, list.width, row_height);
+        let y = list.y + vi as u16;
+        let row_rect = Rect::new(list.x, y, list.width, 1);
         let sel = i == p.cursor;
         if sel {
             fill_bg(f, row_rect, t.sel_bg);
         }
         // (icon, label, color). Folders navigate; files are dimmed + inert.
         let (icon, label, fg) = match p.row(i) {
-            Row::ExistingWorktree(index) => {
-                let entry = &p.worktrees.as_ref().unwrap().entries[index];
-                f.render_widget(
-                    Paragraph::new(format!(
-                        "    {}",
-                        trunc_tail(
-                            &entry.path.display().to_string(),
-                            list.width.saturating_sub(4) as usize
-                        )
-                    ))
-                    .style(Style::new().fg(t.subtext0)),
-                    Rect::new(list.x, y + 1, list.width, 1),
-                );
-                (
-                    "⎇",
-                    entry.branch.clone().unwrap_or_else(|| {
-                        format!("HEAD {}", entry.head.chars().take(8).collect::<String>())
-                    }),
-                    t.text,
-                )
-            }
-            Row::BrowseFolder => (
-                "…",
-                if p.worktrees.as_ref().is_some_and(|choices| choices.loading) {
-                    "…".to_string()
-                } else {
-                    cat.open_workspace.to_string()
-                },
-                t.accent,
-            ),
             Row::Host(index) => (
                 "◆",
                 if index == 0 {

@@ -5360,6 +5360,13 @@ mod tests {
         assert_eq!(params["owner"], "you.ci");
         std::env::remove_var("LUVUS_MODULE_ID");
 
+        let (method, params) = parse(&argv(
+            "luvus bar move --id core:focused-pane --region bottom-right",
+        ))
+        .unwrap();
+        assert_eq!(method, "ui.bar.move");
+        assert_eq!(params["id"], "core:focused-pane");
+
         for bad in [
             "luvus bar push --id status",
             "luvus bar move --id status --region middle",

@@ -4301,6 +4301,16 @@ impl App {
                 }
             }
             "ui.bar.list" => {
+                // Queries can follow owner-scoped input before a foreground
+                // render. Compose current core metadata without invalidating
+                // any already-rendered module hits or overflow popup.
+                let hits = std::mem::take(&mut self.bar.hits);
+                let overflow_hits = std::mem::take(&mut self.bar.overflow_hits);
+                let overflow = self.bar.overflow.take();
+                self.refresh_core_bar_widgets();
+                self.bar.hits = hits;
+                self.bar.overflow_hits = overflow_hits;
+                self.bar.overflow = overflow;
                 let widgets: Vec<Value> = self
                     .bar
                     .declarations
@@ -4318,7 +4328,7 @@ impl App {
                             "key": key,
                             "title": declaration.title,
                             "region": region,
-                            "default_region": declaration.region.as_str(),
+                            "default_region": (key != crate::bar::CORE_FOCUSED_PANE).then(|| declaration.region.as_str()),
                             "priority": live.map_or(declaration.priority, |widget| widget.priority),
                             "live": live.is_some(),
                             "content": live.map(|widget| &widget.content),
@@ -5898,6 +5908,7 @@ impl App {
                             json!({
                                 "pane_id":pane_id.0.to_string(),
                                 "kind":"view",
+                                "workspace_focused":tab_index == workspace.active_tab && tab.layout.focus == pane_id,
                                 "focused":workspace_index == self.active_ws
                                     && tab_index == workspace.active_tab
                                     && tab.layout.focus == pane_id,

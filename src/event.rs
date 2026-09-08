@@ -175,10 +175,6 @@ pub enum AppEvent {
         generation: String,
         result: Result<Vec<String>, String>,
     },
-    WorktreeChoicesLoaded {
-        generation: String,
-        result: Result<Vec<crate::git::model::Worktree>, String>,
-    },
     /// An explicit owner stop/delete from the session context menu finished.
     NamedSessionOperationFinished {
         generation: u64,

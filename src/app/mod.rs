@@ -6803,7 +6803,12 @@ impl App {
         // canonicalize per checkout, which is exactly the kind of stat the
         // worker exists to keep off the loop. A workspace opened mid-scan is
         // only missed on the badge — ⏎ re-resolves against live workspaces.
-        let open_cwds: Vec<PathBuf> = self.workspaces.iter().map(|w| w.cwd.clone()).collect();
+        let open_cwds: Vec<PathBuf> = self
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.remote.is_none())
+            .map(|workspace| workspace.cwd.clone())
+            .collect();
         let accepted = self.io_jobs.submit(self.app_tx.clone(), move || {
             let result = openable_worktrees(&cwd, &open_cwds);
             Box::new(move |app| app.apply_worktree_list(generation, result))
@@ -6881,7 +6886,17 @@ impl App {
     /// Stats `path` and every workspace root, so it's for the user's own pick
     /// on ⏎ — the listing resolves its badges on the worker instead.
     fn workspace_idx_for_path(&self, path: &std::path::Path) -> Option<usize> {
-        checkout_idx_in(path, self.workspaces.iter().map(|w| w.cwd.as_path()))
+        let local: Vec<_> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| workspace.remote.is_none())
+            .collect();
+        checkout_idx_in(
+            path,
+            local.iter().map(|(_, workspace)| workspace.cwd.as_path()),
+        )
+        .map(|index| local[index].0)
     }
 
     /// Keys for the open-worktree list modal: ↑/↓ (or k/j) move, ⏎ opens the
@@ -6904,7 +6919,7 @@ impl App {
                 self.close_worktree_list();
                 if let Some(path) = path {
                     if let Some(idx) = self.workspace_idx_for_path(&path) {
-                        self.active_ws = idx;
+                        self.focus_workspace(idx);
                     } else {
                         self.create_workspace_at(path);
                     }
@@ -8721,7 +8736,6 @@ mod tests {
     fn picker_w_creates_a_worktree_only_on_a_repo() {
         let mk = |path: &str, is_repo: bool| crate::app::FolderPicker {
             hosts: None,
-            worktrees: None,
             path: std::path::PathBuf::from(path),
             entries: Vec::new(),
             cursor: 0,
@@ -9086,6 +9100,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_modals_capture_mobile_header_clicks_before_navigation() {
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, Terminal};
+        let _env = crate::persist::test_env("worktree-modal-mobile-chrome");
+        for (prompt, control) in [false, true]
+            .into_iter()
+            .flat_map(|prompt| (0..3).map(move |control| (prompt, control)))
+        {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let mut app = App::new(48, 24, tx).unwrap();
+            app.split(Axis::Col);
+            let focus = app.layout().focus;
+            if prompt {
+                app.worktree_prompt = Some("feature".into());
+            } else {
+                app.begin_worktree_list();
+            }
+            let mut terminal = Terminal::new(TestBackend::new(48, 24)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::render(frame, &mut app))
+                .unwrap();
+            let menu = match control {
+                0 => app.switcher_button_rect,
+                1 => app.mobile_pane_prev_rect,
+                _ => app.mobile_pane_next_rect,
+            }
+            .expect("narrow owner controls are rendered behind the modal");
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: menu.x,
+                row: menu.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(!app.switcher, "covered MENU must not open the navigator");
+            assert_eq!(app.layout().focus, focus);
+            assert!(
+                app.worktree_open.is_none() && app.worktree_prompt.is_none(),
+                "backdrop cancels the modal"
+            );
+        }
     }
 
     #[test]

@@ -594,10 +594,6 @@ impl App {
                 self.apply_settings_remote_hosts_loaded(generation, result);
                 return true;
             }
-            AppEvent::WorktreeChoicesLoaded { generation, result } => {
-                self.apply_worktree_choices(generation, result);
-                return true;
-            }
             AppEvent::RemoteRegistryLoaded {
                 generation,
                 registry,
@@ -882,7 +878,7 @@ impl App {
                         self.open_ws_menu(self.active_ws, column, row);
                     }
                 } else if command == "open_worktree" {
-                    self.open_worktree_picker_at(self.ws().cwd.clone());
+                    self.open_worktree_list(&self.ws().cwd.clone());
                 } else if command == "delete_worktree" {
                     if self.ws().remote.is_none()
                         && self.ws().worktree.as_ref().is_some_and(|w| w.linked)
@@ -1331,7 +1327,6 @@ impl App {
             | AppEvent::SettingsRemoteHostsLoaded { .. }
             | AppEvent::ClipboardImageReady { .. }
             | AppEvent::ClipboardHelperResult { .. }
-            | AppEvent::WorktreeChoicesLoaded { .. }
             | AppEvent::RemoteSessionWatcherClosed { .. }
             | AppEvent::RemoteProjectionReady { .. }
             | AppEvent::RemoteFrameAvailable { .. }
@@ -2070,36 +2065,6 @@ impl App {
             }
             return;
         }
-        // Tapping the mobile MENU button opens the full-screen navigator.
-        if let (MouseEventKind::Down(MouseButton::Left), Some(r)) =
-            (m.kind, self.switcher_button_rect)
-        {
-            if m.column >= r.x && m.column < r.right() && m.row >= r.y && m.row < r.bottom() {
-                self.open_switcher();
-                return;
-            }
-        }
-        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-            let hit = |rect: Rect| {
-                m.column >= rect.x
-                    && m.column < rect.right()
-                    && m.row >= rect.y
-                    && m.row < rect.bottom()
-            };
-            if self.mobile_pane_prev_rect.is_some_and(hit) {
-                self.cycle_pane(-1);
-                return;
-            }
-            if self.mobile_pane_next_rect.is_some_and(hit) {
-                self.cycle_pane(1);
-                return;
-            }
-        }
-        // The complete two-row mobile header is chrome. Only MENU acts; every
-        // other header tap is consumed instead of leaking into a mouse-aware PTY.
-        if self.compact && self.ws().remote.is_none() && m.row < self.last_pane_area.y {
-            return;
-        }
         // The new-worktree prompt: the ⏎/esc footer buttons act as those keys,
         // a click on the modal body is inert, and a click on the dimmed backdrop
         // cancels — the same gesture as the open-worktree list below.
@@ -2188,6 +2153,37 @@ impl App {
             if matches!(m.kind, MouseEventKind::Down(_)) {
                 self.bar_click(m.column, m.row);
             }
+            return;
+        }
+        // Mobile chrome is below every modal/popup, including the owner's
+        // worktree chooser. Covered MENU/pane arrows must not take the click.
+        if let (MouseEventKind::Down(MouseButton::Left), Some(r)) =
+            (m.kind, self.switcher_button_rect)
+        {
+            if m.column >= r.x && m.column < r.right() && m.row >= r.y && m.row < r.bottom() {
+                self.open_switcher();
+                return;
+            }
+        }
+        if let MouseEventKind::Down(MouseButton::Left) = m.kind {
+            let hit = |rect: Rect| {
+                m.column >= rect.x
+                    && m.column < rect.right()
+                    && m.row >= rect.y
+                    && m.row < rect.bottom()
+            };
+            if self.mobile_pane_prev_rect.is_some_and(hit) {
+                self.cycle_pane(-1);
+                return;
+            }
+            if self.mobile_pane_next_rect.is_some_and(hit) {
+                self.cycle_pane(1);
+                return;
+            }
+        }
+        // Consume the remaining header surface, but retain local reopen buttons
+        // above a remote viewport when the outer sidebar is hidden.
+        if self.compact && self.ws().remote.is_none() && m.row < self.last_pane_area.y {
             return;
         }
         // Clear outer list focus before forwarding a remote press; forwarding

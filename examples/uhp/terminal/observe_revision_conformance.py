@@ -6,7 +6,6 @@ import json
 import os
 import pathlib
 import selectors
-import shlex
 import socket
 import subprocess
 import sys
@@ -65,14 +64,15 @@ def main():
                 time.sleep(0.025)
         print(json.dumps({"binary": binary, "home": str(home), "session": args.session}))
         for control in (False, True):
-            pane = owner("pane.split", {})["pane"]
             trigger = home / f"trigger-{control}"
             child = [sys.executable, str(pathlib.Path(__file__).resolve()), "--child", str(trigger)]
-            owner("pane.run", {"pane": pane, "command": "exec " + shlex.join(child)})
-            inventory = owner("terminal.backend.inventory", {})
-            terminal = next(t for t in inventory["terminals"] if t["pane_id"] == pane)
-            params = {key: terminal[key] for key in ("terminal_id", "pane_id")}
-            params["server_generation"] = inventory["server_generation"]
+            # Start directly; typing exec into an initializing interactive
+            # shell can leave the fixture command unexecuted.
+            terminal = owner("terminal.backend.create", {
+                "command": child, "cwd": str(home),
+                "placement": {"kind": "workspace"}, "focus": False,
+            })
+            params = {key: terminal[key] for key in ("terminal_id", "pane_id", "server_generation")}
             params.update(mode="recent_unwrapped", lines=200, ansi=True)
             gateway = subprocess.Popen(command + ["uhp", "access"] + (["--control"] if control else []),
                                        env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,

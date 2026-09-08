@@ -654,6 +654,38 @@ mod tests {
         let version = app.version_rect.expect("version remains fixed");
         assert_eq!(hit.rect.right() + 5, version.x);
     }
+
+    #[test]
+    fn focused_pane_metadata_renders_with_version_and_narrow_overflow() {
+        let _env = crate::persist::test_env("bar-status-focused-pane");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(200, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let status = app.status.get_mut(&pane).unwrap();
+        status.agent = "qodercli".into();
+        status.state = crate::ui::theme::State::Working;
+        app.config.bars.place(
+            crate::bar::CORE_FOCUSED_PANE,
+            Some(crate::bar::BarRegion::BottomRight),
+        );
+        app.refresh_core_bar_widgets();
+        for width in [200, 120, 80, 35] {
+            let area = Rect::new(0, 0, width, 1);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+            let theme = app.theme.clone();
+            draw_status(&mut target, area, &mut app, &theme);
+            let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+            assert!(
+                text.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+                "{width}: {text}"
+            );
+            if width == 200 {
+                assert!(text.contains(&format!("pane {}", pane.0)), "{text}");
+                assert!(text.contains("qodercli working"), "{text}");
+            }
+        }
+    }
     /// Copy mode's guidance is clipped, never wrapped, so a row wider than the
     /// space left of the version chip loses its tail silently. Cancel and copy are
     /// how you leave the mode with or without the selection, so they have to

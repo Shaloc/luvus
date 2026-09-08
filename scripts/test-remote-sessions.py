@@ -737,6 +737,7 @@ def main():
                 # Read the presentation's own API, not the --host CLI route
                 # that intentionally bypasses presentation and reaches its owner.
                 selected = "api" if merged else "remote-fake-dev-api"
+                presentation_api("ui.bar.move", {"owner":"core", "id":"focused-pane", "region":"bottom-right"}, session=selected)
                 def highlighted():
                     return [a["owner_pane"] for a in presentation_api("agent.list", session=selected)["agents"]
                             if a.get("host") == "fake-dev" and a["focused"]]
@@ -747,6 +748,13 @@ def main():
                         wait_for(lambda: highlighted() == [expected])
                     except AssertionError as error:
                         raise AssertionError(f"{mode}: Agents highlight {highlighted()} differs from selected owner pane {expected}") from error
+                    def metadata_matches():
+                        widgets = presentation_api("ui.bar.list", session=selected)["widgets"]
+                        widget = next(w for w in widgets if w["key"] == "core:focused-pane")
+                        content = widget.get("content") or []
+                        return any(s.get("text") == f"pane {expected}" for s in content) and any(
+                            s.get("type") == "state" and s.get("label", "").startswith("qodercli ") for s in content)
+                    wait_for(metadata_matches)
                 synchronized(second)
                 drain(master, 2)
                 screen = repaint(master)
@@ -1000,6 +1008,37 @@ def main():
 
             row("pane split/focus/resize/close stays on owner", panes)
 
+            def pane_metadata():
+                selected = "remote-fake-dev-api" if mode == "direct-remote" else "api"
+                if remote:
+                    presentation_api("ui.bar.move", {"owner":"core", "id":"focused-pane", "region":"bottom-right"}, session=selected)
+                else:
+                    cli("bar", "move", "--id", "core:focused-pane", "--region", "bottom-right")
+                def matches():
+                    widgets = presentation_api("ui.bar.list", session=selected)["widgets"]
+                    widget = next(w for w in widgets if w["key"] == "core:focused-pane")
+                    content = widget.get("content") or []
+                    return any(s.get("text") == f"pane {temp_pane}" for s in content) and any(
+                        s.get("text") == f"tab {temp_tab}" for s in content)
+                wait_for(matches)
+                screen = repaint(master)
+                try:
+                    position(screen, f"pane {temp_pane}", after_row=30)
+                except AssertionError:
+                    position(screen, f"p{temp_pane}", after_row=30)
+                # Top placement uses a display-owned row above remote tabs;
+                # exercise the rendered lane, not just the cached API content.
+                presentation_api("ui.bar.move", {"owner":"core", "id":"focused-pane", "region":"top-right"}, session=selected)
+                screen = repaint(master)
+                try:
+                    position(screen, f"pane {temp_pane}", before_row=2)
+                except AssertionError:
+                    position(screen, f"p{temp_pane}", before_row=2)
+                presentation_api("ui.bar.move", {"owner":"core", "id":"focused-pane", "region":"off"}, session=selected)
+                repaint(master)
+
+            row("optional status metadata follows owner tab and pane", pane_metadata)
+
             def dimensions():
                 def size(label):
                     marker = f"PTY_SIZE_{mode.replace('-', '_')}_{label}"
@@ -1153,6 +1192,19 @@ def main():
                                         if t["active"] for p in t["panes"] if p["kind"] == "terminal")
                 source_name = next(w["name"] for w in owner("workspace.list")["workspaces"]
                                    if w["workspace"] == "0")
+                if remote:
+                    # Hide only the display projection. Reopening through the
+                    # owner MENU must rediscover AND focus it, without closing
+                    # the owner's workspace or its terminal process.
+                    display_session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
+                    visible = wait_for(lambda: next((w for w in presentation_api(
+                        "workspace.list", session=display_session)["workspaces"]
+                        if w.get("host") == "fake-dev" and w["cwd"] == str(path)), None))
+                    presentation_api("workspace.close", {"workspace": visible["workspace"]},
+                                     session=display_session)
+                    assert not any(w.get("host") == "fake-dev" and w["cwd"] == str(path)
+                                   for w in presentation_api("workspace.list", session=display_session)["workspaces"])
+                    assert any(w["cwd"] == str(path) for w in owner("workspace.list")["workspaces"])
                 # Exercise owner MENU navigation through real client input,
                 # not merely successful owner CLI mutations. At this width
                 # only the remote projection uses its mobile MENU header.

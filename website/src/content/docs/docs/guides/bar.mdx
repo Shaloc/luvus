@@ -22,6 +22,20 @@ The built-in **Runtime status** widget starts at the bottom and shows a compact
 summary such as `NORMAL · 1 pane · tab 2/4`. It can be moved or hidden like a
 module widget, but its content is managed by Luvus.
 
+The optional **Current tab / pane** widget (`core:focused-pane`) starts **Off**.
+Select **Bottom** in Settings to see, for example,
+`tab 2 · pane 27 · ● qodercli working`. The tab position is 1-based and the
+pane ID is the owner's opaque identifier. Local, remote and merged workspaces
+use their actual focused pane; shells and native views omit the agent label.
+Disconnected or not-yet-aligned remote metadata is hidden. In narrow rows it
+uses compact labels such as `t2 p27`, then the standard overflow if needed.
+Mode-specific key guidance retains priority over bottom widgets.
+
+```sh
+luvus bar move --id core:focused-pane --region bottom-right
+luvus bar move --id core:focused-pane --region off
+```
+
 ## Arrange the Bar
 
 Open **Settings → Layout → Luvus Bar**. Every declared widget has **Top**,

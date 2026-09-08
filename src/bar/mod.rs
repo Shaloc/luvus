@@ -13,6 +13,16 @@ use unicode_width::UnicodeWidthStr;
 
 pub const CORE_RUNTIME: &str = "core:runtime-status";
 pub const CORE_AGENTS: &str = "core:agent-summary";
+pub const CORE_FOCUSED_PANE: &str = "core:focused-pane";
+
+/// Cached presentation of one owner's current layout leaf. Tab positions are
+/// 1-based; pane IDs are opaque owner IDs, not projection IDs or ordinals.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FocusedPaneMetadata {
+    pub tab: usize,
+    pub pane: String,
+    pub agent: Option<(String, crate::ui::theme::State)>,
+}
 pub const UNOWNED_NOTIFICATION_OWNER: &str = "core-notification";
 pub const MAX_WIDGETS: usize = 64;
 pub const MAX_WIDGETS_PER_MODULE: usize = 16;
@@ -457,13 +467,23 @@ impl Default for BarState {
                 priority: 100,
             },
         );
+        state.declarations.insert(
+            CORE_FOCUSED_PANE.to_string(),
+            BarDeclaration {
+                key: BarWidgetKey::new("core", "focused-pane"),
+                title: "Current tab / pane".into(),
+                region: BarRegion::BottomRight,
+                priority: 110,
+            },
+        );
         state
     }
 }
 
 impl BarState {
     pub fn sync_modules(&mut self, modules: &crate::module::ModuleRegistry) {
-        self.declarations.retain(|key, _| key == CORE_RUNTIME);
+        self.declarations
+            .retain(|key, _| key == CORE_RUNTIME || key == CORE_FOCUSED_PANE);
         for module in modules.modules.iter().filter(|module| module.is_runnable()) {
             for entry in &module.manifest.bars {
                 let key = BarWidgetKey::new(&module.id, &entry.id);
@@ -639,6 +659,22 @@ impl BarState {
         owner: Option<&str>,
         id: &str,
     ) -> Result<&BarDeclaration, String> {
+        // Module-local IDs may themselves contain ':'. Preserve the existing
+        // explicit-owner meaning before trying a globally canonical spelling.
+        if let Some(declaration) = owner.and_then(|owner| {
+            self.declarations
+                .get(&format!("{owner}:{id}"))
+                .filter(|declaration| declaration.key.owner == owner && declaration.key.id == id)
+        }) {
+            return Ok(declaration);
+        }
+        if let Some(declaration) = self.declarations.get(id) {
+            return if owner.is_none_or(|owner| declaration.key.owner == owner) {
+                Ok(declaration)
+            } else {
+                Err(format!("bar widget {id} belongs to a different owner"))
+            };
+        }
         let matches: Vec<&BarDeclaration> = self
             .declarations
             .values()
@@ -743,9 +779,10 @@ impl crate::app::App {
         })
     }
 
-    /// Refresh the two built-ins from already-cached application state. This is
+    /// Refresh built-ins from already-cached application state. This is
     /// pure in-process composition: no IO, manifest lookup, or subprocess work.
     pub fn refresh_core_bar_widgets(&mut self) {
+        self.refresh_focused_pane_widget();
         if self.workspaces.is_empty() {
             self.bar.remove_widget(CORE_RUNTIME);
             self.bar.remove_widget(CORE_AGENTS);
@@ -830,6 +867,99 @@ impl crate::app::App {
             )
             .expect("core agent summary is bounded");
             let _ = self.bar.push_widget(widget);
+        }
+    }
+
+    fn focused_pane_metadata(&self) -> Option<FocusedPaneMetadata> {
+        let workspace = self.workspaces.get(self.active_ws)?;
+        let tab = workspace.tabs.get(workspace.active_tab)?;
+        if let Some(crate::app::ViewKind::Remote(view)) = self.views.get(&tab.layout.focus) {
+            return view.focused_pane_metadata().cloned();
+        }
+        // Dashboard tabs are not layout leaves, and must not advertise an old
+        // terminal ID retained in their placeholder layout.
+        if tab.is_git() || tab.is_orch() || tab.is_mission() {
+            return None;
+        }
+        let pane = tab.layout.focus;
+        if !self.panes.contains_key(&pane) && !self.views.contains_key(&pane) {
+            return None;
+        }
+        let agent = self
+            .status
+            .get(&pane)
+            .filter(|status| {
+                self.manifests.is_agent(&status.agent)
+                    || status.agent_session.is_some()
+                    || status.agent_report.is_some()
+            })
+            .map(|status| (status.agent.clone(), status.state));
+        Some(FocusedPaneMetadata {
+            tab: workspace.active_tab + 1,
+            pane: pane.0.to_string(),
+            agent,
+        })
+    }
+
+    fn refresh_focused_pane_widget(&mut self) {
+        let metadata = self
+            .config
+            .bars
+            .region_for(CORE_FOCUSED_PANE, BarRegion::BottomRight)
+            .and_then(|_| self.focused_pane_metadata());
+        let Some(metadata) = metadata else {
+            self.bar.remove_widget(CORE_FOCUSED_PANE);
+            return;
+        };
+        let mut content = vec![
+            BarSegment::text(
+                format!("{} {}", self.catalog.act_tab, metadata.tab),
+                BarTone::Normal,
+            ),
+            BarSegment::separator(),
+            BarSegment::text(
+                format!("{} {}", self.catalog.pane, metadata.pane),
+                BarTone::Normal,
+            ),
+        ];
+        let mut compact = vec![BarSegment::text(
+            format!("t{} p{}", metadata.tab, metadata.pane),
+            BarTone::Normal,
+        )];
+        if let Some((agent, state)) = metadata.agent {
+            let segment = BarSegment {
+                kind: BarSegmentKind::State {
+                    state: if state == crate::ui::theme::State::Unknown {
+                        "unknown"
+                    } else {
+                        state.label()
+                    }
+                    .to_string(),
+                    label: Some(format!("{agent} {}", state.label())),
+                    value: None,
+                },
+                tone: BarTone::Normal,
+                action: None,
+            };
+            content.extend([BarSegment::separator(), segment.clone()]);
+            compact.push(BarSegment::text(" ", BarTone::Normal));
+            compact.push(segment);
+        }
+        // Remote strings pass through the same bounds/control-character checks
+        // as module widgets. Invalid metadata must not panic the display App.
+        match BarWidget::new(
+            BarWidgetKey::new("core", "focused-pane"),
+            BarRegion::BottomRight,
+            content,
+            compact,
+            110,
+        ) {
+            Ok(widget) => {
+                let _ = self.bar.push_widget(widget);
+            }
+            Err(_) => {
+                self.bar.remove_widget(CORE_FOCUSED_PANE);
+            }
         }
     }
 
@@ -1044,7 +1174,7 @@ fn lower_priority(
 
 fn survival_priority(candidate: &WidgetCandidate<'_>) -> u16 {
     match candidate.key {
-        CORE_RUNTIME | CORE_AGENTS => 1_024,
+        CORE_RUNTIME | CORE_AGENTS | CORE_FOCUSED_PANE => 1_024,
         "notification" => 768,
         _ => candidate.widget.priority as u16,
     }
@@ -1079,6 +1209,162 @@ fn total_width(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_bar_resolution_preserves_colon_local_ids_with_an_owner() {
+        let mut bar = BarState::default();
+        let key = BarWidgetKey::new("you.ci", CORE_FOCUSED_PANE);
+        bar.declarations.insert(
+            key.canonical(),
+            BarDeclaration {
+                key: key.clone(),
+                title: "Module widget".into(),
+                region: BarRegion::TopRight,
+                priority: 50,
+            },
+        );
+        assert_eq!(
+            bar.resolve_declaration(Some("you.ci"), CORE_FOCUSED_PANE)
+                .unwrap()
+                .key,
+            key
+        );
+        assert_eq!(
+            bar.resolve_declaration(None, CORE_FOCUSED_PANE)
+                .unwrap()
+                .key
+                .owner,
+            "core"
+        );
+        assert!(bar
+            .resolve_declaration(Some("unrelated"), CORE_FOCUSED_PANE)
+            .is_err());
+        let key = BarWidgetKey::new("you:ci", "status");
+        bar.declarations.insert(
+            key.canonical(),
+            BarDeclaration {
+                key,
+                title: "Namespaced module".into(),
+                region: BarRegion::TopRight,
+                priority: 50,
+            },
+        );
+        assert!(bar.resolve_declaration(Some("you"), "ci:status").is_err());
+        assert_eq!(
+            bar.resolve_declaration(Some("you:ci"), "status")
+                .unwrap()
+                .key
+                .owner,
+            "you:ci"
+        );
+    }
+
+    #[test]
+    fn focused_pane_widget_is_opt_in_and_tracks_actual_local_focus() {
+        use crate::ui::theme::State;
+        let _env = crate::persist::test_env("focused-pane-bar");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(200, 30, tx).unwrap();
+        let config: crate::config::Config = serde_json::from_str("{\"bars\":{}}").unwrap();
+        assert_eq!(
+            config
+                .bars
+                .region_for(CORE_FOCUSED_PANE, BarRegion::BottomRight),
+            None
+        );
+        app.refresh_core_bar_widgets();
+        assert!(!app.bar.widgets.contains_key(CORE_FOCUSED_PANE));
+        assert!(app.bar.declaration(CORE_FOCUSED_PANE).is_some());
+        assert!(app
+            .bar
+            .resolve_declaration(Some("unrelated"), CORE_FOCUSED_PANE)
+            .is_err());
+        app.dispatch(
+            "ui.bar.move",
+            &serde_json::json!({"id":"core:focused-pane", "region":"bottom-right"}),
+        )
+        .unwrap();
+        let pane = app.layout().focus;
+        let status = app.status.get_mut(&pane).unwrap();
+        status.agent = "codex".into();
+        status.state = State::Working;
+        app.refresh_core_bar_widgets();
+        let text = mobile_segment_text(&app.bar.widgets[CORE_FOCUSED_PANE].content);
+        assert!(text.contains(&format!("pane {}", pane.0)), "{text}");
+        assert!(
+            text.contains("tab 1") && text.contains("codex working"),
+            "{text}"
+        );
+        let created = app.dispatch("tab.new", &serde_json::json!({})).unwrap();
+        assert!(!created.is_null());
+        app.refresh_core_bar_widgets();
+        let metadata = app.focused_pane_metadata().unwrap();
+        assert_eq!(metadata.tab, 2);
+        assert_ne!(metadata.pane, pane.0.to_string());
+        assert!(metadata.agent.is_none(), "ordinary shells are not agents");
+        let text = mobile_segment_text(&app.bar.widgets[CORE_FOCUSED_PANE].content);
+        assert!(!text.contains("codex"), "{text}");
+        app.bar.sync_modules(&app.modules);
+        assert!(app.bar.declaration(CORE_FOCUSED_PANE).is_some());
+        let saved = crate::config::load();
+        assert_eq!(
+            saved
+                .bars
+                .region_for(CORE_FOCUSED_PANE, BarRegion::BottomRight),
+            Some(BarRegion::BottomRight)
+        );
+        app.dispatch(
+            "ui.bar.move",
+            &serde_json::json!({"owner":"core", "id":"focused-pane", "region":"off"}),
+        )
+        .unwrap();
+        app.refresh_core_bar_widgets();
+        assert!(!app.bar.widgets.contains_key(CORE_FOCUSED_PANE));
+        app.workspaces.clear();
+        app.refresh_core_bar_widgets();
+        assert!(!app.bar.widgets.contains_key(CORE_FOCUSED_PANE));
+    }
+
+    #[test]
+    fn focused_pane_widget_uses_remote_owner_metadata_and_rejects_invalid_text() {
+        let _env = crate::persist::test_env("focused-pane-remote-bar");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(200, 30, tx).unwrap();
+        let (projection, _rx, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        app.config
+            .bars
+            .place(CORE_FOCUSED_PANE, Some(BarRegion::BottomRight));
+        let crate::app::ViewKind::Remote(view) = app.views.get_mut(&projection).unwrap() else {
+            unreachable!()
+        };
+        view.focused_pane = Some(FocusedPaneMetadata {
+            tab: 3,
+            pane: "owner-27".into(),
+            agent: Some(("qodercli".into(), crate::ui::theme::State::Blocked)),
+        });
+        app.refresh_core_bar_widgets();
+        let text = mobile_segment_text(&app.bar.widgets[CORE_FOCUSED_PANE].content);
+        assert!(
+            text.contains("tab 3")
+                && text.contains("pane owner-27")
+                && text.contains("qodercli blocked"),
+            "{text}"
+        );
+        let crate::app::ViewKind::Remote(view) = app.views.get_mut(&projection).unwrap() else {
+            unreachable!()
+        };
+        view.state = crate::app::remote::RemoteViewState::Disconnected;
+        app.refresh_core_bar_widgets();
+        assert!(!app.bar.widgets.contains_key(CORE_FOCUSED_PANE));
+        let crate::app::ViewKind::Remote(view) = app.views.get_mut(&projection).unwrap() else {
+            unreachable!()
+        };
+        view.state = crate::app::remote::RemoteViewState::Ready;
+        view.focused_pane.as_mut().unwrap().agent =
+            Some(("bad\u{1b}[2J".into(), crate::ui::theme::State::Unknown));
+        app.refresh_core_bar_widgets();
+        assert!(!app.bar.widgets.contains_key(CORE_FOCUSED_PANE));
+    }
 
     #[test]
     fn tone_from_name_accepts_the_json_spellings_and_rejects_the_rest() {

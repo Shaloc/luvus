@@ -64,6 +64,41 @@ pub(super) fn draw_sidebar_reopen(
     (tog_w, right_tog_w)
 }
 
+/// Shared top widget lane for local tabs and remote display navigation.
+pub(super) fn draw_top_widgets(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) -> u16 {
+    let (hits, overflow, width) = {
+        let candidates =
+            app.bar
+                .widgets_for(crate::bar::BarRegion::TopRight, &app.config.bars, false);
+        let layout = crate::bar::compose(
+            &candidates,
+            area.width.min(crate::bar::MAX_BAR_REGION_WIDTH),
+            crate::bar::MAX_BAR_WIDGET_WIDTH,
+        );
+        let width = layout.width;
+        let region = Rect::new(
+            area.right().saturating_sub(width),
+            area.y,
+            width,
+            area.height,
+        );
+        let (hits, overflow) = crate::bar::render::draw_region(
+            f,
+            region,
+            crate::bar::BarRegion::TopRight,
+            &candidates,
+            &layout,
+            t,
+        );
+        (hits, overflow, width)
+    };
+    app.bar.hits.extend(hits);
+    if let Some(overflow) = overflow {
+        app.bar.overflow_hits.push(overflow);
+    }
+    width
+}
+
 pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) -> TabHits {
     // Tab bar background = pane background (the sidebar is the lighter one).
     f.render_widget(Block::new().style(Style::new().bg(t.mantle)), area);
@@ -83,32 +118,17 @@ pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
     let top_budget = flex
         .saturating_sub(crate::bar::MIN_TOP_TAB_FLEX_WIDTH)
         .min(crate::bar::MAX_BAR_REGION_WIDTH);
-    let (bar_hits, bar_overflow, bar_w) = {
-        let candidates =
-            app.bar
-                .widgets_for(crate::bar::BarRegion::TopRight, &app.config.bars, false);
-        let layout = crate::bar::compose(&candidates, top_budget, crate::bar::MAX_BAR_WIDGET_WIDTH);
-        let width = layout.width;
-        let region = Rect::new(
-            area.right().saturating_sub(right_tog_w + width),
+    let bar_w = draw_top_widgets(
+        f,
+        Rect::new(
+            area.right().saturating_sub(right_tog_w + top_budget),
             area.y,
-            width,
+            top_budget,
             1,
-        );
-        let (hits, overflow) = crate::bar::render::draw_region(
-            f,
-            region,
-            crate::bar::BarRegion::TopRight,
-            &candidates,
-            &layout,
-            t,
-        );
-        (hits, overflow, width)
-    };
-    app.bar.hits.extend(bar_hits);
-    if let Some(overflow) = bar_overflow {
-        app.bar.overflow_hits.push(overflow);
-    }
+        ),
+        app,
+        t,
+    );
 
     let ws = app.ws();
     let n = ws.tabs.len();

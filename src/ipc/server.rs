@@ -1519,7 +1519,6 @@ fn render_client(
             if owns_size {
                 ui::render_into(&mut target, app);
                 app.resize_active_remote_projection();
-                app.acknowledge_presented_remote_projection();
             } else {
                 ui::render_into_without_pane_resize(&mut target, app);
             }
@@ -1590,6 +1589,11 @@ fn render_client(
     };
 
     let Some(mut message) = message else {
+        // The same cells already have a successfully submitted baseline. A
+        // status-only owner token must not need a visual change to be seen.
+        if interactive && owns_size && client.workspace_id.is_none() {
+            app.acknowledge_presented_remote_projection();
+        }
         UNCHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
         return RenderClientOutcome::default();
     };
@@ -1616,6 +1620,11 @@ fn render_client(
     CHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
     match client.sender.try_send_frame(message) {
         Ok(()) => {
+            // Rendering before an enqueue that fails under backpressure is not
+            // viewing. Only the interactive display's submitted frame may ack.
+            if interactive && owns_size && client.workspace_id.is_none() {
+                app.acknowledge_presented_remote_projection();
+            }
             FRAMES_ENQUEUED.fetch_add(1, Ordering::Relaxed);
             client.behind = false;
             client.force_full = false;
@@ -2240,6 +2249,98 @@ mod tests {
     }
 
     #[test]
+    fn remote_presentation_ack_waits_for_the_local_display_queue() {
+        use crate::app::remote::tests::{
+            add_remote_workspace, remote_ui_app, set_presentable_projection,
+        };
+        use crate::ipc::protocol::ClientMessage;
+        let _env = crate::persist::test_env("remote-presentation-backpressure");
+        let mut app = remote_ui_app();
+        let (pane, remote_rx, _) = add_remote_workspace(&mut app);
+        set_presentable_projection(&mut app, pane, 42);
+        let (mut client, display_rx) = display_client(120, 40, 1);
+        client.sender.frame_pending.store(true, Ordering::Release);
+        super::render_client(
+            &mut app,
+            &mut client,
+            true,
+            true,
+            false,
+            false,
+            &HashMap::new(),
+        );
+        assert!(client.behind);
+        assert!(
+            !remote_rx
+                .try_iter()
+                .any(|message| matches!(message, ClientMessage::ProjectionPresented { .. })),
+            "a dropped local frame is not viewing"
+        );
+        client.sender.frame_pending.store(false, Ordering::Release);
+        assert!(
+            super::render_client(
+                &mut app,
+                &mut client,
+                true,
+                true,
+                false,
+                false,
+                &HashMap::new()
+            )
+            .enqueued
+        );
+        assert!(remote_rx.try_iter().any(|message| matches!(
+            message,
+            ClientMessage::ProjectionPresented {
+                event_sequence: 42,
+                ..
+            }
+        )));
+        display_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        client.sender.frame_pending.store(false, Ordering::Release);
+        set_presentable_projection(&mut app, pane, 43);
+        assert!(
+            !super::render_client(
+                &mut app,
+                &mut client,
+                true,
+                true,
+                false,
+                false,
+                &HashMap::new()
+            )
+            .enqueued
+        );
+        assert!(
+            remote_rx.try_iter().any(|message| matches!(
+                message,
+                ClientMessage::ProjectionPresented {
+                    event_sequence: 43,
+                    ..
+                }
+            )),
+            "unchanged successfully submitted cells remain visible"
+        );
+        drop(display_rx);
+        set_presentable_projection(&mut app, pane, 44);
+        assert!(
+            super::render_client(
+                &mut app,
+                &mut client,
+                true,
+                true,
+                true,
+                false,
+                &HashMap::new()
+            )
+            .disconnected
+        );
+        assert!(!remote_rx
+            .try_iter()
+            .any(|message| matches!(message, ClientMessage::ProjectionPresented { .. })));
+    }
+
+    #[test]
     fn kitten_request_is_sent_only_to_its_display_origin() {
         let _env = crate::persist::test_env("server-kitten-origin");
         let (tx, _rx) = mpsc::channel();
@@ -2539,6 +2640,39 @@ mod tests {
                 crate::ui::theme::State::Idle,
                 "viewing a projected agent must clear its native Done latch"
             );
+        }
+
+        #[test]
+        fn focused_pane_bar_query_after_scoped_input_keeps_foreground_and_hit_geometry() {
+            let _env = crate::persist::test_env("projection-input-bar-query");
+            let mut fixture = Fixture::new();
+            fixture.app.config.bars.place(
+                crate::bar::CORE_FOCUSED_PANE,
+                Some(crate::bar::BarRegion::BottomRight),
+            );
+            fixture.app.refresh_core_bar_widgets();
+            let before = fixture
+                .app
+                .dispatch("ui.bar.list", &serde_json::json!({}))
+                .unwrap();
+            fixture.input(2, ClientInput::Command("new_tab".into()));
+            assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
+            // Include a real saved bar hit: a read-only metadata query must not
+            // invalidate a menu/action already positioned in this viewport.
+            let hit = crate::bar::BarHit {
+                key: crate::bar::BarWidgetKey::new("example", "action"),
+                segment: 0,
+                rect: ratatui::layout::Rect::new(10, 2, 4, 1),
+                action: "details".into(),
+                value: None,
+            };
+            fixture.app.bar.hits.push(hit.clone());
+            let after = fixture
+                .app
+                .dispatch("ui.bar.list", &serde_json::json!({}))
+                .unwrap();
+            assert_eq!(after, before);
+            assert!(fixture.app.bar.hits.contains(&hit));
         }
 
         struct Fixture {

@@ -18,7 +18,6 @@ pub struct Entry {
 /// State of the open folder picker (workspace chooser).
 pub struct FolderPicker {
     pub hosts: Option<WorkspaceHostChoices>,
-    pub worktrees: Option<WorktreeChoices>,
     /// The directory currently being browsed.
     pub path: PathBuf,
     /// Folders + files in `path`, dirs first then files (dotfiles unless
@@ -45,19 +44,11 @@ pub struct WorkspaceHostChoices {
     pub connecting: Option<crate::session::remote::RemoteSession>,
 }
 
-pub struct WorktreeChoices {
-    pub generation: String,
-    pub loading: bool,
-    pub entries: Vec<crate::git::model::Worktree>,
-}
-
 /// A selectable row in the picker. The action rows lead; the directory entries
 /// follow. The "open with worktree" row only exists when the folder is a repo.
 #[derive(Debug)]
 pub enum Row {
     Host(usize),
-    ExistingWorktree(usize),
-    BrowseFolder,
     /// Open the browsed folder as a workspace.
     OpenFolder,
     /// Create a git worktree of the browsed repo (then open it).
@@ -97,9 +88,6 @@ impl FolderPicker {
         if let Some(hosts) = &self.hosts {
             return hosts.hosts.len() + 1;
         }
-        if let Some(worktrees) = &self.worktrees {
-            return worktrees.entries.len() + 1;
-        }
         self.leading() + self.entries.len()
     }
 
@@ -107,13 +95,6 @@ impl FolderPicker {
     pub fn row(&self, i: usize) -> Row {
         if self.hosts.is_some() {
             return Row::Host(i);
-        }
-        if let Some(worktrees) = &self.worktrees {
-            return if i < worktrees.entries.len() {
-                Row::ExistingWorktree(i)
-            } else {
-                Row::BrowseFolder
-            };
         }
         match (i, self.is_repo) {
             (0, _) => Row::OpenFolder,
@@ -134,7 +115,6 @@ impl App {
                     hosts: self.config.remote_hosts.clone(),
                     connecting: None,
                 }),
-                worktrees: None,
                 path: PathBuf::new(),
                 entries: Vec::new(),
                 cursor: 0,
@@ -177,7 +157,6 @@ impl App {
             .unwrap_or_else(|| PathBuf::from("/"));
         self.picker = Some(FolderPicker {
             hosts: None,
-            worktrees: None,
             path: start,
             entries: Vec::new(),
             cursor: 0,
@@ -188,56 +167,6 @@ impl App {
             show_hidden: false,
         });
         self.picker_refresh();
-    }
-
-    pub fn open_worktree_picker_at(&mut self, repo: PathBuf) {
-        let generation = crate::ids::public_id("worktree-picker");
-        self.picker = Some(FolderPicker {
-            hosts: None,
-            path: repo.clone(),
-            entries: vec![],
-            cursor: 0,
-            creating: None,
-            going_to: None,
-            error: None,
-            is_repo: true,
-            show_hidden: false,
-            worktrees: Some(WorktreeChoices {
-                generation: generation.clone(),
-                loading: true,
-                entries: vec![],
-            }),
-        });
-        let tx = self.app_tx.clone();
-        std::thread::spawn(move || {
-            let result = crate::git::local::worktrees(&repo);
-            let _ = tx.send(AppEvent::WorktreeChoicesLoaded { generation, result });
-        });
-    }
-
-    pub(crate) fn apply_worktree_choices(
-        &mut self,
-        generation: String,
-        result: Result<Vec<crate::git::model::Worktree>, String>,
-    ) {
-        let Some(picker) = self.picker.as_mut() else {
-            return;
-        };
-        let Some(choices) = picker
-            .worktrees
-            .as_mut()
-            .filter(|choices| choices.generation == generation)
-        else {
-            return;
-        };
-        choices.loading = false;
-        match result {
-            Ok(entries) => {
-                choices.entries = entries;
-                picker.cursor = 0;
-            }
-            Err(error) => picker.error = Some(error),
-        }
     }
 
     pub fn close_folder_picker(&mut self) {
@@ -316,13 +245,6 @@ impl App {
     /// Consume a paste without letting it reach the pane behind the picker.
     /// Text sub-modes receive text; otherwise a pasted path navigates directly.
     pub fn picker_paste(&mut self, raw: &str) {
-        if self
-            .picker
-            .as_ref()
-            .is_some_and(|picker| picker.worktrees.is_some())
-        {
-            return;
-        }
         let text: String = raw.chars().filter(|c| !c.is_control()).collect();
         if text.is_empty() {
             return;
@@ -354,25 +276,6 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.picker_move(1),
                 KeyCode::Up | KeyCode::Char('k') => self.picker_move(-1),
                 KeyCode::Enter => self.picker_activate(),
-                _ => {}
-            }
-            return;
-        }
-        if self
-            .picker
-            .as_ref()
-            .is_some_and(|picker| picker.worktrees.is_some())
-        {
-            match key.code {
-                KeyCode::Down | KeyCode::Char('j') => self.picker_move(1),
-                KeyCode::Up | KeyCode::Char('k') => self.picker_move(-1),
-                KeyCode::Enter => self.picker_activate(),
-                KeyCode::Esc | KeyCode::Char('q') => self.close_folder_picker(),
-                KeyCode::Char('r') => {
-                    if let Some(picker) = self.picker.as_ref() {
-                        self.open_worktree_picker_at(picker.path.clone());
-                    }
-                }
                 _ => {}
             }
             return;
@@ -615,27 +518,6 @@ impl App {
                     self.discover_remote_session(target);
                 }
             }
-            Row::ExistingWorktree(index) => {
-                let path = self
-                    .picker
-                    .as_ref()
-                    .and_then(|picker| picker.worktrees.as_ref())
-                    .and_then(|choices| choices.entries.get(index))
-                    .map(|entry| entry.path.clone());
-                if let Some(path) = path {
-                    if path.is_dir() {
-                        self.picker = None;
-                        self.create_workspace_at(path);
-                    } else if let Some(picker) = self.picker.as_mut() {
-                        picker.error = Some(self.catalog.folder_not_found.to_string());
-                    }
-                }
-            }
-            Row::BrowseFolder => {
-                if let Some(picker) = self.picker.as_ref() {
-                    self.open_folder_picker_at(picker.path.clone());
-                }
-            }
             // Open the current folder as a new static workspace.
             Row::OpenFolder => {
                 if let Some(p) = self.picker.take() {
@@ -688,7 +570,6 @@ mod tests {
     fn repo_adds_an_open_with_worktree_row_that_shifts_the_indices() {
         let mut p = FolderPicker {
             hosts: None,
-            worktrees: None,
             path: PathBuf::from("/x"),
             entries: vec![Entry {
                 name: "a".into(),
@@ -728,44 +609,31 @@ mod tests {
         std::fs::create_dir_all(&worktree).unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(160, 36, tx).unwrap();
-        app.open_worktree_picker_at(repo.clone());
-        let first = app
-            .picker
-            .as_ref()
-            .unwrap()
-            .worktrees
-            .as_ref()
-            .unwrap()
-            .generation
-            .clone();
-        app.close_folder_picker();
-        app.open_worktree_picker_at(repo.clone());
-        let entries = vec![crate::git::model::Worktree {
+        let (_, _remote_input, _) = crate::app::remote::tests::add_remote_workspace(&mut app);
+        let remote_index = app.active_ws;
+        app.workspaces[remote_index].cwd = worktree.clone();
+        app.active_ws = 0;
+        assert!(
+            app.workspace_idx_for_path(&worktree).is_none(),
+            "a same-path remote checkout is not locally open"
+        );
+        let first = app.begin_worktree_list();
+        app.close_worktree_list();
+        let current = app.begin_worktree_list();
+        let entries = vec![WorktreeOpenEntry {
             path: worktree.clone(),
             branch: Some("feature/picker".into()),
             head: "1234567890".into(),
             is_main: false,
+            open: false,
         }];
-        app.apply_worktree_choices(first, Ok(entries.clone()));
+        assert!(!app.apply_worktree_list(first, Ok(entries.clone())));
+        assert!(app.worktree_open.as_ref().unwrap().loading);
+        app.apply_worktree_list(current, Ok(entries));
         assert!(
-            app.picker
-                .as_ref()
-                .unwrap()
-                .worktrees
-                .as_ref()
-                .unwrap()
-                .loading
+            !crate::ui::retained_pty_eligible(&app),
+            "PTY-only repaint must not overwrite the picker"
         );
-        let current = app
-            .picker
-            .as_ref()
-            .unwrap()
-            .worktrees
-            .as_ref()
-            .unwrap()
-            .generation
-            .clone();
-        app.apply_worktree_choices(current, Ok(entries));
         let mut terminal = Terminal::new(TestBackend::new(160, 36)).unwrap();
         terminal
             .draw(|frame| crate::ui::render(frame, &mut app))
@@ -778,15 +646,14 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(screen.contains("feature/picker"), "{screen}");
-        assert!(
-            screen.contains(&worktree.to_string_lossy().to_string()),
-            "{screen}"
-        );
+        assert!(screen.contains("feature-wt"), "{screen}");
         let count = app.workspaces.len();
-        app.picker_activate();
-        assert!(app.picker.is_none());
+        app.worktree_open_click(0);
+        assert!(app.worktree_open.is_none());
         assert_eq!(app.workspaces.len(), count + 1);
         assert_eq!(app.ws().cwd, worktree);
+        assert!(app.ws().remote.is_none());
+        assert!(app.workspaces[remote_index].remote.is_some());
     }
 
     #[test]
@@ -795,7 +662,6 @@ mod tests {
         let mut app = App::new(80, 24, tx).unwrap();
         app.picker = Some(FolderPicker {
             hosts: None,
-            worktrees: None,
             path: PathBuf::from("/tmp/some-repo"),
             entries: Vec::new(),
             cursor: 1, // the "Open with new worktree" row

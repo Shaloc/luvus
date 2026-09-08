@@ -531,7 +531,7 @@ fn switched_args(raw: &[String], name: &str, remote_host: Option<&str>) -> Vec<S
     out
 }
 
-fn input_loop(mut send: impl FnMut(Event) -> bool, pending: Vec<Event>) {
+fn input_loop(send: impl FnMut(Event) -> bool, pending: Vec<Event>) {
     #[cfg(windows)]
     {
         crate::terminal::host_input::run_input_loop(pending, send);
@@ -539,6 +539,7 @@ fn input_loop(mut send: impl FnMut(Event) -> bool, pending: Vec<Event>) {
 
     #[cfg(not(windows))]
     {
+        let mut send = send;
         for event in pending {
             if !send(event) {
                 return;

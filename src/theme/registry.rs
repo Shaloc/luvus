@@ -270,7 +270,10 @@ impl ThemeRegistry {
                 appearance: bundled.map(|file| file.appearance).unwrap_or_else(|| {
                     if virtual_theme {
                         Appearance::Terminal
-                    } else if matches!(*id, "sky" | "one-light" | "catppuccin-latte" | "gruvbox-light") {
+                    } else if matches!(
+                        *id,
+                        "sky" | "one-light" | "catppuccin-latte" | "gruvbox-light"
+                    ) {
                         Appearance::Light
                     } else {
                         Appearance::Dark

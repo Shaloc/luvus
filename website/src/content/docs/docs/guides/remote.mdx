@@ -72,6 +72,23 @@ the display client's. Global session navigation and local Settings/Agents stay
 local. Pressing the prefix twice sends the owner's configured prefix once.
 The bottom status bar identifies the active remote host and actual session.
 
+To also show the current tab position, pane ID, and agent type/state, select
+**Settings → Layout → Luvus Bar → Current tab / pane → Bottom**. It defaults
+to Off and uses the focused owner's metadata in local, direct remote, and
+merge layouts. Tab positions are 1-based; pane IDs are the owner's opaque IDs,
+not the local projection's ID. Shells and native views have no agent label.
+Metadata is hidden while disconnected or while topology and displayed focus
+do not agree. Mode-specific key guidance takes precedence on the status line;
+narrow rows use compact labels (`t2 p27`) or the normal bar overflow.
+
+The existing CLI/UHP bar placement commands control the same preference on
+the display server:
+
+```sh
+luvus bar move --id core:focused-pane --region bottom-right
+luvus bar move --id core:focused-pane --region off
+```
+
 The Agents highlight follows the pane selected on the workspace's owner, not
 the agent's working/idle state. Mouse, tab, prefix and CLI/API focus changes
 update it through the existing event subscription without periodic polling.
@@ -252,8 +269,11 @@ footer controls instead of clipping Cancel off-screen.
 ### Worktrees and image paste
 
 **Open worktree** in a workspace's context menu lists its Git worktrees with
-branch and path. Choose an entry or use the folder-browser fallback. For a
-remote workspace the list comes from its owner host, not the local filesystem.
+branch (or detached HEAD) and path, including checkouts outside Luvus's managed
+worktree directory. Already-open entries are marked and selecting one focuses
+it. The list loads asynchronously; choose a row or cancel. For a remote
+workspace it comes from its owner host, not the local filesystem. Use workspace
+**+** / **Open Workspace** to browse an arbitrary directory instead.
 
 **Ctrl+V** reads a clipboard image on the display client, sends the bytes to the
 pane's owner, and pastes a private owner-local file path. Empty terminal paste
