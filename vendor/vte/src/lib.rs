@@ -44,6 +44,7 @@ pub use params::{Params, ParamsIter};
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
 const MAX_OSC_RAW: usize = 1024;
+const MAX_APC_RAW: usize = 8192;
 
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
 ///
@@ -65,6 +66,7 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
     ignoring: bool,
+    apc_truncated: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
 }
@@ -189,6 +191,20 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
+            State::ApcString => self.advance_apc_string(performer, byte),
+            State::ApcEscape => {
+                if byte == b'\\' {
+                    if !self.apc_truncated {
+                        performer.apc_dispatch(&self.osc_raw);
+                    }
+                    self.osc_raw.clear();
+                    self.state = State::Ground;
+                } else {
+                    self.osc_raw.clear();
+                    self.state = State::Escape;
+                    self.advance_esc(performer, byte);
+                }
+            },
             State::SosPmApcString => self.anywhere(performer, byte),
             State::Ground => unreachable!(),
         }
@@ -384,7 +400,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.osc_num_params = 0;
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            0x5E => self.state = State::SosPmApcString,
+            0x5F => {
+                self.osc_raw.clear();
+                self.apc_truncated = false;
+                self.state = State::ApcString;
+            },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -441,6 +462,29 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.action_osc_put_param()
             },
             _ => self.action_osc_put(byte),
+        }
+    }
+
+    #[inline(always)]
+    fn advance_apc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x1B => self.state = State::ApcEscape,
+            0x18 | 0x1A => {
+                self.osc_raw.clear();
+                self.anywhere(performer, byte);
+            },
+            _ => {
+                if self.osc_raw.len() >= MAX_APC_RAW {
+                    self.apc_truncated = true;
+                } else if !self.apc_truncated {
+                    #[cfg(not(feature = "std"))]
+                    if self.osc_raw.is_full() {
+                        self.apc_truncated = true;
+                        return;
+                    }
+                    self.osc_raw.push(byte);
+                }
+            },
         }
     }
 
@@ -771,6 +815,8 @@ enum State {
     EscapeIntermediate,
     OscString,
     SosPmApcString,
+    ApcString,
+    ApcEscape,
     #[default]
     Ground,
 }
@@ -856,6 +902,10 @@ pub trait Perform {
     /// subsequent characters were ignored.
     fn esc_dispatch(&mut self, _intermediates: &[u8], _ignore: bool, _byte: u8) {}
 
+    /// A complete, bounded Application Program Command terminated by ST.
+    /// Oversized or cancelled strings are discarded. The default ignores APC.
+    fn apc_dispatch(&mut self, _data: &[u8]) {}
+
     /// Whether the parser should terminate prematurely.
     ///
     /// This can be used in conjunction with
@@ -876,9 +926,36 @@ extern crate std;
 
 #[cfg(test)]
 mod tests {
+    use std::string::String;
     use std::vec::Vec;
 
     use super::*;
+
+    #[test]
+    fn apc_is_bounded_chunk_safe_and_separate_from_text_and_osc() {
+        #[derive(Default)]
+        struct Capture { apc: Vec<Vec<u8>>, text: String }
+        impl Perform for Capture {
+            fn apc_dispatch(&mut self, data: &[u8]) { self.apc.push(data.to_vec()); }
+            fn print(&mut self, ch: char) { self.text.push(ch); }
+        }
+        let source = b"a\x1b_Gi=1;AAAA\x1b\\b\x1b]0;title\x07c";
+        for split in 0..=source.len() {
+            let mut parser = Parser::new();
+            let mut capture = Capture::default();
+            parser.advance(&mut capture, &source[..split]);
+            parser.advance(&mut capture, &source[split..]);
+            assert_eq!(capture.apc, [b"Gi=1;AAAA".to_vec()]);
+            assert_eq!(capture.text, "abc");
+        }
+        let mut parser = Parser::new();
+        let mut capture = Capture::default();
+        parser.advance(&mut capture, b"\x1b_G");
+        parser.advance(&mut capture, &vec![b'A'; MAX_APC_RAW + 1]);
+        parser.advance(&mut capture, b"\x1b\\safe\x1b_Gcancel\x18tail");
+        assert!(capture.apc.is_empty());
+        assert_eq!(capture.text, "safetail");
+    }
 
     #[test]
     fn termination_preserves_unconsumed_text() {

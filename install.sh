@@ -109,7 +109,7 @@ chmod 755 "$stage/$BIN.new"
 version=$("$stage/$BIN.new" --version --remote-session-protocol) || err "downloaded binary cannot run"
 printf '%s\n' "$version"
 case "$version" in
-  "luvus "*" remote-session=2 transport=9"|"luvus "*" remote-session=2 transport=10") ;;
+  "luvus "*" remote-session=2 transport=9"|"luvus "*" remote-session=2 transport=10"|"luvus "*" remote-session=2 transport=11") ;;
   *) err "downloaded binary is not a compatible modified remote-session build" ;;
 esac
 if [ -f "$dir/$BIN" ]; then

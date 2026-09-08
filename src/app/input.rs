@@ -4871,6 +4871,7 @@ mod tests {
                 .tabs
                 .push(Tab::panes(TileLayout::new(focus)));
             app.workspaces.push(Workspace {
+                cell_pixels: None,
                 id: crate::ids::public_id("workspace"),
                 name: format!("workspace-{position}"),
                 cwd: std::path::PathBuf::from(format!("/tmp/workspace-{position}")),
@@ -5165,6 +5166,7 @@ mod tests {
         let closed_root = app.ws().cwd.clone();
         let open_root = closed_root.join("still-open");
         app.workspaces.push(crate::app::Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: "still-open".into(),
             cwd: open_root.clone(),

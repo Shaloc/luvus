@@ -119,6 +119,7 @@ impl Dimensions for Dims {
 }
 
 pub struct AlacrittyEngine {
+    graphics_namespace: String,
     term: Term<EventProxy>,
     parser: Processor,
     title: TitleSlot,
@@ -190,6 +191,7 @@ impl AlacrittyEngine {
         let mut term = Term::new(config, &dims, proxy);
         term.set_deferred_history_maintenance(true);
         AlacrittyEngine {
+            graphics_namespace: crate::ids::public_id("graphics"),
             term,
             parser: Processor::new(),
             title,
@@ -390,6 +392,19 @@ fn history_rows_for_budget(bytes: usize, cols: u16) -> usize {
 }
 
 impl VtEngine for AlacrittyEngine {
+    fn set_cell_pixels(&mut self, width: u16, height: u16) {
+        self.term.set_cell_pixels(width, height);
+    }
+
+    fn graphics(&self) -> Option<(&str, &[alacritty_terminal::term::graphics::Placement])> {
+        (!self.term.graphics.visible().is_empty()).then(|| {
+            (
+                self.graphics_namespace.as_str(),
+                self.term.graphics.visible(),
+            )
+        })
+    }
+
     fn advance(&mut self, bytes: &[u8]) {
         // If output interrupts a partial pass, its packed frontier is no longer
         // proof that all older rows are packed. Otherwise retain the O(1)
@@ -1310,6 +1325,65 @@ mod tests {
 
     fn budget_for_rows(cols: usize, rows: usize) -> usize {
         estimated_row_bytes(cols).saturating_mul(rows)
+    }
+
+    #[test]
+    fn kitty_apc_negotiation_requires_capable_display_and_survives_chunk_boundaries() {
+        let (tx, rx) = channel();
+        let mut engine = AlacrittyEngine::new(80, 24, tx, budget_for_rows(80, 20));
+        let query = b"\x1b_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\";
+        engine.advance(query);
+        assert!(rx.try_recv().is_err());
+        engine.set_cell_pixels(8, 16);
+        for byte in query {
+            engine.advance(&[*byte]);
+        }
+        let InputAction::Bytes(reply) = rx.try_recv().expect("Kitty direct query reply") else {
+            panic!("expected a PTY response");
+        };
+        assert_eq!(reply, b"\x1b_Gi=4207;OK\x1b\\");
+        assert!(
+            engine.graphics().is_none(),
+            "query must not display an image"
+        );
+    }
+
+    #[test]
+    fn kitty_cleanup_survives_display_capability_revocation() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(80, 24, tx, budget_for_rows(80, 20));
+        engine.set_cell_pixels(8, 16);
+        engine.advance(b"\x1b_Ga=T,i=7,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+        assert!(engine.graphics().is_some());
+        engine.set_cell_pixels(0, 0);
+        engine.advance(b"\x1b_Ga=d,d=A;\x1b\\");
+        engine.set_cell_pixels(8, 16);
+        assert!(engine.graphics().is_none());
+    }
+
+    #[test]
+    fn kitty_virtual_placeholders_remain_resolvable_in_retained_scrollback() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(20, 4, tx, budget_for_rows(20, 20));
+        engine.set_cell_pixels(8, 16);
+        engine.advance(b"\x1b_Ga=T,U=1,i=7,f=24,s=1,v=1,c=2,r=1;/wAA\x1b\\");
+        engine.advance("\x1b[38;2;0;0;7m\u{10eeee}\u{0305}\u{0305}\x1b[0m\r\none\r\ntwo\r\nthree\r\nfour\r\nfive".as_bytes());
+        engine.scroll_to_top();
+        assert!(engine.scroll_offset() > 0);
+        let (namespace, placements) = engine.graphics().expect("virtual resource retained");
+        let mut scene = Vec::new();
+        let mut images = 0;
+        engine.for_each_cell(&mut |_, _, symbol, style| {
+            if crate::terminal::graphics::virtual_cell(
+                symbol, style.fg, namespace, placements, &mut scene,
+            )
+            .is_some()
+            {
+                images += 1;
+            }
+        });
+        assert_eq!(images, 1);
+        assert_eq!(scene.len(), 1);
     }
 
     #[test]

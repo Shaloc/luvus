@@ -452,12 +452,14 @@ impl App {
                 format!("workspace directory is unavailable: {}", root.display()),
             ));
         }
-        let pane = self.spawn_into(root.clone()).ok_or_else(|| {
-            (
-                "spawn_failed".to_string(),
-                "the workspace worker pane didn't start".to_string(),
-            )
-        })?;
+        let pane = self
+            .spawn_into(root.clone(), self.workspace_cell_pixels(target))
+            .ok_or_else(|| {
+                (
+                    "spawn_failed".to_string(),
+                    "the workspace worker pane didn't start".to_string(),
+                )
+            })?;
         let mut tab = Tab::panes(TileLayout::new(pane));
         tab.name = Some(task_tab_name(task));
         let tab_id = tab.id.clone();

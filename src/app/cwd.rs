@@ -294,6 +294,7 @@ impl App {
             }
             let name = ws_name(&info.root);
             self.workspaces.push(Workspace {
+                cell_pixels: None,
                 id: crate::ids::public_id("workspace"),
                 name,
                 cwd: info.root.clone(),
@@ -730,6 +731,7 @@ mod tests {
         std::fs::create_dir_all(parent.join(".git")).expect("parent git root");
         std::fs::create_dir_all(wt.join(".git")).expect("worktree git root");
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: "parent".into(),
             cwd: parent.clone(),

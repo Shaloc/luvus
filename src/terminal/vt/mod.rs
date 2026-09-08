@@ -347,6 +347,12 @@ pub trait VtEngine: Send {
     /// Reflow to a new (cols, rows).
     fn resize(&mut self, cols: u16, rows: u16);
 
+    fn set_cell_pixels(&mut self, _width: u16, _height: u16) {}
+
+    fn graphics(&self) -> Option<(&str, &[alacritty_terminal::term::graphics::Placement])> {
+        None
+    }
+
     /// Cursor position in the visible viewport.
     fn cursor(&self) -> Cursor;
 

@@ -225,6 +225,7 @@ mod tests {
         let mut remote = app.workspaces[1].remote.clone().unwrap();
         remote.workspace_id = "linked-remote".into();
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: "linked".into(),
             name: "branch".into(),
             cwd: "/repo/linked".into(),

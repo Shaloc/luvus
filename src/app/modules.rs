@@ -532,6 +532,7 @@ impl App {
             &env,
             history_budget_bytes,
             self.pane_appearance,
+            self.workspace_cell_pixels(self.active_ws),
         )
         .map_err(|e| format!("cannot spawn module pane: {e}"))?;
         let cmd = pane.command.clone();
@@ -1085,10 +1086,13 @@ command = ["sh", "-c", "sleep 5"]
         app.module_link_with(&dir, true, None).unwrap();
 
         let before = app.panes.len();
+        app.workspaces[app.active_ws].cell_pixels = Some((8, 16));
+        app.display_cell_pixels = Some((12, 24));
         let pid = app
             .module_open_pane("you.board", "board", Some("split"), "test")
             .unwrap();
         assert_eq!(app.panes.len(), before + 1, "a real pane was spawned");
+        assert_eq!(app.panes[&pid].cell_pixels(), Some((8, 16)));
         assert!(
             app.module_panes.contains_key(&pid),
             "tracked as a module pane"

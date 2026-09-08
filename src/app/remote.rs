@@ -204,11 +204,13 @@ pub struct RemoteDisplay {
     pub location: RemoteBinaryLocation,
     pub server_generation: Option<String>,
     pub projection: bool,
+    pub graphics: bool,
 }
 
 #[derive(Default)]
 pub struct RemoteProjection {
     frame_deadline: Option<crate::session::remote::ConnectionDeadline>,
+    cell_pixels: Option<(u16, u16)>,
     display: RemoteDisplay,
     epoch: u64,
     active: bool,
@@ -254,6 +256,7 @@ pub(super) struct PendingRemoteNavigation {
 }
 
 pub struct RemoteView {
+    pub graphics: Vec<crate::terminal::graphics::Graphic>,
     pub focused_pane: Option<crate::bar::FocusedPaneMetadata>,
     pub agents: Vec<RemoteAgentMeta>,
     pub history: Vec<super::remote_agents::AgentHistoryRow>,
@@ -293,8 +296,14 @@ impl RemoteView {
     }
 }
 
+type RemoteRenderedFrame = (
+    FrameData,
+    Option<protocol::ProjectionState>,
+    Vec<crate::terminal::graphics::Graphic>,
+);
+
 pub struct RemoteFrameSlot {
-    latest: Mutex<Option<(FrameData, Option<protocol::ProjectionState>)>>,
+    latest: Mutex<Option<RemoteRenderedFrame>>,
     pending: AtomicBool,
 }
 
@@ -338,8 +347,20 @@ impl RemoteFrameSlot {
         state: Option<protocol::ProjectionState>,
         tx: &mpsc::Sender<AppEvent>,
     ) {
+        self.publish_graphics(pane, generation, frame, state, Vec::new(), tx);
+    }
+
+    fn publish_graphics(
+        self: &Arc<Self>,
+        pane: PaneId,
+        generation: u64,
+        frame: FrameData,
+        state: Option<protocol::ProjectionState>,
+        graphics: Vec<crate::terminal::graphics::Graphic>,
+        tx: &mpsc::Sender<AppEvent>,
+    ) {
         if let Ok(mut latest) = self.latest.lock() {
-            *latest = Some((frame, state));
+            *latest = Some((frame, state, graphics));
         }
         if self
             .pending
@@ -354,7 +375,12 @@ impl RemoteFrameSlot {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn take(&self) -> Option<(FrameData, Option<protocol::ProjectionState>)> {
+        self.take_graphics().map(|(frame, state, _)| (frame, state))
+    }
+
+    fn take_graphics(&self) -> Option<RemoteRenderedFrame> {
         // Clear first. A concurrent publisher then either queues a fresh event,
         // or its newer frame is the one taken below; an update cannot be stranded.
         self.pending.store(false, Ordering::Release);
@@ -478,6 +504,7 @@ impl App {
         self.views.insert(
             pane,
             ViewKind::Remote(RemoteView {
+                graphics: Vec::new(),
                 focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
@@ -494,6 +521,7 @@ impl App {
             }),
         );
         self.workspaces.push(Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: target.session.clone(),
             cwd: PathBuf::new(),
@@ -1149,6 +1177,7 @@ impl App {
         self.views.insert(
             pane,
             ViewKind::Remote(RemoteView {
+                graphics: Vec::new(),
                 focused_pane: meta.focused_pane,
                 agents: meta.agents,
                 history: meta.history,
@@ -1168,6 +1197,7 @@ impl App {
             }),
         );
         self.workspaces.push(Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: meta.name,
             cwd: PathBuf::from(meta.cwd),
@@ -1293,6 +1323,7 @@ impl App {
         // while connecting may already have cached our desired size without
         // an input sender, so force it to be sent after this handshake.
         view.last_size = (0, 0);
+        view.projection.cell_pixels = None;
         view.projection.frame_deadline = None;
         let target = RemoteSession {
             host: view.target.host.clone(),
@@ -1319,7 +1350,7 @@ impl App {
         generation: u64,
         slot: &RemoteFrameSlot,
     ) {
-        let Some((frame, state)) = slot.take() else {
+        let Some((frame, state, graphics)) = slot.take_graphics() else {
             return;
         };
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
@@ -1346,6 +1377,7 @@ impl App {
             }
             view.projection.frame_deadline = None;
             view.frame = Some(frame);
+            view.graphics = graphics;
             view.state = RemoteViewState::Ready;
             view.error = None;
         }
@@ -1797,10 +1829,27 @@ impl App {
             return;
         };
         let rect = self.remote_workspace_rect(self.active_ws);
+        let cell_pixels = self.workspace_cell_pixels(self.active_ws);
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
         let size = (rect.width.max(1), rect.height.max(1));
+        if view.projection.display.graphics && view.projection.cell_pixels != cell_pixels {
+            if let Some(input) = &view.input {
+                // The bridge outlives local display clients. Zero/zero revokes
+                // Kitty when the new geometry owner is a plain terminal.
+                let (cell_width, cell_height) = cell_pixels.unwrap_or((0, 0));
+                if input
+                    .send(ClientMessage::Graphics {
+                        cell_width,
+                        cell_height,
+                    })
+                    .is_ok()
+                {
+                    view.projection.cell_pixels = cell_pixels;
+                }
+            }
+        }
         if view.projection.display.projection {
             if let Some(input) = &view.input {
                 if !view.projection.active || size != view.last_size {
@@ -1988,6 +2037,18 @@ pub(super) fn parse_remote_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let snapshot = RemoteSessionSnapshot {
         display: RemoteDisplay {
+            graphics: response
+                .get("result")
+                .and_then(|r| r.get("remote_display"))
+                .is_some_and(|display| {
+                    display.get("transport").and_then(Value::as_u64) == Some(11)
+                        && display
+                            .get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter().any(|cap| cap.as_str() == Some("graphics.v1"))
+                            })
+                }),
             location,
             server_generation: response
                 .get("result")
@@ -1998,16 +2059,16 @@ pub(super) fn parse_remote_snapshot(
                 .get("result")
                 .and_then(|result| result.get("remote_display"))
                 .is_some_and(|display| {
-                    display.get("transport").and_then(Value::as_u64)
-                        == Some(u64::from(protocol::PROTOCOL_VERSION))
-                        && display
-                            .get("capabilities")
-                            .and_then(Value::as_array)
-                            .is_some_and(|caps| {
-                                caps.iter().any(|cap| {
-                                    cap.as_str() == Some(protocol::PROJECTION_CAPABILITY)
-                                })
-                            })
+                    matches!(
+                        display.get("transport").and_then(Value::as_u64),
+                        Some(10 | 11)
+                    ) && display
+                        .get("capabilities")
+                        .and_then(Value::as_array)
+                        .is_some_and(|caps| {
+                            caps.iter()
+                                .any(|cap| cap.as_str() == Some(protocol::PROJECTION_CAPABILITY))
+                        })
                 }),
         },
         event_sequence,
@@ -2216,7 +2277,11 @@ fn run_projection(
             &mut input,
             &if display.projection {
                 ClientMessage::HelloProjection {
-                    version: protocol::PROTOCOL_VERSION,
+                    version: if display.graphics {
+                        protocol::PROTOCOL_VERSION
+                    } else {
+                        protocol::PROJECTION_PROTOCOL_VERSION
+                    },
                     workspace_id: target.workspace_id.clone(),
                 }
             } else if target.workspace_id.is_empty() {
@@ -2275,8 +2340,40 @@ fn run_projection(
 
         let slot = Arc::new(RemoteFrameSlot::new());
         let mut frame = None;
+        let mut graphics = Vec::new();
         loop {
             match protocol::read_message::<_, ServerMessage>(&mut output) {
+                Ok(ServerMessage::GraphicFrame {
+                    state,
+                    text,
+                    graphics: update,
+                }) => {
+                    if !display.graphics {
+                        return Err("unexpected graphic frame".into());
+                    }
+                    graphics = crate::terminal::graphics::apply_updates(&graphics, update)
+                        .map_err(|error| error.to_string())?;
+                    match text {
+                        protocol::GraphicText::Full(next) => frame = Some(next),
+                        protocol::GraphicText::Diff(diff) => {
+                            let Some(current) = frame.as_mut() else {
+                                return Err("graphic diff before full frame".into());
+                            };
+                            if (current.width, current.height) != (diff.width, diff.height) {
+                                return Err("graphic diff size mismatch".into());
+                            }
+                            protocol::apply_diff(current, &diff);
+                        }
+                    }
+                    slot.publish_graphics(
+                        pane,
+                        generation,
+                        frame.as_ref().unwrap().clone(),
+                        state,
+                        graphics.clone(),
+                        app_tx,
+                    );
+                }
                 Ok(ServerMessage::ProjectionFrame { state, frame: next }) => {
                     if !display.projection {
                         return Err("unexpected remote projection codec".into());
@@ -2755,6 +2852,7 @@ pub(crate) mod tests {
         app.views.insert(
             pane,
             ViewKind::Remote(RemoteView {
+                graphics: Vec::new(),
                 focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
@@ -2771,6 +2869,7 @@ pub(crate) mod tests {
             }),
         );
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: "workspace_local_projection".into(),
             name: "api".into(),
             cwd: remote_path.clone(),
@@ -4695,6 +4794,56 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn graphics_capability_downgrade_is_forwarded_to_the_existing_remote_bridge() {
+        let _env = crate::persist::test_env("remote-graphics-capability-downgrade");
+        let mut app = remote_ui_app();
+        let (pane, receiver, _) = add_remote_workspace(&mut app);
+        let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+            unreachable!()
+        };
+        view.projection.display.graphics = true;
+        app.workspaces[app.active_ws].cell_pixels = Some((8, 16));
+        app.resize_active_remote_projection();
+        assert!(receiver.try_iter().any(|message| matches!(
+            message,
+            ClientMessage::Graphics {
+                cell_width: 8,
+                cell_height: 16
+            }
+        )));
+
+        // The local server and remote bridge survive client detach. Attaching
+        // that server from a non-Kitty terminal must revoke the old capability.
+        app.workspaces[app.active_ws].cell_pixels = None;
+        app.resize_active_remote_projection();
+        assert!(
+            receiver.try_iter().any(|message| matches!(
+                message,
+                ClientMessage::Graphics {
+                    cell_width: 0,
+                    cell_height: 0
+                }
+            )),
+            "the remote bridge kept its previous Kitty capability"
+        );
+        app.resize_active_remote_projection();
+        assert!(
+            receiver.try_recv().is_err(),
+            "unchanged capability is not resent"
+        );
+
+        app.workspaces[app.active_ws].cell_pixels = Some((12, 24));
+        app.resize_active_remote_projection();
+        assert!(receiver.try_iter().any(|message| matches!(
+            message,
+            ClientMessage::Graphics {
+                cell_width: 12,
+                cell_height: 24
+            }
+        )));
+    }
+
+    #[test]
     fn remote_projection_ready_resends_size_recorded_before_handshake() {
         let _env = crate::persist::test_env("remote-ready-viewport");
         let (tx, _rx) = mpsc::channel();
@@ -4734,6 +4883,7 @@ pub(crate) mod tests {
         app.views.insert(
             second,
             ViewKind::Remote(RemoteView {
+                graphics: Vec::new(),
                 focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),

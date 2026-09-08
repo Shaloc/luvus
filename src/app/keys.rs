@@ -1074,6 +1074,7 @@ mod tests {
         let focus = app.layout().focus;
         for position in 2..=3 {
             app.workspaces.push(Workspace {
+                cell_pixels: None,
                 id: crate::ids::public_id("workspace"),
                 name: format!("workspace-{position}"),
                 cwd: std::path::PathBuf::from(format!("/tmp/workspace-{position}")),
@@ -1686,6 +1687,7 @@ mod tests {
         let mut app = App::new(80, 24, tx).unwrap();
         let pane = app.layout().focus;
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: "second".into(),
             remote: None,

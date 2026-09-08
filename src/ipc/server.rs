@@ -215,6 +215,8 @@ impl ClientSender {
 }
 
 struct ClientState {
+    graphics: Option<(u16, u16)>,
+    last_graphics: Vec<crate::terminal::graphics::Graphic>,
     sender: ClientSender,
     size: (u16, u16),
     terminal_colors: Option<crate::terminal::theme_probe::TerminalColors>,
@@ -262,6 +264,8 @@ impl ClientState {
         let size = (cols.max(1), rows.max(1));
         Self {
             sender,
+            graphics: None,
+            last_graphics: Vec::new(),
             size,
             terminal_colors,
             render_buf: Buffer::empty(Rect::new(0, 0, size.0, size.1)),
@@ -873,6 +877,21 @@ fn apply(
                 projection.seen_frame = None;
                 return app.acknowledge_agent_view(pane);
             }
+            if let ClientInput::Graphics {
+                cell_width,
+                cell_height,
+            } = input
+            {
+                let Some(client) = clients.get_mut(&id) else {
+                    return false;
+                };
+                client.graphics =
+                    (cell_width != 0 && cell_height != 0).then_some((cell_width, cell_height));
+                client.force_full = true;
+                // Capabilities can arrive before a managed projection's first
+                // interest. Remember them without activating or claiming it.
+                return client.surface_active();
+            }
             if clients
                 .get(&id)
                 .is_some_and(|client| !client.surface_active())
@@ -928,6 +947,12 @@ fn apply(
                 else {
                     return false;
                 };
+                // Actual scoped input has just promoted this display to the
+                // workspace geometry owner. A pane created by that input must
+                // inherit its pixels before the next frame, not the old viewer's.
+                app.workspaces[workspace_index].cell_pixels = client.graphics;
+                let previous_cell_pixels = app.display_cell_pixels;
+                app.display_cell_pixels = client.graphics;
                 // Rebuild exactly this projection's hit geometry and PTY sizes
                 // before applying its input. The ordinary foreground viewport
                 // is forced to rebuild its own geometry on its next input.
@@ -950,7 +975,8 @@ fn apply(
                     ClientInput::Paste(text) => AppEvent::Paste(text),
                     ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                     ClientInput::Command(command) => AppEvent::ClientCommand(command),
-                    ClientInput::Resize(..)
+                    ClientInput::Graphics { .. }
+                    | ClientInput::Resize(..)
                     | ClientInput::ProjectionInterest { .. }
                     | ClientInput::ProjectionPresented { .. } => unreachable!("handled above"),
                 };
@@ -1002,6 +1028,7 @@ fn apply(
                             app.active_ws.min(app.workspaces.len().saturating_sub(1))
                         });
                 }
+                app.display_cell_pixels = previous_cell_pixels;
                 *interactive_size = (0, 0);
                 if let Some(name) = requested_switch {
                     finish_client_navigation(
@@ -1022,6 +1049,12 @@ fn apply(
             // Input ownership follows actual interaction, not background resize
             // noise. Before hit-testing a newly active client, commit its view
             // geometry and PTY dimensions synchronously.
+            // A capability update can precede this input without an intervening
+            // render even when the foreground and character size are unchanged.
+            app.display_cell_pixels = client.graphics;
+            if let Some(workspace) = app.workspaces.get_mut(app.active_ws) {
+                workspace.cell_pixels = client.graphics;
+            }
             let promoted = *foreground != Some(id);
             if promoted {
                 *foreground = Some(id);
@@ -1051,7 +1084,8 @@ fn apply(
                 ClientInput::Paste(text) => AppEvent::Paste(text),
                 ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                 ClientInput::Command(command) => AppEvent::ClientCommand(command),
-                ClientInput::Resize(..)
+                ClientInput::Graphics { .. }
+                | ClientInput::Resize(..)
                 | ClientInput::ProjectionInterest { .. }
                 | ClientInput::ProjectionPresented { .. } => unreachable!("handled above"),
             };
@@ -1485,6 +1519,7 @@ fn render_client(
     }
 
     let may_patch = partial_pass
+        && client.last_graphics.is_empty()
         && client.retained_ready
         && !client.force_full
         && !client.behind
@@ -1498,6 +1533,29 @@ fn render_client(
         None
     };
 
+    let mut graphics = Vec::new();
+    if owns_size {
+        if client.workspace_id.is_none() {
+            app.display_cell_pixels = client.graphics;
+        }
+        {
+            let workspace_index = match client.workspace_id.as_deref() {
+                Some(id) => app.workspaces.iter().position(|ws| ws.id == id),
+                None => Some(app.active_ws),
+            };
+            if let Some(workspace) = workspace_index.and_then(|index| app.workspaces.get_mut(index))
+            {
+                workspace.cell_pixels = client.graphics;
+                if let Some(tab) = workspace.tabs.get(workspace.active_tab) {
+                    for (id, pane) in &app.panes {
+                        if tab.layout.contains(*id) {
+                            pane.set_cell_pixels(client.graphics);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let (cursor, cursor_visible) = if let Some(cursor) = patched {
         PARTIAL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
         cursor
@@ -1508,6 +1566,7 @@ fn render_client(
         FULL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
         client.render_buf.reset();
         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
+        target.graphics_enabled = client.graphics.is_some();
         if let Some(workspace_id) = client.workspace_id.as_deref() {
             if owns_size {
                 ui::render_workspace_owner_projection(&mut target, app, workspace_id);
@@ -1530,7 +1589,9 @@ fn render_client(
             client.retained_pane_content = ui::render_projection(&mut target, app);
             client.retained_ready = true;
         }
-        (target.cursor(), target.cursor_visible())
+        let cursor = (target.cursor(), target.cursor_visible());
+        graphics = std::mem::take(&mut target.graphics);
+        cursor
     };
 
     let projected_pane = client.projection.as_ref().and_then(|_| {
@@ -1552,6 +1613,8 @@ fn render_client(
     let state_changed = client.projection.as_ref().is_some_and(|projection| {
         projection.last_focus != projected_pane || projection.last_observation != observation
     });
+    // Image content and text cells have independent damage. Stable graphic
+    // slots let a new image replace its pixels without repainting its cells.
     let full = state_changed
         || force_all
         || client.force_full
@@ -1575,7 +1638,7 @@ fn render_client(
         let runs = protocol::diff_buffer(previous, &client.render_buf);
         previous.cursor = cursor;
         previous.cursor_visible = cursor_visible;
-        if runs.is_empty() && !cursor_moved {
+        if runs.is_empty() && !cursor_moved && graphics == client.last_graphics {
             None
         } else {
             Some(ServerMessage::FrameDiff(protocol::FrameDiff {
@@ -1618,8 +1681,31 @@ fn render_client(
         };
     }
     CHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
+    if client.graphics.is_some() && (!graphics.is_empty() || !client.last_graphics.is_empty()) {
+        let (state, text) = match message {
+            ServerMessage::Frame(frame) => (None, protocol::GraphicText::Full(frame)),
+            ServerMessage::FrameDiff(frame) => (None, protocol::GraphicText::Diff(frame)),
+            ServerMessage::ProjectionFrame { state, frame } => {
+                (Some(state), protocol::GraphicText::Full(frame))
+            }
+            ServerMessage::ProjectionDiff { state, frame } => {
+                (Some(state), protocol::GraphicText::Diff(frame))
+            }
+            _ => unreachable!("rendered frame"),
+        };
+        let updates = crate::terminal::graphics::updates(
+            &graphics,
+            if full { &[] } else { &client.last_graphics },
+        );
+        message = ServerMessage::GraphicFrame {
+            state,
+            text,
+            graphics: updates,
+        };
+    }
     match client.sender.try_send_frame(message) {
         Ok(()) => {
+            client.last_graphics = graphics;
             // Rendering before an enqueue that fails under backpressure is not
             // viewing. Only the interactive display's submitted frame may ack.
             if interactive && owns_size && client.workspace_id.is_none() {
@@ -1754,7 +1840,11 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 version,
                 workspace_id,
             }) => {
-                if version != protocol::PROTOCOL_VERSION || workspace_id.len() > 128 {
+                if !matches!(
+                    version,
+                    protocol::PROJECTION_PROTOCOL_VERSION | protocol::PROTOCOL_VERSION
+                ) || workspace_id.len() > 128
+                {
                     let _ = protocol::write_message(
                         &mut writer,
                         &ServerMessage::Welcome {
@@ -1811,6 +1901,10 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 ServerMessage::FrameDiff(frame) => Some((false, frame.runs.len())),
                 ServerMessage::ProjectionFrame { .. } => Some((true, 0)),
                 ServerMessage::ProjectionDiff { frame, .. } => Some((false, frame.runs.len())),
+                ServerMessage::GraphicFrame { text, .. } => Some(match text {
+                    protocol::GraphicText::Full(_) => (true, 0),
+                    protocol::GraphicText::Diff(frame) => (false, frame.runs.len()),
+                }),
                 _ => None,
             };
             if frame_stats.is_some() {
@@ -1859,6 +1953,23 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
 
     loop {
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::Graphics {
+                cell_width,
+                cell_height,
+            }) => {
+                if version >= 11
+                    && ((cell_width == 0 && cell_height == 0)
+                        || ((1..=512).contains(&cell_width) && (1..=512).contains(&cell_height)))
+                {
+                    let _ = app_tx.send(AppEvent::ClientInput {
+                        id,
+                        input: ClientInput::Graphics {
+                            cell_width,
+                            cell_height,
+                        },
+                    });
+                }
+            }
             Ok(ClientMessage::ProjectionInterest {
                 epoch,
                 active,
@@ -2528,11 +2639,207 @@ mod tests {
         }
 
         #[test]
+        fn workspace_pixels_api_tab_uses_its_owner_after_another_workspace_render() {
+            let _env = crate::persist::test_env("workspace-pixels-api-tab");
+            let mut fixture = Fixture::new();
+            fixture.render_distinct_owner_pixels();
+            fixture.app.active_ws = fixture.target_index();
+            fixture.api("tab.new", serde_json::json!({}));
+            assert_eq!(
+                fixture.app.panes[&fixture.target_pane()].cell_pixels(),
+                Some((8, 16)),
+                "workspace A must not inherit workspace B's last-rendered metrics"
+            );
+        }
+
+        #[test]
+        fn workspace_pixels_api_cross_workspace_split_uses_destination_owner() {
+            let _env = crate::persist::test_env("workspace-pixels-api-cross-split");
+            let mut fixture = Fixture::new();
+            fixture.render_distinct_owner_pixels();
+            let target = fixture.target_pane();
+            let previous: std::collections::HashSet<_> =
+                fixture.app.panes.keys().copied().collect();
+            fixture.api(
+                "pane.split",
+                serde_json::json!({"pane":target.0.to_string(), "focus":false}),
+            );
+            let created: Vec<_> = fixture
+                .app
+                .panes
+                .iter()
+                .filter(|(id, _)| !previous.contains(id))
+                .collect();
+            assert_eq!(created.len(), 1);
+            assert_eq!(
+                created[0].1.cell_pixels(),
+                Some((8, 16)),
+                "inactive target must not inherit the active workspace font"
+            );
+            assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
+        }
+
+        #[test]
+        fn workspace_pixels_scoped_render_and_input_preserve_the_ordinary_display_context() {
+            let _env = crate::persist::test_env("workspace-pixels-context");
+            let mut fixture = Fixture::new();
+            fixture.render_distinct_owner_pixels();
+            let client = fixture.clients.get_mut(&2).unwrap();
+            crate::ipc::server::render_client(
+                &mut fixture.app,
+                client,
+                false,
+                true,
+                true,
+                false,
+                &HashMap::new(),
+            );
+            fixture.input(2, ClientInput::Command("new_tab".into()));
+            assert_eq!(fixture.app.display_cell_pixels, Some((12, 24)));
+            assert_eq!(
+                fixture.app.workspace_cell_pixels(fixture.target_index()),
+                Some((8, 16))
+            );
+            fixture.api("workspace.new", serde_json::json!({}));
+            assert_eq!(fixture.app.ws().cell_pixels, Some((12, 24)));
+            assert_eq!(
+                fixture.app.panes[&fixture.app.layout().focus].cell_pixels(),
+                Some((12, 24))
+            );
+        }
+
+        #[test]
+        fn workspace_pixels_disabled_destination_does_not_inherit_another_display() {
+            let _env = crate::persist::test_env("workspace-pixels-disabled-target");
+            let mut fixture = Fixture::new();
+            fixture.render_distinct_owner_pixels();
+            fixture.input(
+                2,
+                ClientInput::Graphics {
+                    cell_width: 0,
+                    cell_height: 0,
+                },
+            );
+            let client = fixture.clients.get_mut(&2).unwrap();
+            crate::ipc::server::render_client(
+                &mut fixture.app,
+                client,
+                false,
+                true,
+                true,
+                false,
+                &HashMap::new(),
+            );
+            fixture.app.active_ws = fixture.target_index();
+            fixture.api("tab.new", serde_json::json!({}));
+            assert_eq!(
+                fixture.app.panes[&fixture.target_pane()].cell_pixels(),
+                None
+            );
+            assert_eq!(fixture.app.display_cell_pixels, Some((12, 24)));
+        }
+
+        #[test]
+        fn graphics_capability_normal_input_applies_pixels_before_spawn() {
+            let _env = crate::persist::test_env("foreground-graphics-before-spawn");
+            let mut fixture = Fixture::new();
+            fixture.input(
+                1,
+                ClientInput::Graphics {
+                    cell_width: 12,
+                    cell_height: 24,
+                },
+            );
+            // No intervening frame is required between a capability update and
+            // a foreground user's new-tab command.
+            fixture.input(1, ClientInput::Command("new_tab".into()));
+            let pane = fixture.app.layout().focus;
+            assert_eq!(fixture.app.panes[&pane].cell_pixels(), Some((12, 24)));
+        }
+
+        #[test]
+        fn graphics_capability_revocation_reaches_the_owner_engine() {
+            let _env = crate::persist::test_env("projection-graphics-revocation");
+            let mut fixture = Fixture::new();
+            fixture.clients.get_mut(&2).unwrap().projection = Some(Default::default());
+            fixture.input(
+                2,
+                ClientInput::Graphics {
+                    cell_width: 8,
+                    cell_height: 16,
+                },
+            );
+            fixture.input(
+                2,
+                ClientInput::ProjectionInterest {
+                    epoch: 1,
+                    active: true,
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            fixture.render();
+            let pane = fixture.target_pane();
+            let engine = fixture.app.panes[&pane].engine.clone();
+            engine
+                .lock()
+                .unwrap()
+                .advance(b"\x1b_Ga=T,i=7,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+            assert_eq!(engine.lock().unwrap().graphics().unwrap().1.len(), 1);
+            engine.lock().unwrap().advance(b"\x1b_Ga=d,d=A;\x1b\\");
+
+            fixture.input(
+                2,
+                ClientInput::Graphics {
+                    cell_width: 0,
+                    cell_height: 0,
+                },
+            );
+            assert!(fixture.clients[&2].graphics.is_none());
+            fixture.render();
+            engine
+                .lock()
+                .unwrap()
+                .advance(b"\x1b_Ga=T,i=8,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+            assert!(engine
+                .lock()
+                .unwrap()
+                .graphics()
+                .is_none_or(|(_, placements)| placements.is_empty()));
+
+            fixture.input(
+                2,
+                ClientInput::Graphics {
+                    cell_width: 12,
+                    cell_height: 24,
+                },
+            );
+            fixture.render();
+            engine
+                .lock()
+                .unwrap()
+                .advance(b"\x1b_Ga=T,i=9,f=24,s=1,v=1,C=1;/wAA\x1b\\");
+            assert_eq!(engine.lock().unwrap().graphics().unwrap().1.len(), 1);
+        }
+
+        #[test]
         fn hidden_managed_projection_has_no_frames_input_or_seen_ack() {
             use crate::ui::theme::State;
             let _env = crate::persist::test_env("projection-hidden-interest");
             let mut fixture = Fixture::new();
             fixture.clients.get_mut(&2).unwrap().projection = Some(Default::default());
+            fixture.input(
+                2,
+                ClientInput::Graphics {
+                    cell_width: 8,
+                    cell_height: 16,
+                },
+            );
+            assert_eq!(fixture.clients[&2].graphics, Some((8, 16)));
+            assert!(
+                !fixture.clients[&2].surface_active(),
+                "capabilities must not activate a projection"
+            );
             let pane = fixture.target_pane();
             fixture.api("agent.report", serde_json::json!({
                 "pane":pane.0.to_string(), "source":"test/hidden", "agent":"codex", "status":"done"
@@ -2688,6 +2995,28 @@ mod tests {
         }
 
         impl Fixture {
+            fn render_distinct_owner_pixels(&mut self) {
+                for (id, pixels) in [(2, (8, 16)), (1, (12, 24))] {
+                    self.input(
+                        id,
+                        ClientInput::Graphics {
+                            cell_width: pixels.0,
+                            cell_height: pixels.1,
+                        },
+                    );
+                    let client = self.clients.get_mut(&id).unwrap();
+                    crate::ipc::server::render_client(
+                        &mut self.app,
+                        client,
+                        id == 1,
+                        true,
+                        true,
+                        false,
+                        &HashMap::new(),
+                    );
+                }
+            }
+
             fn new() -> Self {
                 // Only this test's PTYs exist: cat does not read shell startup
                 // files, and no test input is sent to a child process. Fail
@@ -3353,6 +3682,8 @@ mod tests {
         fn workspace_projection_close_does_not_resize_the_shifted_workspace_index() {
             let _env = crate::persist::test_env("projection-close-workspace-geometry");
             let mut fixture = Fixture::new();
+            fixture.render_distinct_owner_pixels();
+            let foreground_size = fixture.app.panes[&fixture.foreground_pane].size();
             fixture.input(2, ClientInput::Resize(117, 37));
             assert_eq!(fixture.target_index(), 0);
             fixture.input(
@@ -3365,7 +3696,27 @@ mod tests {
                 .workspaces
                 .iter()
                 .all(|workspace| workspace.id != fixture.workspace_id));
-            fixture.assert_foreground_unchanged();
+            assert_eq!(
+                fixture.app.panes[&fixture.foreground_pane].size(),
+                foreground_size
+            );
+            // The old projection can survive until its bridge disconnects. It
+            // must not apply its old font metrics to the shifted survivor.
+            let client = fixture.clients.get_mut(&2).unwrap();
+            crate::ipc::server::render_client(
+                &mut fixture.app,
+                client,
+                false,
+                true,
+                true,
+                false,
+                &HashMap::new(),
+            );
+            assert_eq!(fixture.app.ws().cell_pixels, Some((12, 24)));
+            assert_eq!(
+                fixture.app.panes[&fixture.app.layout().focus].cell_pixels(),
+                Some((12, 24))
+            );
         }
 
         #[test]
@@ -3485,23 +3836,55 @@ mod tests {
             let _env = crate::persist::test_env("projection-passive-resize-geometry");
             let mut fixture = Fixture::new();
             fixture.projection_only();
+            fixture.input(
+                2,
+                ClientInput::Graphics {
+                    cell_width: 8,
+                    cell_height: 16,
+                },
+            );
             fixture.input(2, ClientInput::Resize(117, 37));
             let expected = fixture.app.panes[&fixture.target_pane()].size();
             let (passive, rx) = projection_client(fixture.workspace_id.clone(), 0);
             fixture.clients.insert(3, passive);
             fixture._client_receivers.push(rx);
 
+            fixture.input(
+                3,
+                ClientInput::Graphics {
+                    cell_width: 12,
+                    cell_height: 24,
+                },
+            );
             fixture.input(3, ClientInput::Resize(65, 21));
             fixture.assert_target_size(expected);
             fixture.render();
             fixture.assert_target_size(expected);
+            assert_eq!(
+                fixture.app.workspace_cell_pixels(fixture.target_index()),
+                Some((8, 16)),
+                "passive client must not overwrite owner font metrics"
+            );
             assert_eq!(fixture.foreground, None);
             assert_eq!(fixture.clients[&3].last_frame.as_ref().unwrap().width, 65);
 
             // A real command, unlike resize noise, transfers this workspace's
             // viewport ownership. No key bytes are sent to a child process.
             fixture.input(3, ClientInput::Command("new_tab".into()));
+            assert_eq!(
+                fixture.app.panes[&fixture.target_pane()].cell_pixels(),
+                Some((12, 24)),
+                "spawn must inherit its new owner metrics before the next render"
+            );
             fixture.render();
+            assert_eq!(
+                fixture.app.workspace_cell_pixels(fixture.target_index()),
+                Some((12, 24))
+            );
+            assert_eq!(
+                fixture.app.display_cell_pixels, None,
+                "scoped input/render must preserve the ordinary display context"
+            );
             let actual = fixture.app.panes[&fixture.target_pane()].size();
             let area = ratatui::layout::Rect::new(0, 0, 65, 21);
             let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -3640,6 +4023,54 @@ mod tests {
             ServerMessage::Frame(frame) => (frame.width, frame.height),
             ServerMessage::FrameDiff(frame) => (frame.width, frame.height),
             _ => panic!("expected rendered frame"),
+        }
+    }
+
+    #[test]
+    fn kitty_changed_image_sends_graphics_with_an_empty_text_diff() {
+        let _env = crate::persist::test_env("kitty-graphic-diff");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.server_mode = true;
+        let engine = app.panes[&app.layout().focus].engine.clone();
+        engine.lock().unwrap().set_cell_pixels(8, 16);
+        let (mut client, rx) = display_client(100, 30, 1);
+        client.graphics = Some((8, 16));
+        for (index, payload) in ["/wAA", "AP8A"].iter().enumerate() {
+            engine.lock().unwrap().advance(
+                format!("\x1b_Ga=T,i=7,f=24,s=1,v=1,c=6,r=3,C=1,q=2;{payload}\x1b\\").as_bytes(),
+            );
+            client.sender.frame_pending.store(false, Ordering::Release);
+            assert!(
+                super::render_client(
+                    &mut app,
+                    &mut client,
+                    true,
+                    true,
+                    false,
+                    false,
+                    &HashMap::new()
+                )
+                .enqueued
+            );
+            let ServerMessage::GraphicFrame { text, graphics, .. } =
+                rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected graphic frame");
+            };
+            assert_eq!(graphics.len(), 1);
+            assert_eq!(graphics[0].image.as_ref().unwrap().data, *payload);
+            if index == 0 {
+                assert!(matches!(text, crate::ipc::protocol::GraphicText::Full(_)));
+            } else {
+                let crate::ipc::protocol::GraphicText::Diff(diff) = text else {
+                    panic!("image update must not force a full text frame");
+                };
+                assert!(
+                    diff.runs.is_empty(),
+                    "image-only update has no changed text cells"
+                );
+            }
         }
     }
 

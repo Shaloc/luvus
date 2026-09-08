@@ -94,6 +94,37 @@ pub struct MouseModes {
     pub alternate_scroll: bool,
 }
 
+/// One geometry record for both immediate PTYs and deferred-spawn handoff.
+/// Keep cell pixels, not only totals, so later row/column resizes preserve the
+/// negotiated font metrics without inferring them from a rounded ioctl value.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PaneSize {
+    cols: u16,
+    rows: u16,
+    cell_pixels: Option<(u16, u16)>,
+}
+
+impl PaneSize {
+    fn new(cols: u16, rows: u16, cell_pixels: Option<(u16, u16)>) -> Self {
+        Self {
+            cols,
+            rows,
+            cell_pixels: cell_pixels
+                .filter(|(width, height)| (1..=512).contains(width) && (1..=512).contains(height)),
+        }
+    }
+
+    fn pty_size(self) -> PtySize {
+        let (width, height) = self.cell_pixels.unwrap_or((0, 0));
+        PtySize {
+            cols: self.cols.max(1),
+            rows: self.rows.max(1),
+            pixel_width: self.cols.max(1).saturating_mul(width),
+            pixel_height: self.rows.max(1).saturating_mul(height),
+        }
+    }
+}
+
 pub struct Pane {
     /// Stable application identity for operational lifecycle events. This is
     /// never derived from the child command or terminal contents.
@@ -131,7 +162,7 @@ pub struct Pane {
     child_exited: Arc<AtomicBool>,
     /// The latest requested size, shared with the deferred spawn worker so a
     /// resize racing the spawn still lands.
-    size: Arc<Mutex<(u16, u16)>>,
+    size: Arc<Mutex<PaneSize>>,
     /// Set by `Drop` so a close-before-spawn aborts the spawn worker.
     cancelled: Arc<AtomicBool>,
 }
@@ -198,6 +229,7 @@ impl Pane {
         shell: &str,
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        cell_pixels: Option<(u16, u16)>,
     ) -> Result<Pane> {
         let cmd = CommandBuilder::new(shell);
         Self::build(
@@ -212,6 +244,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            cell_pixels,
         )
     }
 
@@ -231,6 +264,7 @@ impl Pane {
         argv: &[String],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        cell_pixels: Option<(u16, u16)>,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty shell command"));
@@ -251,6 +285,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            cell_pixels,
         )
     }
 
@@ -267,6 +302,7 @@ impl Pane {
         env: &[(String, String)],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        cell_pixels: Option<(u16, u16)>,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty module command"));
@@ -287,6 +323,7 @@ impl Pane {
             env,
             history_budget_bytes,
             appearance,
+            cell_pixels,
         )
     }
 
@@ -306,6 +343,7 @@ impl Pane {
         shell: &str,
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        cell_pixels: Option<(u16, u16)>,
     ) -> Pane {
         let cmd = CommandBuilder::new(shell);
         Self::build_deferred(
@@ -321,6 +359,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            cell_pixels,
         )
     }
 
@@ -340,6 +379,7 @@ impl Pane {
         shell: &str,
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        cell_pixels: Option<(u16, u16)>,
     ) -> Pane {
         let cmd = CommandBuilder::new(shell);
         Self::build_deferred(
@@ -355,6 +395,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            cell_pixels,
         )
     }
 
@@ -373,6 +414,7 @@ impl Pane {
         argv: &[String],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        cell_pixels: Option<(u16, u16)>,
     ) -> Result<Pane> {
         let Some((program, args)) = argv.split_first() else {
             return Err(anyhow::anyhow!("empty shell command"));
@@ -394,6 +436,7 @@ impl Pane {
             &[],
             history_budget_bytes,
             appearance,
+            cell_pixels,
         ))
     }
 
@@ -410,14 +453,11 @@ impl Pane {
         extra_env: &[(String, String)],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        cell_pixels: Option<(u16, u16)>,
     ) -> Result<Pane> {
         let pty_system = native_pty_system();
-        let pair = pty_system.openpty(PtySize {
-            rows: rows.max(1),
-            cols: cols.max(1),
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
+        let size = PaneSize::new(cols, rows, cell_pixels);
+        let pair = pty_system.openpty(size.pty_size())?;
 
         apply_pane_env(&mut cmd, id, &cwd, extra_env);
         let mut child = pair.slave.spawn_command(cmd)?;
@@ -445,6 +485,12 @@ impl Pane {
             history_budget_bytes,
             appearance,
         );
+        // A module or shell startup can query graphics before the first App
+        // render. Initialize only an already-negotiated display capability,
+        // before the I/O actor can consume any child output.
+        if let Some((width, height)) = cell_pixels {
+            engine.lock().unwrap().set_cell_pixels(width, height);
+        }
         // Replay the saved screen so a restored pane shows its prior content.
         if let Some(screen) = initial {
             if let Ok(mut e) = engine.lock() {
@@ -493,7 +539,7 @@ impl Pane {
             command,
             data_pending,
             child_exited,
-            size: Arc::new(Mutex::new((cols, rows))),
+            size: Arc::new(Mutex::new(size)),
             cancelled,
         })
     }
@@ -516,6 +562,7 @@ impl Pane {
         extra_env: &[(String, String)],
         history_budget_bytes: usize,
         appearance: PaneAppearance,
+        cell_pixels: Option<(u16, u16)>,
     ) -> Pane {
         // Everything a caller can observe before the child exists: the engine
         // (pane.read, detection, rendering) and the input queue.
@@ -529,6 +576,11 @@ impl Pane {
             history_budget_bytes,
             appearance,
         );
+        // Do this before launching the worker, not after returning the Pane:
+        // the child may write its one-shot query as soon as it is spawned.
+        if let Some((width, height)) = cell_pixels {
+            engine.lock().unwrap().set_cell_pixels(width, height);
+        }
         if let Some(screen) = initial {
             if let Ok(mut engine) = engine.lock() {
                 engine.advance(screen.as_bytes());
@@ -542,7 +594,7 @@ impl Pane {
         let data_pending = Arc::new(AtomicBool::new(false));
         let content_revision = Arc::new(AtomicU64::new(0));
         let child_exited = Arc::new(AtomicBool::new(false));
-        let size = Arc::new(Mutex::new((cols, rows)));
+        let size = Arc::new(Mutex::new(PaneSize::new(cols, rows, cell_pixels)));
         let cancelled = Arc::new(AtomicBool::new(false));
 
         let worker = {
@@ -577,14 +629,9 @@ impl Pane {
                     let _ = tx.send(AppEvent::PtyExit(id));
                 };
 
-                let (cols, rows) = *size.lock().unwrap_or_else(|p| p.into_inner());
+                let initial_size = *size.lock().unwrap_or_else(|p| p.into_inner());
                 let pty_system = native_pty_system();
-                let pair = match pty_system.openpty(PtySize {
-                    rows: rows.max(1),
-                    cols: cols.max(1),
-                    pixel_width: 0,
-                    pixel_height: 0,
-                }) {
+                let pair = match pty_system.openpty(initial_size.pty_size()) {
                     Ok(pair) => pair,
                     Err(_) => return fail(),
                 };
@@ -650,13 +697,8 @@ impl Pane {
 
                 // A resize raced the spawn: re-apply the latest size.
                 let latest = *size.lock().unwrap_or_else(|p| p.into_inner());
-                if latest != (cols, rows) {
-                    let _ = pair.master.resize(PtySize {
-                        rows: latest.1.max(1),
-                        cols: latest.0.max(1),
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
+                if latest != initial_size {
+                    let _ = pair.master.resize(latest.pty_size());
                 }
 
                 if io::start(
@@ -1083,6 +1125,30 @@ impl Pane {
         self.try_send(&wrap_paste(text, bracketed))
     }
 
+    /// Update negotiated display metrics on the same geometry owner as resize.
+    /// Passive viewers never call this. None revokes graphics and resets ioctl
+    /// pixel totals while retaining the pane's character dimensions.
+    pub(crate) fn set_cell_pixels(&self, cell_pixels: Option<(u16, u16)>) {
+        let updated = {
+            let mut size = self.size.lock().unwrap_or_else(|p| p.into_inner());
+            let updated = PaneSize::new(size.cols, size.rows, cell_pixels);
+            if *size == updated {
+                return;
+            }
+            *size = updated;
+            updated
+        };
+        if let Ok(master) = self.master.lock() {
+            if let Some(master) = master.as_ref() {
+                let _ = master.resize(updated.pty_size());
+            }
+        }
+        if let Ok(mut engine) = self.engine.lock() {
+            let (width, height) = updated.cell_pixels.unwrap_or((0, 0));
+            engine.set_cell_pixels(width, height);
+        }
+    }
+
     /// Resize the PTY + engine. Returns whether the size actually changed (so the
     /// caller can note the resize for detection's post-resize grace, docs/07).
     /// A deferred pane that has not spawned yet records the size; the spawn
@@ -1091,21 +1157,18 @@ impl Pane {
         if cols == 0 || rows == 0 {
             return false;
         }
-        {
+        let updated = {
             let mut size = self.size.lock().unwrap_or_else(|p| p.into_inner());
-            if (cols, rows) == *size {
+            if (cols, rows) == (size.cols, size.rows) {
                 return false;
             }
-            *size = (cols, rows);
-        }
+            size.cols = cols;
+            size.rows = rows;
+            size.pty_size()
+        };
         if let Ok(master) = self.master.lock() {
             if let Some(master) = master.as_ref() {
-                let _ = master.resize(PtySize {
-                    rows,
-                    cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                });
+                let _ = master.resize(updated);
             }
         }
         if let Ok(mut e) = self.engine.lock() {
@@ -1123,9 +1186,18 @@ impl Pane {
         true
     }
 
+    /// Negotiated metrics carried with this pane's PTY geometry.
+    pub(crate) fn cell_pixels(&self) -> Option<(u16, u16)> {
+        self.size
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cell_pixels
+    }
+
     #[cfg(test)]
     pub(crate) fn size(&self) -> (u16, u16) {
-        *self.size.lock().unwrap_or_else(|p| p.into_inner())
+        let size = self.size.lock().unwrap_or_else(|p| p.into_inner());
+        (size.cols, size.rows)
     }
 }
 
@@ -1356,8 +1428,242 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            None,
         )
         .expect("spawn")
+    }
+
+    #[test]
+    fn pty_pixel_geometry_tracks_resize_and_display_capability_changes() {
+        for deferred in [false, true] {
+            let (tx, _rx) = mpsc::channel();
+            let cwd = std::env::current_dir().unwrap();
+            let mut pane = if deferred {
+                Pane::spawn_deferred(
+                    PaneId::alloc(),
+                    80,
+                    24,
+                    cwd,
+                    &[],
+                    tx,
+                    "/bin/sh",
+                    64 * 1024,
+                    PaneAppearance::default(),
+                    Some((8, 16)),
+                )
+            } else {
+                Pane::spawn(
+                    PaneId::alloc(),
+                    80,
+                    24,
+                    cwd,
+                    tx,
+                    None,
+                    "/bin/sh",
+                    64 * 1024,
+                    PaneAppearance::default(),
+                    Some((8, 16)),
+                )
+                .unwrap()
+            };
+            // These changes can precede the deferred worker's PTY handoff.
+            pane.set_cell_pixels(Some((10, 20)));
+            assert!(pane.resize(100, 35));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                if pane.master.lock().unwrap().is_some() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "PTY did not become ready"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let kernel_size = || {
+                pane.master
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .get_size()
+                    .unwrap()
+            };
+            let size = kernel_size();
+            assert_eq!(
+                (size.cols, size.rows, size.pixel_width, size.pixel_height),
+                (100, 35, 1000, 700)
+            );
+            pane.set_cell_pixels(None);
+            let size = kernel_size();
+            assert_eq!(
+                (size.cols, size.rows, size.pixel_width, size.pixel_height),
+                (100, 35, 0, 0)
+            );
+            pane.set_cell_pixels(Some((0, 24)));
+            assert_eq!(
+                kernel_size().pixel_height,
+                0,
+                "invalid capability stays disabled"
+            );
+            pane.set_cell_pixels(Some((12, 24)));
+            let size = kernel_size();
+            assert_eq!((size.pixel_width, size.pixel_height), (1200, 840));
+        }
+        let saturated = PaneSize::new(u16::MAX, u16::MAX, Some((512, 512))).pty_size();
+        assert_eq!(
+            (saturated.pixel_width, saturated.pixel_height),
+            (u16::MAX, u16::MAX)
+        );
+    }
+
+    #[test]
+    fn pty_child_observes_pixel_geometry_at_startup() {
+        const CHILD_MODE: &str = "LUVUS_PIXEL_GEOMETRY_TEST_CHILD";
+        if std::env::var_os(CHILD_MODE).is_some() {
+            let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut size) }, 0);
+            println!(
+                "CHILD-PIXELS:{}x{};CELLS:{}x{}",
+                size.ws_xpixel, size.ws_ypixel, size.ws_col, size.ws_row
+            );
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let args = [
+            "--exact",
+            "terminal::pty::reap_tests::pty_child_observes_pixel_geometry_at_startup",
+            "--nocapture",
+        ];
+        let extra_env = [(CHILD_MODE.to_string(), "1".to_string())];
+        for deferred in [false, true] {
+            let mut command = CommandBuilder::new(&exe);
+            command.args(args);
+            let (tx, _rx) = mpsc::channel();
+            let pane = if deferred {
+                Pane::build_deferred(
+                    PaneId::alloc(),
+                    80,
+                    24,
+                    std::env::current_dir().unwrap(),
+                    &[],
+                    tx,
+                    None,
+                    command,
+                    "pixel-test".into(),
+                    &extra_env,
+                    64 * 1024,
+                    PaneAppearance::default(),
+                    Some((8, 16)),
+                )
+            } else {
+                Pane::build(
+                    PaneId::alloc(),
+                    80,
+                    24,
+                    std::env::current_dir().unwrap(),
+                    tx,
+                    None,
+                    command,
+                    "pixel-test".into(),
+                    &extra_env,
+                    64 * 1024,
+                    PaneAppearance::default(),
+                    Some((8, 16)),
+                )
+                .unwrap()
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let text = pane.engine.lock().unwrap().detection_text(24);
+                if text.contains("CHILD-PIXELS:") {
+                    assert!(
+                        text.contains("CHILD-PIXELS:640x384;CELLS:80x24"),
+                        "deferred={deferred}: {text:?}"
+                    );
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "test child produced no pixel receipt"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    #[test]
+    fn graphics_capability_is_initialized_before_child_output_in_both_spawn_paths() {
+        // No App render runs here: a module command or shell startup is allowed
+        // to query the terminal immediately after its child is spawned.
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "stty -echo -icanon min 0 time 2; \
+             printf '\\033_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\\033\\\\'; \
+             reply=$(dd bs=64 count=1 2>/dev/null); \
+             case \"$reply\" in *';OK'*) printf 'GRAPHICS-ACK' ;; \
+             *) printf 'GRAPHICS-NACK' ;; esac; sleep 3"
+                .to_string(),
+        ];
+        for deferred in [false, true] {
+            for (cell_pixels, expected) in [
+                (Some((8, 16)), "GRAPHICS-ACK"),
+                (None, "GRAPHICS-NACK"),
+                (Some((0, 16)), "GRAPHICS-NACK"),
+            ] {
+                let (tx, _rx) = mpsc::channel();
+                let id = PaneId::alloc();
+                let cwd = std::env::current_dir().unwrap();
+                let pane = if deferred {
+                    Pane::spawn_shell_with_deferred(
+                        id,
+                        80,
+                        24,
+                        cwd,
+                        &[],
+                        tx,
+                        None,
+                        "/bin/sh",
+                        &argv,
+                        64 * 1024,
+                        PaneAppearance::default(),
+                        cell_pixels,
+                    )
+                    .unwrap()
+                } else {
+                    Pane::spawn_command(
+                        id,
+                        80,
+                        24,
+                        cwd,
+                        tx,
+                        &argv,
+                        &[],
+                        64 * 1024,
+                        PaneAppearance::default(),
+                        cell_pixels,
+                    )
+                    .unwrap()
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                loop {
+                    let text = pane.engine.lock().unwrap().detection_text(24);
+                    if text.contains("GRAPHICS-") {
+                        assert!(
+                            text.contains(expected),
+                            "deferred={deferred}, cell_pixels={cell_pixels:?}: {text:?}"
+                        );
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "child produced no receipt"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
     }
 
     #[test]
@@ -1413,6 +1719,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            None,
         )
         .expect("spawn shell with inherited blocked SIGCHLD");
         let pid = pane.child_pid.load(Ordering::SeqCst);
@@ -1461,7 +1768,7 @@ mod reap_tests {
         let mut pane = Pane::spawn_command(
             PaneId::alloc(), 80, 24, std::env::current_dir().unwrap(), tx,
             &["/bin/sh".into(), "-c".into(), "i=0; while [ $i -lt 2024 ]; do printf 'row %s cafe\n' \"$i\"; i=$((i + 1)); done; sleep 10".into()],
-            &[], 16 * 1024 * 1024, PaneAppearance::default(),
+            &[], 16 * 1024 * 1024, PaneAppearance::default(), None,
         ).unwrap();
         for resize in [false, true] {
             if resize {
@@ -1506,6 +1813,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            None,
         );
         assert_eq!(
             pane.child_pid.load(Ordering::SeqCst),
@@ -1552,6 +1860,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            None,
         );
         assert!(
             pane.engine
@@ -1580,6 +1889,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            None,
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1622,6 +1932,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            None,
         );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -1658,6 +1969,7 @@ mod reap_tests {
             "/bin/sh",
             500,
             PaneAppearance::default(),
+            None,
         );
         // The spawn has not forked yet: this is the racing resize.
         assert!(pane.resize(132, 40));

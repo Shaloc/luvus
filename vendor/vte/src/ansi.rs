@@ -496,6 +496,9 @@ pub trait Timeout: Default {
 /// XXX Should probably not provide default impls for everything, but it makes
 /// writing specific handler impls for tests far easier.
 pub trait Handler {
+    /// A complete bounded Application Program Command, without ESC _ or ST.
+    fn application_command(&mut self, _data: &[u8]) {}
+
     /// OSC to set window title.
     fn set_title(&mut self, _: Option<String>) {}
 
@@ -706,6 +709,9 @@ pub trait Handler {
 
     /// Report text area size in pixels.
     fn text_area_size_pixels(&mut self) {}
+
+    /// Report the size of one text cell in pixels (CSI 16 t).
+    fn cell_size_pixels(&mut self) {}
 
     /// Report text area size in characters.
     fn text_area_size_chars(&mut self) {}
@@ -1302,6 +1308,10 @@ where
     H: Handler + 'a,
     T: Timeout,
 {
+    fn apc_dispatch(&mut self, data: &[u8]) {
+        self.handler.application_command(data);
+    }
+
     #[inline]
     fn print(&mut self, c: char) {
         self.handler.input(c);
@@ -1768,6 +1778,7 @@ where
             ('T', []) => handler.scroll_down(next_param_or(1) as usize),
             ('t', []) => match next_param_or(1) as usize {
                 14 => handler.text_area_size_pixels(),
+                16 => handler.cell_size_pixels(),
                 18 => handler.text_area_size_chars(),
                 22 => handler.push_title(),
                 23 => handler.pop_title(),

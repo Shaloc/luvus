@@ -1722,6 +1722,9 @@ pub enum OrchMenuItem {
 }
 
 pub struct Workspace {
+    /// Transient font metrics of this workspace's actual geometry owner.
+    /// None means no negotiated graphical display; never restored from disk.
+    pub(crate) cell_pixels: Option<(u16, u16)>,
     /// Stable public identity across display reordering and restarts.
     pub id: String,
     pub name: String,
@@ -2454,6 +2457,10 @@ pub struct App {
     /// there is no idle session discovery polling.
     remote_session_watchers: std::collections::HashMap<String, remote::RemoteWatcher>,
     remote_display_pane: Option<PaneId>,
+    /// Ordinary interactive display context, temporarily bound during scoped
+    /// input when creating a workspace. Existing workspace spawns use its own
+    /// cell_pixels so independent projections cannot overwrite one another.
+    pub(crate) display_cell_pixels: Option<(u16, u16)>,
     /// A pointer gesture begun in a remote frame must release on that same
     /// owner even when it crosses the local sidebar or the workspace changes.
     remote_mouse_capture: Option<(PaneId, Rect, ratatui::crossterm::event::MouseButton)>,
@@ -2931,6 +2938,7 @@ impl App {
                 &shell,
                 config.scrollback_bytes(),
                 pane_appearance,
+                None,
             )?;
             let command = pane.command.clone();
             panes.insert(id, pane);
@@ -2957,6 +2965,7 @@ impl App {
             manifests: crate::detect::Manifests::load(&crate::persist::ensure_manifests_dir()),
             editors: crate::platform::editor_choices(),
             workspaces: vec![Workspace {
+                cell_pixels: None,
                 id: crate::ids::public_id("workspace"),
                 name,
                 worktree: worktree_membership(&cwd),
@@ -3074,6 +3083,7 @@ impl App {
             focus_event_scope: false,
             remote_session_watchers: std::collections::HashMap::new(),
             remote_display_pane: None,
+            display_cell_pixels: None,
             remote_mouse_capture: None,
             pending_remote_navigation: None,
             remote_registry_generation: 0,
@@ -3533,6 +3543,7 @@ impl App {
                                     argv,
                                     history_budget_bytes,
                                     pane_appearance,
+                                    None,
                                 )
                                 .ok(),
                                 None => Some(Pane::spawn_restored(
@@ -3546,6 +3557,7 @@ impl App {
                                     &shell,
                                     history_budget_bytes,
                                     pane_appearance,
+                                    None,
                                 )),
                             };
                             let Some(pane) = pane else {
@@ -3601,6 +3613,7 @@ impl App {
             }
             let active_tab = ws.active_tab.min(tabs.len() - 1);
             workspaces.push(Workspace {
+                cell_pixels: None,
                 id: ws.id,
                 name: ws.name,
                 worktree: worktree_membership(&ws.cwd),
@@ -3759,6 +3772,7 @@ impl App {
             focus_event_scope: false,
             remote_session_watchers: std::collections::HashMap::new(),
             remote_display_pane: None,
+            display_cell_pixels: None,
             remote_mouse_capture: None,
             pending_remote_navigation: None,
             remote_registry_generation: 0,
@@ -4850,7 +4864,11 @@ impl App {
 
     // ── mutations ─────────────────────────────────────────────────────────────
 
-    fn spawn_into(&mut self, cwd: PathBuf) -> Option<PaneId> {
+    pub(crate) fn workspace_cell_pixels(&self, workspace: usize) -> Option<(u16, u16)> {
+        self.workspaces.get(workspace).and_then(|ws| ws.cell_pixels)
+    }
+
+    fn spawn_into(&mut self, cwd: PathBuf, cell_pixels: Option<(u16, u16)>) -> Option<PaneId> {
         let id = PaneId::alloc();
         let shell = crate::platform::resolve_shell(&self.config.shell);
         let history_budget_bytes = self.config.scrollback_bytes();
@@ -4864,6 +4882,7 @@ impl App {
             &shell,
             history_budget_bytes,
             self.pane_appearance,
+            cell_pixels,
         ) {
             Ok(pane) => {
                 let cmd = pane.command.clone();
@@ -4905,7 +4924,12 @@ impl App {
     /// Used only where synchronous failure reporting is not required — the
     /// sync `spawn_into` keeps `workspace.open`'s "shell failed to start"
     /// contract.
-    fn spawn_into_deferred(&mut self, cwd: PathBuf, fallback_cwds: &[PathBuf]) -> Option<PaneId> {
+    fn spawn_into_deferred(
+        &mut self,
+        cwd: PathBuf,
+        fallback_cwds: &[PathBuf],
+        cell_pixels: Option<(u16, u16)>,
+    ) -> Option<PaneId> {
         let id = PaneId::alloc();
         let shell = crate::platform::resolve_shell(&self.config.shell);
         let history_budget_bytes = self.config.scrollback_bytes();
@@ -4919,6 +4943,7 @@ impl App {
             &shell,
             history_budget_bytes,
             self.pane_appearance,
+            cell_pixels,
         );
         let cmd = pane.command.clone();
         self.panes.insert(id, pane);
@@ -4935,7 +4960,12 @@ impl App {
     /// `spawn_into`, but queues an agent resume/fork command. POSIX and custom
     /// shells receive it through a normal interactive PTY so profile-managed
     /// executables are available; PowerShell can launch it directly.
-    fn spawn_resume_pane(&mut self, cwd: PathBuf, resume: &str) -> Option<PaneId> {
+    fn spawn_resume_pane(
+        &mut self,
+        cwd: PathBuf,
+        resume: &str,
+        cell_pixels: Option<(u16, u16)>,
+    ) -> Option<PaneId> {
         let id = PaneId::alloc();
         let shell = crate::platform::resolve_shell(&self.config.shell);
         let history_budget_bytes = self.config.scrollback_bytes();
@@ -4952,6 +4982,7 @@ impl App {
                 a,
                 history_budget_bytes,
                 self.pane_appearance,
+                cell_pixels,
             ),
             None => Pane::spawn(
                 id,
@@ -4963,6 +4994,7 @@ impl App {
                 &shell,
                 history_budget_bytes,
                 self.pane_appearance,
+                cell_pixels,
             ),
         };
         match spawned {
@@ -5055,7 +5087,7 @@ impl App {
         let cwds = self.spawn_cwds_for(wsi, pane);
         let (cwd, fallback_cwds) = cwds.split_first()?;
         self.spawn_and_attach_new_pane(wsi, ti, pane, axis, focus, |app| {
-            app.spawn_into_deferred(cwd.clone(), fallback_cwds)
+            app.spawn_into_deferred(cwd.clone(), fallback_cwds, app.workspace_cell_pixels(wsi))
         })
     }
 
@@ -5110,7 +5142,7 @@ impl App {
 
         let new_id = self
             .spawn_and_attach_new_pane(wsi, ti, pane, Axis::Col, focus, |app| {
-                app.spawn_resume_pane(cwd, &fork)
+                app.spawn_resume_pane(cwd, &fork, app.workspace_cell_pixels(wsi))
             })
             .ok_or(AgentForkError::SpawnFailed)?;
         // Label the new pane as the same agent right away (detection will confirm
@@ -5168,7 +5200,7 @@ impl App {
         let Some(cwd) = self.spawn_cwds().into_iter().next() else {
             return;
         };
-        if let Some(id) = self.spawn_into(cwd) {
+        if let Some(id) = self.spawn_into(cwd, self.workspace_cell_pixels(self.active_ws)) {
             let ws = &mut self.workspaces[self.active_ws];
             ws.tabs.push(Tab::panes(TileLayout::new(id)));
             ws.active_tab = ws.tabs.len() - 1;
@@ -5249,12 +5281,14 @@ impl App {
     pub fn create_workspace_at(&mut self, cwd: PathBuf) -> bool {
         let name = ws_name(&cwd);
         let branch = git_branch(&cwd);
-        let Some(id) = self.spawn_into(cwd.clone()) else {
+        let cell_pixels = self.display_cell_pixels;
+        let Some(id) = self.spawn_into(cwd.clone(), cell_pixels) else {
             self.show_toast(format!("couldn't open {} — shell failed to start", name));
             return false;
         };
         self.forget_closed_workspace_path(&cwd);
         self.workspaces.push(Workspace {
+            cell_pixels,
             id: crate::ids::public_id("workspace"),
             name,
             worktree: worktree_membership(&cwd),
@@ -7213,13 +7247,16 @@ impl App {
         let Some(resume) = crate::agent::resume_command(&s.agent, &s.session_id) else {
             return;
         };
-        let Some(id) = self.spawn_resume_pane(s.cwd.clone(), &resume) else {
+        let target = self.resume_workspace_target(&s.cwd);
+        let cell_pixels = target.map_or(self.display_cell_pixels, |wi| {
+            self.workspace_cell_pixels(wi)
+        });
+        let Some(id) = self.spawn_resume_pane(s.cwd.clone(), &resume, cell_pixels) else {
             return;
         };
         let tab = Tab::panes(TileLayout::new(id));
         // Per the Layout setting, reuse the session's own workspace (or the workspace at
         // its cwd); otherwise open it as a tab in the currently active workspace.
-        let target = self.resume_workspace_target(&s.cwd);
         if let Some(wi) = target {
             self.focus_workspace(wi);
             let ws = &mut self.workspaces[wi];
@@ -7228,6 +7265,7 @@ impl App {
         } else {
             let branch = git_branch(&s.cwd);
             self.workspaces.push(Workspace {
+                cell_pixels,
                 id: crate::ids::public_id("workspace"),
                 name: ws_name(&s.cwd),
                 cwd: s.cwd.clone(),
@@ -8170,6 +8208,7 @@ fn restore_module_pane(
         &env,
         history_budget_bytes,
         appearance,
+        None,
     )
     .ok()?;
     Some((
@@ -10240,6 +10279,7 @@ mod tests {
         let pane = app.layout().focus;
         let common_dir = PathBuf::from("/tmp/luvus-group/.git");
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: "parent".into(),
             cwd: PathBuf::from("/tmp/luvus-group"),
@@ -10255,6 +10295,7 @@ mod tests {
             remote: None,
         });
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: "child".into(),
             cwd: PathBuf::from("/tmp/luvus-group-child"),
@@ -10338,6 +10379,7 @@ mod tests {
         let mut app = App::new(80, 24, tx).unwrap();
         let target_id = crate::ids::public_id("workspace");
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: target_id.clone(),
             name: "target".into(),
             cwd: app.workspaces[0].cwd.clone(),
@@ -10370,6 +10412,7 @@ mod tests {
         let mut app = App::new(80, 24, tx).unwrap();
         let target_id = crate::ids::public_id("workspace");
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: target_id.clone(),
             name: "target".into(),
             cwd: app.workspaces[0].cwd.clone(),
@@ -10397,6 +10440,7 @@ mod tests {
         let mut app = App::new(80, 24, tx).unwrap();
         let survivor_id = crate::ids::public_id("workspace");
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: survivor_id.clone(),
             name: "survivor".into(),
             cwd: app.workspaces[0].cwd.clone(),
@@ -14807,6 +14851,7 @@ mod tests {
         let first_cwd = app.workspaces[0].cwd.clone();
         let second_cwd = crate::persist::config_dir().join("second-workspace");
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: "second".into(),
             cwd: second_cwd.clone(),
@@ -14916,6 +14961,7 @@ mod tests {
         let mut app = App::new(120, 40, tx).unwrap();
         let second = PaneId::alloc();
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: "beta".into(),
             cwd: PathBuf::from("/tmp/luvus-mission-beta"),
@@ -14965,6 +15011,7 @@ mod tests {
         });
         app.status.insert(second, second_status);
         app.workspaces.push(Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: "beta".into(),
             cwd: PathBuf::from("/tmp/luvus-mission-beta"),

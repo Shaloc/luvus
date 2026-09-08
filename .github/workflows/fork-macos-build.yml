@@ -88,6 +88,11 @@ jobs:
           cmp skills/luvus/SKILL.md "$RUNNER_TEMP/luvus-skill.md"
           python3 scripts/test-fork-installer.py "target/$TARGET/release/luvus"
           echo "name=$package" >> "$GITHUB_OUTPUT"
+      - name: Isolated local and remote Kitty transport smoke
+        run: |
+          # Same checkout binary, private homes and fake SSH only; no real hosts.
+          # Physical Kitty rendering is verified separately on the Linux fixture.
+          NO_COLOR=1 python3 scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --graphics-only
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.package.outputs.name }}

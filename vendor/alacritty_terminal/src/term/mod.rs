@@ -28,6 +28,7 @@ use crate::vte::ansi::{
 
 pub mod cell;
 pub mod color;
+pub mod graphics;
 pub mod search;
 
 /// Minimum number of columns.
@@ -268,6 +269,9 @@ impl TermDamageState {
 }
 
 pub struct Term<T> {
+    pub graphics: graphics::Graphics,
+    cell_pixels: (u16, u16),
+    graphics_enabled: bool,
     /// Terminal focus controlling the cursor shape.
     pub is_focused: bool,
 
@@ -410,6 +414,13 @@ pub enum Osc52 {
 }
 
 impl<T> Term<T> {
+    pub fn set_cell_pixels(&mut self, width: u16, height: u16) {
+        self.graphics_enabled = (1..=512).contains(&width) && (1..=512).contains(&height);
+        if (1..=512).contains(&width) && (1..=512).contains(&height) {
+            self.cell_pixels = (width, height);
+        }
+    }
+
     #[inline]
     pub fn scroll_display(&mut self, scroll: Scroll)
     where
@@ -448,6 +459,9 @@ impl<T> Term<T> {
         let damage = TermDamageState::new(num_cols, num_lines);
 
         Term {
+            graphics: Default::default(),
+            cell_pixels: (8, 16),
+            graphics_enabled: false,
             inactive_grid,
             scroll_region,
             event_proxy,
@@ -828,6 +842,7 @@ impl<T> Term<T> {
     /// Swap primary and alternate screen buffer.
     pub fn swap_alt(&mut self) {
         let entering = !self.mode.contains(TermMode::ALT_SCREEN);
+        self.graphics.swap_alt(entering);
         if entering {
             // Set alt screen cursor to the current primary screen cursor.
             self.inactive_grid.cursor = self.grid.cursor.clone();
@@ -895,6 +910,7 @@ impl<T> Term<T> {
 
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
+        self.graphics.scroll(origin.0, self.scroll_region.end.0, lines as i32);
         self.mark_fully_damaged();
     }
 
@@ -914,6 +930,7 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+        self.graphics.scroll(origin.0, self.scroll_region.end.0, -(lines as i32));
         if self.mode.contains(TermMode::ALT_SCREEN) {
             self.rebalance_alt_history();
         }
@@ -1987,6 +2004,9 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn clear_screen(&mut self, mode: ansi::ClearMode) {
         trace!("Clearing screen: {mode:?}");
+        if matches!(mode, ansi::ClearMode::All) {
+            self.graphics.erase_screen();
+        }
         let bg = self.grid.cursor.template.bg;
 
         let screen_lines = self.screen_lines();
@@ -2071,6 +2091,7 @@ impl<T: EventListener> Handler for Term<T> {
     /// Reset all important fields in the term struct.
     #[inline]
     fn reset_state(&mut self) {
+        self.graphics.reset();
         if self.mode.contains(TermMode::ALT_SCREEN) {
             mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
@@ -2504,11 +2525,35 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn text_area_size_pixels(&mut self) {
-        self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
-            let height = window_size.num_lines * window_size.cell_height;
-            let width = window_size.num_cols * window_size.cell_width;
-            format!("\x1b[4;{height};{width}t")
-        })));
+        let height = self.screen_lines() * usize::from(self.cell_pixels.1);
+        let width = self.columns() * usize::from(self.cell_pixels.0);
+        self.event_proxy.send_event(Event::PtyWrite(format!("\x1b[4;{height};{width}t")));
+    }
+
+    fn cell_size_pixels(&mut self) {
+        self.event_proxy.send_event(Event::PtyWrite(format!("\x1b[6;{};{}t", self.cell_pixels.1, self.cell_pixels.0)));
+    }
+
+    fn application_command(&mut self, data: &[u8]) {
+        if !self.graphics_enabled {
+            // Applications may delete resources while an incapable client is
+            // attached. Honor cleanup, but never admit uploads or query ACKs.
+            let deletion = data.strip_prefix(b"G").and_then(|data| data.split(|b| *b == b';').next())
+                .is_some_and(|header| header.split(|b| *b == b',').any(|field| field == b"a=d"));
+            if !deletion { return; }
+        }
+        let point = self.grid.cursor.point;
+        let (reply, advance) = self.graphics.command(data, point.line.0, point.column.0 as u32, self.cell_pixels);
+        if let Some(reply) = reply {
+            self.event_proxy.send_event(Event::PtyWrite(reply));
+        }
+        if let Some((rows, cols)) = advance {
+            // Leaving the screen/scroll region is implementation-defined in
+            // Kitty. Clamp instead of scrolling a full-screen canvas away.
+            self.grid.cursor.point.line = Line((point.line.0 + rows as i32).min(self.bottommost_line().0));
+            self.grid.cursor.point.column = Column((point.column.0 + cols as usize).min(self.columns() - 1));
+        }
+        if data.starts_with(b"G") { self.mark_fully_damaged(); }
     }
 
     #[inline]

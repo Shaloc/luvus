@@ -1127,7 +1127,7 @@ fn verified_version_output(
     });
     if !remote_protocol || !transport_protocol {
         return Err(format!(
-            "SSH host `{host}` has Luvus {version}, but it is not a compatible modified remote-session build; install a build supporting remote-session=2 and transport 9 or {} there, or use `luvus host add {host} --install`",
+            "SSH host `{host}` has Luvus {version}, but it is not a compatible modified remote-session build; install a build supporting remote-session=2 and transport 9, 10 or {} there, or use `luvus host add {host} --install`",
             crate::ipc::protocol::PROTOCOL_VERSION
         ));
     }

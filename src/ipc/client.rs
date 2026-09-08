@@ -1,7 +1,7 @@
 //! Thin client (M2): connects to the server, forwards input, and blits the
 //! frames it streams back onto the real terminal. Holds no app state.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::Path;
 use std::thread;
 
@@ -100,7 +100,10 @@ where
 {
     let mut terminal = ratatui::init();
     crate::install_tui_panic_hook();
-    let result = run_inner(reader, writer, &mut terminal, local);
+    let mut graphics = crate::terminal::graphics::ClientGraphics::default();
+    let result = run_inner(reader, writer, &mut terminal, local, &mut graphics);
+    // Also release terminal-owned resources after an early I/O/decode failure.
+    let _ = graphics.apply(Vec::new(), &mut std::io::stdout());
     let _ = execute!(
         std::io::stdout(),
         crossterm::event::PopKeyboardEnhancementFlags,
@@ -141,6 +144,7 @@ fn run_inner<R, W>(
     mut writer: W,
     terminal: &mut DefaultTerminal,
     local: bool,
+    graphics: &mut crate::terminal::graphics::ClientGraphics,
 ) -> Result<ClientExit>
 where
     R: Read + Send + 'static,
@@ -251,9 +255,16 @@ where
     // `last_cursor` parks IME when this frame hid the PTY caret: CUP onto the
     // pane even after `?25l`, so composition does not follow chrome.
     let mut last_cursor = None;
+    let graphics_enabled = std::env::var("TERM").is_ok_and(|term| term.contains("kitty"));
+    if graphics_enabled {
+        send_graphics_size(&mut writer)?;
+    }
     let exit = loop {
         let message = match rx.recv() {
             Ok(ClientEvent::Input(message)) => {
+                if graphics_enabled && matches!(message, ClientMessage::Resize { .. }) {
+                    let _ = send_graphics_size(&mut writer);
+                }
                 // A switch can already be queued behind the final old-server
                 // frame. Its closed socket must not terminate this client.
                 let _ = protocol::write_message(&mut writer, &message);
@@ -274,11 +285,49 @@ where
             Err(_) => break ClientExit::Done,
         };
         match message {
+            Ok(ServerMessage::GraphicFrame {
+                text,
+                graphics: update,
+                ..
+            }) if graphics_enabled => {
+                sync_begin();
+                let result = (|| -> Result<()> {
+                    if matches!(text, protocol::GraphicText::Full(_)) {
+                        terminal.backend_mut().clear()?;
+                    }
+                    graphics.apply(update, &mut std::io::stdout())?;
+                    std::io::stdout().flush()?;
+                    let (mut cells, cursor, visible, _full) = match text {
+                        protocol::GraphicText::Full(frame) => (
+                            frame_cells(&frame, true),
+                            frame.cursor,
+                            frame.cursor_visible,
+                            true,
+                        ),
+                        protocol::GraphicText::Diff(diff) => (
+                            diff_cells(&diff, true),
+                            diff.cursor,
+                            diff.cursor_visible,
+                            false,
+                        ),
+                    };
+                    graphics.translate(&mut cells);
+                    let _metadata_colors =
+                        crate::terminal::graphics::MetadataColors::prepare(&mut cells);
+                    paint(terminal, &cells, cursor, visible, false, &mut last_cursor)?;
+                    Ok(())
+                })();
+                sync_end();
+                result?;
+            }
             // A full frame repaints the whole screen; a diff writes *only its changed
             // cells* straight to the terminal (O(changed), not a whole re-blit). Each
             // is wrapped in a DEC 2026 synchronized update so it paints atomically.
             Ok(ServerMessage::Frame(frame)) => {
                 sync_begin();
+                if !graphics.scene.is_empty() {
+                    graphics.apply(Vec::new(), &mut std::io::stdout())?;
+                }
                 let r = paint(
                     terminal,
                     &frame_cells(&frame, truecolor),
@@ -347,6 +396,10 @@ where
                 generation += 1;
                 let (reader, next_writer) = connection;
                 writer = Box::new(next_writer);
+                graphics.apply(Vec::new(), &mut std::io::stdout())?;
+                if graphics_enabled {
+                    send_graphics_size(&mut writer)?;
+                }
                 spawn_frame_reader(reader, generation, tx.clone());
                 crate::session::apply_explicit_name(&target).map_err(anyhow::Error::msg)?;
                 current = target;
@@ -377,7 +430,19 @@ where
             }
         }
     };
+    graphics.apply(Vec::new(), &mut std::io::stdout())?;
     Ok(exit)
+}
+
+fn send_graphics_size(writer: &mut impl Write) -> io::Result<()> {
+    let (cell_width, cell_height) = crate::terminal::graphics::terminal_cell_pixels();
+    protocol::write_message(
+        writer,
+        &ClientMessage::Graphics {
+            cell_width,
+            cell_height,
+        },
+    )
 }
 
 enum ClientEvent {

@@ -702,6 +702,26 @@ impl App {
         let shell = crate::platform::resolve_shell(&self.config.shell);
         let history_budget = self.config.scrollback_bytes();
         let appearance = self.pane_appearance;
+        let cell_pixels = match &commit.placement {
+            backend::CreatePlacement::Sibling(locator) => locator
+                .pane_id
+                .parse::<u32>()
+                .ok()
+                .and_then(|id| self.workspace_of_pane(PaneId(id)))
+                .and_then(|workspace| workspace.cell_pixels),
+            backend::CreatePlacement::Workspace => self.display_cell_pixels,
+        };
+        // Canonicalization already runs off-loop below. Resolve a workspace
+        // placement against those same destination semantics before spawning.
+        let workspace_pixels: Vec<_> =
+            if matches!(commit.placement, backend::CreatePlacement::Workspace) {
+                self.workspaces
+                    .iter()
+                    .map(|workspace| (workspace.cwd.clone(), workspace.cell_pixels))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let app_tx = self.app_tx.clone();
         let event_tx = self.app_tx.clone();
         std::thread::spawn(move || {
@@ -716,6 +736,10 @@ impl App {
                 });
             let (resolved_cwd, branch, worktree, result) = match canonical {
                 Ok(resolved_cwd) => {
+                    let cell_pixels = workspace_pixels
+                        .iter()
+                        .find(|(cwd, _)| crate::platform::same_path(cwd, &resolved_cwd))
+                        .map_or(cell_pixels, |(_, pixels)| *pixels);
                     let branch = git_branch(&resolved_cwd);
                     let worktree = worktree_membership(&resolved_cwd);
                     let result = match command.as_ref() {
@@ -729,6 +753,7 @@ impl App {
                             &[],
                             history_budget,
                             appearance,
+                            cell_pixels,
                         ),
                         None => crate::terminal::pty::Pane::spawn(
                             pane_id,
@@ -740,6 +765,7 @@ impl App {
                             &shell,
                             history_budget,
                             appearance,
+                            cell_pixels,
                         ),
                     }
                     .map_err(|_| "PTY or root process failed to start".to_string());
@@ -812,6 +838,7 @@ impl App {
                     .position(|workspace| crate::platform::same_path(&workspace.cwd, &cwd))
                     .unwrap_or_else(|| {
                         self.workspaces.push(Workspace {
+                            cell_pixels: pane.cell_pixels(),
                             id: crate::ids::public_id("workspace"),
                             name: ws_name(&cwd),
                             cwd: cwd.clone(),
@@ -1562,6 +1589,68 @@ mod tests {
     }
 
     #[test]
+    fn backend_create_pixels_follow_the_resolved_workspace_or_sibling() {
+        let _env = crate::persist::test_env("backend-create-pixels");
+        let config = crate::config::Config {
+            shell: "/bin/cat".into(),
+            ..Default::default()
+        };
+        crate::config::save(&config);
+        let (tx, events) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let target = app.layout().focus;
+        let cwd = app.ws().cwd.clone();
+        app.workspaces[0].cell_pixels = Some((8, 16));
+        app.display_cell_pixels = Some((12, 24));
+        let other = crate::persist::config_dir().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        app.dispatch("workspace.open", &json!({"path":other}))
+            .unwrap();
+        assert_eq!(app.active_ws, 1);
+        for pixels in [Some((8, 16)), None] {
+            app.workspaces[0].cell_pixels = pixels;
+            for placement in [
+                json!({"kind":"workspace"}),
+                json!({"kind":"sibling", "of_terminal":locator(&app, target)}),
+            ] {
+                let (reply, response) = std::sync::mpsc::channel();
+                app.start_backend_create(ApiRequest {
+                    id: "pixel-create".into(),
+                    method: "terminal.backend.create".into(),
+                    params: json!({"cwd":cwd.join("."), "focus":false, "placement":placement}),
+                    reply,
+                });
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let response: Value = loop {
+                    if let Ok(response) = response.try_recv() {
+                        break serde_json::from_str(&response).unwrap();
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "backend create must finish"
+                    );
+                    if let Ok(event) = events.recv_timeout(Duration::from_millis(50)) {
+                        app.handle_event(event);
+                    }
+                };
+                assert!(response.get("error").is_none(), "{response}");
+                let pane = PaneId(
+                    response["result"]["pane_id"]
+                        .as_str()
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                );
+                assert_eq!(app.panes[&pane].cell_pixels(), pixels);
+                assert_eq!(
+                    app.active_ws, 1,
+                    "focus=false must preserve the other workspace"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn backend_close_preserves_workspace_sidebar_folds() {
         let _env = crate::persist::test_env("backend-close-sidebar");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -1659,7 +1748,7 @@ mod tests {
         );
 
         let resumed = app
-            .spawn_resume_pane(workspace, "")
+            .spawn_resume_pane(workspace, "", app.workspace_cell_pixels(app.active_ws))
             .expect("resume terminal spawns");
         assert_eq!(
             app.backend_validate(&locator(&app, resumed)).unwrap()["state"],
@@ -1678,7 +1767,7 @@ mod tests {
         let before = app.backend_terminal_index.clone();
         let floor = crate::ipc::api::current_sequence(&app.events);
         let deferred = app
-            .spawn_into_deferred(cwd.clone(), &[])
+            .spawn_into_deferred(cwd.clone(), &[], app.workspace_cell_pixels(app.active_ws))
             .expect("deferred pane is allocated before spawn");
         assert!(app.panes[&deferred].terminal_runtime().is_none());
         assert_eq!(app.backend_terminal_index, before);
@@ -1694,6 +1783,7 @@ mod tests {
             &valid_shell,
             app.config.scrollback_bytes(),
             app.pane_appearance,
+            app.display_cell_pixels,
         )
         .unwrap();
         app.panes.insert(deferred, ready);
@@ -1710,7 +1800,12 @@ mod tests {
 
         app.config.shell = valid_shell;
         let floor = crate::ipc::api::current_sequence(&app.events);
-        let synchronous = app.spawn_into(app.ws().cwd.clone()).unwrap();
+        let synchronous = app
+            .spawn_into(
+                app.ws().cwd.clone(),
+                app.workspace_cell_pixels(app.active_ws),
+            )
+            .unwrap();
         assert_eq!(
             app.backend_terminal_index.get(
                 &app.panes[&synchronous]

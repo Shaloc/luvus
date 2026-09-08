@@ -4,6 +4,8 @@
 pub mod appearance;
 pub mod backend;
 pub mod clipboard;
+pub(crate) mod graphics;
+mod graphics_diacritics;
 #[cfg(any(windows, test))]
 pub mod host_input;
 pub mod host_key;

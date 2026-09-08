@@ -265,6 +265,11 @@ pub(super) fn patch_terminal_damage(
                 cell.set_style(blank);
             }
             for cell in &row.cells {
+                if cell.character == crate::terminal::graphics::MARKER {
+                    // A raw child image ID must pass through full scene
+                    // composition, including first/reappearing placeholders.
+                    return Err(());
+                }
                 let style = terminal_cell_style(cell.style, theme, app.downsample);
                 let symbol: &str = if cell.zero_width.is_empty() {
                     cell.character.encode_utf8(&mut stack)
@@ -429,7 +434,10 @@ fn draw_one_pane(
             let scan_pi = agent == "pi";
             let mut pi_caret: Option<(u16, u16)> = None;
             {
-                let buf = f.buffer_mut();
+                let graphics_enabled = f.graphics_enabled;
+                let scene = &mut f.graphics;
+                let buf = &mut *f.buf;
+                let child_graphics = engine.graphics();
                 engine.for_each_cell(&mut |row, col, sym, cell| {
                     if row >= content.height || col >= content.width {
                         return;
@@ -439,6 +447,32 @@ fn draw_one_pane(
                     }
                     let x = content.x + col;
                     let y = content.y + row;
+                    if sym.starts_with(crate::terminal::graphics::MARKER) {
+                        let mapped = graphics_enabled
+                            .then(|| {
+                                child_graphics.and_then(|(namespace, placements)| {
+                                    crate::terminal::graphics::virtual_cell(
+                                        sym, cell.fg, namespace, placements, scene,
+                                    )
+                                })
+                            })
+                            .flatten();
+                        let target = &mut buf[(x, y)];
+                        if let Some((symbol, foreground)) = mapped {
+                            target.set_symbol(&symbol).set_fg(foreground);
+                            // Transparent image pixels reveal the child's
+                            // background, not necessarily Luvus's pane fill.
+                            if let Some(background) = terminal_cell_style(cell, t, downsample).bg {
+                                target.set_bg(background);
+                            }
+                            target.modifier = ratatui::style::Modifier::empty();
+                        } else {
+                            // Missing/deleted resources and incapable displays
+                            // must never leak raw child IDs into the outer TUI.
+                            target.set_symbol(" ");
+                        }
+                        return;
+                    }
                     let mut style = terminal_cell_style(cell, t, downsample);
                     // Highlight the cell if it's inside the mouse selection.
                     if sel.is_some_and(|selection| {
@@ -485,6 +519,17 @@ fn draw_one_pane(
                 });
             }
             scrolled = engine.scroll_offset();
+            if f.graphics_enabled && scrolled == 0 {
+                if let Some((namespace, placements)) = engine.graphics() {
+                    crate::terminal::graphics::draw(
+                        f.buf,
+                        content,
+                        namespace,
+                        placements,
+                        &mut f.graphics,
+                    );
+                }
+            }
             if is_codex {
                 composer_region = engine.codex_composer_region();
             }
@@ -584,6 +629,15 @@ fn draw_remote_view(
 
     let width = frame.width.min(area.width);
     let height = frame.height.min(area.height);
+    let graphic_slots: Vec<_> = view
+        .graphics
+        .iter()
+        .map(|graphic| {
+            f.graphics_enabled
+                .then(|| crate::terminal::graphics::add(&mut f.graphics, graphic.clone()))
+                .flatten()
+        })
+        .collect();
     let buffer = f.buffer_mut();
     for row in 0..height {
         for column in 0..width {
@@ -612,6 +666,15 @@ fn draw_remote_view(
             cell.set_fg(color(source.fg));
             cell.set_bg(color(source.bg));
             cell.modifier = crate::ipc::protocol::unpack_mods(source.mods);
+            if let Some(index) =
+                crate::terminal::graphics::index(symbol, crate::ipc::protocol::unpack(source.fg))
+            {
+                if let Some(Some(slot)) = graphic_slots.get(index) {
+                    cell.set_fg(crate::terminal::graphics::slot_color(*slot));
+                } else {
+                    cell.set_symbol(" ");
+                }
+            }
         }
     }
     if view.state != crate::app::remote::RemoteViewState::Ready {
@@ -778,6 +841,49 @@ fn draw_codex_composer(
 mod tests {
     use super::*;
     use crate::terminal::vt::CodexComposerRegion;
+
+    #[test]
+    fn kitty_virtual_image_preserves_child_background() {
+        use crate::terminal::appearance::PaneAppearance;
+        use crate::terminal::vt::{create_engine, VtEngineKind};
+        use std::sync::mpsc;
+
+        let _env = crate::persist::test_env("kitty-virtual-background");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).expect("isolated app");
+        let (response_tx, _response_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            80,
+            24,
+            response_tx,
+            1024 * 1024,
+            PaneAppearance::default(),
+        );
+        let focus = app.layout().focus;
+        app.panes.get_mut(&focus).unwrap().engine = engine.clone();
+        {
+            let mut engine = engine.lock().unwrap();
+            engine.set_cell_pixels(8, 16);
+            engine.advance(b"\x1b_Ga=T,U=1,i=7,f=32,s=1,v=1,c=2,r=1;AAAAAA==\x1b\\");
+            engine.advance(
+                "\x1b[48;2;12;34;56m\x1b[38;2;0;0;7m\u{10eeee}\u{0305}\u{0305}".as_bytes(),
+            );
+        }
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+        target.graphics_enabled = true;
+        crate::ui::render_into(&mut target, &mut app);
+        assert_eq!(target.graphics.len(), 1);
+        let markers: Vec<_> = buffer
+            .content
+            .iter()
+            .filter(|cell| cell.symbol().starts_with(crate::terminal::graphics::MARKER))
+            .collect();
+        assert_eq!(markers.len(), 1);
+        assert_eq!(markers[0].bg, Color::Rgb(12, 34, 56));
+    }
 
     #[test]
     fn composer_uses_only_a_subtle_theme_fill_and_preserves_geometry() {

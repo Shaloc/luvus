@@ -13,13 +13,17 @@ use serde::{Deserialize, Serialize};
 use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::TerminalColors;
 
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROJECTION_PROTOCOL_VERSION: u32 = 10;
 pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 
 /// Transport 9 is frozen. New projection messages are opt-in on transport 10;
 /// old clients continue receiving only the existing generation-9 messages.
 pub fn supports_version(version: u32) -> bool {
-    matches!(version, LEGACY_PROTOCOL_VERSION | PROTOCOL_VERSION)
+    matches!(
+        version,
+        LEGACY_PROTOCOL_VERSION | PROJECTION_PROTOCOL_VERSION | PROTOCOL_VERSION
+    )
 }
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -73,6 +77,12 @@ pub enum ClientMessage {
     ProjectionPresented {
         epoch: u64,
         event_sequence: u64,
+    },
+    /// Opt-in only on transport 11, after Welcome/Ready. Re-sent on resize.
+    /// Zero/zero revokes the capability; a single zero is invalid.
+    Graphics {
+        cell_width: u16,
+        cell_height: u16,
     },
 }
 
@@ -130,6 +140,17 @@ pub enum ServerMessage {
         state: ProjectionState,
         frame: FrameDiff,
     },
+    GraphicFrame {
+        state: Option<ProjectionState>,
+        text: GraphicText,
+        graphics: Vec<crate::terminal::graphics::GraphicUpdate>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub enum GraphicText {
+    Full(FrameData),
+    Diff(FrameDiff),
 }
 
 /// State and geometry travel in the same frame, rather than being correlated
@@ -146,8 +167,8 @@ pub struct ProjectionState {
 pub const PROJECTION_CAPABILITY: &str = "projection.v1";
 
 pub fn remote_display_capabilities() -> serde_json::Value {
-    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROTOCOL_VERSION],
-        "capabilities":[PROJECTION_CAPABILITY]})
+    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, PROTOCOL_VERSION],
+        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1"]})
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -544,7 +565,8 @@ mod tests {
         assert!(supports_version(9));
         assert!(supports_version(10));
         assert!(!supports_version(8));
-        assert!(!supports_version(11));
+        assert!(supports_version(11));
+        assert!(!supports_version(12));
     }
 
     #[test]

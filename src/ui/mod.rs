@@ -23,6 +23,8 @@ use crate::ui::theme::{State, Theme};
 /// `--local` path and tests keep calling `render(&mut Frame, …)`, which wraps the
 /// terminal's own buffer in one of these.
 pub struct RenderTarget<'a> {
+    pub(crate) graphics_enabled: bool,
+    pub(crate) graphics: Vec<crate::terminal::graphics::Graphic>,
     buf: &'a mut Buffer,
     area: Rect,
     cursor: Option<(u16, u16)>,
@@ -33,6 +35,8 @@ impl<'a> RenderTarget<'a> {
     /// Wrap a buffer we own (the server's frame buffer) as a draw surface.
     pub fn new(buf: &'a mut Buffer, area: Rect) -> Self {
         RenderTarget {
+            graphics_enabled: false,
+            graphics: Vec::new(),
             buf,
             area,
             cursor: None,
@@ -94,6 +98,8 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let (cursor, visible) = {
         let mut target = RenderTarget {
+            graphics_enabled: false,
+            graphics: Vec::new(),
             buf: f.buffer_mut(),
             area,
             cursor: None,

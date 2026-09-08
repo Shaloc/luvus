@@ -2107,6 +2107,7 @@ mod tests {
     fn add_test_workspace(app: &mut App, cwd: PathBuf) -> usize {
         let id = PaneId::alloc();
         app.workspaces.push(crate::app::Workspace {
+            cell_pixels: None,
             id: crate::ids::public_id("workspace"),
             name: cwd
                 .file_name()

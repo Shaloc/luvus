@@ -506,6 +506,24 @@ mod tests {
         &app.changelog_rows.as_ref().expect("built").2
     }
 
+    fn open_with_reference() -> (App, Terminal<TestBackend>) {
+        let (mut app, mut term) = open();
+        // Hit testing must not depend on whether the newest release happens
+        // to contain a commit link on its first screen.
+        let fixture = crate::changelog::inline(
+            "[`abc1234`](https://github.com/example/project/commit/abc1234)",
+        );
+        let reference = super::row(
+            &fixture,
+            0,
+            ratatui::style::Style::new(),
+            &crate::ui::theme::Theme::noir(),
+        );
+        app.changelog_rows.as_mut().unwrap().2.insert(0, reference);
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        (app, term)
+    }
+
     fn click(app: &mut App, col: u16, row: u16) {
         app.handle_event(crate::event::AppEvent::Mouse(
             ratatui::crossterm::event::MouseEvent {
@@ -616,8 +634,23 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Contributors"));
-        assert!(text.contains("RizRiyz"));
-        assert!(text.contains("RiN (@r17x)"));
+        let contributors = CHANGELOG[0]
+            .2
+            .split("## Contributors")
+            .nth(1)
+            .expect("latest release credits");
+        let first = contributors
+            .lines()
+            .find_map(|line| line.strip_prefix("- "))
+            .expect("at least one credit");
+        let expected = crate::changelog::inline(first)
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<String>();
+        assert!(
+            text.contains(&expected),
+            "latest release credit is rendered: {expected}"
+        );
     }
 
     /// Commit and PR references in the notes are clickable, which is the whole
@@ -625,7 +658,7 @@ mod tests {
     #[test]
     fn commit_references_are_clickable() {
         let _env = crate::persist::test_env("cl-commit");
-        let (mut app, _t) = open();
+        let (mut app, _t) = open_with_reference();
         // Find a rendered commit/PR link (not the website row).
         let (rect, url) = app
             .changelog_link_rects
@@ -678,7 +711,7 @@ mod tests {
     #[test]
     fn scrolled_away_links_stop_being_clickable() {
         let _env = crate::persist::test_env("cl-scroll");
-        let (mut app, mut term) = open();
+        let (mut app, mut term) = open_with_reference();
         let before = app.changelog_link_rects.clone();
         assert!(!before.is_empty(), "links on the first screen");
 

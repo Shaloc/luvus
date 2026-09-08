@@ -457,6 +457,7 @@ impl App {
             &[],
             history_budget_bytes,
             self.pane_appearance,
+            self.workspace_cell_pixels(self.active_ws),
         ) {
             Ok(pane) => {
                 let cmd = pane.command.clone();
@@ -1640,6 +1641,8 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
         let tabs_before = app.workspaces[app.active_ws].tabs.len();
+        app.workspaces[app.active_ws].cell_pixels = Some((8, 16));
+        app.display_cell_pixels = Some((12, 24));
 
         // `cat` stands in for an editor: a real program launched with the file as
         // a literal argv element (present on every unix CI runner).
@@ -1651,6 +1654,7 @@ mod tests {
             "a new tab opened for the editor"
         );
         let focus = app.layout().focus;
+        assert_eq!(app.panes[&focus].cell_pixels(), Some((8, 16)));
         assert!(
             app.panes.contains_key(&focus),
             "the editor runs in a real PTY pane"

@@ -357,6 +357,68 @@ owner's pane. `agent list` includes `host`, `owner_session`, and `owner_pane` fo
 remote rows. Follow up with those owner selectors and `--host`, not the qualified
 local presentation row ID. Remote FILES views do not expose a stale local tree.
 
+### Kitty graphics preview
+
+Fork graphics builds report `transport=11` with
+`luvus --version --remote-session-protocol`. Use Kitty 0.28 or newer on the display
+machine and matching graphics builds on remote owners. An older managed owner
+can still display text, but cannot supply graphics. For an SSH-hosted display
+client, preserve `TERM=xterm-kitty`; changing TERM in the child pane alone does
+not enable graphics on the outer client.
+
+Luvus accepts direct-transfer (`t=d`) RGB, RGBA and PNG images, including zlib
+compression for RGB/RGBA. It forwards compressed pixels without decoding them
+into its text grid. File and shared-memory queries return unsupported so tools
+such as terminal-browser can select inline transfer. No kitten helper is needed
+for rendering; the clipboard helper described above is a separate feature.
+
+Images are clipped to pane cells and compose with local and remote menus.
+Image-only updates retain the client's image IDs and do not resend unchanged
+text. `NO_COLOR` keeps ordinary text colorless while retaining the RGB metadata
+needed by Kitty's Unicode image placeholders. Closing a graphic application or
+switching workspaces removes only the images owned by that Luvus display client.
+
+Inline-image clients can use `U=1` virtual images with a default placement ID
+and explicit Unicode placeholder row/column coordinates. Luvus preserves those
+coordinates while remapping image IDs per pane and display. This supports
+tele-style message scrolling and mosaic windows without decoding or cropping
+pixels. Erasing the text does not delete the reusable image; explicit deletion
+and replacement update its lifetime. Retained placeholder text can also display
+in scrollback while its image remains in the bounded owner cache.
+
+The tele path is verified with independent protocol fixtures derived from its
+[renderer contract](https://github.com/sorokin-vladimir/tele/blob/98d7489982aa9a5c094d7430ccebc5bcf2f303f4/internal/ui/media/kitty.go),
+not by installing, compiling or logging into tele. If the child's environment
+does not identify Kitty, start it with `TERM=xterm-kitty tele` or select tele's
+Kitty photo mode. Full application acceptance remains a user test.
+
+This is a graphics preview, not complete Kitty protocol support. Sixel, animation
+commands, relative placements, non-default virtual placement IDs, omitted
+placeholder coordinates, nonzero z-order, source-pixel cropping, stretched
+ordinary placements, compressed PNG and ordinary-image scrollback are not
+supported. A placement can span at most 297 columns and 297 rows; larger
+placements are rejected instead of incorrectly tiling the image. Pane-edge and
+scroll-region clipping remain supported without changing source coordinates.
+Uploads are bounded to
+32 MiB of encoded data and 16 million pixels per image, with 32 images and 128
+placements per terminal; the composed display has a 48 MiB encoded-data bound.
+High-resolution scrolling still depends on the application's pixel encoder,
+network bandwidth and Kitty rendering. Passing transport tests does not establish
+Chromium performance or guarantee 60 FPS. terminal-code requires separate
+application-level verification.
+
+To compare the same isolated PixelEngine workload between builds on Linux:
+
+```sh
+LUVUS_TEST_PIXEL_PERF=1 LUVUS_TEST_PIXEL_PERF_SIZE=268x70 \
+LUVUS_TEST_PIXEL_BINDING=/path/to/terminal-browser/browser/native/pixel.node \
+python3 scripts/test-remote-sessions.py target/release/luvus --graphics-only
+```
+
+The test uses private homes and a local SSH substitute under `target/`, not
+configured hosts or production sessions. It measures simple canvas updates
+arriving at the thin client's output, not the physical display frame rate.
+
 ### Which machine owns a control?
 
 The local Settings window, session/workspace navigation, Agents All/Active and

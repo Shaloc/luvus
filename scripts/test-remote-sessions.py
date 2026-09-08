@@ -121,6 +121,7 @@ def main():
     agent_seen_only = "--agent-seen-only" in sys.argv[1:]
     reconnect_only = "--reconnect-only" in sys.argv[1:]
     network_reconnect_only = "--network-reconnect-only" in sys.argv[1:]
+    graphics_only = "--graphics-only" in sys.argv[1:]
     theme_sync_only = "--theme-sync-only" in sys.argv[1:]
     if reconnect_only or network_reconnect_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
@@ -131,7 +132,7 @@ def main():
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -142,6 +143,7 @@ def main():
     (root / ".isolated-smoke").write_text(str(root))
     clients = []
     client_terminals = {}
+    graphics_output = bytearray()
     env = {key: value for key, value in os.environ.items() if not key.startswith("LUVUS_")}
     for directory in ("local-home/.ssh", "local-home/picker-local", "local-state", "remote-home",
                       "remote-state", "bin", "project/picker-remote", "second"):
@@ -177,6 +179,12 @@ def main():
     env.pop("WAYLAND_DISPLAY", None)
     if network_reconnect_only:
         env["LUVUS_SMOKE_NETWORK_RECONNECT"] = "1"
+    if graphics_only:
+        env["TERM"] = "xterm-kitty"
+        if os.environ.get("LUVUS_TEST_PIXEL_BINDING"):
+            binding = Path(os.environ["LUVUS_TEST_PIXEL_BINDING"]).resolve()
+            assert binding.is_file() and binding.name == "pixel.node", binding
+            env["LUVUS_TEST_PIXEL_BINDING"] = str(binding)
     if clipboard_only:
         helper = Path(os.environ["LUVUS_TEST_KITTEN"]).resolve()
         assert helper.is_relative_to(repo / "target") and helper.is_file(), helper
@@ -430,11 +438,13 @@ def main():
             deadline = time.monotonic() + 4
             while time.monotonic() < deadline and (
                     b"luvus" not in screen.lower()
-                    or (theme_sync_only and not re.search(rb"\x1b\[\d+;\d+H", screen))):
+                    or ((theme_sync_only or graphics_only) and not re.search(rb"\x1b\[\d+;\d+H", screen))):
                 if select.select([master], [], [], 0.1)[0]:
                     screen.extend(os.read(master, 65536))
             assert process.poll() is None and b"luvus" in screen.lower(), screen[-1000:]
             assert b"\x1b[?1049h" in screen, "the fixture must observe the initial alternate-screen entry"
+            if graphics_only:
+                graphics_output.extend(screen)
             if reconnect_only or network_reconnect_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
@@ -450,6 +460,8 @@ def main():
                     screen.extend(os.read(master, 65536))
             if master in client_terminals:
                 client_terminals[master][1].feed(bytes(screen))
+            if graphics_only:
+                graphics_output.extend(screen)
             return screen
 
         def repaint(master):
@@ -494,6 +506,248 @@ def main():
 
         def click(master, x, y, button=0):
             os.write(master, f"\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m".encode())
+
+        if graphics_only:
+            import zlib
+            checkpoints = []
+
+            def checkpoint(label, color, visible=True, **expectations):
+                # Replay the actual composed client stream in a real Kitty
+                # display using test-kitty-graphics-visual.py. No synthetic
+                # image/placeholder commands are added to this recording.
+                assert len(graphics_output) <= 64 * 1024 * 1024
+                recording = root / ("kitty-" + label + ".ansi")
+                recording.write_bytes(graphics_output)
+                checkpoints.append({"file": recording.name, "color": color, "visible": visible, **expectations})
+                (root / "kitty-checkpoints.json").write_text(json.dumps(checkpoints))
+
+            fixture = repo / "scripts/kitty-graphics-fixture.py"
+            process, master = start_client(["--session", "api"])
+
+            def output_until(predicate, seconds=8):
+                observed = bytearray()
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    observed.extend(drain(master, 0.15))
+                    if predicate(bytes(observed)):
+                        return bytes(observed)
+                raise AssertionError("graphic output predicate timed out: " + repr(observed[-600:]))
+
+            def has_pixels(output, color, canvas_size=(64, 64)):
+                header, payload = None, bytearray()
+                for command in re.findall(rb"\x1b_G(.*?)\x1b\\", output, re.S):
+                    control, _, data = command.partition(b";")
+                    fields = dict(item.split(b"=", 1) for item in control.split(b",") if b"=" in item)
+                    if fields.get(b"a") == b"t":
+                        header, payload = fields, bytearray()
+                    if header is None:
+                        continue
+                    payload.extend(data)
+                    if fields.get(b"m", b"0") == b"0":
+                        raw = base64.b64decode(payload)
+                        if header.get(b"o") == b"z":
+                            raw = zlib.decompress(raw)
+                        if canvas_size is None:
+                            width, height = int(header[b"s"]), int(header[b"v"])
+                            center = 4 * ((height // 2) * width + width // 2)
+                            if len(raw) == width * height * 4 and raw[center:center + 4] == bytes(color):
+                                return True
+                        elif raw == bytes(color) * (canvas_size[0] * canvas_size[1]):
+                            return True
+                        header = None
+                return False
+
+            def launch(label, remote=False):
+                pane = api("pane.list", remote=remote)["panes"][0]["pane"]
+                run("--session", "api", "pane", "run", str(pane),
+                    shlex.join([sys.executable, str(fixture), label]), remote=remote)
+                report = root / ("graphics-" + label + ".json")
+                wait_for(report.exists)
+                result = json.loads(report.read_text())
+                assert result["ack"] and result["cell_size"], result
+                return pane
+
+            def check_scrolling(pane, label, remote=False):
+                for key, receipt, suffix, expectations in [
+                    ("u", b"UUUUUUUU", "up", {"less_than": f"kitty-{label}-green.ansi"}),
+                    ("r", b"RRRRRRRR", "back", {"same_pixels_as": f"kitty-{label}-scroll-up.ansi"}),
+                    ("e", b"EEEEEEEE", "off", {}),
+                ]:
+                    run("--session", "api", "pane", "send", str(pane), key, remote=remote)
+                    output_until(lambda output: receipt in output)
+                    checkpoint(f"{label}-scroll-{suffix}", [0, 255, 0], key != "e", **expectations)
+                run("--session", "api", "pane", "send", str(pane), "g", remote=remote)
+                output_until(lambda output: has_pixels(output, (0, 255, 0, 255)))
+                checkpoint(f"{label}-scroll-redraw", [0, 255, 0], same_pixels_as=f"kitty-{label}-green.ansi")
+                print(f"PASS: {label} inline image follows page scrolling, clips permanently and redraws", flush=True)
+
+            def check_virtual_images(pane, label, remote=False):
+                for key, receipt, suffix, color, absent in [
+                    ("v", b"VVVVVVVV", "full", [0,255,0], []),
+                    ("w", b"WWWWWWWW", "window", [0,255,0], [[255,0,0], [0,0,255]]),
+                    ("f", b"VVVVVVVV", "uncropped", [255,0,0], []),
+                    ("x", b"XXXXXXXX", "delete", [255,255,0], [[255,0,0], [0,255,0], [0,0,255]]),
+                    ("v", b"VVVVVVVV", "return", [0,0,255], []),
+                ]:
+                    run("--session", "api", "pane", "send", str(pane), key, remote=remote)
+                    painted = output_until(lambda output: receipt in output)
+                    if key in ("w", "f"):
+                        assert b"a=t,t=d" not in painted, "moving virtual windows must reuse uploaded images"
+                    checkpoint(f"{label}-virtual-{suffix}", color, absent_colors=absent)
+                run("--session", "api", "pane", "send", str(pane), "h", remote=remote)
+                output_until(lambda output: b"HHHHHHHH" in output)
+                checkpoint(f"{label}-virtual-hidden", [255,0,0], False, absent_colors=[[0,255,0], [0,0,255], [255,255,0]])
+                run("--session", "api", "pane", "send", str(pane), "f", remote=remote)
+                output_until(lambda output: b"VVVVVVVV" in output)
+                checkpoint(f"{label}-virtual-reappear", [255,0,0])
+                run("--session", "api", "pane", "send", str(pane), "c", remote=remote)
+                output_until(lambda output: b"a=d,d=I" in output)
+                checkpoint(f"{label}-virtual-clear", [0,255,0], False, absent_colors=[[255,0,0], [0,0,255], [255,255,0]])
+                run("--session", "api", "pane", "send", str(pane), "g", remote=remote)
+                output_until(lambda output: has_pixels(output, (0,255,0,255)))
+                print(f"PASS: {label} tele-style virtual PNG placeholders crop by cells, reuse uploads, delete and re-enter without stale IDs", flush=True)
+
+            local_pane = launch("local")
+            painted = output_until(lambda output: has_pixels(output, (255, 0, 0, 255)))
+            assert "\U0010eeee".encode() in painted and b"a=p,U=1" in painted
+            assert re.search(rb"38;2;[0-9]+;[0-9]+;[0-9]+", painted), "placeholder RGB identity must survive NO_COLOR"
+            checkpoint("local-red", [255, 0, 0])
+            print("PASS: local Kitty query, cell geometry, chunked RGBA and composed placeholders", flush=True)
+            run("--session", "api", "pane", "send", str(local_pane), "g")
+            output_until(lambda output: has_pixels(output, (0, 255, 0, 255)))
+            checkpoint("local-green", [0, 255, 0])
+            check_scrolling(local_pane, "local")
+            check_virtual_images(local_pane, "local")
+            run("--session", "api", "pane", "send", str(local_pane), "q")
+            output_until(lambda output: b"a=d,d=I,i=" in output)
+            checkpoint("local-exit", [0, 255, 0], False)
+            print("PASS: changed image repaints; leaving the alternate screen deletes only client-owned image IDs", flush=True)
+
+            if env.get("LUVUS_TEST_PIXEL_BINDING"):
+                run("--session", "api", "pane", "run", str(local_pane),
+                    shlex.join(["node", str(repo / "scripts/kitty-pixel-fixture.cjs")]))
+                native = output_until(lambda output: has_pixels(output, (255, 0, 0, 255), None))
+                assert b"a=t,t=d" in native and b"o=z" in native
+                checkpoint("pixel-engine", [255, 0, 0])
+                wait_for(lambda: (root / "graphics-pixel.json").exists())
+                events = json.loads((root / "graphics-pixel.json").read_text())
+                assert not any(isinstance(event, str) or event.get("error") for event in events), events
+                drain(master)
+                print("PASS: installed terminal-browser native PixelEngine negotiates direct zlib canvas inside a Luvus PTY", flush=True)
+
+            run("session", "merge", "on")
+            wait_for(projected)
+            remote_workspace = next(w["workspace"] for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
+            api("workspace.focus", {"workspace": remote_workspace})
+            drain(master)
+            remote_pane = launch("remote", remote=True)
+            output_until(lambda output: has_pixels(output, (0, 0, 255, 255)))
+            checkpoint("remote-blue", [0, 0, 255])
+            print("PASS: merged remote owner query/cell size and zlib pixels reach the same local client", flush=True)
+            os.write(master, b"\x02=")
+            output_until(lambda output: b"Settings" in output)
+            checkpoint("remote-menu", [0, 0, 255], False)
+            os.write(master, b"\x1b")
+            output_until(lambda output: "\U0010eeee".encode() in output)
+            checkpoint("remote-menu-closed", [0, 0, 255])
+            run("--session", "api", "pane", "send", str(remote_pane), "g", remote=True)
+            output_until(lambda output: has_pixels(output, (0, 255, 0, 255)))
+            checkpoint("remote-green", [0, 255, 0])
+            check_scrolling(remote_pane, "remote", remote=True)
+            check_virtual_images(remote_pane, "remote", remote=True)
+            run("--session", "api", "pane", "send", str(remote_pane), "q", remote=True)
+            output_until(lambda output: b"a=d,d=I,i=" in output)
+            checkpoint("remote-exit", [0, 255, 0], False)
+            assert process.poll() is None
+            print("PASS: local modal remains operable over remote graphics; update and cleanup stay owner-scoped", flush=True)
+            print(f"Kitty visual checkpoints: {root}", flush=True)
+            if os.environ.get("LUVUS_TEST_PIXEL_PERF") == "1":
+                assert env.get("LUVUS_TEST_PIXEL_BINDING"), "native PixelEngine required"
+                size = os.environ.get("LUVUS_TEST_PIXEL_PERF_SIZE", "120x30")
+                assert re.fullmatch(r"[0-9]{2,3}x[0-9]{2,3}", size), size
+                columns, rows = map(int, size.split("x"))
+                assert 80 <= columns <= 300 and 24 <= rows <= 120, size
+                fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, columns, 0, 0))
+                drain(master)
+                summaries = []
+                for is_remote in (False, True):
+                    target_ws = next(w["workspace"] for w in api("workspace.list")["workspaces"]
+                                     if bool(w.get("host")) == is_remote)
+                    api("workspace.focus", {"workspace": target_ws})
+                    drain(master)
+                    for fps in (30, 60):
+                        label = ("remote" if is_remote else "local") + f"-{fps}"
+                        report = root / f"graphics-perf-{label}.json"
+                        before = api("pane.list", remote=is_remote)["render_performance"]
+                        run("--session", "api", "pane", "run",
+                            str(remote_pane if is_remote else local_pane),
+                            shlex.join(["node", str(repo / "scripts/kitty-pixel-fixture.cjs"),
+                                        "--perf", str(fps), label]), remote=is_remote)
+                        pending, payload = bytearray(), bytearray()
+                        header = None
+                        received = {}
+                        chunks = []
+                        deadline = time.monotonic() + 12
+                        while time.monotonic() < deadline and not report.exists():
+                            if not select.select([master], [], [], 0.02)[0]:
+                                continue
+                            chunk = os.read(master, 65536)
+                            at = time.monotonic()
+                            chunks.append((at, len(chunk)))
+                            pending.extend(chunk)
+                            while True:
+                                start = pending.find(b"\x1b_G")
+                                if start < 0:
+                                    pending[:] = pending[-3:]
+                                    break
+                                end = pending.find(b"\x1b\\", start)
+                                if end < 0:
+                                    del pending[:start]
+                                    break
+                                command = bytes(pending[start + 3:end])
+                                del pending[:end + 2]
+                                control, _, data = command.partition(b";")
+                                fields = dict(item.split(b"=", 1) for item in control.split(b",") if b"=" in item)
+                                if fields.get(b"a") == b"t":
+                                    header, payload = fields, bytearray()
+                                if header is None:
+                                    continue
+                                payload.extend(data)
+                                if fields.get(b"m", b"0") != b"0":
+                                    continue
+                                raw = base64.b64decode(payload)
+                                if header.get(b"o") == b"z":
+                                    raw = zlib.decompress(raw)
+                                width, height = int(header[b"s"]), int(header[b"v"])
+                                pixel = raw[4 * ((height // 2) * width + width // 2):][:4]
+                                if len(pixel) == 4 and pixel[1:] == bytes((64, 128, 255)) and pixel[0]:
+                                    received.setdefault(pixel[0], {"at": at, "width": width,
+                                                                  "height": height, "payload_bytes": len(payload)})
+                                header = None
+                        assert report.exists(), f"native engine timed out: {label}"
+                        submitted = json.loads(report.read_text())
+                        assert not any(isinstance(e, str) or e.get("error") for e in submitted["events"])
+                        assert received, f"no benchmark frame reached client: {label}"
+                        after = api("pane.list", remote=is_remote)["render_performance"]
+                        rows = [{**item, **received[item["id"]],
+                                 "latency_ms": 1000 * (received[item["id"]]["at"] - item["at"])}
+                                for item in submitted["submitted"] if item["id"] in received]
+                        latencies = sorted(row["latency_ms"] for row in rows)
+                        start = submitted["submitted"][0]["at"]
+                        record = {"label": label, "submitted": len(submitted["submitted"]),
+                                  "received": len(rows), "fps_over_3s": len(rows) / 3,
+                                  "latency_p50_ms": latencies[len(latencies) // 2],
+                                  "latency_p95_ms": latencies[int(len(latencies) * 0.95)],
+                                  "width": rows[-1]["width"], "height": rows[-1]["height"],
+                                  "stdout_bytes_per_second": sum(n for at, n in chunks if start <= at < start + 3) / 3,
+                                  "render_delta": {key: after[key] - before[key] for key in (
+                                      "frames_sent", "full_frames_sent", "frame_bytes_sent", "frames_backpressured")}}
+                        summaries.append(record)
+                        (root / f"graphics-perf-{label}-received.json").write_text(json.dumps(rows))
+                        print("GRAPHICS_PERF: " + json.dumps(record), flush=True)
+                        drain(master)
+                (root / "graphics-perf-summary.json").write_text(json.dumps(summaries, indent=2))
+            return
 
         if theme_sync_only:
             process, master = start_client(["--session", "api"])
@@ -1863,8 +2117,9 @@ def main():
                 directory = state if name == "default" else state / "sessions" / name
                 assert directory.resolve().is_relative_to(state), name
                 run("--session", name, "remote-server-command", "stop", remote=remote, okay=False)
-        # Retain failure evidence; successful fixtures are disposable test data.
-        if sys.exc_info()[0] is None:
+        # Graphics checkpoints are replayed in real Kitty after owner teardown.
+        # Other successful fixtures are disposable; failures retain evidence.
+        if sys.exc_info()[0] is None and not graphics_only:
             assert_isolated(env)
             assert_isolated(remote_env)
             shutil.rmtree(root)
