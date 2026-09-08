@@ -58,15 +58,20 @@ You can also select and connect a configured SSH alias from the CLI:
 
 ```sh
 luvus host add devbox
-luvus host add devbox --install --json
+luvus host add devbox --install
+# Only after explicit installation authorization, for unattended automation:
+luvus host add devbox --install --yes --json
 ```
 
 `host add` saves the alias in the local managed-host selection and discovers
 existing remote sessions; it does not create a session. `--install` permits
-installation only if the compatible fork binary is missing. Alternatively,
-enable **Settings → Remote → Auto-install Luvus when selecting a host** before
+an installation offer only if the compatible fork binary is missing. Alternatively,
+enable **Settings → Remote → Offer Luvus installation when selecting a host** before
 selecting a host (or running `host add`). This policy defaults to **off**;
-changing it alone never starts installation. A failed host remains selected
+changing it alone never starts installation. Before any install/update, the UI
+asks whether to proceed for that specific host, with **Cancel** selected by
+default. The CLI asks `[y/N]`; non-interactive execution requires explicit
+`--install --yes`. The saved policy never bypasses confirmation. A failed host remains selected
 so its connection error can be inspected and retried.
 
 Installation runs the bundled fork installer via SSH. It detects the remote

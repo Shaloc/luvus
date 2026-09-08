@@ -20,6 +20,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import select
 import socket
 import shlex
@@ -69,6 +70,46 @@ def ssh_substitute():
     assert command and Path(command[0]).name == "luvus", command
     binary = Path(os.environ.get("LUVUS_SMOKE_REMOTE_BINARY", os.environ["LUVUS_SMOKE_BINARY"])).resolve()
     assert binary.is_relative_to(Path(__file__).resolve().parent.parent / "target") and binary.is_file(), binary
+    if os.environ.get("LUVUS_SMOKE_NETWORK_RECONNECT"):
+        kind = next((arg for arg in command if arg in ("remote-control-bridge", "remote-client-bridge")), None)
+        if kind:
+            with (root / "bridge-starts").open("a") as log:
+                log.write(json.dumps({"pid": os.getpid(), "kind": kind, "at": time.monotonic()}) + "\n")
+            marker = root / ("stall-next-" + kind)
+            try:
+                marker.unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                # One old connection remains open but sends no response, like
+                # a stale SSH pipe after a network change. Fresh SSH still works.
+                (root / "stalled-bridge").write_text(str(os.getpid()))
+                while True:
+                    signal.pause()
+            if kind == "remote-client-bridge":
+                try:
+                    (root / "stall-next-frame").unlink()
+                except FileNotFoundError:
+                    pass
+                else:
+                    # Finish Welcome/Ready, but black-hole the first frame.
+                    # The independent control channel remains fully usable.
+                    child = subprocess.Popen([str(binary), *command[1:]], stdin=sys.stdin, stdout=subprocess.PIPE)
+                    def exact(count):
+                        result = bytearray()
+                        while len(result) < count:
+                            chunk = child.stdout.read(count - len(result))
+                            assert chunk, "fixture handshake closed early"
+                            result.extend(chunk)
+                        return result
+                    for _ in range(2):
+                        header = exact(4)
+                        payload = exact(int.from_bytes(header, "little"))
+                        sys.stdout.buffer.write(header + payload)
+                        sys.stdout.buffer.flush()
+                    (root / "stalled-bridge").write_text(str(os.getpid()))
+                    while True:
+                        signal.pause()
     os.execv(str(binary), command)
 
 
@@ -79,8 +120,9 @@ def main():
     agent_focus_only = "--agent-focus-only" in sys.argv[1:]
     agent_seen_only = "--agent-seen-only" in sys.argv[1:]
     reconnect_only = "--reconnect-only" in sys.argv[1:]
+    network_reconnect_only = "--network-reconnect-only" in sys.argv[1:]
     theme_sync_only = "--theme-sync-only" in sys.argv[1:]
-    if reconnect_only:
+    if reconnect_only or network_reconnect_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -89,7 +131,7 @@ def main():
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -133,6 +175,8 @@ def main():
                LUVUS_SMOKE_ROOT=str(root), LUVUS_SMOKE_BINARY=str(binary),
                LUVUS_SMOKE_REMOTE_BINARY=str(remote_binary), DISPLAY=":smoke")
     env.pop("WAYLAND_DISPLAY", None)
+    if network_reconnect_only:
+        env["LUVUS_SMOKE_NETWORK_RECONNECT"] = "1"
     if clipboard_only:
         helper = Path(os.environ["LUVUS_TEST_KITTEN"]).resolve()
         assert helper.is_relative_to(repo / "target") and helper.is_file(), helper
@@ -391,7 +435,7 @@ def main():
                     screen.extend(os.read(master, 65536))
             assert process.poll() is None and b"luvus" in screen.lower(), screen[-1000:]
             assert b"\x1b[?1049h" in screen, "the fixture must observe the initial alternate-screen entry"
-            if reconnect_only:
+            if reconnect_only or network_reconnect_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -736,6 +780,45 @@ def main():
             assert saved_dir(False).exists()
             assert api("uhp.capabilities", remote=True)["server_generation"] == owner_generation
             print("PASS: unmerged remote stopped row: outside click cancels; confirmed Delete removes remote only", flush=True)
+            return
+
+        if network_reconnect_only:
+            run("session", "merge", "on")
+            wait_for(projected)
+            workspace = next(w for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
+            api("workspace.focus", {"workspace": workspace["workspace"]})
+            process, master = start_client(["--session", "api"])
+            drain(master, 1)
+            local_generation = api("uhp.capabilities")["server_generation"]
+            owner_generation = api("uhp.capabilities", remote=True)["server_generation"]
+            selected_pane = next(p["pane"] for p in api("pane.list", remote=True)["panes"] if p["focused"])
+            api("pane.run", {"pane": selected_pane, "command": "printf 'NETWORK_%s\\n' BASELINE"}, remote=True)
+            def visible(marker):
+                drain(master, 0.1)
+                return marker in "\n".join(client_terminals[master][0].display)
+            wait_for(lambda: visible("NETWORK_BASELINE"))
+            fault = os.environ.get("LUVUS_SMOKE_NETWORK_FAULT", "remote-control-bridge")
+            assert fault in ("remote-control-bridge", "remote-client-bridge", "frame")
+            (root / ("stall-next-" + fault)).touch()
+            starts = [json.loads(line) for line in (root / "bridge-starts").read_text().splitlines()]
+            # Only the currently live fixture topology bridge is interrupted.
+            topology = next(item for item in reversed(starts) if item["kind"] == "remote-control-bridge")
+            os.kill(topology["pid"], signal.SIGKILL)
+            wait_for(lambda: (root / "stalled-bridge").exists())
+            assert host_cli("pane", "list")["panes"], "fresh SSH must work while the old connection is stalled"
+            print(f"BASELINE: fresh SSH/control succeeds while reconnect {fault} remains open and silent", flush=True)
+            api("pane.run", {"pane": selected_pane, "command": "printf 'NETWORK_%s\\n' RECOVERED"}, remote=True)
+            started = time.monotonic()
+            deadline = started + 22
+            while time.monotonic() < deadline and not visible("NETWORK_RECOVERED"):
+                pass
+            assert visible("NETWORK_RECOVERED"), (
+                "fresh SSH works but Luvus remains Connecting after 22 seconds: " +
+                repr("\n".join(client_terminals[master][0].display)))
+            assert process.poll() is None
+            assert api("uhp.capabilities")["server_generation"] == local_generation
+            assert api("uhp.capabilities", remote=True)["server_generation"] == owner_generation
+            print(f"PASS: silent reconnect connection replaced in {time.monotonic() - started:.1f}s; existing client and owner survive", flush=True)
             return
 
         if reconnect_only:

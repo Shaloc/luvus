@@ -39,6 +39,7 @@ pub struct Catalog {
     pub language_sync_done: &'static str,
     pub language_sync_failed: &'static str,
     pub remote_auto_install: &'static str,
+    pub remote_install_prompt: &'static str,
     pub theme_sync_done: &'static str,
     pub theme_sync_failed: &'static str,
     pub focused_pane_metadata: &'static str,
@@ -127,7 +128,8 @@ pub struct Catalog {
 pub static EN: Catalog = Catalog {
     language_sync_done: "Language synchronized: {hosts}",
     language_sync_failed: "Language sync failed: {error}",
-    remote_auto_install: "Auto-install Luvus when selecting a host",
+    remote_auto_install: "Offer Luvus installation when selecting a host",
+    remote_install_prompt: "Remote machine `{host}` needs Luvus installed/updated. Proceed?",
     theme_sync_done: "Theme synchronized: {hosts}",
     theme_sync_failed: "Theme sync failed: {error}",
     focused_pane_metadata: "Current tab / pane",
@@ -300,7 +302,8 @@ pub static EN: Catalog = Catalog {
 pub static ES: Catalog = Catalog {
     language_sync_done: "Idioma sincronizado: {hosts}",
     language_sync_failed: "Error al sincronizar el idioma: {error}",
-    remote_auto_install: "Instalar Luvus al seleccionar un host",
+    remote_auto_install: "Ofrecer instalar Luvus al seleccionar un host",
+    remote_install_prompt: "La máquina remota `{host}` necesita instalar/actualizar Luvus. ¿Continuar?",
     theme_sync_done: "Tema sincronizado: {hosts}",
     theme_sync_failed: "Error al sincronizar el tema: {error}",
     focused_pane_metadata: "Pestaña / panel actual",
@@ -344,7 +347,8 @@ pub static ES: Catalog = Catalog {
 pub static PT: Catalog = Catalog {
     language_sync_done: "Idioma sincronizado: {hosts}",
     language_sync_failed: "Falha ao sincronizar o idioma: {error}",
-    remote_auto_install: "Instalar Luvus ao selecionar um host",
+    remote_auto_install: "Oferecer instalação do Luvus ao selecionar um host",
+    remote_install_prompt: "A máquina remota `{host}` precisa instalar/atualizar o Luvus. Continuar?",
     theme_sync_done: "Tema sincronizado: {hosts}",
     theme_sync_failed: "Falha ao sincronizar o tema: {error}",
     focused_pane_metadata: "Aba / painel atual",
@@ -386,7 +390,8 @@ pub static PT: Catalog = Catalog {
 pub static FR: Catalog = Catalog {
     language_sync_done: "Langue synchronisée : {hosts}",
     language_sync_failed: "Échec de la synchronisation de la langue : {error}",
-    remote_auto_install: "Installer Luvus à la sélection d’un hôte",
+    remote_auto_install: "Proposer Luvus à la sélection d’un hôte",
+    remote_install_prompt: "La machine distante `{host}` nécessite l’installation/la mise à jour de Luvus. Continuer ?",
     theme_sync_done: "Thème synchronisé : {hosts}",
     theme_sync_failed: "Échec de la synchronisation du thème : {error}",
     focused_pane_metadata: "Onglet / panneau actif",
@@ -428,7 +433,8 @@ pub static FR: Catalog = Catalog {
 pub static DE: Catalog = Catalog {
     language_sync_done: "Sprache synchronisiert: {hosts}",
     language_sync_failed: "Sprachsynchronisierung fehlgeschlagen: {error}",
-    remote_auto_install: "Luvus bei Host-Auswahl installieren",
+    remote_auto_install: "Luvus-Installation bei Host-Auswahl anbieten",
+    remote_install_prompt: "Auf dem Remote-Rechner `{host}` muss Luvus installiert/aktualisiert werden. Fortfahren?",
     theme_sync_done: "Design synchronisiert: {hosts}",
     theme_sync_failed: "Design-Synchronisierung fehlgeschlagen: {error}",
     focused_pane_metadata: "Aktueller Tab / Bereich",
@@ -470,7 +476,8 @@ pub static DE: Catalog = Catalog {
 pub static ID: Catalog = Catalog {
     language_sync_done: "Bahasa disinkronkan: {hosts}",
     language_sync_failed: "Sinkronisasi bahasa gagal: {error}",
-    remote_auto_install: "Instal Luvus saat memilih host",
+    remote_auto_install: "Tawarkan instalasi Luvus saat memilih host",
+    remote_install_prompt: "Mesin remote `{host}` memerlukan instalasi/pembaruan Luvus. Lanjutkan?",
     theme_sync_done: "Tema disinkronkan: {hosts}",
     theme_sync_failed: "Sinkronisasi tema gagal: {error}",
     focused_pane_metadata: "Tab / panel aktif",
@@ -640,7 +647,8 @@ pub static ID: Catalog = Catalog {
 pub static ZH: Catalog = Catalog {
     language_sync_done: "语言已同步：{hosts}",
     language_sync_failed: "语言同步失败：{error}",
-    remote_auto_install: "选择主机时自动安装 Luvus",
+    remote_auto_install: "选择主机时提示安装 Luvus",
+    remote_install_prompt: "远程机器 `{host}` 需要安装/更新 Luvus，是否执行？",
     theme_sync_done: "主题已同步：{hosts}",
     theme_sync_failed: "主题同步失败：{error}",
     focused_pane_metadata: "当前标签页 / 窗格",
@@ -806,7 +814,9 @@ pub static ZH: Catalog = Catalog {
 pub static JA: Catalog = Catalog {
     language_sync_done: "言語を同期しました：{hosts}",
     language_sync_failed: "言語の同期に失敗しました：{error}",
-    remote_auto_install: "ホスト選択時に Luvus を自動インストール",
+    remote_auto_install: "ホスト選択時に Luvus のインストールを提案",
+    remote_install_prompt:
+        "リモートマシン `{host}` に Luvus のインストール/更新が必要です。実行しますか？",
     theme_sync_done: "テーマを同期しました：{hosts}",
     theme_sync_failed: "テーマの同期に失敗しました：{error}",
     focused_pane_metadata: "現在のタブ / ペイン",
@@ -981,7 +991,8 @@ pub static JA: Catalog = Catalog {
 pub static KO: Catalog = Catalog {
     language_sync_done: "언어 동기화 완료: {hosts}",
     language_sync_failed: "언어 동기화 실패: {error}",
-    remote_auto_install: "호스트 선택 시 Luvus 자동 설치",
+    remote_auto_install: "호스트 선택 시 Luvus 설치 제안",
+    remote_install_prompt: "원격 머신 `{host}`에 Luvus 설치/업데이트가 필요합니다. 진행할까요?",
     theme_sync_done: "테마 동기화 완료: {hosts}",
     theme_sync_failed: "테마 동기화 실패: {error}",
     focused_pane_metadata: "현재 탭 / 창",

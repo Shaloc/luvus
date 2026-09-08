@@ -28,12 +28,14 @@ for scope, custom-theme requirements, and failure behavior.
 | **Modules** | installed extensions: enable/disable, action counts, load warnings |
 | **Integrations** | install/uninstall the per-agent session hook (Claude · Copilot · Codex · Antigravity · opencode · Kimi · Qoder CLI · Grok · Hermes · OMP) |
 | **Language** | the UI and human CLI information in 9 languages (en · es · pt · fr · de · id · zh · ja · ko), swapped live; command syntax, JSON, and UHP remain canonical |
-| **Remote** | selected SSH hosts, global same-name merge, and **Auto-install Luvus when selecting a host** (off by default) |
+| **Remote** | selected SSH hosts, global same-name merge, and **Offer Luvus installation when selecting a host** (off by default) |
 
 The automatic-install checkbox applies to subsequent explicit host selections,
 not to every SSH config entry or an already selected host. Enable it before
 checking a host; for a previously failed selection, deselect and select again.
-It installs a missing/incompatible fork binary on macOS ARM64 or Linux x86_64,
+It asks for confirmation before installing a missing/incompatible fork binary
+on macOS ARM64 or Linux x86_64. The dialog names the host and defaults to Cancel.
+Only an affirmative response starts installation,
 using checksummed `Shaloc/luvus` releases. Compatible installations are skipped.
 It does not restart servers. See [remote host setup](/docs/guides/remote/#managed-remote-sessions).
 

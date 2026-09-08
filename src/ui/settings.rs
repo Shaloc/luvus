@@ -103,6 +103,62 @@ pub(super) fn draw_settings(
     let inner = block.inner(modal);
     f.render_widget(block, modal);
 
+    if let Some(ui) = app
+        .settings
+        .as_ref()
+        .filter(|ui| !ui.remote_install_prompts.is_empty())
+    {
+        let prompt = app
+            .catalog
+            .settings
+            .remote_install_prompt
+            .replace("{host}", &ui.remote_install_prompts[0]);
+        let body = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(2),
+        );
+        f.render_widget(
+            Paragraph::new(prompt)
+                .style(Style::new().fg(t.text))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            body,
+        );
+        let mut ctls = Vec::new();
+        let width = inner.width / 2;
+        if inner.height > 0 {
+            for (index, label) in [app.catalog.settings.install, app.catalog.act_cancel]
+                .into_iter()
+                .enumerate()
+            {
+                let rect = Rect::new(inner.x + index as u16 * width, inner.bottom() - 1, width, 1);
+                let selected = (index == 0) == ui.remote_install_confirm;
+                let style = if selected {
+                    Style::new().fg(t.crust).bg(t.accent).bold()
+                } else {
+                    Style::new().fg(t.text)
+                };
+                f.render_widget(
+                    Paragraph::new(format!("[{label}]"))
+                        .style(style)
+                        .alignment(Alignment::Center),
+                    rect,
+                );
+                ctls.push((index, rect));
+            }
+        }
+        return SettingsHits {
+            modal,
+            close: Rect::default(),
+            tabs: Vec::new(),
+            ctls,
+            theme_remove: Vec::new(),
+            arrows: Vec::new(),
+            layout_scroll: 0,
+        };
+    }
+
     let (tab, cursor, layout_scroll) = app
         .settings
         .as_ref()

@@ -455,8 +455,11 @@ text or starts a process.
 
 `config.remote_auto_install` is a boolean, default `false`. Changing it through
 `config.patch` only saves owner-local policy and never installs a binary.
-Installation is admitted by a later explicit Settings host selection or local
-`luvus host add <alias> [--install]`; it is not a remote UHP operation.
+Installation is offered after a later explicit Settings host selection or local
+`luvus host add <alias> [--install]`. Each host requires an affirmative confirmation;
+the dialog and CLI prompt default to cancellation. Unattended CLI use must explicitly
+pass `--install --yes`; the saved policy never supplies that confirmation.
+Installation is not a remote UHP operation.
 Local Settings language and theme changes fan out to connected hosts' running
 owners through surgical `config.patch` requests. Incoming language/theme patches
 apply live and persist without rebroadcast or remote discovery.

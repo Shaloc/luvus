@@ -16,11 +16,18 @@ fn install_command(host: &str) -> Command {
     command
 }
 
-pub(crate) fn connect_host(host: &str, install: bool) -> Result<HostStatus, String> {
+pub(crate) fn connect_host(
+    host: &str,
+    install: bool,
+    confirm: impl FnOnce(&str) -> Result<bool, String>,
+) -> Result<HostStatus, String> {
     match inspect_remote_build(host)? {
         RemoteBuild::Compatible(_) => {}
         RemoteBuild::NeedsInstall(reason) if !install => return Err(reason),
-        RemoteBuild::NeedsInstall(_) => {
+        RemoteBuild::NeedsInstall(reason) => {
+            if !confirm(host)? {
+                return Err(reason);
+            }
             // Deselecting a host while its read-only preflight ran revokes
             // admission before installation starts. Once admitted, an install
             // is a bounded operation; disconnect does not roll it back.
@@ -48,7 +55,11 @@ pub(crate) fn connect_host(host: &str, install: bool) -> Result<HostStatus, Stri
     })
 }
 
-pub(crate) fn add_host(host: &str, install: bool) -> Result<HostStatus, String> {
+pub(crate) fn add_host(
+    host: &str,
+    install: bool,
+    confirm: impl FnOnce(&str) -> Result<bool, String>,
+) -> Result<HostStatus, String> {
     require_configured_host(host)?;
     let mut config = crate::config::load();
     let baseline = config.clone();
@@ -63,7 +74,7 @@ pub(crate) fn add_host(host: &str, install: bool) -> Result<HostStatus, String> 
     ) {
         return Err("could not save SSH host selection".into());
     }
-    let status = connect_host(host, install || config.remote_auto_install);
+    let status = connect_host(host, install || config.remote_auto_install, confirm);
     // Preserve the selection on failure so Settings shows the connection error.
     // Reload existing local owners only; never start a default/local namespace.
     let reload = reload_local_sessions(None);

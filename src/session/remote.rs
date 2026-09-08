@@ -109,13 +109,14 @@ pub struct HostStatus {
 /// User-triggered, bounded host discovery. Use the existing SSH preflight and
 /// local named-session inventory, never recursive remote discovery or SCP.
 pub fn discover_hosts() -> (RemoteRegistry, Vec<HostStatus>) {
-    discover_hosts_with_install(&HashSet::new())
+    discover_hosts_with_install(&HashSet::new(), &|_| false)
 }
 
 /// Only explicit host admission passes install candidates. Read-only inventory
 /// and reconnection retain `discover_hosts`, which cannot install anything.
 pub(crate) fn discover_hosts_with_install(
     install_hosts: &HashSet<String>,
+    confirm: &(dyn Fn(&str) -> bool + Sync),
 ) -> (RemoteRegistry, Vec<HostStatus>) {
     let mut registry = load_registry();
     let hosts = crate::config::load().remote_hosts;
@@ -131,7 +132,8 @@ pub(crate) fn discover_hosts_with_install(
                     .map(|host| {
                         scope.spawn(move || {
                             match if install_hosts.contains(host) {
-                                bootstrap::connect_host(host, true).map(|status| status.sessions)
+                                bootstrap::connect_host(host, true, |host| Ok(confirm(host)))
+                                    .map(|status| status.sessions)
                             } else {
                                 list_host_sessions(host)
                             } {
@@ -1406,6 +1408,52 @@ pub(crate) struct ConnectionScope {
     cancelled: Condvar,
 }
 
+/// A bound on an expected SSH protocol response, not an idle-stream timeout.
+/// Dropping it after negotiation wakes and retires the guard. Expiry kills
+/// only this bridge, so blocked pipe reads/writes return to the retry owner.
+pub(crate) struct ConnectionDeadline {
+    _cancel: std::sync::mpsc::Sender<()>,
+    expired: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ConnectionDeadline {
+    pub(crate) fn new(child: &Arc<Mutex<Child>>, timeout: Duration) -> Self {
+        let child = Arc::clone(child);
+        Self::on_expire(timeout, move || {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.kill();
+            }
+        })
+    }
+
+    pub(crate) fn on_expire(timeout: Duration, failure: impl FnOnce() + Send + 'static) -> Self {
+        let (cancel, done) = std::sync::mpsc::channel();
+        let expired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let timed_out = Arc::clone(&expired);
+        thread::spawn(move || {
+            if matches!(
+                done.recv_timeout(timeout),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                timed_out.store(true, Ordering::Release);
+                failure();
+            }
+        });
+        Self {
+            _cancel: cancel,
+            expired,
+        }
+    }
+
+    pub(crate) fn error(&self, operation: &str, error: impl std::fmt::Display) -> String {
+        if self.expired.load(Ordering::Acquire) {
+            format!("{operation} timed out")
+        } else {
+            error.to_string()
+        }
+    }
+}
+
 impl ConnectionScope {
     pub(crate) fn cancel(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -1494,6 +1542,10 @@ impl Drop for ControlConnection {
 }
 
 impl ControlConnection {
+    pub(crate) fn deadline(&self, timeout: Duration) -> ConnectionDeadline {
+        ConnectionDeadline::new(&self.child, timeout)
+    }
+
     pub(crate) fn in_scope(self, scope: &ConnectionScope) -> Result<Self, String> {
         scope.register(&self.child)?;
         Ok(self)
@@ -1545,7 +1597,7 @@ pub(crate) fn request_control_in_scope(
         location,
         &["--existing"],
     ))?;
-    request_on_control_in_scope(connection, method, params, timeout, response_limit, scope)
+    request_on_control_in_scope(connection, method, params, timeout, response_limit, &scope)
 }
 
 #[cfg(test)]
@@ -1562,21 +1614,21 @@ fn request_on_control(
         params,
         timeout,
         response_limit,
-        Arc::new(ConnectionScope::default()),
+        &ConnectionScope::default(),
     )
 }
 
-fn request_on_control_in_scope(
+pub(crate) fn request_on_control_in_scope(
     connection: ControlConnection,
     method: &str,
     params: serde_json::Value,
     timeout: Duration,
     response_limit: usize,
-    scope: Arc<ConnectionScope>,
+    scope: &ConnectionScope,
 ) -> Result<serde_json::Value, String> {
     use std::io::BufRead;
 
-    let mut connection = connection.in_scope(&scope)?;
+    let mut connection = connection.in_scope(scope)?;
     let child = Arc::clone(&connection.child);
     let request = serde_json::json!({"id":"remote-request","method":method,"params":params});
     let wire = format!("{request}\n");
@@ -1789,7 +1841,7 @@ mod tests {
             serde_json::json!({}),
             Duration::from_millis(20),
             1024,
-            Arc::clone(&scope),
+            &scope,
         );
         assert!(result.unwrap_err().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(1));
@@ -1802,7 +1854,7 @@ mod tests {
             serde_json::json!({}),
             Duration::from_secs(1),
             1024,
-            scope,
+            &scope,
         )
         .unwrap();
         assert_eq!(result["result"]["ok"], true);
@@ -1822,7 +1874,7 @@ mod tests {
             serde_json::json!({"patch":{"theme":"one-dark"}}),
             Duration::from_secs(3),
             1024,
-            scope,
+            &scope,
         );
         assert!(result.unwrap_err().contains("closed"));
         assert!(started.elapsed() < Duration::from_secs(1));

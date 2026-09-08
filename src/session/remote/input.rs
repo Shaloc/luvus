@@ -55,6 +55,13 @@ pub struct RemoteInput {
 }
 
 impl RemoteInput {
+    pub(crate) fn expect_frame(&self, timeout: Duration) -> super::ConnectionDeadline {
+        let failure = Arc::clone(&self.failure);
+        super::ConnectionDeadline::on_expire(timeout, move || {
+            failure("remote display frame timed out".into());
+        })
+    }
+
     pub(crate) fn spawn(
         writer: impl Write + Send + 'static,
         child: Arc<Mutex<Child>>,
@@ -485,4 +492,19 @@ mod tests {
             .send(ClientMessage::Paste("no replay".into()))
             .is_err());
     }
+}
+#[test]
+fn expected_frame_timeout_is_cancelled_on_delivery_and_does_not_poll_idle_input() {
+    let (failure, failed) = mpsc::channel();
+    let input = RemoteInput::with_writer(Vec::new(), Duration::from_secs(1), move |error| {
+        let _ = failure.send(error);
+    });
+    let delivered = input.expect_frame(Duration::from_millis(30));
+    drop(delivered);
+    assert!(failed.recv_timeout(Duration::from_millis(70)).is_err());
+    let _pending = input.expect_frame(Duration::from_millis(30));
+    assert_eq!(
+        failed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        "remote display frame timed out"
+    );
 }

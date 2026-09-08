@@ -559,9 +559,15 @@ fn draw_remote_view(
     f.render_widget(Block::new().style(Style::new().bg(t.mantle)), area);
     let Some(frame) = &view.frame else {
         let label = match (&view.state, &view.error) {
-            (crate::app::remote::RemoteViewState::Connecting, _) => format!(
-                "{} {} / {}…",
-                catalog.remote_connecting, view.target.host, view.target.session
+            (crate::app::remote::RemoteViewState::Connecting, error) => format!(
+                "{} {} / {}…{}",
+                catalog.remote_connecting,
+                view.target.host,
+                view.target.session,
+                error
+                    .as_ref()
+                    .map(|error| format!(" {error}"))
+                    .unwrap_or_default()
             ),
             (_, Some(error)) => format!("{}: {error}", catalog.remote_workspace_unavailable),
             _ => format!("{}…", catalog.remote_workspace_waiting),

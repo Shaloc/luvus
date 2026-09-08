@@ -23,6 +23,7 @@ use crate::session::remote::{RemoteBinaryLocation, RemoteInput, RemoteSession};
 
 const REMOTE_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const REMOTE_RETRY_MAX: Duration = Duration::from_secs(10);
+const REMOTE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) struct RemoteWatcher {
     target: RemoteSession,
@@ -207,6 +208,7 @@ pub struct RemoteDisplay {
 
 #[derive(Default)]
 pub struct RemoteProjection {
+    frame_deadline: Option<crate::session::remote::ConnectionDeadline>,
     display: RemoteDisplay,
     epoch: u64,
     active: bool,
@@ -443,6 +445,8 @@ impl App {
                         view.projection.frame_state = None;
                         view.state = RemoteViewState::Connecting;
                         if let Some(input) = &view.input {
+                            view.projection.frame_deadline =
+                                Some(input.expect_frame(REMOTE_RESPONSE_TIMEOUT));
                             let _ = input.send(ClientMessage::ProjectionInterest {
                                 epoch: view.projection.epoch,
                                 active: true,
@@ -516,6 +520,8 @@ impl App {
         let enabled_hosts = self.config.remote_hosts.clone();
         self.pending_remote_installs
             .retain(|host| enabled_hosts.contains(host) && self.config.remote_auto_install);
+        self.approved_remote_installs
+            .retain(|host| enabled_hosts.contains(host));
         self.retain_remote_sessions(|host, _| enabled_hosts.iter().any(|item| item == host));
         self.remote_host_status
             .retain(|status| enabled_hosts.contains(&status.host));
@@ -556,14 +562,28 @@ impl App {
             }
         }
         let tx = self.app_tx.clone();
-        let install_hosts = std::mem::take(&mut self.pending_remote_installs);
+        let mut install_hosts = std::mem::take(&mut self.pending_remote_installs);
+        let approved = std::mem::take(&mut self.approved_remote_installs);
+        install_hosts.extend(approved.iter().cloned());
+        let settings_generation = self.settings.as_ref().map(|ui| ui.generation.clone());
         // Serialize discovery/bootstrap batches. A new selection fences old UI
         // results but must not lose an in-progress install's completion or launch
         // a duplicate installer. On completion, re-probe the latest saved choice.
         self.remote_discovery_inflight = Some(generation);
         std::thread::spawn(move || {
             let (registry, hosts) =
-                crate::session::remote::discover_hosts_with_install(&install_hosts);
+                crate::session::remote::discover_hosts_with_install(&install_hosts, &|host| {
+                    if approved.contains(host) {
+                        return true;
+                    }
+                    if let Some(generation) = &settings_generation {
+                        let _ = tx.send(AppEvent::RemoteInstallNeeded {
+                            generation: generation.clone(),
+                            host: host.into(),
+                        });
+                    }
+                    false
+                });
             let _ = tx.send(AppEvent::RemoteRegistryLoaded {
                 generation,
                 registry,
@@ -770,6 +790,7 @@ impl App {
         for view in self.views.values_mut() {
             if let ViewKind::Remote(view) = view {
                 if view.target.host == target.host && view.target.session == target.session {
+                    view.projection.frame_deadline = None;
                     if let Some(input) = view.input.take() {
                         let _ = input.send(ClientMessage::Detach);
                     }
@@ -1272,6 +1293,7 @@ impl App {
         // while connecting may already have cached our desired size without
         // an input sender, so force it to be sent after this handshake.
         view.last_size = (0, 0);
+        view.projection.frame_deadline = None;
         let target = RemoteSession {
             host: view.target.host.clone(),
             session: view.target.session.clone(),
@@ -1322,6 +1344,7 @@ impl App {
                 }
                 view.projection.frame_state = Some(state);
             }
+            view.projection.frame_deadline = None;
             view.frame = Some(frame);
             view.state = RemoteViewState::Ready;
             view.error = None;
@@ -1342,6 +1365,7 @@ impl App {
         }
         view.state = RemoteViewState::Disconnected;
         view.input = None;
+        view.projection.frame_deadline = None;
         view.error = Some(error.clone());
         let target = RemoteSession {
             host: view.target.host.clone(),
@@ -1753,6 +1777,7 @@ impl App {
                 if let Some(ViewKind::Remote(view)) = self.views.get_mut(&previous) {
                     if view.projection.display.projection && view.projection.active {
                         view.projection.active = false;
+                        view.projection.frame_deadline = None;
                         view.projection.epoch = view.projection.epoch.saturating_add(1);
                         view.projection.frame_state = None;
                         if let Some(input) = &view.input {
@@ -1784,6 +1809,8 @@ impl App {
                     view.projection.frame_state = None;
                     view.state = RemoteViewState::Connecting;
                     view.last_size = size;
+                    view.projection.frame_deadline =
+                        Some(input.expect_frame(REMOTE_RESPONSE_TIMEOUT));
                     let _ = input.send(ClientMessage::ProjectionInterest {
                         epoch: view.projection.epoch,
                         active: true,
@@ -1869,18 +1896,15 @@ fn remote_snapshot_at(
     location: RemoteBinaryLocation,
     scope: &crate::session::remote::ConnectionScope,
 ) -> Result<RemoteSessionSnapshot, String> {
-    let mut connection =
-        crate::session::remote::connect_control_at(target, location)?.in_scope(scope)?;
-    writeln!(
+    let connection = crate::session::remote::connect_control_at(target, location)?;
+    let response = crate::session::remote::request_on_control_in_scope(
         connection,
-        "{}",
-        json!({"id":"remote-session-discovery","method":"session.snapshot","params":{}})
-    )
-    .map_err(|error| error.to_string())?;
-    let mut reader = BufReader::new(connection);
-    let response =
-        crate::ipc::api::read_response_frame(&mut reader).map_err(|error| error.to_string())?;
-    let response: Value = serde_json::from_str(&response).map_err(|error| error.to_string())?;
+        "session.snapshot",
+        json!({}),
+        REMOTE_RESPONSE_TIMEOUT,
+        crate::terminal::backend::MAX_FRAME_BYTES,
+        scope,
+    )?;
     parse_remote_snapshot(&response, location)
 }
 
@@ -2012,6 +2036,7 @@ fn watch_remote_session(
     loop {
         let mut connection =
             crate::session::remote::connect_control_at(target, location)?.in_scope(scope)?;
+        let deadline = connection.deadline(REMOTE_RESPONSE_TIMEOUT);
         writeln!(
             connection,
             "{}",
@@ -2023,8 +2048,9 @@ fn watch_remote_session(
         )
         .map_err(|error| error.to_string())?;
         let mut reader = BufReader::new(connection);
-        let response =
-            crate::ipc::api::read_response_frame(&mut reader).map_err(|error| error.to_string())?;
+        let response = crate::ipc::api::read_response_frame(&mut reader)
+            .map_err(|error| deadline.error("remote event subscription", error))?;
+        drop(deadline);
         let response: Value = serde_json::from_str(&response).map_err(|error| error.to_string())?;
         if let Some(error) = response.get("error") {
             if error.get("code").and_then(Value::as_str) == Some("resync_required") {
@@ -2184,6 +2210,8 @@ fn run_projection(
     };
     let diagnostics = crate::session::remote::BridgeDiagnostics::capture(stderr);
     let run = || -> Result<(), String> {
+        let deadline =
+            crate::session::remote::ConnectionDeadline::new(&child.0, REMOTE_RESPONSE_TIMEOUT);
         protocol::write_message(
             &mut input,
             &if display.projection {
@@ -2209,7 +2237,7 @@ fn run_projection(
         .map_err(|error| error.to_string())?;
         let mut output = BufReader::new(output);
         match protocol::read_message::<_, ServerMessage>(&mut output)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| deadline.error("remote display handshake", error))?
         {
             ServerMessage::Welcome { error: None, .. } => {}
             ServerMessage::Welcome {
@@ -2218,7 +2246,7 @@ fn run_projection(
             _ => return Err("unexpected remote projection handshake".to_string()),
         }
         let probe_terminal = match protocol::read_message::<_, ServerMessage>(&mut output)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| deadline.error("remote display negotiation", error))?
         {
             ServerMessage::Ready { probe_terminal } => probe_terminal,
             _ => return Err("unexpected remote projection negotiation".to_string()),
@@ -2227,6 +2255,7 @@ fn run_projection(
             protocol::write_message(&mut input, &ClientMessage::TerminalColors(None))
                 .map_err(|error| error.to_string())?;
         }
+        drop(deadline);
 
         let failed = app_tx.clone();
         let input_tx = RemoteInput::spawn(input, child.0.clone(), move |error| {
@@ -2458,6 +2487,12 @@ pub(crate) mod tests {
         let (input, receiver) = mpsc::channel();
         app.apply_remote_projection_ready(pane, 1, input.into());
         app.resize_active_remote_projection();
+        assert!(app
+            .remote_workspace_view(app.active_ws)
+            .unwrap()
+            .projection
+            .frame_deadline
+            .is_some());
         assert!(matches!(
             receiver.try_recv().unwrap(),
             ClientMessage::ProjectionInterest { epoch: 1, .. }
@@ -2482,6 +2517,12 @@ pub(crate) mod tests {
             &tx,
         );
         app.apply_remote_frame(pane, 1, &slot);
+        assert!(app
+            .remote_workspace_view(app.active_ws)
+            .unwrap()
+            .projection
+            .frame_deadline
+            .is_none());
         assert_eq!(
             app.remote_workspace_view(app.active_ws).unwrap().state,
             RemoteViewState::Ready

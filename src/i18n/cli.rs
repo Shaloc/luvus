@@ -155,6 +155,28 @@ static HELP: &[Translation] = &[
         "활성화 및 연결; --install로 포크 설치 허용"
     ),
     tr!(
+        "Remote machine `{host}` needs Luvus installed/updated. Proceed?",
+        "La máquina remota `{host}` necesita instalar/actualizar Luvus. ¿Continuar?",
+        "A máquina remota `{host}` precisa instalar/atualizar o Luvus. Continuar?",
+        "La machine distante `{host}` nécessite l’installation/la mise à jour de Luvus. Continuer ?",
+        "Auf dem Remote-Rechner `{host}` muss Luvus installiert/aktualisiert werden. Fortfahren?",
+        "Mesin remote `{host}` memerlukan instalasi/pembaruan Luvus. Lanjutkan?",
+        "远程机器 `{host}` 需要安装/更新 Luvus，是否执行？",
+        "リモートマシン `{host}` に Luvus のインストール/更新が必要です。実行しますか？",
+        "원격 머신 `{host}`에 Luvus 설치/업데이트가 필요합니다. 진행할까요?"
+    ),
+    tr!(
+        "Remote installation requires confirmation; run interactively or explicitly pass --install --yes.",
+        "La instalación remota requiere confirmación; ejecute de forma interactiva o indique --install --yes.",
+        "A instalação remota exige confirmação; execute interativamente ou passe --install --yes.",
+        "L’installation distante exige une confirmation ; exécutez en mode interactif ou indiquez --install --yes.",
+        "Die Remote-Installation erfordert eine Bestätigung; interaktiv ausführen oder --install --yes angeben.",
+        "Instalasi remote memerlukan konfirmasi; jalankan secara interaktif atau gunakan --install --yes.",
+        "远端安装需要确认；请交互执行，或明确传入 --install --yes。",
+        "リモートインストールには確認が必要です。対話的に実行するか --install --yes を明示してください。",
+        "원격 설치에는 확인이 필요합니다. 대화형으로 실행하거나 --install --yes를 명시하세요."
+    ),
+    tr!(
         "connected SSH host",
         "host SSH conectado",
         "host SSH conectado",

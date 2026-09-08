@@ -99,7 +99,9 @@ def host_admission_smoke(repo, root, binary, env):
     assert config["remote_hosts"] == ["denied", "fixture"] and config["language"] == "ja"
     run("session", "list", "--json")
     assert not (root / "installs").exists(), "read-only discovery installed a binary"
-    status = json.loads(run("host", "add", "fixture", "--install", "--json").stdout)
+    rejected = run("host", "add", "fixture", "--install", "--json", ok=False)
+    assert not installed.exists() and not (root / "installs").exists(), rejected.stdout
+    status = json.loads(run("host", "add", "fixture", "--install", "--yes", "--json").stdout)
     assert status["type"] == "host_added" and status["host"] == "fixture"
     assert installed.read_bytes() == binary.read_bytes()
     assert (root / "installs").read_text().splitlines() == ["fixture"]
@@ -108,7 +110,9 @@ def host_admission_smoke(repo, root, binary, env):
     installed.unlink()  # Only the validated fixture installation, never a production binary.
     config["remote_auto_install"] = True
     config_file.write_text(json.dumps(config))
-    run("host", "add", "fixture")
+    run("host", "add", "fixture", ok=False)
+    assert not installed.exists(), "saved policy bypassed confirmation"
+    run("host", "add", "fixture", "--install", "--yes")
     assert installed.read_bytes() == binary.read_bytes()
     assert len((root / "installs").read_text().splitlines()) == 2
     print("PASS: host add explicit admission, default-off, installed policy, auth/alias rejection, fallback, no server lifecycle")
@@ -145,12 +149,22 @@ def host_admission_smoke(repo, root, binary, env):
         drain(3)
         os.write(master, b"\x02=8")
         screen = drain(1)
-        assert b"Auto-install" in screen, "Remote policy was not rendered"
+        assert b"Offer Luvus" in screen, "Remote policy was not rendered"
         os.write(master, b"\x1b[B\r")
         drain(0.5)
         assert json.loads(config_file.read_text())["remote_auto_install"]
         assert not installed.exists(), "policy checkbox alone installed a binary"
         os.write(master, b"\x1b[B\x1b[B\r")  # Skip denied, select fixture in sorted SSH aliases.
+        prompt = drain(2)
+        assert b"needs Luvus installed/updated" in prompt, prompt
+        assert not installed.exists(), "host selection bypassed confirmation"
+        os.write(master, b"\r")  # Default is Cancel.
+        drain(0.5)
+        assert not installed.exists(), "default Enter installed without affirmative consent"
+        os.write(master, b"\r\r")  # Deselect/reselect explicitly to offer again.
+        prompt = drain(2)
+        assert b"needs Luvus installed/updated" in prompt, prompt
+        os.write(master, b"y")
         deadline = time.monotonic() + 12
         while time.monotonic() < deadline and not installed.exists():
             drain(0.2)
@@ -160,7 +174,7 @@ def host_admission_smoke(repo, root, binary, env):
         assert len((root / "installs").read_text().splitlines()) == 3
         assert pid_file.read_bytes() == pid_before and client.poll() is None
         assert not list((root / "remote-state").rglob("server.pid"))
-        print("PASS: real Settings checkbox only persists policy; selecting host installs, existing UI owner survives")
+        print("PASS: real Settings selection prompts, default Enter cancels, affirmative consent installs; existing UI owner survives")
     finally:
         if client is not None:
             client.terminate()

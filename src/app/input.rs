@@ -594,6 +594,10 @@ impl App {
                 self.apply_settings_remote_hosts_loaded(generation, result);
                 return true;
             }
+            AppEvent::RemoteInstallNeeded { generation, host } => {
+                self.offer_remote_install(generation, host);
+                return true;
+            }
             AppEvent::RemoteRegistryLoaded {
                 generation,
                 registry,
@@ -1327,6 +1331,7 @@ impl App {
             | AppEvent::RemoteRegistryLoaded { .. }
             | AppEvent::RemoteMergeChanged { .. }
             | AppEvent::SettingsRemoteHostsLoaded { .. }
+            | AppEvent::RemoteInstallNeeded { .. }
             | AppEvent::ClipboardImageReady { .. }
             | AppEvent::ClipboardHelperResult { .. }
             | AppEvent::RemoteSessionWatcherClosed { .. }

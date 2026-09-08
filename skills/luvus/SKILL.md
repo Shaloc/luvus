@@ -137,11 +137,14 @@ or bypass a disabled host with raw SSH. Selecting a host connects and discovers
 its sessions. Opening the switcher (or pressing `r`) refreshes discovery;
 there is no idle polling. Newly created remote sessions need no registration.
 
-`luvus host add <alias> [--install] [--json]` selects a human-specified SSH
+`luvus host add <alias> [--install [--yes]] [--json]` selects a human-specified SSH
 config alias locally and discovers sessions without starting an owner. Use
 `--install` only with installation authorization. The saved
-`remote_auto_install` policy (Settings → Remote, default `false`) also allows
-installation on subsequent explicit host selection or `host add`; enabling
+`remote_auto_install` policy (Settings → Remote, default `false`) also offers
+installation on subsequent explicit host selection or `host add`. A host-specific
+confirmation is mandatory before installation; UI/CLI prompts default to Cancel.
+For unattended execution, use `--install --yes` only after the user explicitly
+authorizes installation on that host. The saved policy is not confirmation. Enabling
 policy alone, listing, config reload, and reconnect never install. Installation
 uses checksummed `Shaloc/luvus` releases for macOS ARM64 or Linux x86_64,
 backs up and atomically replaces the user-local binary, skips compatible builds,

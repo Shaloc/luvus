@@ -393,7 +393,7 @@ sessions:
                              toggle global same-name session merging
 
 remote:
-  host add <ssh-alias> [--install] [--json]
+  host add <ssh-alias> [--install [--yes]] [--json]
                              enable and connect; --install allows fork installation
   --host <ssh-alias> [--session <name>] <command>
                              run server-backed CLI controls against the selected
@@ -896,8 +896,8 @@ fn write_topic_help_english(
             detailed_section("remote:\n", "\nserver:\n"),
         ),
         "host" => (
-            "luvus host add <ssh-alias> [--install] [--json]",
-            "  host add <ssh-alias> [--install] [--json]\n                             enable and connect; --install allows fork installation\n",
+            "luvus host add <ssh-alias> [--install [--yes]] [--json]",
+            "  host add <ssh-alias> [--install [--yes]] [--json]\n                             enable and connect; --install allows fork installation\n",
         ),
         "server" => (
             "luvus [--session <name>] server <command>",
@@ -1000,8 +1000,8 @@ fn detailed_section_to_end(start: &str) -> &'static str {
     &DETAILED_USAGE[start..]
 }
 
-fn parse_host_add(args: &[String]) -> Result<(&str, bool, bool)> {
-    const USAGE: &str = "usage: luvus host add <ssh-alias> [--install] [--json]";
+fn parse_host_add(args: &[String]) -> Result<(&str, bool, bool, bool)> {
+    const USAGE: &str = "usage: luvus host add <ssh-alias> [--install [--yes]] [--json]";
     if args.first().map(String::as_str) != Some("add") {
         return Err(anyhow!(USAGE));
     }
@@ -1009,18 +1009,23 @@ fn parse_host_add(args: &[String]) -> Result<(&str, bool, bool)> {
     crate::session::remote::validate_host_alias(host).map_err(anyhow::Error::msg)?;
     let mut install = false;
     let mut json = false;
+    let mut yes = false;
     for arg in &args[2..] {
         match arg.as_str() {
             "--install" if !install => install = true,
             "--json" if !json => json = true,
+            "--yes" if !yes => yes = true,
             _ => return Err(anyhow!(USAGE)),
         }
     }
-    Ok((host, install, json))
+    if yes && !install {
+        return Err(anyhow!(USAGE));
+    }
+    Ok((host, install, json, yes))
 }
 
 fn host_cmd(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
-    let (host, install, json_output) = parse_host_add(args)?;
+    let (host, install, json_output, yes) = parse_host_add(args)?;
     if crate::session::remote::process_target().is_some() {
         return session_error(
             "invalid_request",
@@ -1028,7 +1033,35 @@ fn host_cmd(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> 
             json_output,
         );
     }
-    match crate::session::remote::bootstrap::add_host(host, install) {
+    match crate::session::remote::bootstrap::add_host(host, install, |host| {
+        use std::io::{BufRead, IsTerminal, Write};
+        if yes {
+            return Ok(true);
+        }
+        if !std::io::stdin().is_terminal() {
+            return Err(context.text("Remote installation requires confirmation; run interactively or explicitly pass --install --yes.").into());
+        }
+        eprint!(
+            "{} [y/N] ",
+            context.render(
+                "Remote machine `{host}` needs Luvus installed/updated. Proceed?",
+                &[("host", host)]
+            )
+        );
+        std::io::stderr()
+            .flush()
+            .map_err(|error| error.to_string())?;
+        let mut line = String::new();
+        std::io::stdin()
+            .lock()
+            .take(128)
+            .read_line(&mut line)
+            .map_err(|error| error.to_string())?;
+        Ok(matches!(
+            line.trim().to_ascii_lowercase().as_str(),
+            "y" | "yes"
+        ))
+    }) {
         Ok(status) => {
             if json_output {
                 println!(
@@ -4505,14 +4538,18 @@ mod tests {
 
     #[test]
     fn host_add_parser_and_help_reject_ambiguous_admission() {
+        assert_eq!(
+            parse_host_add(&argv("add dev --install --yes --json")).unwrap(),
+            ("dev", true, true, true)
+        );
         assert!(is_cli(&argv("luvus host add dev --install")));
         assert_eq!(
             parse_host_add(&argv("add dev --json --install")).unwrap(),
-            ("dev", true, true)
+            ("dev", true, true, false)
         );
         assert_eq!(
             parse_host_add(&argv("add dev")).unwrap(),
-            ("dev", false, false)
+            ("dev", false, false, false)
         );
         for args in [
             "",

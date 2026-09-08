@@ -223,11 +223,14 @@ are allowed; the default list is empty. Never enable or connect every SSH
 config entry. Merge toggles and registration changes refresh a running local
 session, and disabling a host disconnects its projections without stopping
 remote panes.
-For an explicitly requested host, `luvus host add <alias> [--install] [--json]`
+For an explicitly requested host, `luvus host add <alias> [--install [--yes]] [--json]`
 selects the SSH config alias and discovers its sessions without starting an
 owner. `--install`, or the saved `remote_auto_install` policy (default false),
-permits installing a missing/incompatible fork binary during that explicit
-admission. It uses checksummed `Shaloc/luvus` releases for macOS ARM64 and Linux
+offers installation of a missing/incompatible fork binary during that explicit
+admission. Each host requires confirmation, defaulting to Cancel. For unattended
+execution, pass `--install --yes` only with the user's explicit authorization
+to install on that host; saved policy does not count as confirmation.
+It uses checksummed `Shaloc/luvus` releases for macOS ARM64 and Linux
 x86_64, preserves a backup, skips compatible builds, and never restarts a
 server. Treat installation authorization separately from connecting; do not
 enable the policy automatically. Listing, reload and reconnect never install.

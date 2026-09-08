@@ -61,6 +61,8 @@ impl SettingsTab {
 
 /// Transient state of the open Settings modal.
 pub struct SettingsUi {
+    pub remote_install_prompts: std::collections::VecDeque<String>,
+    pub remote_install_confirm: bool,
     pub generation: String,
     pub kitten_status: Option<crate::terminal::clipboard::kitten::Outcome>,
     pub kitten_installing: bool,
@@ -254,6 +256,8 @@ impl App {
     /// preselects the active palette, via `settings_set_tab`.
     pub fn open_settings(&mut self) {
         self.settings = Some(SettingsUi {
+            remote_install_prompts: Default::default(),
+            remote_install_confirm: false,
             generation: crate::ids::public_id("settings"),
             kitten_status: None,
             kitten_installing: false,
@@ -312,6 +316,7 @@ impl App {
 
     pub fn close_settings(&mut self) {
         self.settings = None;
+        self.pending_remote_installs.clear();
         self.module_setting_edit = None;
     }
 
@@ -353,6 +358,30 @@ impl App {
     }
 
     pub fn handle_settings_key(&mut self, key: KeyEvent) {
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|ui| !ui.remote_install_prompts.is_empty())
+        {
+            match key.code {
+                KeyCode::Char('y' | 'Y') => self.confirm_remote_install(true),
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => self.confirm_remote_install(false),
+                KeyCode::Enter => {
+                    let confirmed = self
+                        .settings
+                        .as_ref()
+                        .is_some_and(|ui| ui.remote_install_confirm);
+                    self.confirm_remote_install(confirmed);
+                }
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right => {
+                    if let Some(ui) = self.settings.as_mut() {
+                        ui.remote_install_confirm = !ui.remote_install_confirm;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         let Some((tab, cursor, capturing, prefix_candidate)) = self
             .settings
             .as_ref()
@@ -441,6 +470,25 @@ impl App {
     /// Route a click while the modal is open (close / switch tab / hit a control).
     pub fn handle_settings_click(&mut self, c: u16, r: u16) {
         let hit = |rect: Rect| c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom();
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|ui| !ui.remote_install_prompts.is_empty())
+        {
+            let selected = self
+                .settings_ctl_rects
+                .iter()
+                .find(|(_, rect)| hit(*rect))
+                .map(|(index, _)| *index);
+            if let Some(index) = selected {
+                self.confirm_remote_install(index == 0);
+            } else if self.settings_close_rect.is_some_and(hit)
+                || self.settings_modal_rect.is_some_and(|rect| !hit(rect))
+            {
+                self.confirm_remote_install(false);
+            }
+            return;
+        }
         if self.settings_close_rect.is_some_and(hit) {
             self.close_settings();
             return;
@@ -634,10 +682,52 @@ impl App {
         self.emit_event("config.changed", serde_json::json!({}));
     }
 
+    pub(super) fn offer_remote_install(&mut self, generation: String, host: String) {
+        if !self.config.remote_auto_install || !self.config.remote_hosts.contains(&host) {
+            return;
+        }
+        if let Some(ui) = self
+            .settings
+            .as_mut()
+            .filter(|ui| ui.generation == generation)
+        {
+            if !ui.remote_install_prompts.contains(&host) {
+                if ui.remote_install_prompts.is_empty() {
+                    self.settings_ctl_rects.clear();
+                    self.settings_tab_rects.clear();
+                }
+                ui.remote_install_prompts.push_back(host);
+            }
+        }
+    }
+
+    fn confirm_remote_install(&mut self, confirmed: bool) {
+        let Some(ui) = self.settings.as_mut() else {
+            return;
+        };
+        let Some(host) = ui.remote_install_prompts.pop_front() else {
+            return;
+        };
+        ui.remote_install_confirm = false;
+        self.settings_ctl_rects.clear();
+        if confirmed && self.config.remote_auto_install && self.config.remote_hosts.contains(&host)
+        {
+            self.approved_remote_installs.insert(host);
+            self.start_merged_remote_sessions();
+        }
+    }
+
     /// Mouse-wheel scroll in the open modal: nudge the selection a few rows so a
     /// long list (the Keys reference, the theme list) scrolls without holding the
     /// arrows. `dir` is -1 (up) or +1 (down).
     pub fn settings_scroll(&mut self, dir: i32) {
+        if self
+            .settings
+            .as_ref()
+            .is_some_and(|ui| !ui.remote_install_prompts.is_empty())
+        {
+            return;
+        }
         self.settings_move(dir * 3);
     }
 
@@ -1618,6 +1708,80 @@ mod tests {
             Ok(Status::Installed("kitten 0.48.2".into()))
         ));
         assert!(app.settings.as_ref().unwrap().kitten_status.is_none());
+    }
+
+    #[test]
+    fn remote_install_confirmation_defaults_to_cancel_and_rejects_stale_admission() {
+        let _env = crate::persist::test_env("remote-install-confirmation");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.config.remote_auto_install = true;
+        app.config.remote_hosts = vec!["fixture".into()];
+        app.open_settings();
+        let generation = app.settings.as_ref().unwrap().generation.clone();
+        app.offer_remote_install(generation.clone(), "fixture".into());
+        assert!(app.approved_remote_installs.is_empty());
+        app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            app.approved_remote_installs.is_empty(),
+            "Enter must cancel by default"
+        );
+        app.offer_remote_install(generation.clone(), "fixture".into());
+        app.config.remote_hosts.clear();
+        app.handle_settings_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(
+            app.approved_remote_installs.is_empty(),
+            "deselection revokes the prompt"
+        );
+        app.config.remote_hosts.push("fixture".into());
+        app.close_settings();
+        app.open_settings();
+        app.offer_remote_install(generation, "fixture".into());
+        assert!(
+            app.settings
+                .as_ref()
+                .unwrap()
+                .remote_install_prompts
+                .is_empty(),
+            "reopening Settings cannot accept an old offer"
+        );
+        let generation = app.settings.as_ref().unwrap().generation.clone();
+        app.offer_remote_install(generation, "fixture".into());
+        // Hold a read-only discovery lane to observe intent without any SSH.
+        app.remote_discovery_inflight = Some(app.remote_registry_generation);
+        app.handle_settings_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.approved_remote_installs.contains("fixture"));
+        assert!(app.remote_config_refresh_pending);
+    }
+
+    #[test]
+    fn remote_install_prompt_blocks_wheel_previews_and_preference_fanout() {
+        let _env = crate::persist::test_env("remote-install-wheel");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.config.remote_auto_install = true;
+        app.config.remote_hosts = vec!["fixture".into()];
+        app.open_settings();
+        // The user can change tabs while the off-loop host probe is running.
+        for tab in [SettingsTab::Theme, SettingsTab::Language] {
+            app.settings_set_tab(tab);
+            let generation = app.settings.as_ref().unwrap().generation.clone();
+            app.offer_remote_install(generation, "fixture".into());
+            let cursor = app.settings.as_ref().unwrap().cursor;
+            let theme = app.config.theme.clone();
+            let language = app.config.language.clone();
+            let theme_revision = app.theme_selection_revision;
+            let language_revision = app.remote_language_sync.revision;
+            app.settings_scroll(1);
+            app.settings_scroll(-1);
+            assert_eq!(app.settings.as_ref().unwrap().cursor, cursor);
+            assert_eq!(app.config.theme, theme);
+            assert_eq!(app.config.language, language);
+            assert_eq!(app.theme_selection_revision, theme_revision);
+            assert_eq!(app.remote_language_sync.revision, language_revision);
+            assert!(!app.settings.as_ref().unwrap().remote_install_confirm);
+            app.confirm_remote_install(false);
+        }
     }
 
     #[test]

@@ -2462,6 +2462,7 @@ pub struct App {
     remote_config_refresh_pending: bool,
     remote_discovery_inflight: Option<u64>,
     pending_remote_installs: std::collections::HashSet<String>,
+    approved_remote_installs: std::collections::HashSet<String>,
     pub(crate) remote_host_status: Vec<crate::session::remote::HostStatus>,
     remote_theme_sync: remote_settings::RemotePreferenceSync,
     remote_language_sync: remote_settings::RemotePreferenceSync,
@@ -3079,6 +3080,7 @@ impl App {
             remote_config_refresh_pending: false,
             remote_discovery_inflight: None,
             pending_remote_installs: std::collections::HashSet::new(),
+            approved_remote_installs: std::collections::HashSet::new(),
             remote_host_status: Vec::new(),
             remote_theme_sync: remote_settings::RemotePreferenceSync::default(),
             remote_language_sync: remote_settings::RemotePreferenceSync::default(),
@@ -3763,6 +3765,7 @@ impl App {
             remote_config_refresh_pending: false,
             remote_discovery_inflight: None,
             pending_remote_installs: std::collections::HashSet::new(),
+            approved_remote_installs: std::collections::HashSet::new(),
             remote_host_status: Vec::new(),
             remote_theme_sync: remote_settings::RemotePreferenceSync::default(),
             remote_language_sync: remote_settings::RemotePreferenceSync::default(),
@@ -14594,6 +14597,8 @@ mod tests {
             .position(|r| matches!(r, LayoutRow::Dock(k) if *k == DockKind::Workspaces))
             .unwrap();
         app.settings = Some(SettingsUi {
+            remote_install_prompts: Default::default(),
+            remote_install_confirm: false,
             generation: crate::ids::public_id("settings"),
             kitten_status: None,
             kitten_installing: false,
