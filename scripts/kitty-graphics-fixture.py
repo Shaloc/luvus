@@ -90,8 +90,15 @@ def upload_virtual():
 def virtual_markers(window=False, deleted=False, clear=True):
     # ED erases text, not virtual resources. Returning to the full window must
     # therefore work without another image upload.
+    # Keep the clear and new markers in one presented frame. Without BSU/ESU,
+    # a scheduler pause can present the empty screen, correctly evicting the
+    # display's visible-image cache and invalidating the reuse assertion.
+    os.write(1, b"\x1b[?2026h")
     if clear:
         os.write(1, b"\x1b[2J")
+        if window:
+            # Span render intervals, but stay below the 150 ms sync timeout.
+            time.sleep(0.05)
     h_off, v_off, cols, rows = (8, 4, 8, 4) if window else (0, 0, 16, 8)
     for position, image_id in enumerate(virtual_ids):
         if deleted and position == 0:
@@ -103,7 +110,7 @@ def virtual_markers(window=False, deleted=False, clear=True):
             os.write(1, (f"\x1b[{row + 2};{2 + position * 24}H"
                          + foreground + cells + "\x1b[0m").encode())
     receipt = "XXXXXXXX" if deleted else "WWWWWWWW" if window else "VVVVVVVV"
-    os.write(1, b"\x1b[20;1H" + receipt.encode())
+    os.write(1, b"\x1b[20;1H" + receipt.encode() + b"\x1b[?2026l")
 
 
 try:
