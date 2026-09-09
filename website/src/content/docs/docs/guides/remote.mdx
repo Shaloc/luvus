@@ -372,6 +372,13 @@ into its text grid. File and shared-memory queries return unsupported so tools
 such as terminal-browser can select inline transfer. No kitten helper is needed
 for rendering; the clipboard helper described above is a separate feature.
 
+Keyboard input also follows the child's negotiated Kitty modes. Applications
+requesting report-all plus associated text receive printable text in the key
+event, including case and Unicode, while shortcuts remain non-text events.
+This allows terminal-browser login fields to accept normal typing, not only
+paste. In managed remote panes the owner performs this encoding, so update
+the owner binary as well as the display machine when applying input fixes.
+
 Images are clipped to pane cells and compose with local and remote menus.
 Image-only updates retain the client's image IDs and do not resend unchanged
 text. `NO_COLOR` keeps ordinary text colorless while retaining the RGB metadata

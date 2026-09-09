@@ -3286,6 +3286,7 @@ impl App {
                         modes.application_cursor,
                         modes.disambiguate_escape_codes,
                         modes.report_all_keys_as_escape_codes,
+                        modes.report_associated_text,
                     ) {
                         pane.send(&bytes);
                     }
@@ -4324,6 +4325,7 @@ impl App {
                             modes.application_cursor,
                             modes.disambiguate_escape_codes,
                             modes.report_all_keys_as_escape_codes,
+                            modes.report_associated_text,
                         ) {
                             pane.send(&bytes);
                         }
@@ -4428,6 +4430,7 @@ impl App {
                     modes.application_cursor,
                     modes.disambiguate_escape_codes,
                     modes.report_all_keys_as_escape_codes,
+                    modes.report_associated_text,
                 ) {
                     if let Some(p) = self.focused() {
                         // Typing snaps the view back to the live bottom, so you
@@ -4558,7 +4561,7 @@ fn encode_key(
     app_cursor: bool,
     disambiguate: bool,
 ) -> Option<Vec<u8>> {
-    encode_key_with_modes(key, newline, app_cursor, disambiguate, false)
+    encode_key_with_modes(key, newline, app_cursor, disambiguate, false, false)
 }
 
 fn encode_key_with_modes(
@@ -4567,6 +4570,7 @@ fn encode_key_with_modes(
     app_cursor: bool,
     disambiguate: bool,
     report_all: bool,
+    report_text: bool,
 ) -> Option<Vec<u8>> {
     // AltGr arrives as Ctrl+Alt on Windows (`keys::is_ctrl_chord`) and types a
     // character — it is neither a Ctrl chord nor an `ESC`-prefixed Alt key.
@@ -4594,6 +4598,30 @@ fn encode_key_with_modes(
                 } else {
                     c
                 };
+                // Report-all replaces literal text with key events. A child
+                // requesting associated text (e.g. a browser) uses the third
+                // CSI-u field for insertion, not the unshifted key identity.
+                // Do not turn shortcuts or control characters into text.
+                if report_text
+                    && !c.is_control()
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL
+                            | KeyModifiers::ALT
+                            | KeyModifiers::SUPER
+                            | KeyModifiers::HYPER
+                            | KeyModifiers::META,
+                    )
+                {
+                    return Some(
+                        format!(
+                            "\x1b[{};{};{}u",
+                            u32::from(codepoint),
+                            key_modifier_param(key.modifiers),
+                            u32::from(c),
+                        )
+                        .into_bytes(),
+                    );
+                }
                 return Some(csi_u_char(codepoint, key.modifiers));
             } else if ctrl {
                 if disambiguate
@@ -4841,6 +4869,94 @@ fn csi_tilde_key(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negotiated_associated_text_reaches_focused_pane_input() {
+        use crate::terminal::pty::InputAction;
+
+        let _env = crate::persist::test_env("keyboard-associated-text");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        let (reply_tx, _reply_rx) = std::sync::mpsc::channel();
+        let pane = app.panes.get_mut(&focus).unwrap();
+        pane.engine = crate::terminal::vt::create_engine(
+            crate::terminal::vt::VtEngineKind::default(),
+            80,
+            24,
+            reply_tx,
+            64 * 1024,
+            crate::terminal::appearance::PaneAppearance::default(),
+        );
+        pane.replace_input_sender_for_test(input_tx);
+        // Same child negotiation as terminal-browser: report all keys and
+        // associated text. Exercise VTE -> Pane modes -> App -> PTY writer,
+        // not just a direct call to the encoder with manually supplied flags.
+        pane.engine.lock().unwrap().advance(b"\x1b[>31u");
+
+        for (character, modifiers, expected) in [
+            ('a', KeyModifiers::NONE, "\x1b[97;1;97u"),
+            ('A', KeyModifiers::SHIFT, "\x1b[97;2;65u"),
+            ('@', KeyModifiers::NONE, "\x1b[64;1;64u"),
+            (' ', KeyModifiers::NONE, "\x1b[32;1;32u"),
+            ('中', KeyModifiers::NONE, "\x1b[20013;1;20013u"),
+            ('É', KeyModifiers::SHIFT, "\x1b[233;2;201u"),
+            ('a', KeyModifiers::CONTROL, "\x1b[97;5u"),
+            ('a', KeyModifiers::ALT, "\x1b[97;3u"),
+            ('a', KeyModifiers::SUPER, "\x1b[97;9u"),
+            ('\u{85}', KeyModifiers::NONE, "\x1b[133u"),
+        ] {
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char(character),
+                modifiers,
+            )));
+            let InputAction::Bytes(bytes) = input_rx.try_recv().expect("forwarded key") else {
+                panic!("key must be an ordinary PTY write");
+            };
+            assert_eq!(bytes, expected.as_bytes(), "{character:?} {modifiers:?}");
+        }
+
+        // A repeated character still types; a release never duplicates it.
+        for (kind, expected) in [(KeyEventKind::Repeat, true), (KeyEventKind::Release, false)] {
+            app.handle_event(AppEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                kind,
+            )));
+            assert_eq!(input_rx.try_recv().is_ok(), expected);
+        }
+
+        // The alternate input route used when typing out of scroll mode must
+        // snapshot the same flags and deliver to this pane, not lose text.
+        app.scroll_pane = Some(focus);
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('z'),
+            KeyModifiers::NONE,
+        )));
+        let InputAction::Bytes(bytes) = input_rx.try_recv().unwrap() else {
+            panic!("PTY write")
+        };
+        assert_eq!(bytes, b"\x1b[122;1;122u");
+
+        // A child which did not request associated text keeps its old bytes;
+        // text-only mode without report-all must not change legacy text.
+        for (flags, expected) in [(8, b"\x1b[97u".as_slice()), (16, b"a"), (0, b"a")] {
+            app.panes[&focus]
+                .engine
+                .lock()
+                .unwrap()
+                .advance(format!("\x1b[={flags}u").as_bytes());
+            app.handle_event(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+            )));
+            let InputAction::Bytes(bytes) = input_rx.try_recv().unwrap() else {
+                panic!("PTY write")
+            };
+            assert_eq!(bytes, expected, "flags={flags}");
+        }
+    }
 
     #[test]
     fn task_prompt_paste_preserves_normalized_newlines() {
@@ -5421,6 +5537,7 @@ mod tests {
                 false,
                 disambiguate,
                 report_all,
+                false,
             )
         };
 
@@ -5486,6 +5603,7 @@ mod tests {
                 false,
                 disambiguate,
                 report_all,
+                false,
             )
         };
 

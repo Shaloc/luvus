@@ -509,6 +509,12 @@ pub trait VtEngine: Send {
     /// keys as escape sequences instead of their legacy bytes.
     fn report_all_keys_as_escape_codes(&self) -> bool;
 
+    /// Whether Kitty key events must include the text produced by the key.
+    /// This flag only affects encoding when report-all is also enabled.
+    fn report_associated_text(&self) -> bool {
+        false
+    }
+
     /// Whether the child also requested **drag/motion tracking** (1002/1003) —
     /// press-and-move events are forwarded only then, so a click-only (1000)
     /// app isn't spammed with motion it never asked for.

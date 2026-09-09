@@ -11,12 +11,24 @@ if (path.dirname(root) !== path.join(repo, 'target') ||
 const binding = require(process.env.LUVUS_TEST_PIXEL_BINDING);
 const engine = new binding.PixelEngine(undefined, undefined, {...process.env, TERM: 'xterm-kitty'});
 const events = [];
+if (process.argv[2] === '--keyboard') engine.setKeyEventTypes(true);
 engine.start((error, json) => {
   events.push(error ? String(error) : JSON.parse(json));
 });
 // Opt-in transport benchmark only. This drives the installed native engine,
 // not Chromium, and must not be reported as browser/display FPS.
-if (process.argv[2] === '--perf') {
+if (process.argv[2] === '--keyboard') {
+  const label = process.argv[3];
+  if (!['local', 'remote', 'direct'].includes(label)) throw new Error('invalid input test');
+  setTimeout(() => {
+    fs.writeFileSync(path.join(root, `keyboard-${label}-ready`), 'ready');
+  }, 500);
+  setTimeout(() => {
+    engine.stop();
+    fs.writeFileSync(path.join(root, `keyboard-${label}.json`), JSON.stringify(events));
+    process.exit(0);
+  }, 3000);
+} else if (process.argv[2] === '--perf') {
   const fps = Number(process.argv[3]);
   const label = process.argv[4];
   if (![30, 60].includes(fps) || !/^(local|remote)-(30|60)$/.test(label)) {

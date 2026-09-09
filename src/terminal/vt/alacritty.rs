@@ -1145,6 +1145,10 @@ impl VtEngine for AlacrittyEngine {
         self.term.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
     }
 
+    fn report_associated_text(&self) -> bool {
+        self.term.mode().contains(TermMode::REPORT_ASSOCIATED_TEXT)
+    }
+
     fn mouse_drag(&self) -> bool {
         self.term
             .mode()
@@ -2462,23 +2466,32 @@ mod tests {
         assert!(!e.disambiguate_escape_codes());
         assert!(!e.report_all_keys_as_escape_codes());
 
+        assert!(!e.report_associated_text());
         e.advance(b"\x1b[>1u");
         assert!(e.disambiguate_escape_codes());
         assert!(!e.report_all_keys_as_escape_codes());
 
-        e.advance(b"\x1b[=8u");
+        e.advance(b"\x1b[>24u");
         assert!(!e.disambiguate_escape_codes());
         assert!(e.report_all_keys_as_escape_codes());
+        assert!(e.report_associated_text());
 
         e.set_history_budget(budget_for_rows(20, 1_000));
         assert!(
             e.report_all_keys_as_escape_codes(),
             "changing scrollback settings must not disable the child keyboard protocol"
         );
+        assert!(e.report_associated_text());
 
+        e.advance(b"\x1b[>8u");
+        assert!(!e.report_associated_text());
         e.advance(b"\x1b[<u");
+        assert!(e.report_associated_text(), "pop restores the parent flags");
+
+        e.advance(b"\x1b[<2u");
         assert!(!e.disambiguate_escape_codes());
         assert!(!e.report_all_keys_as_escape_codes());
+        assert!(!e.report_associated_text());
     }
 
     #[test]

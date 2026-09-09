@@ -80,6 +80,7 @@ pub struct KeyEncodingModes {
     pub application_cursor: bool,
     pub disambiguate_escape_codes: bool,
     pub report_all_keys_as_escape_codes: bool,
+    pub report_associated_text: bool,
 }
 
 /// A pane app's mouse-tracking state (all four DECSET-derived flags in one
@@ -1071,6 +1072,7 @@ impl Pane {
                 application_cursor: e.application_cursor(),
                 disambiguate_escape_codes: e.disambiguate_escape_codes(),
                 report_all_keys_as_escape_codes: e.report_all_keys_as_escape_codes(),
+                report_associated_text: e.report_associated_text(),
             })
             .unwrap_or_default()
     }

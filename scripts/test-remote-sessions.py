@@ -635,6 +635,36 @@ def main():
                 drain(master)
                 print("PASS: installed terminal-browser native PixelEngine negotiates direct zlib canvas inside a Luvus PTY", flush=True)
 
+            def check_keyboard(pane, label, remote=False):
+                if not env.get("LUVUS_TEST_PIXEL_BINDING"):
+                    return
+                run("--session", "api", "pane", "run", str(pane),
+                    shlex.join(["node", str(repo / "scripts/kitty-pixel-fixture.cjs"),
+                                "--keyboard", label]), remote=remote)
+                try:
+                    wait_for(lambda: (root / f"keyboard-{label}-ready").exists())
+                except AssertionError as error:
+                    raise AssertionError(f"native keyboard setup {label}: "
+                                         f"{api('pane.read', {'pane': pane}, remote=remote)}") from error
+                drain(master, 0.1)
+                # Normal text travels through crossterm and both Luvus input
+                # owners, not pane.send_input (which bypasses key encoding).
+                os.write(master, "aA@中".encode())
+                os.write(master, b"\x01\x7f")  # Ctrl+A and Backspace are not text.
+                os.write(master, b"\x1b[200~pasted\x1b[201~")
+                wait_for(lambda: (root / f"keyboard-{label}.json").exists())
+                events = json.loads((root / f"keyboard-{label}.json").read_text())
+                assert not any(isinstance(e, str) or e.get("error") for e in events), events
+                keys = [e for e in events if e.get("type") == "key"]
+                assert "".join(e.get("text") or "" for e in keys) == "aA@中", events
+                assert any(e.get("key") == "a" and e["mods"]["ctrl"] for e in keys), events
+                assert any(e.get("key") == "backspace" for e in keys), events
+                assert any(e.get("type") == "paste" and e.get("text") == "pasted" for e in events), events
+                drain(master)
+                print(f"PASS: {label} native browser keyboard receives ASCII, case, Unicode, shortcuts and paste via the thin client", flush=True)
+
+            check_keyboard(local_pane, "local")
+
             run("session", "merge", "on")
             wait_for(projected)
             remote_workspace = next(w["workspace"] for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
@@ -660,6 +690,7 @@ def main():
             checkpoint("remote-exit", [0, 255, 0], False)
             assert process.poll() is None
             print("PASS: local modal remains operable over remote graphics; update and cleanup stay owner-scoped", flush=True)
+            check_keyboard(remote_pane, "remote", remote=True)
             print(f"Kitty visual checkpoints: {root}", flush=True)
             if os.environ.get("LUVUS_TEST_PIXEL_PERF") == "1":
                 assert env.get("LUVUS_TEST_PIXEL_BINDING"), "native PixelEngine required"
@@ -747,6 +778,14 @@ def main():
                         print("GRAPHICS_PERF: " + json.dumps(record), flush=True)
                         drain(master)
                 (root / "graphics-perf-summary.json").write_text(json.dumps(summaries, indent=2))
+            if env.get("LUVUS_TEST_PIXEL_BINDING"):
+                run("session", "merge", "off")
+                wait_for(lambda: not projected())
+                process.terminate()
+                process.wait(timeout=5)
+                process, master = start_client(["session", "attach", "remote-fake-dev-api"])
+                drain(master)
+                check_keyboard(remote_pane, "direct", remote=True)
             return
 
         if theme_sync_only:
