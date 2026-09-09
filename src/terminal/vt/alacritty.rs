@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell as VtCell, Flags};
+use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::term::{ClipboardType, Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{Color as VtColor, NamedColor, Processor, Rgb};
 
@@ -54,9 +55,13 @@ impl EventListener for EventProxy {
                 let _ = self.tx.send(InputAction::Bytes(text.into_bytes()));
             }
             Event::ColorRequest(index, format) => {
-                if index == NamedColor::Background as usize {
-                    if let Ok(appearance) = self.appearance.lock() {
-                        let [r, g, b] = appearance.background;
+                if let Ok(appearance) = self.appearance.lock() {
+                    let rgb = match index {
+                        i if i == NamedColor::Foreground as usize => appearance.foreground,
+                        i if i == NamedColor::Background as usize => appearance.background,
+                        _ => None,
+                    };
+                    if let Some([r, g, b]) = rgb {
                         let _ = self
                             .tx
                             .send(InputAction::Bytes(format(Rgb { r, g, b }).into_bytes()));
@@ -329,8 +334,8 @@ impl AlacrittyEngine {
                 continue;
             }
             let next_style = (
-                map_color(cell.fg),
-                map_color(cell.bg),
+                map_foreground(cell, self.term.colors()),
+                map_color(cell.bg, self.term.colors()),
                 map_flags(cell.flags),
             );
             let style_code =
@@ -406,6 +411,17 @@ impl VtEngine for AlacrittyEngine {
     }
 
     fn advance(&mut self, bytes: &[u8]) {
+        let graphics_generation = self.term.graphics.generation();
+        self.parser.advance(&mut self.term, bytes);
+        let terminal_activity = self.parser.terminal_activity();
+        if terminal_activity || graphics_generation != self.term.graphics.generation() {
+            self.output_generation = self.output_generation.wrapping_add(1);
+        }
+        // Buffered escape/image payloads and graphics-only commands cannot
+        // change scrollback. Do not re-arm compaction or invalidate its cache.
+        if !terminal_activity {
+            return;
+        }
         // If output interrupts a partial pass, its packed frontier is no longer
         // proof that all older rows are packed. Otherwise retain the O(1)
         // already-packed frontier fast path for ordinary quiet output.
@@ -417,8 +433,6 @@ impl VtEngine for AlacrittyEngine {
         self.history_maintenance_cursors = [0; 2];
         self.history_maintenance_pending = true;
         self.history_metrics_cache.set(None);
-        self.parser.advance(&mut self.term, bytes);
-        self.output_generation = self.output_generation.wrapping_add(1);
     }
 
     fn take_clipboard(&mut self) -> Option<String> {
@@ -558,8 +572,8 @@ impl VtEngine for AlacrittyEngine {
                 indexed.point.column.0 as u16,
                 sym,
                 RenderCell {
-                    fg: map_color(cell.fg),
-                    bg: map_color(cell.bg),
+                    fg: map_foreground(cell, self.term.colors()),
+                    bg: map_color(cell.bg, self.term.colors()),
                     mods: map_flags(cell.flags),
                 },
             );
@@ -623,8 +637,8 @@ impl VtEngine for AlacrittyEngine {
                     continue;
                 }
                 let style = RenderCell {
-                    fg: map_color(cell.fg),
-                    bg: map_color(cell.bg),
+                    fg: map_foreground(cell, self.term.colors()),
+                    bg: map_color(cell.bg, self.term.colors()),
                     mods: map_flags(cell.flags),
                 };
                 if let Some(damage_cell) = damaged_row.cells.get_mut(used) {
@@ -1198,8 +1212,8 @@ impl VtEngine for AlacrittyEngine {
                 !cell.flags.contains(Flags::WIDE_CHAR_SPACER)
                     && (cell.c != ' ' && cell.c != '\0'
                         || cell.zerowidth().is_some_and(|chars| !chars.is_empty())
-                        || map_color(cell.fg) != Color::Reset
-                        || map_color(cell.bg) != Color::Reset
+                        || map_foreground(cell, self.term.colors()) != Color::Reset
+                        || map_color(cell.bg, self.term.colors()) != Color::Reset
                         || !map_flags(cell.flags).is_empty())
             });
             let Some(last) = last else { continue };
@@ -1214,8 +1228,8 @@ impl VtEngine for AlacrittyEngine {
                     continue;
                 }
                 let style = (
-                    map_color(cell.fg),
-                    map_color(cell.bg),
+                    map_foreground(cell, self.term.colors()),
+                    map_color(cell.bg, self.term.colors()),
                     map_flags(cell.flags),
                 );
                 if style != cur {
@@ -1270,7 +1284,32 @@ fn push_color(s: &mut String, c: Color, base: u8) {
     }
 }
 
-fn map_color(c: VtColor) -> Color {
+fn map_foreground(cell: &VtCell, colors: &Colors) -> Color {
+    if cell.c == crate::terminal::graphics::MARKER {
+        // Kitty encodes image identity in the foreground of Unicode
+        // placeholders. Palette changes must not rewrite those protocol bits.
+        raw_color(cell.fg)
+    } else {
+        map_color(cell.fg, colors)
+    }
+}
+
+fn map_color(c: VtColor, colors: &Colors) -> Color {
+    // OSC overrides belong to this pane, not to the displaying terminal. Resolve
+    // them before both full/damage projection and ANSI capture. Leave unmodified
+    // defaults as Reset so the Terminal theme retains background transparency.
+    let index = match c {
+        VtColor::Spec(_) => None,
+        VtColor::Indexed(i) => Some(i as usize),
+        VtColor::Named(n) => Some(n as usize),
+    };
+    if let Some(rgb) = index.and_then(|index| colors[index]) {
+        return Color::Rgb(rgb.r, rgb.g, rgb.b);
+    }
+    raw_color(c)
+}
+
+fn raw_color(c: VtColor) -> Color {
     match c {
         VtColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
         VtColor::Indexed(i) => Color::Indexed(i),
@@ -1630,8 +1669,14 @@ mod tests {
                     let actual = &replay.term.grid()[point];
                     assert_eq!(actual.c, expected.c, "{cols}: {point:?}");
                     assert_eq!(actual.zerowidth(), expected.zerowidth());
-                    assert_eq!(map_color(actual.fg), map_color(expected.fg));
-                    assert_eq!(map_color(actual.bg), map_color(expected.bg));
+                    assert_eq!(
+                        map_color(actual.fg, replay.term.colors()),
+                        map_color(expected.fg, source.term.colors())
+                    );
+                    assert_eq!(
+                        map_color(actual.bg, replay.term.colors()),
+                        map_color(expected.bg, source.term.colors())
+                    );
                     assert_eq!(map_flags(actual.flags), map_flags(expected.flags));
                 }
             }
@@ -1981,6 +2026,127 @@ mod tests {
         assert_eq!(e.history_len(), 20);
         assert_eq!(metrics.packed_blocks, Some(0));
         assert_eq!(metrics.packed_rows, Some(0));
+    }
+
+    #[test]
+    fn incomplete_graphics_upload_does_not_publish_terminal_output() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(20, 5, tx, budget_for_rows(20, 20));
+        engine.set_cell_pixels(8, 16);
+        engine.finish_output_batch();
+        assert!(engine.acknowledge_damage(engine.output_generation()));
+        let initial_damage = engine.damage_snapshot();
+        let cursor_rows = initial_damage.rows.len();
+        engine.recycle_damage_snapshot(initial_damage);
+        // Separate protocol chunks and arbitrary PTY read boundaries. Neither
+        // has changed the composed image until the final transfer completes.
+        for byte in b"\x1b_Ga=T,i=7,f=32,s=1,v=1,C=1,q=2,m=1;AAAA\x1b\\" {
+            engine.advance(&[*byte]);
+            assert_eq!(
+                engine.output_generation(),
+                0,
+                "incomplete upload woke rendering"
+            );
+            assert!(!engine.history_maintenance_pending());
+        }
+        assert!(engine.graphics().is_none());
+        let damage = engine.damage_snapshot();
+        assert_eq!(damage.kind, DamageKind::Partial);
+        assert_eq!(
+            damage.rows.len(),
+            cursor_rows,
+            "only the existing cursor is damaged"
+        );
+        engine.recycle_damage_snapshot(damage);
+
+        engine.advance(b"\x1b_Gm=0,q=2;AA==\x1b\\");
+        assert_eq!(engine.output_generation(), 1);
+        assert_eq!(engine.graphics().unwrap().1.len(), 1);
+        assert_eq!(engine.damage_snapshot().kind, DamageKind::Full);
+    }
+
+    #[test]
+    fn synchronized_graphics_frame_wakes_only_when_committed() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(20, 5, tx, budget_for_rows(20, 20));
+        engine.set_cell_pixels(8, 16);
+        engine.finish_output_batch();
+        // terminal-browser opens 2026 and positions the cursor before its
+        // chunked image. No frame is ready until ESU commits the buffered data.
+        for part in [
+            b"\x1b[?2026h\x1b[H".as_slice(),
+            b"\x1b_Ga=T,i=7,f=32,s=1,v=1,C=1,q=2,m=1;AAAA\x1b\\",
+            b"\x1b_Gm=0,q=2;AA==\x1b\\",
+        ] {
+            engine.advance(part);
+            assert_eq!(engine.output_generation(), 0);
+            assert!(!engine.history_maintenance_pending());
+            assert!(engine.graphics().is_none());
+        }
+        engine.advance(b"\x1b[?2026l");
+        assert_eq!(engine.output_generation(), 1);
+        assert_eq!(engine.graphics().unwrap().1.len(), 1);
+    }
+
+    #[test]
+    fn graphics_queries_and_rejected_commands_reply_without_rendering() {
+        let (tx, rx) = channel();
+        let mut engine = AlacrittyEngine::new(20, 5, tx, budget_for_rows(20, 20));
+        engine.set_cell_pixels(8, 16);
+        for (command, reply) in [
+            (b"\x1b_Ga=q,i=7,f=24,s=1,v=1;AAAA\x1b\\".as_slice(), "OK"),
+            (b"\x1b_Ga=q,i=7,t=f;AAAA\x1b\\".as_slice(), "ENOTSUP"),
+            (
+                b"\x1b_Ga=T,i=7,f=32,s=1,v=1;AAAA\x1b\\".as_slice(),
+                "EINVAL",
+            ),
+        ] {
+            // q=0 requests the response without adding any screen content.
+            let command = String::from_utf8(command.to_vec())
+                .unwrap()
+                .replace("i=7,", "i=7,q=0,");
+            for byte in command.bytes() {
+                engine.advance(&[byte]);
+            }
+            let response = match rx.try_recv().expect("query reply") {
+                crate::terminal::pty::InputAction::Bytes(bytes) => bytes,
+                _ => panic!("expected terminal response bytes"),
+            };
+            assert!(String::from_utf8(response).unwrap().contains(reply));
+            assert_eq!(engine.output_generation(), 0);
+            assert!(engine.graphics().is_none());
+        }
+    }
+
+    #[test]
+    fn graphics_buffering_preserves_interleaved_terminal_effects() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(20, 5, tx, budget_for_rows(20, 20));
+        engine.set_cell_pixels(8, 16);
+        engine.advance(b"\x1b_Ga=T,i=7,f=32,s=1,v=1,C=1,q=2,m=1;AAAA\x1b\\");
+        assert_eq!(engine.output_generation(), 0);
+        for output in [
+            "hello 界".as_bytes(),
+            b"\x1b]2;browser title\x07",
+            b"\x1b]52;c;Y29weQ==\x1b\\",
+            b"\x1b[>24u\x1b[?1000h\x1b[2;3H",
+        ] {
+            let before = engine.output_generation();
+            for byte in output {
+                engine.advance(&[*byte]);
+            }
+            assert!(engine.output_generation() > before);
+        }
+        assert_eq!(engine.take_clipboard().as_deref(), Some("copy"));
+        assert!(engine.report_associated_text());
+        assert_eq!((engine.cursor().x, engine.cursor().y), (2, 1));
+        let generation = engine.output_generation();
+        engine.advance(b"\x1b_Gm=0,q=2;AA==\x1b\\");
+        assert_eq!(engine.output_generation(), generation + 1);
+        assert_eq!(engine.graphics().unwrap().1.len(), 1);
+        engine.advance(b"\x1b_Ga=d,d=I,i=7,q=2;\x1b\\");
+        assert_eq!(engine.output_generation(), generation + 2);
+        assert!(engine.graphics().is_none());
     }
 
     #[test]
@@ -2655,7 +2821,11 @@ mod tests {
         scheme: ColorScheme,
     ) -> (AlacrittyEngine, std::sync::mpsc::Receiver<InputAction>) {
         let (tx, rx) = channel();
-        let appearance = PaneAppearance { background, scheme };
+        let appearance = PaneAppearance {
+            background: Some(background),
+            scheme,
+            ..PaneAppearance::default()
+        };
         let engine =
             AlacrittyEngine::with_appearance(40, 5, tx, budget_for_rows(40, 20), appearance);
         (engine, rx)
@@ -2686,6 +2856,134 @@ mod tests {
     }
 
     #[test]
+    fn default_color_probe_returns_both_colors_on_a_light_pane() {
+        let (mut engine, rx) = appearance_engine([0xf5, 0xf5, 0xf6], ColorScheme::Light);
+        engine.set_appearance(PaneAppearance {
+            foreground: Some([0x38, 0x3a, 0x42]),
+            background: Some([0xf5, 0xf5, 0xf6]),
+            scheme: ColorScheme::Light,
+        });
+        engine.advance(b"\x1b]10;?\x07\x1b]11;?\x07");
+        assert_eq!(recv_bytes(&rx), b"\x1b]10;rgb:3838/3a3a/4242\x07");
+        assert_eq!(recv_bytes(&rx), b"\x1b]11;rgb:f5f5/f5f5/f6f6\x07");
+        engine.advance(b"\x1b]10;?;?\x1b\\");
+        assert_eq!(recv_bytes(&rx), b"\x1b]10;rgb:3838/3a3a/4242\x1b\\");
+        assert_eq!(recv_bytes(&rx), b"\x1b]11;rgb:f5f5/f5f5/f6f6\x1b\\");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn indexed_theme_query_does_not_invent_host_palette_colors() {
+        let (mut engine, rx) = appearance_engine([0, 0, 0], ColorScheme::Dark);
+        engine.set_appearance(PaneAppearance::resolve(
+            Color::Indexed(196),
+            Color::Indexed(244),
+            crate::theme::format::Appearance::Dark,
+            None,
+        ));
+        engine.advance(b"\x1b]10;?\x07\x1b]11;?\x07");
+        assert_eq!(recv_bytes(&rx), b"\x1b]10;rgb:ffff/0000/0000\x07");
+        assert_eq!(recv_bytes(&rx), b"\x1b]11;rgb:8080/8080/8080\x07");
+        engine.set_appearance(PaneAppearance::resolve(
+            Color::Indexed(2),
+            Color::Indexed(7),
+            crate::theme::format::Appearance::Light,
+            None,
+        ));
+        engine.advance(b"\x1b]10;?\x07\x1b]11;?\x07");
+        assert!(
+            rx.try_recv().is_err(),
+            "unknown host palette must not masquerade as default RGB"
+        );
+    }
+
+    #[test]
+    fn osc_palette_does_not_rewrite_placeholder_identity_in_damage_or_capture() {
+        let (mut engine, _rx) = appearance_engine([0, 0, 0], ColorScheme::Dark);
+        let marker = "\x1b[38;5;7m\u{10eeee}\u{0305}\u{0305}";
+        engine.advance(b"\x1b]4;7;#abcdef\x07\x1b]11;#123456\x07");
+        assert!(engine.acknowledge_damage(engine.output_generation()));
+        engine.advance(marker.as_bytes());
+        let damage = engine.damage_snapshot();
+        assert_eq!(damage.kind, DamageKind::Partial);
+        assert_eq!(damage.rows[0].cells[0].style.fg, Color::Indexed(7));
+        assert_eq!(
+            damage.rows[0].cells[0].style.bg,
+            Color::Rgb(0x12, 0x34, 0x56)
+        );
+        for text in [
+            engine.snapshot_ansi(),
+            engine
+                .backend_capture(CaptureMode::Visible, 5, true, 8192)
+                .text,
+        ] {
+            assert!(text.contains(";38;5;7"));
+            assert!(!text.contains(";38;2;171;205;239"));
+        }
+    }
+
+    #[test]
+    fn osc_background_override_is_used_for_cells_and_queries() {
+        let (mut engine, rx) = appearance_engine([0xf5, 0xf5, 0xf6], ColorScheme::Light);
+        engine.advance(b"\x1b]11;rgb:12/34/56\x07\x1b]11;?\x07hello");
+        assert_eq!(recv_bytes(&rx), b"\x1b]11;rgb:1212/3434/5656\x07");
+        let mut backgrounds = Vec::new();
+        engine.for_each_cell(&mut |_, _, _, cell| backgrounds.push(cell.bg));
+        assert!(backgrounds
+            .iter()
+            .all(|bg| *bg == Color::Rgb(0x12, 0x34, 0x56)));
+    }
+
+    #[test]
+    fn osc_colors_match_full_damage_and_capture_without_leaking_to_other_panes() {
+        let (mut engine, rx) = appearance_engine([0xf5, 0xf5, 0xf6], ColorScheme::Light);
+        engine.advance(b"\x1b]10;#abcdef\x07\x1b]11;#123456\x07\x1b]4;2;#246824\x07\x1b[32mA\x1b[39mB\x1b[48;2;1;2;3mC");
+        assert!(rx.try_recv().is_err());
+        let projected = |engine: &AlacrittyEngine| {
+            let mut cells = Vec::new();
+            engine.for_each_cell(&mut |row, col, _, cell| {
+                if row == 0 && col < 3 {
+                    cells.push(cell);
+                }
+            });
+            cells
+        };
+        let colors = projected(&engine);
+        assert_eq!(colors[0].fg, Color::Rgb(0x24, 0x68, 0x24));
+        assert_eq!(colors[1].fg, Color::Rgb(0xab, 0xcd, 0xef));
+        assert_eq!(colors[0].bg, Color::Rgb(0x12, 0x34, 0x56));
+        assert_eq!(colors[2].bg, Color::Rgb(1, 2, 3));
+        assert_eq!(engine.damage_snapshot().kind, DamageKind::Full);
+        assert!(engine.acknowledge_damage(engine.output_generation()));
+        engine.advance(b"\r\x1b[32;49mZ");
+        let damage = engine.damage_snapshot();
+        assert_eq!(damage.kind, DamageKind::Partial);
+        assert_eq!(damage.rows[0].cells[0].style, colors[0]);
+
+        let (mut replay, _) = appearance_engine([0, 0, 0], ColorScheme::Dark);
+        replay.advance(engine.snapshot_ansi().as_bytes());
+        assert_eq!(projected(&replay), colors);
+        let capture = engine.backend_capture(CaptureMode::Visible, 5, true, 8192);
+        assert!(capture.text.contains(";48;2;18;52;86"));
+        engine.advance(b"\x1b]4;2;?\x07\x1b]10;?\x07");
+        assert_eq!(recv_bytes(&rx), b"\x1b]4;2;rgb:2424/6868/2424\x07");
+        assert_eq!(recv_bytes(&rx), b"\x1b]10;rgb:abab/cdcd/efef\x07");
+
+        let (mut other, other_rx) = appearance_engine([0xee, 0xdd, 0xcc], ColorScheme::Light);
+        other.advance(b"\x1b]11;?\x07");
+        assert_eq!(recv_bytes(&other_rx), b"\x1b]11;rgb:eeee/dddd/cccc\x07");
+        assert_eq!(projected(&other)[0].bg, Color::Reset);
+
+        engine.advance(b"\x1b]110\x07\x1b]111\x07\x1b]104;2\x07\x1b]11;?\x07");
+        assert_eq!(recv_bytes(&rx), b"\x1b]11;rgb:f5f5/f5f5/f6f6\x07");
+        let reset = projected(&engine);
+        assert_eq!(reset[0].fg, Color::Indexed(2));
+        assert_eq!(reset[1].fg, Color::Reset);
+        assert_eq!(reset[0].bg, Color::Reset);
+        assert_eq!(reset[2].bg, Color::Rgb(1, 2, 3));
+    }
+
+    #[test]
     fn osc11_set_color_does_not_reply_or_print_the_payload() {
         let (mut engine, rx) = appearance_engine([0x11, 0x22, 0x33], ColorScheme::Dark);
         engine.advance(b"\x1b]11;rgb:aa/bb/cc\x07hello");
@@ -2708,8 +3006,9 @@ mod tests {
         assert_eq!(recv_bytes(&rx), b"\x1b[?2031;1$y");
 
         engine.set_appearance(PaneAppearance {
-            background: [0xf2, 0xe5, 0xbc],
+            background: Some([0xf2, 0xe5, 0xbc]),
             scheme: ColorScheme::Light,
+            ..PaneAppearance::default()
         });
         assert_eq!(recv_bytes(&rx), b"\x1b[?997;2n");
         engine.advance(b"\x1b[?996n");

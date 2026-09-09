@@ -843,6 +843,67 @@ mod tests {
     use crate::terminal::vt::CodexComposerRegion;
 
     #[test]
+    fn pane_background_matches_child_query_and_preserves_explicit_colors() {
+        use crate::terminal::appearance::PaneAppearance;
+        use crate::terminal::vt::{create_engine, VtEngineKind};
+        use std::sync::mpsc;
+
+        let _env = crate::persist::test_env("pane-color-negotiation");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let (response_tx, response_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::Alacritty,
+            80,
+            24,
+            response_tx,
+            1024 * 1024,
+            PaneAppearance::default(),
+        );
+        let focus = app.layout().focus;
+        app.panes.get_mut(&focus).unwrap().engine = engine.clone();
+        for (id, theme) in [
+            ("one-light", Theme::one_light()),
+            ("one-dark", Theme::one_dark()),
+        ] {
+            app.set_effective_theme(id, theme.clone());
+            engine.lock().unwrap().advance(
+                b"\x1b[0m\x1b[2J\x1b[H\x1b]10;?\x07\x1b]11;?\x07Q\x1b[48;2;230;255;237mR\x1b[0mS",
+            );
+            for (slot, color) in [(10, theme.text), (11, theme.mantle)] {
+                let Color::Rgb(r, g, b) = color else {
+                    panic!("static theme must supply RGB");
+                };
+                let expected =
+                    format!("\x1b]{slot};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}\x07");
+                let crate::terminal::pty::InputAction::Bytes(reply) =
+                    response_rx.try_recv().unwrap()
+                else {
+                    panic!("query reply");
+                };
+                assert_eq!(reply, expected.as_bytes());
+            }
+            let area = Rect::new(0, 0, 80, 24);
+            let mut buffer = Buffer::empty(area);
+            let mut target = RenderTarget::new(&mut buffer, area);
+            crate::ui::render_into(&mut target, &mut app);
+            let q = buffer
+                .content
+                .iter()
+                .position(|cell| cell.symbol() == "Q")
+                .unwrap();
+            assert_eq!(buffer.content[q].fg, theme.text);
+            assert_eq!(buffer.content[q].bg, theme.mantle);
+            assert_eq!(buffer.content[q + 1].bg, Color::Rgb(230, 255, 237));
+            assert_eq!(
+                buffer.content[q + 2].bg,
+                theme.mantle,
+                "SGR reset must clear the previous diff background"
+            );
+        }
+    }
+
+    #[test]
     fn kitty_virtual_image_preserves_child_background() {
         use crate::terminal::appearance::PaneAppearance;
         use crate::terminal::vt::{create_engine, VtEngineKind};
@@ -869,6 +930,8 @@ mod tests {
             engine.advance(
                 "\x1b[48;2;12;34;56m\x1b[38;2;0;0;7m\u{10eeee}\u{0305}\u{0305}".as_bytes(),
             );
+            // A placeholder foreground encodes an image ID, not a paint color.
+            engine.advance("\x1b]4;7;#abcdef\x07\x1b[38;5;7m\u{10eeee}\u{0305}\u{0305}".as_bytes());
         }
         let area = Rect::new(0, 0, 80, 24);
         let mut buffer = ratatui::buffer::Buffer::empty(area);
@@ -881,8 +944,9 @@ mod tests {
             .iter()
             .filter(|cell| cell.symbol().starts_with(crate::terminal::graphics::MARKER))
             .collect();
-        assert_eq!(markers.len(), 1);
+        assert_eq!(markers.len(), 2);
         assert_eq!(markers[0].bg, Color::Rgb(12, 34, 56));
+        assert_eq!(markers[1].bg, Color::Rgb(12, 34, 56));
     }
 
     #[test]

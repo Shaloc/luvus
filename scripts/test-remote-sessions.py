@@ -9,6 +9,7 @@ Use --remote-only-open-only for merge routing without implicit local owners.
 Use --agent-focus-only for Agents highlight and owner focus synchronization.
 Use --agent-seen-only for native Done acknowledgement after remote owner restart.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
+Use --colors-only for child color queries and composed local/remote backgrounds (requires pyte).
 Use --reconnect-only for remote owner restart and automatic reconnection.
 That mode uses a real VT decoder: uv run --with pyte==0.8.2 scripts/test-remote-sessions.py target/debug/luvus --reconnect-only
 All homes, sockets, files and child processes are isolated below target/.
@@ -123,7 +124,8 @@ def main():
     network_reconnect_only = "--network-reconnect-only" in sys.argv[1:]
     graphics_only = "--graphics-only" in sys.argv[1:]
     theme_sync_only = "--theme-sync-only" in sys.argv[1:]
-    if reconnect_only or network_reconnect_only:
+    colors_only = "--colors-only" in sys.argv[1:]
+    if reconnect_only or network_reconnect_only or colors_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -132,7 +134,7 @@ def main():
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -144,6 +146,7 @@ def main():
     clients = []
     client_terminals = {}
     graphics_output = bytearray()
+    color_output = bytearray()
     env = {key: value for key, value in os.environ.items() if not key.startswith("LUVUS_")}
     for directory in ("local-home/.ssh", "local-home/picker-local", "local-state", "remote-home",
                       "remote-state", "bin", "project/picker-remote", "second"):
@@ -177,6 +180,11 @@ def main():
                LUVUS_SMOKE_ROOT=str(root), LUVUS_SMOKE_BINARY=str(binary),
                LUVUS_SMOKE_REMOTE_BINARY=str(remote_binary), DISPLAY=":smoke")
     env.pop("WAYLAND_DISPLAY", None)
+    if colors_only:
+        env["COLORTERM"] = "truecolor"
+        # Tool runners commonly export NO_COLOR. This private display must
+        # actually emit SGR colors for end-to-end color assertions.
+        env.pop("NO_COLOR", None)
     if network_reconnect_only:
         env["LUVUS_SMOKE_NETWORK_RECONNECT"] = "1"
     if graphics_only:
@@ -438,14 +446,17 @@ def main():
             deadline = time.monotonic() + 4
             while time.monotonic() < deadline and (
                     b"luvus" not in screen.lower()
-                    or ((theme_sync_only or graphics_only) and not re.search(rb"\x1b\[\d+;\d+H", screen))):
+                    or ((theme_sync_only or graphics_only or colors_only) and not re.search(rb"\x1b\[\d+;\d+H", screen))):
                 if select.select([master], [], [], 0.1)[0]:
                     screen.extend(os.read(master, 65536))
             assert process.poll() is None and b"luvus" in screen.lower(), screen[-1000:]
             assert b"\x1b[?1049h" in screen, "the fixture must observe the initial alternate-screen entry"
             if graphics_only:
                 graphics_output.extend(screen)
-            if reconnect_only or network_reconnect_only:
+            if colors_only:
+                color_output.clear()
+                color_output.extend(screen)
+            if reconnect_only or network_reconnect_only or colors_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -462,6 +473,9 @@ def main():
                 client_terminals[master][1].feed(bytes(screen))
             if graphics_only:
                 graphics_output.extend(screen)
+            if colors_only:
+                assert len(color_output) + len(screen) < 16 * 1024 * 1024
+                color_output.extend(screen)
             return screen
 
         def repaint(master):
@@ -506,6 +520,80 @@ def main():
 
         def click(master, x, y, button=0):
             os.write(master, f"\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m".encode())
+
+        if colors_only:
+            def color_case(label, master, remote):
+                pane_id = api("pane.list", remote=remote)["panes"][0]["pane"]
+                report = root / ("colors-" + label + ".json")
+                run("--session", "api", "pane", "run", str(pane_id),
+                    shlex.join([sys.executable, str(repo / "scripts/terminal-color-fixture.py"), label]), remote=remote)
+                wait_for(report.exists)
+                revision = json.loads(report.read_text())["revision"]
+
+                def check(fg, bg, key=b"p", index=None):
+                    nonlocal revision
+                    os.write(master, key)
+                    def recorded():
+                        drain(master, 0.05)
+                        data = json.loads(report.read_text())
+                        return data if data["revision"] > revision else None
+                    data = wait_for(recorded)
+                    revision = data["revision"]
+                    assert data["colors"] == {"10": fg, "11": bg}, (label, data)
+                    observed = {}
+                    def colors_match():
+                        drain(master, 0.1)
+                        terminal = client_terminals[master][0]
+                        for marker, expected_fg, expected_bg in (
+                                ("COLOR_DEFAULT", fg, bg), ("COLOR_DIFF", fg, data["diff"]),
+                                ("COLOR_RESET", fg, bg), ("COLOR_INDEX", index, bg)):
+                            found = next(((y, line.index(marker)) for y, line in enumerate(terminal.display)
+                                          if marker in line), None)
+                            if found is None:
+                                observed[marker] = "missing"
+                                return False
+                            y, x = found
+                            for column in range(x, x + len(marker)):
+                                cell = terminal.buffer[y][column]
+                                observed[marker] = {"fg": cell.fg, "bg": cell.bg}
+                                rgb = lambda value: "".join(f"{part:02x}" for part in value)
+                                if cell.bg != rgb(expected_bg) or (expected_fg is not None and cell.fg != rgb(expected_fg)):
+                                    return False
+                        return True
+                    try:
+                        wait_for(colors_match)
+                    except AssertionError as error:
+                        (root / ("colors-" + label + ".ansi")).write_bytes(color_output)
+                        raise AssertionError((label, data, observed)) from error
+                    repaint(master)
+                    assert colors_match(), "full repaint changed colors"
+
+                check([0x38, 0x3a, 0x42], [0xf5, 0xf5, 0xf6])
+                check([0xab, 0xcd, 0xef], [0x12, 0x34, 0x56], b"d", [0x24, 0x68, 0x24])
+                run("--session", "api", "theme", "use", "one-dark", remote=remote)
+                check([0xab, 0xb2, 0xbf], [0x28, 0x2c, 0x34], b"r")
+                os.write(master, b"q")
+                drain(master)
+                print(f"PASS: {label}: foreground/background queries match visible colors; overrides, reset and theme change survive sparse/full frames", flush=True)
+
+            for remote in (False, True):
+                run("--session", "api", "theme", "use", "one-light", remote=remote)
+            process, master = start_client(["--session", "api"])
+            color_case("local", master, False)
+            run("session", "merge", "on")
+            wait_for(projected)
+            api("config.patch", {"patch": {"theme": "one-light"}}, remote=True)
+            workspace = next(w["workspace"] for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
+            api("workspace.focus", {"workspace": workspace})
+            drain(master)
+            color_case("merged", master, True)
+            run("session", "merge", "off")
+            process.terminate()
+            process.wait(timeout=5)
+            api("config.patch", {"patch": {"theme": "one-light"}}, remote=True)
+            process, master = start_client(["session", "attach", "remote-fake-dev-api"])
+            color_case("direct", master, True)
+            return
 
         if graphics_only:
             import zlib
@@ -581,6 +669,28 @@ def main():
                 checkpoint(f"{label}-scroll-redraw", [0, 255, 0], same_pixels_as=f"kitty-{label}-green.ansi")
                 print(f"PASS: {label} inline image follows page scrolling, clips permanently and redraws", flush=True)
 
+            def check_chunked_rendering(pane, label, remote=False):
+                drain(master)
+                before = api("pane.list", remote=remote)["render_performance"]
+                run("--session", "api", "pane", "send", str(pane), "b", remote=remote)
+                wait_for(lambda: (root / f"graphics-buffered-{label}").exists())
+                pending = drain(master)
+                after = api("pane.list", remote=remote)["render_performance"]
+                passes = after["render_passes"] - before["render_passes"]
+                unchanged = after["unchanged_projections"] - before["unchanged_projections"]
+                (root / f"graphics-render-{label}.json").write_text(json.dumps({
+                    "passes": passes, "unchanged": unchanged, "chunks": 43,
+                }))
+                assert not has_pixels(pending, (64, 128, 192, 255)), "partial image reached display"
+                # CLI/input and asynchronous metadata can each request a frame;
+                # 43 paced transfer-only chunks must not add one per interval.
+                assert passes <= 6, f"{label}: incomplete upload triggered {passes} render passes ({unchanged} unchanged)"
+                (root / f"graphics-complete-{label}").touch()
+                output_until(lambda output: has_pixels(output, (64, 128, 192, 255)))
+                run("--session", "api", "pane", "send", str(pane), "g", remote=remote)
+                output_until(lambda output: has_pixels(output, (0, 255, 0, 255)))
+                print(f"PASS: {label}: 43 incomplete upload chunks caused only {passes} control/metadata renders; complete pixels delivered", flush=True)
+
             def check_virtual_images(pane, label, remote=False):
                 for key, receipt, suffix, color, absent in [
                     ("v", b"VVVVVVVV", "full", [0,255,0], []),
@@ -616,6 +726,7 @@ def main():
             run("--session", "api", "pane", "send", str(local_pane), "g")
             output_until(lambda output: has_pixels(output, (0, 255, 0, 255)))
             checkpoint("local-green", [0, 255, 0])
+            check_chunked_rendering(local_pane, "local")
             check_scrolling(local_pane, "local")
             check_virtual_images(local_pane, "local")
             run("--session", "api", "pane", "send", str(local_pane), "q")
@@ -683,6 +794,7 @@ def main():
             run("--session", "api", "pane", "send", str(remote_pane), "g", remote=True)
             output_until(lambda output: has_pixels(output, (0, 255, 0, 255)))
             checkpoint("remote-green", [0, 255, 0])
+            check_chunked_rendering(remote_pane, "remote", remote=True)
             check_scrolling(remote_pane, "remote", remote=True)
             check_virtual_images(remote_pane, "remote", remote=True)
             run("--session", "api", "pane", "send", str(remote_pane), "q", remote=True)
@@ -772,7 +884,8 @@ def main():
                                   "width": rows[-1]["width"], "height": rows[-1]["height"],
                                   "stdout_bytes_per_second": sum(n for at, n in chunks if start <= at < start + 3) / 3,
                                   "render_delta": {key: after[key] - before[key] for key in (
-                                      "frames_sent", "full_frames_sent", "frame_bytes_sent", "frames_backpressured")}}
+                                      "frames_sent", "full_frames_sent", "frame_bytes_sent", "frames_backpressured",
+                                      "render_passes", "unchanged_projections")}}
                         summaries.append(record)
                         (root / f"graphics-perf-{label}-received.json").write_text(json.dumps(rows))
                         print("GRAPHICS_PERF: " + json.dumps(record), flush=True)

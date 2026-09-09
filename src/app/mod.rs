@@ -2897,7 +2897,7 @@ fn child_appearance(
         .get(theme_id)
         .map(|entry| entry.appearance)
         .unwrap_or(crate::theme::format::Appearance::Dark);
-    crate::terminal::appearance::PaneAppearance::resolve(theme.mantle, declared, probed)
+    crate::terminal::appearance::PaneAppearance::resolve(theme.text, theme.mantle, declared, probed)
 }
 
 impl App {

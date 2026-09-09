@@ -1280,7 +1280,8 @@ fn path_with_server_binary(exe: &Path, inherited: Option<OsString>) -> Option<Os
 }
 
 /// Parse a Windows PTY read and forward its clipboard effect outside the VT
-/// lock. The Unix actor performs the same effect after its bounded read batch.
+/// lock. Returns whether output needs a coalesced notification. The Unix actor
+/// performs the same effects after its bounded read batch.
 #[cfg(any(windows, test))]
 fn advance_output(
     id: PaneId,
@@ -1288,17 +1289,22 @@ fn advance_output(
     engine: &Arc<Mutex<dyn VtEngine>>,
     content_revision: &AtomicU64,
     tx: &Sender<AppEvent>,
-) {
-    let clipboard = if let Ok(mut engine) = engine.lock() {
+) -> bool {
+    let (clipboard, changed) = if let Ok(mut engine) = engine.lock() {
+        let generation = engine.output_generation();
         engine.advance(bytes);
-        content_revision.fetch_add(1, Ordering::Release);
-        engine.take_clipboard()
+        let changed = generation != engine.output_generation();
+        if changed {
+            content_revision.fetch_add(1, Ordering::Release);
+        }
+        (engine.take_clipboard(), changed)
     } else {
-        None
+        (None, false)
     };
     if let Some(text) = clipboard {
         let _ = tx.send(AppEvent::PtyClipboard { pane: id, text });
     }
+    changed
 }
 
 #[cfg(windows)]
@@ -1318,11 +1324,12 @@ fn read_loop(
                 break;
             }
             Ok(n) => {
-                advance_output(id, &buf[..n], &engine, &content_revision, &tx);
+                let changed = advance_output(id, &buf[..n], &engine, &content_revision, &tx);
                 // Announce new output only when no announcement is already in
                 // flight — the loop reads the engine's *latest* state anyway,
                 // so a burst needs one wakeup, not one per read.
-                if !data_pending.swap(true, Ordering::AcqRel)
+                if changed
+                    && !data_pending.swap(true, Ordering::AcqRel)
                     && tx.send(AppEvent::PtyData(id)).is_err()
                 {
                     break;
@@ -1335,6 +1342,36 @@ fn read_loop(
 #[cfg(test)]
 mod clipboard_tests {
     use super::*;
+
+    #[test]
+    fn graphics_fragments_do_not_announce_split_reader_output_until_complete() {
+        let (input_tx, _input_rx) = mpsc::channel();
+        let (app_tx, app_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::default(),
+            20,
+            3,
+            input_tx,
+            64 * 1024,
+            PaneAppearance::default(),
+        );
+        engine.lock().unwrap().set_cell_pixels(8, 16);
+        let revision = AtomicU64::new(0);
+        let pane = PaneId(23);
+        for byte in b"\x1b_Ga=T,i=7,f=32,s=1,v=1,C=1,q=2,m=1;AAAA\x1b\\" {
+            assert!(!advance_output(pane, &[*byte], &engine, &revision, &app_tx));
+        }
+        assert_eq!(revision.load(Ordering::Acquire), 0);
+        assert!(advance_output(
+            pane,
+            b"\x1b_Gm=0,q=2;AA==\x1b\\",
+            &engine,
+            &revision,
+            &app_tx
+        ));
+        assert_eq!(revision.load(Ordering::Acquire), 1);
+        assert!(app_rx.try_recv().is_err());
+    }
 
     #[test]
     fn osc52_live_output_reaches_app_even_when_pty_data_is_coalesced() {

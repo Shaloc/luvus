@@ -1296,6 +1296,12 @@ fn render_clients(
     if clients.is_empty() {
         return false;
     }
+    // Consume the notifications represented by this frame *before* capturing
+    // terminal state. Clearing only after projection mistakes the original
+    // wake for fresh output and schedules an unchanged tail frame. Output
+    // arriving during projection sets the flag again and retains that tail.
+    let (_, _, title_changed) = rearm_pty_notify_by_visibility(app, clients);
+    let visible_pty_only = visible_pty_only && !title_changed;
     if foreground.is_none_or(|id| !clients.contains_key(&id)) {
         *foreground = latest_client(clients);
         apply_foreground_theme(app, clients, *foreground);
@@ -4175,6 +4181,9 @@ mod tests {
             "\rshort\x1b[K",
             "\x1b]2;new title\x07!",
             "\rnext",
+            "\x1b]10;#abcdef\x07\x1b]11;#123456\x07\rtheme",
+            "\r\x1b[48;2;230;255;237mP\x1b[0mQ",
+            "\x1b]110\x07\x1b]111\x07",
         ] {
             for client in clients.values() {
                 client.sender.frame_pending.store(false, Ordering::Release);
@@ -4193,7 +4202,7 @@ mod tests {
             for rx in &receivers {
                 rx.recv_timeout(Duration::from_secs(1)).unwrap();
             }
-            if !bytes.contains("\x1b]2;") {
+            if !bytes.contains("\x1b]") {
                 assert!(
                     super::PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed)
                         >= partial_before + 3,
@@ -4260,6 +4269,7 @@ mod tests {
             .lock()
             .expect("engine lock")
             .advance(b"one changed row");
+        app.panes[&focus].mark_data_pending_for_test();
         let before = super::PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed);
         assert!(render_clients(
             &mut app,
@@ -4272,6 +4282,10 @@ mod tests {
         ));
         assert!(matches!(rx.recv().unwrap(), ServerMessage::FrameDiff(_)));
         assert!(
+            !super::rearm_pty_notify_by_visibility(&app, &clients).0,
+            "the notification for output just rendered must not schedule a duplicate tail frame"
+        );
+        assert!(
             super::PARTIAL_TERMINAL_PROJECTIONS.load(Ordering::Relaxed) > before,
             "PTY-only render patched the retained client buffer"
         );
@@ -4282,6 +4296,11 @@ mod tests {
         // complete resynchronization, so acknowledging shared VT damage cannot
         // leave that client permanently behind.
         engine.lock().expect("engine lock").advance(b" more");
+        app.panes[&focus].mark_data_pending_for_test();
+        assert!(
+            super::rearm_pty_notify_by_visibility(&app, &clients).0,
+            "fresh output after a frame still requests its trailing render"
+        );
         assert!(!render_clients(
             &mut app,
             &mut clients,

@@ -414,6 +414,17 @@ network bandwidth and Kitty rendering. Passing transport tests does not establis
 Chromium performance or guarantee 60 FPS. terminal-code requires separate
 application-level verification.
 
+Incomplete image transfers and graphics capability queries do not request a
+terminal repaint or scrollback compaction. A completed image mutation still
+wakes the existing renderer immediately, subject to its normal frame cap and
+backpressure. Opening a synchronized frame does not repaint the old screen;
+committing that frame publishes its buffered output. The renderer consumes old
+output notifications before projection while keeping trailing notifications
+for output that arrives during projection. Text, input modes, titles and
+clipboard effects interleaved with uploads keep their normal handling. This
+applies to local and managed remote owners; it does not reduce the application's
+full-image payload size.
+
 To compare the same isolated PixelEngine workload between builds on Linux:
 
 ```sh

@@ -341,7 +341,10 @@ pub trait VtEngine: Send {
         false
     }
 
-    /// Monotonic generation of successfully parsed terminal output.
+    /// Monotonic generation of dispatched terminal output. Buffered escape
+    /// sequences, incomplete image transfers and image queries do not advance
+    /// it; text, metadata/modes and completed image mutations do. PTY readers
+    /// use this to avoid waking rendering/detection for transfer-only bytes.
     fn output_generation(&self) -> u64;
 
     /// Reflow to a new (cols, rows).

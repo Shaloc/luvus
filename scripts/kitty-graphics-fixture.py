@@ -119,6 +119,26 @@ try:
         key = os.read(0, 4096)
         if b"q" in key:
             break
+        if b"b" in key:
+            # Deliberately span many render intervals without completing the
+            # image. No text/cursor/metadata changes are mixed into this phase.
+            # The remote case also uses terminal-browser's synchronized frame.
+            if label == "remote":
+                os.write(1, b"\x1b[?2026h\x1b[H")
+            encoded = base64.b64encode(bytes((64, 128, 192, 255)) * (64 * 64))
+            for offset in range(0, len(encoded), 512):
+                header = ("a=T,i=7,f=32,s=64,v=64,c=16,r=8,C=1,q=2,m=1"
+                          if offset == 0 else "m=1,q=2")
+                os.write(1, b"\x1b_G" + header.encode() + b";" + encoded[offset:offset + 512] + b"\x1b\\")
+                time.sleep(0.025)
+            (root / f"graphics-buffered-{label}").touch()
+            deadline = time.monotonic() + 8
+            while not (root / f"graphics-complete-{label}").exists():
+                assert time.monotonic() < deadline, "test did not release image completion"
+                time.sleep(0.02)
+            os.write(1, b"\x1b_Gm=0,q=2;\x1b\\")
+            if label == "remote":
+                os.write(1, b"\x1b[?2026l")
         if b"g" in key:
             render((0, 255, 0, 255))
         if b"v" in key:

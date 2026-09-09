@@ -1931,15 +1931,19 @@ impl<T: EventListener> Handler for Term<T> {
         trace!("Requested write of escape sequence for color code {prefix}: color[{index}]");
 
         let terminator = terminator.to_owned();
-        self.event_proxy.send_event(Event::ColorRequest(
-            index,
-            Arc::new(move |color| {
-                format!(
-                    "\x1b]{};rgb:{1:02x}{1:02x}/{2:02x}{2:02x}/{3:02x}{3:02x}{4}",
-                    prefix, color.r, color.g, color.b, terminator
-                )
-            }),
-        ));
+        let format = move |color: Rgb| {
+            format!(
+                "\x1b]{};rgb:{1:02x}{1:02x}/{2:02x}{2:02x}/{3:02x}{3:02x}{4}",
+                prefix, color.r, color.g, color.b, terminator
+            )
+        };
+        // A child-set OSC color is terminal state and must outrank the display's
+        // default palette, just as it does during rendering.
+        if let Some(color) = self.colors[index] {
+            self.event_proxy.send_event(Event::PtyWrite(format(color)));
+        } else {
+            self.event_proxy.send_event(Event::ColorRequest(index, Arc::new(format)));
+        }
     }
 
     /// Reset the indexed color to original value.
@@ -2543,6 +2547,7 @@ impl<T: EventListener> Handler for Term<T> {
             if !deletion { return; }
         }
         let point = self.grid.cursor.point;
+        let generation = self.graphics.generation();
         let (reply, advance) = self.graphics.command(data, point.line.0, point.column.0 as u32, self.cell_pixels);
         if let Some(reply) = reply {
             self.event_proxy.send_event(Event::PtyWrite(reply));
@@ -2553,7 +2558,7 @@ impl<T: EventListener> Handler for Term<T> {
             self.grid.cursor.point.line = Line((point.line.0 + rows as i32).min(self.bottommost_line().0));
             self.grid.cursor.point.column = Column((point.column.0 + cols as usize).min(self.columns() - 1));
         }
-        if data.starts_with(b"G") { self.mark_fully_damaged(); }
+        if generation != self.graphics.generation() { self.mark_fully_damaged(); }
     }
 
     #[inline]

@@ -247,6 +247,7 @@ fn actor_loop(
                         break;
                     }
                 }
+                Ok(ReadState::Buffered) => {}
                 Ok(ReadState::WouldBlock) if terminal_events & libc::POLLHUP == 0 => {}
                 Ok(ReadState::WouldBlock | ReadState::Eof) | Err(_) => break,
             }
@@ -402,6 +403,8 @@ fn write_pending(fd: RawFd, pending: &mut VecDeque<PendingWrite>) -> io::Result<
 
 enum ReadState {
     Data,
+    /// Bytes consumed, but no terminal output was dispatched yet.
+    Buffered,
     WouldBlock,
     Eof,
 }
@@ -452,8 +455,9 @@ fn read_available(
         }
         let count = count as usize;
         if let Some(terminal) = terminal.as_deref_mut() {
+            let generation = terminal.output_generation();
             terminal.advance(&buffer[..count]);
-            advanced_any = true;
+            advanced_any |= generation != terminal.output_generation();
         }
         read_any = true;
         budget -= count;
@@ -466,12 +470,82 @@ fn read_available(
     if let Some(text) = clipboard {
         let _ = app_tx.send(AppEvent::PtyClipboard { pane: id, text });
     }
-    Ok(state)
+    if read_any && !advanced_any {
+        Ok(ReadState::Buffered)
+    } else {
+        Ok(state)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn graphics_fragments_do_not_announce_unix_output_until_complete() {
+        use crate::terminal::appearance::PaneAppearance;
+        use crate::terminal::vt::{create_engine, VtEngineKind};
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let (input_tx, input_rx) = mpsc::channel();
+        let (app_tx, app_rx) = mpsc::channel();
+        let engine = create_engine(
+            VtEngineKind::default(),
+            20,
+            3,
+            input_tx,
+            64 * 1024,
+            PaneAppearance::default(),
+        );
+        engine.lock().unwrap().set_cell_pixels(8, 16);
+        let revision = AtomicU64::new(0);
+        let pane = PaneId(42);
+        let read = || {
+            read_available(
+                reader.as_raw_fd(),
+                &mut [0; 7],
+                &engine,
+                &revision,
+                pane,
+                &app_tx,
+            )
+            .unwrap()
+        };
+        for fragment in [
+            b"\x1b_Ga=T,i=7,f=32,s=1,v=1,C=1,q=2,m=1;AA".as_slice(),
+            b"AA\x1b\\",
+            b"\x1b_Gm=0,q=2;AA==\x1b",
+        ] {
+            writer.write_all(fragment).unwrap();
+            assert!(matches!(read(), ReadState::Buffered));
+            assert_eq!(revision.load(Ordering::Acquire), 0);
+        }
+        writer.write_all(b"\\").unwrap();
+        assert!(matches!(read(), ReadState::Data));
+        assert_eq!(revision.load(Ordering::Acquire), 1);
+        assert_eq!(engine.lock().unwrap().graphics().unwrap().1.len(), 1);
+
+        writer
+            .write_all(b"\x1b_Ga=q,i=8,q=0,f=24,s=1,v=1;AAAA\x1b\\")
+            .unwrap();
+        assert!(matches!(read(), ReadState::Buffered));
+        assert!(
+            matches!(input_rx.try_recv(), Ok(InputAction::Bytes(reply)) if reply == b"\x1b_Gi=8;OK\x1b\\")
+        );
+        assert_eq!(revision.load(Ordering::Acquire), 1);
+        writer.write_all(b"text\x1b]52;c;Y29weQ==\x07").unwrap();
+        assert!(matches!(read(), ReadState::Data));
+        assert_eq!(revision.load(Ordering::Acquire), 2);
+        assert!(
+            matches!(app_rx.try_recv(), Ok(AppEvent::PtyClipboard { text, .. }) if text == "copy")
+        );
+        assert!(matches!(read(), ReadState::WouldBlock));
+        drop(writer);
+        assert!(matches!(read(), ReadState::Eof));
+    }
 
     #[test]
     fn blocked_writer_keeps_input_bounded_and_cancellation_releases_it() {

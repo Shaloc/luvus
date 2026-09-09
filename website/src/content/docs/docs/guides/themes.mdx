@@ -208,10 +208,31 @@ the same palette. **Terminal** remains special and client-derived. A custom
 palette containing `reset` may also depend on the foreground terminal and is
 reported with a warning unless its appearance is `terminal`.
 
-Programs running inside panes can query that pane background with OSC 11
-(`ESC]11;?`, BEL or ST). Luvus replies with the active theme's mantle color. If
-the Terminal theme keeps that color as `reset`, Luvus uses the last host-terminal
-probe when available and otherwise its bundled fallback palette. DEC private
-mode 2031 is supported: `CSI ? 996 n` queries the current scheme,
+Programs running inside panes can query their default foreground with OSC 10
+and background with OSC 11 (`ESC]10;?` / `ESC]11;?`, BEL or ST). Luvus replies
+with the active theme's text and mantle colors, including when both queries
+arrive together. Both replies matter: applications that require a complete
+pair may otherwise fall back to dark colors on a light pane. If
+the Terminal theme keeps a color as `reset`, Luvus uses the last host-terminal
+probe when available and otherwise its bundled fallback palette, without
+making a transparent terminal background opaque.
+
+For custom themes, fixed xterm indices 16 through 255 have queryable RGB values. The
+first 16 ANSI colors belong to the displaying terminal; when their RGB is
+unknown, Luvus leaves that query unanswered instead of returning an unrelated
+default color.
+
+Child-set OSC 10/11 and OSC 4 palette overrides stay local to that pane.
+Queries, full and partial rendering, and ANSI captures all use those same
+overrides; OSC 110/111/104 restore defaults. Explicit SGR RGB backgrounds are
+preserved, and SGR resets return to the effective pane background. These rules
+also apply to merged and directly attached remote panes. Luvus does not replace
+the host's unmodified ANSI palette or recolor explicit application output.
+Kitty Unicode image placeholders retain their encoded image IDs even when an
+application overrides the corresponding ANSI color.
+Applications that cache startup colors may need to re-query or restart their
+own UI after changing themes or upgrading from incomplete query support.
+
+DEC private mode 2031 is supported: `CSI ? 996 n` queries the current scheme,
 `CSI ? 2031 h/l` subscribes, DECRQM reports set or reset, and a theme change
 sends `CSI ? 997;1n` (dark) or `CSI ? 997;2n` (light) to subscribed panes.

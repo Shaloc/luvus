@@ -133,6 +133,7 @@ pub struct Graphics {
     transfer: Option<(BTreeMap<u8, String>, String)>,
     next_image: u32,
     sequence: u64,
+    generation: u64,
     bytes: usize,
 }
 
@@ -149,6 +150,12 @@ fn option(params: &Params, key: u8, default: &str) -> bool {
 }
 
 impl Graphics {
+    /// Completed mutating commands, excluding queries and transfer fragments.
+    /// Conservative: a successful delete of a missing image still counts.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn visible(&self) -> &[Placement] {
         &self.placements[self.alternate]
     }
@@ -173,8 +180,10 @@ impl Graphics {
 
     pub fn reset(&mut self) {
         let sequence = self.sequence;
+        let generation = self.generation.wrapping_add(1);
         *self = Self::default();
         self.sequence = sequence;
+        self.generation = generation;
     }
 
     pub fn scroll(&mut self, start: i32, end: i32, delta: i32) {
@@ -289,6 +298,9 @@ impl Graphics {
         cell: (u16, u16),
     ) -> (Option<String>, Option<(u32, u32)>) {
         let result = self.apply(&params, payload, row, col, cell);
+        if result.is_ok() && params.get(&b'a').is_none_or(|action| action != "q") {
+            self.generation = self.generation.wrapping_add(1);
+        }
         match result {
             Ok(advance) => (Self::reply(&params, "OK"), advance),
             Err(error) => (Self::reply(&params, error), None),

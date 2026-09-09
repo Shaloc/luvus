@@ -242,6 +242,10 @@ fn parse_number(input: &[u8]) -> Option<u8> {
 /// Internal state for VTE processor.
 #[derive(Debug, Default)]
 struct ProcessorState<T: Timeout> {
+    /// Non-APC dispatch during the latest advance. APC consumers track their
+    /// own activity, since transfer fragments need not change terminal state.
+    terminal_activity: bool,
+
     /// Last processed character for repetition.
     preceding_char: Option<char>,
 
@@ -302,6 +306,7 @@ impl<T: Timeout> Processor<T> {
     where
         H: Handler,
     {
+        self.state.terminal_activity = false;
         let mut processed = 0;
         while processed != bytes.len() {
             if self.state.sync_state.timeout.pending_timeout() {
@@ -312,6 +317,14 @@ impl<T: Timeout> Processor<T> {
                     self.parser.advance_until_terminated(&mut performer, &bytes[processed..]);
             }
         }
+    }
+
+    /// Whether the latest `advance` dispatched ordinary terminal output.
+    /// This is conservative (modes, queries and ignored commands count too),
+    /// but excludes buffered bytes, begin-sync delimiters and APCs. The APC handler must separately
+    /// report changes before callers can suppress an output notification.
+    pub fn terminal_activity(&self) -> bool {
+        self.state.terminal_activity
     }
 
     /// End a synchronized update.
@@ -353,6 +366,7 @@ impl<T: Timeout> Processor<T> {
             },
             // Report mode and clear state if no new BSU is present.
             None => {
+                self.state.terminal_activity = true;
                 handler.unset_private_mode(NamedPrivateMode::SyncUpdate.into());
                 self.state.sync_state.timeout.clear_timeout();
                 self.state.sync_state.buffer.clear();
@@ -1314,12 +1328,14 @@ where
 
     #[inline]
     fn print(&mut self, c: char) {
+        self.state.terminal_activity = true;
         self.handler.input(c);
         self.state.preceding_char = Some(c);
     }
 
     #[inline]
     fn print_ascii(&mut self, bytes: &[u8]) {
+        self.state.terminal_activity = true;
         self.handler.input_ascii(bytes);
         self.state.preceding_char = bytes.last().copied().map(char::from);
     }
@@ -1333,6 +1349,7 @@ where
 
     #[inline]
     fn execute(&mut self, byte: u8) {
+        self.state.terminal_activity = true;
         match byte {
             C0::HT => self.handler.put_tab(1),
             C0::BS => self.handler.backspace(),
@@ -1348,6 +1365,7 @@ where
 
     #[inline]
     fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.state.terminal_activity = true;
         debug!(
             "[unhandled hook] params={:?}, ints: {:?}, ignore: {:?}, action: {:?}",
             params, intermediates, ignore, action
@@ -1356,16 +1374,19 @@ where
 
     #[inline]
     fn put(&mut self, byte: u8) {
+        self.state.terminal_activity = true;
         debug!("[unhandled put] byte={:?}", byte);
     }
 
     #[inline]
     fn unhook(&mut self) {
+        self.state.terminal_activity = true;
         debug!("[unhandled unhook]");
     }
 
     #[inline]
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.state.terminal_activity = true;
         let terminator = if bell_terminated { "\x07" } else { "\x1b\\" };
 
         fn unhandled(params: &[&[u8]]) {
@@ -1572,6 +1593,13 @@ where
         has_ignored_intermediates: bool,
         action: char,
     ) {
+        // BSU only opens the processor's buffer; it does not present output.
+        // Keep preceding activity in this batch and conservatively count mixed
+        // private modes, malformed sequences and all other CSI commands.
+        let begin_sync_only = action == 'h' && intermediates == [b'?']
+            && !has_ignored_intermediates && params.len() == 1
+            && params.iter().next() == Some([2026].as_slice());
+        self.state.terminal_activity |= !begin_sync_only;
         macro_rules! unhandled {
             () => {{
                 debug!(
@@ -1812,6 +1840,7 @@ where
 
     #[inline]
     fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
+        self.state.terminal_activity = true;
         macro_rules! unhandled {
             () => {{
                 debug!(
@@ -2057,6 +2086,54 @@ pub mod C0 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_activity_excludes_buffered_bytes_and_apc_dispatch() {
+        #[derive(Default)]
+        struct Capture { text: String, apcs: usize }
+        impl Handler for Capture {
+            fn input(&mut self, c: char) { self.text.push(c); }
+            fn application_command(&mut self, _: &[u8]) { self.apcs += 1; }
+        }
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = Capture::default();
+        for byte in b"\x1b_Ga=T,m=1;AAAA\x1b\\" {
+            parser.advance(&mut handler, &[*byte]);
+            assert!(!parser.terminal_activity());
+        }
+        assert_eq!(handler.apcs, 1, "APC handling is not suppressed");
+        for bytes in [b"text".as_slice(), "界".as_bytes(), b"\r\n", b"\x1b]2;title\x07",
+            b"\x1b[?1000h", b"\x1b7", b"\x1bPqabc\x1b\\"] {
+            let mut dispatched = false;
+            for byte in bytes {
+                parser.advance(&mut handler, &[*byte]);
+                dispatched |= parser.terminal_activity();
+            }
+            assert!(dispatched, "ordinary terminal command was lost: {bytes:?}");
+        }
+        assert!(handler.text.starts_with("text界"));
+        parser.advance(&mut handler, b"\x1b_Gcancel\x18tail");
+        assert!(parser.terminal_activity());
+        assert!(handler.text.ends_with("tail"));
+        parser.advance(&mut handler, b"");
+        assert!(!parser.terminal_activity());
+    }
+
+    #[test]
+    fn terminal_activity_accounts_for_synchronized_dispatch() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+        parser.advance(&mut handler, b"\x1b[?2026h");
+        assert!(!parser.terminal_activity(), "opening a buffered frame is not output yet");
+        parser.advance(&mut handler, b"\x1b[1m");
+        assert!(!parser.terminal_activity());
+        assert!(handler.attr.is_none());
+        parser.advance(&mut handler, b"\x1b[?2026l");
+        assert!(parser.terminal_activity());
+        assert_eq!(handler.attr, Some(Attr::Bold));
+        parser.advance(&mut handler, b"text before begin\x1b[?2026h");
+        assert!(parser.terminal_activity(), "opening sync must not erase prior activity");
+    }
 
     #[derive(Default)]
     pub struct TestSyncHandler {
