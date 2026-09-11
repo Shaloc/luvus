@@ -58,12 +58,12 @@ remain active with this setting off.
   workspaces with hostname tags, or use the raw SSH attach escape hatch.
 - **Terminal tools:** Configure per-pane Scrollback Memory, search across pane
   history, use copy mode, click detected links, and run full-screen terminal apps.
-- **Kitty graphics preview:** Display direct-transfer images in local and managed
+- **Kitty graphics:** Display direct-transfer images in local and managed
   remote panes, including terminal-browser's inline pixel output and tele-style
   scrolling Unicode image placeholders. Image updates
   reuse display IDs without repainting unchanged text; pane clipping and menus
   compose with the images. Requires Kitty 0.28 or newer and transport 11 builds
-  on the display machine and remote owners. See the [graphics preview limits](https://github.com/Shaloc/luvus/blob/main/website/src/content/docs/docs/guides/remote.mdx#kitty-graphics-preview).
+  on the display machine and remote owners. See the [graphics support and limits](https://github.com/Shaloc/luvus/blob/main/website/src/content/docs/docs/guides/remote.mdx#kitty-graphics).
 - **Extensible surfaces:** Install modules with actions, events, settings,
   startup hooks, panes, sidebar docks, and Top or Bottom Luvus Bar widgets.
 - **Universal Harness Protocol:** Build harnesses and orchestrators on the
@@ -103,10 +103,9 @@ sessions. To upgrade, rerun the installer above; `luvus update`, the upstream
 website installers, Homebrew tap, and crates.io package still target upstream.
 Prebuilt fork releases currently cover only the two platforms listed above.
 
-Graphics preview releases are marked as prereleases and do not replace the
-stable installer default. To try one, copy its exact tag from the fork's release
-page and pass `LUVUS_VERSION=<tag>` to `sh` in the installer pipeline. Installation
-does not restart servers; load the matching build on each machine when ready.
+Kitty graphics are included in stable fork releases and the default installer.
+Installation does not restart servers; load the matching build on the display
+machine and remote owners when ready.
 
 After configuring an SSH alias, `luvus host add devbox --install` enables it
 and prompts before installing a missing/incompatible fork binary on that host,

@@ -12,7 +12,6 @@ pub(crate) const MAX_AGENT_REPORT_TTL_S: u64 = 86400;
 pub(crate) const MAX_AGENT_REPORT_MESSAGE_CHARS: usize = 4096;
 pub(crate) const MAX_AGENT_PROMPT_CHARS: usize = 262_144;
 pub(crate) const MAX_AGENT_START_ARGS: usize = 64;
-const AGENT_PROMPT_QUIET: Duration = Duration::from_millis(1200);
 const DETECTION_INTERVAL: Duration = Duration::from_millis(100);
 const DETECTION_AUDIT_INTERVAL: Duration = Duration::from_secs(2);
 const CWD_SCAN_INTERVAL: Duration = Duration::from_secs(1);
@@ -1343,21 +1342,43 @@ pub struct AgentStart {
     cancelled: Arc<AtomicBool>,
 }
 
-/// A submitted prompt waiting for post-submission evidence. `saw_output`
-/// closes the fast-turn gap where an agent starts and settles between two
-/// semantic detection ticks; the quiet window prevents prompt echo alone from
-/// being reported as completion immediately.
+/// A queued prompt waiting for an observed active transition and requested state.
+/// Capture transitions on the app loop so a fast turn cannot disappear between
+/// workflow ticks. Output and presentation metadata alone cannot complete a wait.
 pub struct AgentPrompt {
     request_id: String,
     until: Vec<State>,
     baseline_revision: u64,
     last_revision: u64,
-    last_output_at: Instant,
-    saw_output: bool,
-    saw_working: bool,
+    last_state: Option<State>,
+    observed_state: Option<State>,
     reply: Sender<String>,
     deadline: Instant,
     cancelled: Arc<AtomicBool>,
+}
+
+impl AgentPrompt {
+    fn observe(&mut self, state: Option<State>) {
+        if state != self.last_state && matches!(state, Some(State::Working | State::Blocked)) {
+            self.observed_state
+                .get_or_insert(state.expect("active state"));
+        }
+        self.last_state = state;
+    }
+
+    fn failure(&self, pane: PaneId, code: &str, reason: &str) -> String {
+        json!({"id":self.request_id,"error":{
+            "code":code,
+            "message": "prompt observation ended before the requested condition; do not automatically resend",
+            "data":{
+                "pane":pane.0.to_string(), "queued":true,
+                "submitted":true,
+                "observed_state":self.observed_state.map(state_str), "reason":reason,
+                "baseline_revision":self.baseline_revision,
+                "content_revision":self.last_revision,
+            }
+        }}).to_string()
+    }
 }
 
 /// The canonical `wait.output` response: `matched` says whether the marker
@@ -1398,8 +1419,9 @@ fn agent_prompt_response(
     baseline_revision: u64,
     content_revision: u64,
     evidence: &str,
+    observed_state: Option<State>,
 ) -> String {
-    json!({
+    let mut response = json!({
         "id":request_id,
         "result":{
             "type":"agent_prompt",
@@ -1411,8 +1433,18 @@ fn agent_prompt_response(
             "content_revision":content_revision,
             "evidence":evidence,
         }
-    })
-    .to_string()
+    });
+    if evidence != "queued" {
+        response["result"]["observed_state"] = json!(observed_state.map(state_str));
+    }
+    response.to_string()
+}
+
+fn agent_prompt_not_ready_error() -> (String, String) {
+    (
+        "agent_not_ready".to_string(),
+        "target agent has not exposed a prompt-ready composer; no prompt input was queued; inspect it with agent read and use agent keys only for an explicit interaction".to_string(),
+    )
 }
 
 /// Debounce dwell for committing a newly-desired agent state (hysteresis).
@@ -1613,9 +1645,6 @@ impl App {
         }
         for prompt in self.agent_prompts.values().flatten() {
             consider(prompt.deadline, true);
-            if prompt.saw_output {
-                consider(prompt.last_output_at + AGENT_PROMPT_QUIET, true);
-            }
         }
         if !self.backend_revision_waits.is_empty() {
             consider(self.last_backend_wait_scan + WAIT_RETEST_INTERVAL, true);
@@ -2023,6 +2052,10 @@ impl App {
                 running_for_detection,
                 &self.manifests,
             );
+            let inspect_codex_composer = known_agent.eq_ignore_ascii_case("codex")
+                || self
+                    .manifests
+                    .process_has_agent(running_for_detection, "codex");
             let (last_generation, force_detect) = self
                 .status
                 .get(&id)
@@ -2042,10 +2075,13 @@ impl App {
                             } else {
                                 engine.detection_text(detection_rows)
                             };
+                            let codex_composer_ready = inspect_codex_composer
+                                .then(|| engine.codex_composer_region().is_some());
                             Some((
                                 generation,
                                 engine.title().map(Arc::<str>::from),
                                 Arc::<str>::from(text),
+                                codex_composer_ready,
                             ))
                         } else {
                             None
@@ -2054,8 +2090,11 @@ impl App {
                     Err(_) => None,
                 }
             };
+            let inspected_composer_ready = inspected
+                .as_ref()
+                .and_then(|(_, _, _, composer_ready)| *composer_ready);
             if let Some(s) = self.status.get_mut(&id) {
-                if let Some((generation, title, bottom)) = inspected {
+                if let Some((generation, title, bottom, _)) = inspected {
                     if audit_only {
                         self.detection_audit_recoveries =
                             self.detection_audit_recoveries.saturating_add(1);
@@ -2102,6 +2141,13 @@ impl App {
                 Some(report) => detect::Detection {
                     state: report.state,
                     agent: report.agent.clone(),
+                    prompt_evidence: if report.state == State::Blocked {
+                        detect::PromptEvidence::Blocked
+                    } else if report.agent.eq_ignore_ascii_case("codex") {
+                        detect::PromptEvidence::Unknown
+                    } else {
+                        detect::PromptEvidence::Ready
+                    },
                     identity_source: "integration_report",
                     state_source: "integration_report",
                     rule_priority: None,
@@ -2124,6 +2170,17 @@ impl App {
                 s.state_source = det.state_source;
                 s.rule_priority = det.rule_priority;
                 s.rule_region = det.rule_region;
+                s.prompt_evidence = if det.prompt_evidence == detect::PromptEvidence::Blocked {
+                    detect::PromptEvidence::Blocked
+                } else if det.agent.eq_ignore_ascii_case("codex") {
+                    match inspected_composer_ready {
+                        Some(true) => detect::PromptEvidence::Ready,
+                        Some(false) => detect::PromptEvidence::Unknown,
+                        None => s.prompt_evidence,
+                    }
+                } else {
+                    det.prompt_evidence
+                };
                 let focused = id == focus;
                 if focused {
                     s.seen = true;
@@ -3789,6 +3846,9 @@ impl App {
                         "agent send text must not be empty".to_string(),
                     ));
                 }
+                if !self.agent_prompt_is_ready(id) {
+                    return Err(agent_prompt_not_ready_error());
+                }
                 let pane = self.panes.get(&id).ok_or_else(|| {
                     (
                         "send_failed".to_string(),
@@ -3808,7 +3868,7 @@ impl App {
             // Send named control keys (enter, esc, ctrl+c, up, …) to a target agent,
             // e.g. to answer a blocked approval prompt. All keys validate first.
             "agent.keys" => {
-                reject_api_fields(p, &["target", "keys"])?;
+                reject_api_fields(p, &["target", "keys", "if_content_revision", "terminal_id"])?;
                 let id = self.resolve_agent_target(p)?;
                 if !self.is_agent_pane(id) {
                     return Err((
@@ -3840,11 +3900,68 @@ impl App {
                         ("invalid_request".to_string(), format!("unknown key: {key}"))
                     })?);
                 }
-                self.panes
-                    .get(&id)
-                    .ok_or_else(not_found)?
-                    .try_send(&bytes)
-                    .map_err(|message| ("send_failed".to_string(), message))?;
+                let fence = match (p.get("if_content_revision"), p.get("terminal_id")) {
+                    (None, None) => None,
+                    (Some(revision), Some(terminal_id)) => {
+                        let revision = revision.as_u64().ok_or_else(|| {
+                            (
+                                "invalid_request".to_string(),
+                                "if_content_revision must be a non-negative integer".to_string(),
+                            )
+                        })?;
+                        let terminal_id = terminal_id
+                            .as_str()
+                            .filter(|id| crate::terminal::backend::valid_id(id))
+                            .ok_or_else(|| {
+                                (
+                                    "invalid_request".to_string(),
+                                    "terminal_id must be 32 lowercase hexadecimal characters"
+                                        .to_string(),
+                                )
+                            })?;
+                        Some((revision, terminal_id))
+                    }
+                    _ => {
+                        return Err((
+                            "invalid_request".to_string(),
+                            "if_content_revision and terminal_id must be supplied together"
+                                .to_string(),
+                        ));
+                    }
+                };
+                let pane = self.panes.get(&id).ok_or_else(not_found)?;
+                if let Some((expected_revision, expected_terminal)) = fence {
+                    // The PTY reader advances content_revision under this same lock.
+                    // Keep it through queue admission, but never through child I/O.
+                    let engine = pane.engine.lock().map_err(|_| {
+                        (
+                            "content_revision_conflict".to_string(),
+                            format!(
+                                "expected terminal_id={expected_terminal} content_revision={expected_revision}; actual unavailable (terminal engine lock failed)"
+                            ),
+                        )
+                    })?;
+                    let actual_revision = pane.content_revision();
+                    let actual_terminal =
+                        pane.terminal_runtime().map(|runtime| runtime.terminal_id);
+                    if actual_revision != expected_revision
+                        || actual_terminal.as_deref() != Some(expected_terminal)
+                    {
+                        return Err((
+                            "content_revision_conflict".to_string(),
+                            format!(
+                                "expected terminal_id={expected_terminal} content_revision={expected_revision}; actual terminal_id={} content_revision={actual_revision}",
+                                actual_terminal.as_deref().unwrap_or("null")
+                            ),
+                        ));
+                    }
+                    let sent = pane.try_send(&bytes);
+                    drop(engine);
+                    sent.map_err(|message| ("send_failed".to_string(), message))?;
+                } else {
+                    pane.try_send(&bytes)
+                        .map_err(|message| ("send_failed".to_string(), message))?;
+                }
                 Ok(json!({"type":"ok","pane": id.0.to_string()}))
             }
             // Read a target agent's output, addressed by name or pane id.
@@ -3854,20 +3971,29 @@ impl App {
                 // `visible` = the current screen; anything else = recent output
                 // (soft wraps joined), the default and best for transcripts.
                 let source = p.get("source").and_then(|v| v.as_str()).unwrap_or("recent");
-                let text = self
+                let (text, content_revision, terminal_id) = self
                     .panes
                     .get(&id)
                     .and_then(|pane| {
                         pane.engine.lock().ok().map(|e| {
-                            if source == "visible" {
+                            let text = if source == "visible" {
                                 e.visible_rows().join("\n")
                             } else {
                                 e.detection_text(lines)
-                            }
+                            };
+                            // Capture coordinates with the text, as terminal capture does.
+                            (
+                                text,
+                                Some(pane.content_revision()),
+                                pane.terminal_runtime().map(|runtime| runtime.terminal_id),
+                            )
                         })
                     })
                     .unwrap_or_default();
-                Ok(json!({"type":"agent_read","pane": id.0.to_string(), "text": text}))
+                Ok(
+                    json!({"type":"agent_read","pane": id.0.to_string(), "text": text,
+                    "content_revision": content_revision, "terminal_id": terminal_id}),
+                )
             }
             // One agent's live info, resolved by name / pane id / kind — what to
             // check before deciding how to answer a blocked agent.
@@ -6315,6 +6441,11 @@ impl App {
             fail("send_failed", message);
             return;
         }
+        if let Some(status) = self.status.get_mut(&pane) {
+            status.prompt_evidence = detect::PromptEvidence::Unknown;
+            status.prompt_evidence_required = detect::prompt_requires_positive_evidence(kind);
+            status.force_detect = true;
+        }
         self.set_agent_name(pane, Some(name));
         self.agent_starts.insert(
             pane,
@@ -6329,8 +6460,68 @@ impl App {
         );
     }
 
+    /// Return current raw readiness evidence for prompt admission. Normal
+    /// detection already caches this result. If terminal output arrived after
+    /// that pass, inspect only the same bounded live rows once, on this request,
+    /// so an agent-start/prompt race cannot submit Enter before a composer exists.
+    fn agent_prompt_is_ready(&self, id: PaneId) -> bool {
+        let Some(status) = self.status.get(&id) else {
+            return true;
+        };
+        let positive_evidence_required = status.prompt_evidence_required
+            || status
+                .agent_session
+                .as_ref()
+                .is_some_and(|session| detect::prompt_requires_positive_evidence(&session.agent));
+        let admits = |evidence| match evidence {
+            detect::PromptEvidence::Ready => true,
+            detect::PromptEvidence::Blocked => false,
+            detect::PromptEvidence::Unknown => !positive_evidence_required,
+        };
+        let Some(pane) = self.panes.get(&id) else {
+            return true;
+        };
+        let Ok(engine) = pane.engine.lock() else {
+            return false;
+        };
+        if !status.force_detect && status.last_detect_generation == Some(engine.output_generation())
+        {
+            return admits(status.prompt_evidence);
+        }
+        let running = self
+            .proc_commands
+            .get(&id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let rows = detect::screen_rows(&status.agent, running, &self.manifests);
+        let bottom = if detect::screen_uses_non_empty_rows(&status.agent, running, &self.manifests)
+        {
+            engine.detection_text_non_empty(rows)
+        } else {
+            engine.detection_text(rows)
+        };
+        let raw = detect::prompt_evidence(
+            engine.title().as_deref(),
+            &bottom,
+            &status.agent,
+            &self.manifests,
+        );
+        let evidence = if raw == detect::PromptEvidence::Blocked {
+            raw
+        } else if status.agent.eq_ignore_ascii_case("codex") {
+            if engine.codex_composer_region().is_some() {
+                detect::PromptEvidence::Ready
+            } else {
+                detect::PromptEvidence::Unknown
+            }
+        } else {
+            raw
+        };
+        admits(evidence)
+    }
+
     /// Atomically submit a prompt and, when requested, retain the response until
-    /// the post-submission lifecycle has settled. The single queued PTY action
+    /// an active transition and the requested state are observed. The queued PTY action
     /// guarantees that paste and Enter cannot be accepted independently.
     pub(crate) fn start_agent_prompt(
         &mut self,
@@ -6423,6 +6614,11 @@ impl App {
                 return;
             }
         }
+        if !self.agent_prompt_is_ready(pane) {
+            let (code, message) = agent_prompt_not_ready_error();
+            fail(&code, message);
+            return;
+        }
         let Some(target) = self.panes.get(&pane) else {
             fail("not_found", "pane not found".to_string());
             return;
@@ -6443,6 +6639,7 @@ impl App {
                 baseline_revision,
                 baseline_revision,
                 "queued",
+                None,
             ));
             return;
         }
@@ -6455,9 +6652,8 @@ impl App {
                 until,
                 baseline_revision,
                 last_revision: baseline_revision,
-                last_output_at: now,
-                saw_output: false,
-                saw_working: status == Some(State::Working),
+                last_state: status,
+                observed_state: None,
                 reply,
                 deadline: now + timeout,
                 cancelled,
@@ -6507,6 +6703,7 @@ impl App {
             let revision = self
                 .panes
                 .get(&pane)
+                .filter(|target| !target.child_exited())
                 .map(crate::terminal::pty::Pane::content_revision);
             let state = self.status.get(&pane).map(|status| status.state);
             let Some(waiters) = self.agent_prompts.get_mut(&pane) else {
@@ -6517,47 +6714,13 @@ impl App {
                     return false;
                 }
                 let Some(revision) = revision else {
-                    let _ = waiter.reply.send(agent_prompt_response(
-                        &waiter.request_id,
-                        pane,
-                        true,
-                        false,
-                        None,
-                        waiter.baseline_revision,
-                        waiter.last_revision,
-                        "pane_closed",
-                    ));
+                    let _ =
+                        waiter
+                            .reply
+                            .send(waiter.failure(pane, "agent_not_running", "pane_closed"));
                     return false;
                 };
-                if revision != waiter.last_revision {
-                    waiter.last_revision = revision;
-                    waiter.last_output_at = now;
-                    waiter.saw_output = revision > waiter.baseline_revision;
-                }
-                if state == Some(State::Working) {
-                    waiter.saw_working = true;
-                }
-                let target = state.is_some_and(|state| waiter.until.contains(&state));
-                let quiet = waiter.saw_output
-                    && now.saturating_duration_since(waiter.last_output_at) >= AGENT_PROMPT_QUIET;
-                if target && (waiter.saw_working || quiet) {
-                    let evidence = if waiter.saw_working {
-                        "state_transition"
-                    } else {
-                        "output_settled"
-                    };
-                    let _ = waiter.reply.send(agent_prompt_response(
-                        &waiter.request_id,
-                        pane,
-                        true,
-                        true,
-                        state,
-                        waiter.baseline_revision,
-                        revision,
-                        evidence,
-                    ));
-                    return false;
-                }
+                waiter.last_revision = revision;
                 if now >= waiter.deadline {
                     let _ = waiter.reply.send(agent_prompt_response(
                         &waiter.request_id,
@@ -6568,6 +6731,23 @@ impl App {
                         waiter.baseline_revision,
                         revision,
                         "timeout",
+                        waiter.observed_state,
+                    ));
+                    return false;
+                }
+                waiter.observe(state);
+                let target = state.is_some_and(|state| waiter.until.contains(&state));
+                if waiter.observed_state.is_some() && target {
+                    let _ = waiter.reply.send(agent_prompt_response(
+                        &waiter.request_id,
+                        pane,
+                        true,
+                        target,
+                        state,
+                        waiter.baseline_revision,
+                        revision,
+                        "state_transition",
+                        waiter.observed_state,
                     ));
                     return false;
                 }
@@ -6619,6 +6799,15 @@ impl App {
     }
 
     pub(crate) fn check_agent_waits(&mut self, id: PaneId) {
+        if let Some(prompts) = self.agent_prompts.get_mut(&id) {
+            let state = self.status.get(&id).map(|status| status.state);
+            let now = Instant::now();
+            for prompt in prompts {
+                if now < prompt.deadline {
+                    prompt.observe(state);
+                }
+            }
+        }
         let Some(current) = self.status.get(&id).map(|status| status.state) else {
             return;
         };
@@ -6686,16 +6875,9 @@ impl App {
         }
         if let Some(prompts) = self.agent_prompts.remove(&id) {
             for prompt in prompts {
-                let _ = prompt.reply.send(agent_prompt_response(
-                    &prompt.request_id,
-                    id,
-                    true,
-                    false,
-                    None,
-                    prompt.baseline_revision,
-                    prompt.last_revision,
-                    "pane_closed",
-                ));
+                let _ = prompt
+                    .reply
+                    .send(prompt.failure(id, "agent_not_running", "pane_closed"));
             }
         }
     }
@@ -9755,6 +9937,106 @@ command = ["true"]
     }
 
     #[test]
+    fn prompt_apis_reject_a_fresh_interaction_screen_without_queueing_input() {
+        let _env = crate::persist::test_env("prompt-interaction-guard");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 32, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        app.panes[&pane].engine.lock().unwrap().advance(
+            b"\x1b[2J\x1b[HWelcome to Codex\r\n\r\n\
+              > 1. Sign in with ChatGPT\r\n\
+                2. Sign in with Device Code\r\n\
+                3. Provide your own API key\r\n\r\n\
+              Press enter to continue",
+        );
+        let (input, received) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(input);
+
+        let error = app
+            .dispatch(
+                "agent.send",
+                &json!({"target":pane.0.to_string(),"text":"do not submit"}),
+            )
+            .expect_err("an interaction chooser must reject agent.send");
+        assert_eq!(error.0, "agent_not_ready");
+        assert!(error.1.contains("no prompt input was queued"));
+        assert!(received.try_recv().is_err());
+
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "blocked-prompt".into(),
+            json!({"target":pane.0.to_string(),"text":"do not submit"}),
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "agent_not_ready");
+        assert!(value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("no prompt input was queued"));
+        assert!(received.try_recv().is_err());
+        assert!(app.agent_prompts.is_empty());
+    }
+
+    #[test]
+    fn native_codex_requires_live_composer_geometry() {
+        let _env = crate::persist::test_env("prompt-composer-geometry");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let status = app.status.get_mut(&pane).unwrap();
+        status.agent = "codex".into();
+        status.agent_session = Some(crate::app::AgentSession {
+            agent: "codex".into(),
+            session_id: "native-session".into(),
+        });
+
+        let (input, received) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(input);
+
+        // A transcript can retain the same marker as the composer. Text alone
+        // is not enough to admit another turn.
+        app.panes[&pane]
+            .engine
+            .lock()
+            .unwrap()
+            .advance("\x1b[1;1Htranscript\r\n› old prompt\r\nanswer".as_bytes());
+        let error = app
+            .dispatch(
+                "agent.send",
+                &json!({"target":pane.0.to_string(),"text":"new prompt"}),
+            )
+            .expect_err("transcript marker must not establish readiness");
+        assert_eq!(error.0, "agent_not_ready");
+        assert!(received.try_recv().is_err());
+
+        // The existing VT boundary recognizes the live Codex composer from its
+        // cursor and padding geometry; no echo polling is needed.
+        app.panes[&pane]
+            .engine
+            .lock()
+            .unwrap()
+            .advance("\x1b[2J\x1b[2;1H› ".as_bytes());
+        app.dispatch(
+            "agent.send",
+            &json!({"target":pane.0.to_string(),"text":"new prompt"}),
+        )
+        .expect("live composer accepts prompt");
+        let crate::terminal::pty::InputAction::Submit { .. } = received.try_recv().unwrap() else {
+            panic!("prompt must remain one atomic submit action")
+        };
+        assert!(received.try_recv().is_err());
+    }
+
+    #[test]
     fn pane_input_methods_report_rejection_and_run_is_one_action() {
         let _env = crate::persist::test_env("pane-input-admission");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -9864,7 +10146,8 @@ command = ["true"]
     }
 
     #[test]
-    fn atomic_agent_prompt_uses_output_evidence_for_a_fast_settled_turn() {
+    fn atomic_agent_prompt_ignores_output_without_a_relevant_transition() {
+        let _env = crate::persist::test_env("prompt-unrelated-output");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         let pane = app.layout().focus;
@@ -9886,14 +10169,384 @@ command = ["true"]
         );
 
         let revision = app.panes[&pane].content_revision_handle();
+        app.panes[&pane]
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b]0;unrelated-title\x07");
+        app.check_agent_waits(pane);
         revision.fetch_add(1, Ordering::Release);
         app.tick_agent_workflows(started + Duration::from_millis(10));
-        app.tick_agent_workflows(started + AGENT_PROMPT_QUIET + Duration::from_millis(20));
+        app.tick_agent_workflows(started + Duration::from_millis(1220));
+        assert!(
+            response.try_recv().is_err(),
+            "quiet output is not transition evidence"
+        );
+        app.status.get_mut(&pane).unwrap().state = State::Working;
+        app.check_agent_waits(pane);
+        app.status.get_mut(&pane).unwrap().state = State::Idle;
+        app.check_agent_waits(pane);
+        app.tick_agent_workflows(started + Duration::from_secs(2));
         let value: Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
         assert_eq!(value["result"]["type"], "agent_prompt");
         assert_eq!(value["result"]["submitted"], true);
         assert_eq!(value["result"]["matched"], true);
-        assert_eq!(value["result"]["evidence"], "output_settled");
+        assert_eq!(value["result"]["evidence"], "state_transition");
+        assert!(app.agent_prompts.is_empty());
+    }
+
+    #[test]
+    fn observed_prompt_pane_exit_is_a_structured_failure() {
+        let _env = crate::persist::test_env("observed-prompt-exit");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "prompt".into(),
+            json!({"target":pane.0.to_string(), "text":"review", "wait":true}),
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.cancel_agent_waits(pane);
+        let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "agent_not_running");
+        assert_eq!(value["error"]["data"]["pane"], pane.0.to_string());
+        assert_eq!(value["error"]["data"]["queued"], true);
+        assert_eq!(value["error"]["data"]["submitted"], true);
+        assert_eq!(value["error"]["data"]["observed_state"], Value::Null);
+        assert_eq!(value["error"]["data"]["reason"], "pane_closed");
+        assert!(value["error"]["data"]["baseline_revision"].is_u64());
+        assert!(value["error"]["data"]["content_revision"].is_u64());
+        assert!(app.agent_prompts.is_empty());
+    }
+
+    #[test]
+    fn observed_prompt_no_wait_keeps_the_queued_response_and_no_ownership() {
+        let _env = crate::persist::test_env("prompt-no-wait");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (input, received) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(input);
+        for pending_wait in [false, true] {
+            if pending_wait {
+                let (reply, _response) = std::sync::mpsc::channel();
+                app.start_agent_prompt(
+                    "waiting".into(),
+                    json!({"target":pane.0.to_string(),"text":"first","wait":true}),
+                    reply,
+                    Arc::new(AtomicBool::new(false)),
+                );
+                received.try_recv().unwrap();
+            }
+            let baseline = app.panes[&pane].content_revision();
+            let (reply, response) = std::sync::mpsc::channel();
+            app.start_agent_prompt(
+                "queued".into(),
+                json!({"target":pane.0.to_string(),"text":"review"}),
+                reply,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert_eq!(
+                value,
+                json!({"id":"queued","result":{
+                    "type":"agent_prompt","pane":pane.0.to_string(),"submitted":true,
+                    "matched":false,"status":"idle","baseline_revision":baseline,
+                    "content_revision":baseline,"evidence":"queued"
+                }})
+            );
+            received.try_recv().unwrap();
+            assert_eq!(app.agent_prompts.len(), usize::from(pending_wait));
+        }
+    }
+
+    #[test]
+    fn observed_prompt_exited_terminal_releases_ownership_before_pane_removal() {
+        let _env = crate::persist::test_env("prompt-terminal-exit");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "exit".into(),
+            json!({"target":pane.0.to_string(),"text":"exit","wait":true}),
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.panes[&pane].child_exited() {
+            assert!(Instant::now() < deadline, "test shell did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        app.tick_agent_workflows(Instant::now());
+        let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "agent_not_running");
+        assert_eq!(value["error"]["data"]["pane"], pane.0.to_string());
+        assert_eq!(value["error"]["data"]["reason"], "pane_closed");
+        assert_eq!(value["error"]["data"]["observed_state"], Value::Null);
+        assert!(app.agent_prompts.is_empty());
+        assert_eq!(app.status[&pane].state, State::Idle);
+    }
+
+    #[test]
+    fn observed_prompt_requires_a_new_active_state_and_preserves_until() {
+        let _env = crate::persist::test_env("observed-prompt-states");
+        for initial in [State::Idle, State::Working, State::Blocked, State::Done] {
+            for active in [State::Working, State::Blocked] {
+                for until in [State::Idle, State::Working, State::Blocked, State::Done] {
+                    let (tx, _rx) = std::sync::mpsc::channel();
+                    let mut app = App::new(80, 24, tx).unwrap();
+                    let pane = app.layout().focus;
+                    let status = app.status.get_mut(&pane).unwrap();
+                    status.agent = "codex".into();
+                    status.state = initial;
+                    let (reply, response) = std::sync::mpsc::channel();
+                    app.start_agent_prompt("states".into(), json!({"target":pane.0.to_string(),"text":"review","wait":true,"until":[state_str(until)]}), reply, Arc::new(AtomicBool::new(false)));
+                    app.check_agent_waits(pane);
+                    app.tick_agent_workflows(Instant::now());
+                    assert!(
+                        response.try_recv().is_err(),
+                        "the initial state is not a new transition"
+                    );
+                    app.status.get_mut(&pane).unwrap().state = State::Idle;
+                    app.check_agent_waits(pane);
+                    app.status.get_mut(&pane).unwrap().state = active;
+                    app.check_agent_waits(pane);
+                    app.status.get_mut(&pane).unwrap().state = until;
+                    app.check_agent_waits(pane);
+                    app.tick_agent_workflows(Instant::now());
+                    let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+                    assert_eq!(value["result"]["submitted"], true);
+                    assert_eq!(value["result"]["matched"], true);
+                    assert_eq!(value["result"]["status"], state_str(until));
+                    assert_eq!(value["result"]["observed_state"], state_str(active));
+                    assert!(app.agent_prompts.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn observed_prompt_unknown_state_times_out_without_changing_status() {
+        let _env = crate::persist::test_env("observed-prompt-unknown");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let status = app.status.get_mut(&pane).unwrap();
+        status.agent = "codex".into();
+        status.state = State::Unknown;
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "prompt".into(),
+            json!({"target":pane.0.to_string(),"text":"review","wait":true,"timeout_s":0}),
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        app.tick_agent_workflows(Instant::now());
+        let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["result"]["evidence"], "timeout");
+        assert_eq!(value["result"]["matched"], false);
+        assert_eq!(value["result"]["observed_state"], Value::Null);
+        assert_eq!(app.status[&pane].state, State::Unknown);
+        assert!(app.agent_prompts.is_empty());
+    }
+
+    #[test]
+    fn observed_prompt_cancellation_and_missing_terminal_release_ownership() {
+        let _env = crate::persist::test_env("observed-prompt-cleanup");
+        for cancel in [true, false] {
+            let (tx, _rx) = std::sync::mpsc::channel();
+            let mut app = App::new(80, 24, tx).unwrap();
+            let pane = app.layout().focus;
+            app.status.get_mut(&pane).unwrap().agent = "codex".into();
+            let (reply, response) = std::sync::mpsc::channel();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            app.start_agent_prompt(
+                "prompt".into(),
+                json!({"target":pane.0.to_string(),"text":"review","wait":true}),
+                reply,
+                cancelled.clone(),
+            );
+            if cancel {
+                cancelled.store(true, Ordering::Release);
+            } else {
+                app.panes.remove(&pane);
+            }
+            app.tick_agent_workflows(Instant::now());
+            assert!(app.agent_prompts.is_empty());
+            if cancel {
+                assert!(response.try_recv().is_err());
+            } else {
+                let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+                assert_eq!(value["error"]["code"], "agent_not_running");
+                assert_eq!(value["error"]["data"]["submitted"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn observed_prompt_rejected_requests_never_queue_input() {
+        let _env = crate::persist::test_env("observed-prompt-rejections");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (input, received) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(input);
+        for patch in [
+            json!({"extra":true}),
+            json!({"target":"missing"}),
+            json!({"text":""}),
+            json!({"text":7}),
+            json!({"text":"x".repeat(MAX_AGENT_PROMPT_CHARS + 1)}),
+            json!({"wait":"true"}),
+            json!({"until":["done"]}),
+            json!({"timeout_s":1}),
+            json!({"wait":true,"until":[]}),
+            json!({"wait":true,"until":["unknown"]}),
+            json!({"wait":true,"timeout_s":-1}),
+            json!({"wait":true,"timeout_s":3601}),
+            json!({"wait":true,"timeout_s":"1"}),
+        ] {
+            let mut params = json!({"target":pane.0.to_string(),"text":"review"});
+            params
+                .as_object_mut()
+                .unwrap()
+                .extend(patch.as_object().unwrap().clone());
+            let (reply, response) = std::sync::mpsc::channel();
+            app.start_agent_prompt(
+                "invalid".into(),
+                params,
+                reply,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+            assert!(value.get("error").is_some());
+            assert!(received.try_recv().is_err());
+            assert!(app.agent_prompts.is_empty());
+        }
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "cancelled".into(),
+            json!({"target":pane.0.to_string(),"text":"review"}),
+            reply,
+            Arc::new(AtomicBool::new(true)),
+        );
+        assert!(response.try_recv().is_err());
+        assert!(received.try_recv().is_err());
+        assert!(app.agent_prompts.is_empty());
+        drop(received);
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "send-failed".into(),
+            json!({"target":pane.0.to_string(),"text":"review"}),
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "send_failed");
+        assert!(app.agent_prompts.is_empty());
+    }
+
+    #[test]
+    fn observed_prompt_admission_failures_preserve_input_and_ownership() {
+        let _env = crate::persist::test_env("observed-prompt-admission");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let (input, received) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(input);
+        let params = json!({"target":pane.0.to_string(),"text":"review","wait":true});
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "shell".into(),
+            params.clone(),
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "agent_not_ready");
+        assert!(received.try_recv().is_err());
+        assert!(app.agent_prompts.is_empty());
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (reply, _response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "first".into(),
+            params.clone(),
+            reply.clone(),
+            Arc::new(AtomicBool::new(false)),
+        );
+        let _queued = received.try_recv().unwrap();
+        let (second_reply, second_response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "busy".into(),
+            params.clone(),
+            second_reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let value: Value = serde_json::from_str(&second_response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "agent_prompt_busy");
+        assert!(received.try_recv().is_err());
+        assert_eq!(app.agent_prompts[&pane].len(), 1);
+        for _ in 1..MAX_AGENT_WAITS_TOTAL {
+            app.agent_prompts.get_mut(&pane).unwrap().push(AgentPrompt {
+                request_id: "capacity-fixture".into(),
+                until: vec![State::Done],
+                baseline_revision: 0,
+                last_revision: 0,
+                last_state: Some(State::Idle),
+                observed_state: None,
+                reply: reply.clone(),
+                deadline: Instant::now() + MAX_AGENT_WAIT,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            });
+        }
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt(
+            "full".into(),
+            params,
+            reply,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["error"]["code"], "unavailable");
+        assert!(received.try_recv().is_err());
+        assert_eq!(app.agent_prompts[&pane].len(), MAX_AGENT_WAITS_TOTAL);
+    }
+
+    #[test]
+    fn observed_prompt_completion_timeout_preserves_transition_evidence() {
+        let _env = crate::persist::test_env("observed-prompt-deadline");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (reply, response) = std::sync::mpsc::channel();
+        app.start_agent_prompt("prompt".into(), json!({"target":pane.0.to_string(),"text":"review","wait":true,"until":["done"],"timeout_s":1}), reply, Arc::new(AtomicBool::new(false)));
+        app.status.get_mut(&pane).unwrap().state = State::Working;
+        app.check_agent_waits(pane);
+        app.status.get_mut(&pane).unwrap().state = State::Unknown;
+        app.tick_agent_workflows(Instant::now() + Duration::from_secs(2));
+        let value: Value = serde_json::from_str(&response.try_recv().unwrap()).unwrap();
+        assert_eq!(value["result"]["submitted"], true);
+        assert_eq!(value["result"]["matched"], false);
+        assert_eq!(value["result"]["observed_state"], "working");
+        assert_eq!(value["result"]["evidence"], "timeout");
+        assert_eq!(value["result"]["status"], "unknown");
         assert!(app.agent_prompts.is_empty());
     }
 
@@ -9910,11 +10563,15 @@ command = ["true"]
             reply,
             Arc::new(AtomicBool::new(false)),
         );
+        app.status.get_mut(&pane).unwrap().state = State::Working;
+        app.check_agent_waits(pane);
         app.tick_agent_workflows(Instant::now());
         let value: Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
         assert_eq!(value["result"]["submitted"], true);
         assert_eq!(value["result"]["matched"], false);
         assert_eq!(value["result"]["evidence"], "timeout");
+        assert_eq!(value["result"]["observed_state"], Value::Null);
+        assert!(app.agent_prompts.is_empty());
     }
 
     #[test]
@@ -9959,6 +10616,11 @@ command = ["true"]
             Arc::new(AtomicBool::new(false)),
         );
         assert_eq!(app.agent_names.get("reviewer"), Some(&pane));
+        assert!(
+            app.status[&pane].prompt_evidence_required
+                && app.status[&pane].prompt_evidence == detect::PromptEvidence::Unknown,
+            "a server-launched Codex pane needs positive composer evidence"
+        );
         assert!(response.try_recv().is_err());
 
         let status = app.status.get_mut(&pane).unwrap();
@@ -11415,5 +12077,333 @@ command = ["true"]
             "a closed workspace fails its parked waiters"
         );
         assert!(app.output_waits.is_empty(), "no waiters leak");
+    }
+    #[test]
+    #[ignore = "PTY child for content fence tests"]
+    fn content_fence_quiet_child() {
+        if std::env::var("LUVUS_CONTENT_FENCE_CHILD").as_deref() != Ok("1") {
+            return;
+        }
+        use std::io::{Read, Write};
+        println!("\nU02_QUIET_CHILD_READY");
+        std::io::stdout().flush().unwrap();
+        let mut byte = [0];
+        while std::io::stdin().read(&mut byte).unwrap_or(0) != 0 {}
+    }
+
+    /// Keep a real terminal lifetime with controlled output and a private input queue.
+    /// A normal interactive shell can redraw after a read and invalidate test pairs.
+    fn content_fence_app() -> (
+        App,
+        PaneId,
+        std::sync::mpsc::Receiver<crate::terminal::pty::InputAction>,
+    ) {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let child = Pane::spawn_command(
+            pane,
+            80,
+            24,
+            app.ws().cwd.clone(),
+            app.app_tx.clone(),
+            &[
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                "--exact".into(),
+                "app::dispatch::tests::content_fence_quiet_child".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+                "--quiet".into(),
+            ],
+            &[("LUVUS_CONTENT_FENCE_CHILD".into(), "1".into())],
+            app.config.scrollback_bytes(),
+            app.pane_appearance,
+            None,
+        )
+        .unwrap();
+        app.panes.insert(pane, child);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let ready = app.panes[&pane]
+                .engine
+                .lock()
+                .unwrap()
+                .visible_rows()
+                .iter()
+                .any(|line| line.trim() == "U02_QUIET_CHILD_READY");
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "quiet child did not become ready"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.status.get_mut(&pane).unwrap().agent = "claude".into();
+        let (input_tx, input_rx) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(input_tx);
+        (app, pane, input_rx)
+    }
+
+    /// Capture valid fence parameters from the fixture terminal under its engine lock.
+    fn content_fence_pair(app: &App, pane_id: PaneId) -> Value {
+        let pane = &app.panes[&pane_id];
+        let _engine = pane.engine.lock().unwrap();
+        json!({
+            "target": pane_id.0.to_string(), "keys": ["enter"],
+            "if_content_revision": pane.content_revision(),
+            "terminal_id": pane.terminal_runtime().unwrap().terminal_id,
+        })
+    }
+
+    /// Replace fixture output and increment its revision while holding the reader lock.
+    fn content_fence_advance(app: &App, pane: PaneId) {
+        let pane = &app.panes[&pane];
+        let mut engine = pane.engine.lock().unwrap();
+        engine.advance(b"\x1b[2J\x1b[HCHOOSER_B");
+        pane.content_revision_handle()
+            .fetch_add(1, Ordering::Release);
+    }
+
+    /// Unfenced callers retain their existing admission behavior after output changes.
+    #[test]
+    fn content_fence_legacy_keys_still_queue_after_output_changes() {
+        let _env = crate::persist::test_env("content-fence-legacy");
+        let (mut app, pane, input) = content_fence_app();
+        content_fence_advance(&app, pane);
+        app.dispatch(
+            "agent.keys",
+            &json!({"target":pane.0.to_string(),"keys":["enter"]}),
+        )
+        .unwrap();
+        let crate::terminal::pty::InputAction::Bytes(bytes) = input.try_recv().unwrap() else {
+            panic!("expected bytes")
+        };
+        assert_eq!(bytes, b"\r");
+        assert!(input.try_recv().is_err());
+    }
+
+    /// Matching coordinates admit exactly one ordered batch, including aliases and Unicode.
+    #[test]
+    fn content_fence_matching_pair_queues_one_ordered_batch() {
+        let _env = crate::persist::test_env("content-fence-match");
+        let (mut app, pane, input) = content_fence_app();
+        let mut params = content_fence_pair(&app, pane);
+        params["keys"] = json!(["up", "enter", "CTRL+C", "é"]);
+        app.dispatch("agent.keys", &params).unwrap();
+        let crate::terminal::pty::InputAction::Bytes(bytes) = input.try_recv().unwrap() else {
+            panic!("expected bytes")
+        };
+        assert_eq!(bytes, "\x1b[A\r\x03é".as_bytes());
+        assert!(input.try_recv().is_err());
+    }
+
+    /// A changed output revision rejects the complete batch without admitting a prefix.
+    #[test]
+    fn content_fence_stale_revision_queues_nothing() {
+        let _env = crate::persist::test_env("content-fence-stale");
+        let (mut app, pane, input) = content_fence_app();
+        let params = content_fence_pair(&app, pane);
+        content_fence_advance(&app, pane);
+        let error = app.dispatch("agent.keys", &params).unwrap_err();
+        assert_eq!(error.0, "content_revision_conflict");
+        assert!(error.1.contains("expected"));
+        assert!(error.1.contains("actual"));
+        assert!(error.1.contains(&params["if_content_revision"].to_string()));
+        assert!(input.try_recv().is_err());
+    }
+
+    /// A different terminal lifetime rejects keys even when the revision matches.
+    #[test]
+    fn content_fence_wrong_terminal_identity_queues_nothing() {
+        let _env = crate::persist::test_env("content-fence-identity");
+        let (mut app, pane, input) = content_fence_app();
+        let mut params = content_fence_pair(&app, pane);
+        let actual = params["terminal_id"].as_str().unwrap().to_owned();
+        let first = if actual.starts_with('0') { "1" } else { "0" };
+        params["terminal_id"] = json!(format!("{first}{}", &actual[1..]));
+        let error = app.dispatch("agent.keys", &params).unwrap_err();
+        assert_eq!(error.0, "content_revision_conflict");
+        assert!(error.1.contains(params["terminal_id"].as_str().unwrap()));
+        assert!(error.1.contains(&actual));
+        assert!(input.try_recv().is_err());
+    }
+
+    /// Either one-sided fence is a validation error and leaves the queue empty.
+    #[test]
+    fn content_fence_requires_both_fields() {
+        let _env = crate::persist::test_env("content-fence-pair");
+        let (mut app, pane, input) = content_fence_app();
+        for missing in ["if_content_revision", "terminal_id"] {
+            let mut params = content_fence_pair(&app, pane);
+            params.as_object_mut().unwrap().remove(missing);
+            assert_eq!(
+                app.dispatch("agent.keys", &params).unwrap_err().0,
+                "invalid_request"
+            );
+            assert!(input.try_recv().is_err());
+        }
+    }
+
+    /// Visible and recent reads report the coordinates belonging to their captured text.
+    #[test]
+    fn content_fence_read_returns_text_and_runtime_coordinates() {
+        let _env = crate::persist::test_env("content-fence-read");
+        let (mut app, pane, _input) = content_fence_app();
+        content_fence_advance(&app, pane);
+        for source in ["visible", "recent"] {
+            let result = app
+                .dispatch(
+                    "agent.read",
+                    &json!({"target":pane.0.to_string(), "source":source}),
+                )
+                .unwrap();
+            assert_eq!(
+                result["content_revision"],
+                app.panes[&pane].content_revision()
+            );
+            assert_eq!(
+                result["terminal_id"],
+                app.panes[&pane].terminal_runtime().unwrap().terminal_id
+            );
+            assert!(result["text"].as_str().unwrap().contains("CHOOSER_B"));
+        }
+    }
+
+    /// Invalid key arrays fail before both matching and stale fence comparisons.
+    #[test]
+    fn content_fence_invalid_keys_validate_before_comparison() {
+        let _env = crate::persist::test_env("content-fence-invalid-keys");
+        let (mut app, pane, input) = content_fence_app();
+        for stale in [false, true] {
+            let mut params = content_fence_pair(&app, pane);
+            if stale {
+                content_fence_advance(&app, pane);
+            }
+            for keys in [
+                json!([]),
+                Value::Null,
+                json!("enter"),
+                json!(["enter", 7]),
+                json!(["enter", "not-a-key"]),
+            ] {
+                params["keys"] = keys;
+                assert_eq!(
+                    app.dispatch("agent.keys", &params).unwrap_err().0,
+                    "invalid_request"
+                );
+                assert!(input.try_recv().is_err());
+            }
+        }
+    }
+
+    /// Malformed revision and identity values cannot admit keys.
+    #[test]
+    fn content_fence_rejects_malformed_coordinates() {
+        let _env = crate::persist::test_env("content-fence-malformed");
+        let (mut app, pane, input) = content_fence_app();
+        for (field, values) in [
+            (
+                "if_content_revision",
+                vec![Value::Null, json!(-1), json!(1.5), json!(true), json!("1")],
+            ),
+            (
+                "terminal_id",
+                vec![
+                    Value::Null,
+                    json!(7),
+                    json!(""),
+                    json!("0123456789ABCDEF0123456789ABCDEF"),
+                    json!("0123456789abcdef0123456789abcdeg"),
+                    json!("0123456789abcdef0123456789abcdef\n"),
+                ],
+            ),
+        ] {
+            for value in values {
+                let mut params = content_fence_pair(&app, pane);
+                params[field] = value;
+                assert_eq!(
+                    app.dispatch("agent.keys", &params).unwrap_err().0,
+                    "invalid_request"
+                );
+                assert!(input.try_recv().is_err());
+            }
+        }
+    }
+
+    /// A matching fence preserves the existing closed-writer delivery error.
+    #[test]
+    fn content_fence_closed_writer_is_send_failed() {
+        let _env = crate::persist::test_env("content-fence-closed");
+        let (mut app, pane, input) = content_fence_app();
+        drop(input);
+        let params = content_fence_pair(&app, pane);
+        assert_eq!(
+            app.dispatch("agent.keys", &params).unwrap_err().0,
+            "send_failed"
+        );
+    }
+
+    /// Deferred panes expose no terminal identity and cannot accept a fenced batch.
+    #[test]
+    fn content_fence_missing_runtime_is_conflict_and_read_identity_is_null() {
+        let _env = crate::persist::test_env("content-fence-no-runtime");
+        let (mut app, _, _) = content_fence_app();
+        app.config.shell = "luvus-content-fence-nonexistent-shell".into();
+        let pane = app
+            .spawn_into_deferred(app.ws().cwd.clone(), &[], None)
+            .unwrap();
+        assert!(app.panes[&pane].terminal_runtime().is_none());
+        app.status.get_mut(&pane).unwrap().agent = "claude".into();
+        let (sender, input) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(sender);
+        let params = json!({"target":pane.0.to_string(),"keys":["enter"],"if_content_revision":0,"terminal_id":"0123456789abcdef0123456789abcdef"});
+        let error = app.dispatch("agent.keys", &params).unwrap_err();
+        assert_eq!(error.0, "content_revision_conflict");
+        assert!(error.1.contains("expected"));
+        assert!(error.1.contains("actual"));
+        assert!(input.try_recv().is_err());
+        let result = app
+            .dispatch("agent.read", &json!({"target":pane.0.to_string()}))
+            .unwrap();
+        assert!(result.as_object().unwrap().contains_key("terminal_id"));
+        assert!(result["terminal_id"].is_null());
+        assert_eq!(
+            result["content_revision"],
+            app.panes[&pane].content_revision()
+        );
+    }
+
+    /// An unavailable engine cannot admit fenced input or fabricate a read revision.
+    #[test]
+    fn content_fence_unavailable_engine_queues_nothing() {
+        let _env = crate::persist::test_env("content-fence-poison");
+        let (mut app, pane, input) = content_fence_app();
+        let params = content_fence_pair(&app, pane);
+        let engine = app.panes[&pane].engine.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = engine.lock().unwrap();
+            panic!("fixture poisons the engine lock");
+        }));
+        let error = app.dispatch("agent.keys", &params).unwrap_err();
+        assert_eq!(error.0, "content_revision_conflict");
+        assert!(input.try_recv().is_err());
+        let result = app
+            .dispatch("agent.read", &json!({"target":pane.0.to_string()}))
+            .unwrap();
+        assert_eq!(result["text"], "");
+        assert!(result["content_revision"].is_null());
+        // Clear poison so unrelated teardown does not inherit the fixture failure.
+        engine.clear_poison();
     }
 }

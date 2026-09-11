@@ -245,6 +245,7 @@ where
         )
     });
     let mut generation = 0;
+    let mut clipboard = ClipboardCompletion::new(generation, tx.clone());
     spawn_frame_reader(reader, generation, tx.clone());
     let mut writer: Box<dyn Write + Send> = Box::new(writer);
     let mut current = crate::session::display_name();
@@ -260,7 +261,12 @@ where
         send_graphics_size(&mut writer)?;
     }
     let exit = loop {
-        let message = match rx.recv() {
+        let event = rx.recv();
+        if let Some(message) = clipboard.0.take() {
+            crate::emit_notification(message);
+        }
+        let message = match event {
+            Ok(ClientEvent::Clipboard(epoch)) if epoch == generation => continue,
             Ok(ClientEvent::Input(message)) => {
                 if graphics_enabled && matches!(message, ClientMessage::Resize { .. }) {
                     let _ = send_graphics_size(&mut writer);
@@ -370,7 +376,9 @@ where
             }
             Ok(ServerMessage::Notify(msg)) => crate::emit_notification(&msg),
             Ok(ServerMessage::Sound(signal)) => crate::emit_sound(signal),
-            Ok(ServerMessage::Clipboard(text)) => crate::emit_clipboard(&text),
+            Ok(ServerMessage::Clipboard(text)) => {
+                crate::emit_clipboard_to(&text, clipboard.0.clone());
+            }
             Ok(ServerMessage::OpenUrl(url)) => crate::platform::open_url(&url),
             Ok(ServerMessage::ClipboardHelper(request)) => {
                 let sender = tx.clone();
@@ -394,6 +402,7 @@ where
                     }
                 };
                 generation += 1;
+                clipboard = ClipboardCompletion::new(generation, tx.clone());
                 let (reader, next_writer) = connection;
                 writer = Box::new(next_writer);
                 graphics.apply(Vec::new(), &mut std::io::stdout())?;
@@ -445,7 +454,27 @@ fn send_graphics_size(writer: &mut impl Write) -> io::Result<()> {
     )
 }
 
+/// Retire completion state on switching, detach and early I/O errors alike.
+struct ClipboardCompletion(std::sync::Arc<crate::clipboard::Completion>);
+
+impl ClipboardCompletion {
+    fn new(generation: u64, tx: std::sync::mpsc::SyncSender<ClientEvent>) -> Self {
+        Self(crate::clipboard::Completion::with_wake(move || {
+            // A full queue already wakes the event loop; its next event drains
+            // the coalesced completion slot. The worker never writes to the TTY.
+            let _ = tx.try_send(ClientEvent::Clipboard(generation));
+        }))
+    }
+}
+
+impl Drop for ClipboardCompletion {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 enum ClientEvent {
+    Clipboard(u64),
     Input(ClientMessage),
     Helper(
         u64,
@@ -1229,6 +1258,29 @@ mod tests {
 mod render_tests {
     use super::*;
     use ratatui::backend::TestBackend;
+
+    #[test]
+    fn clipboard_completion_wakes_idle_client_and_retires_on_switch() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let old = ClipboardCompletion::new(7, tx.clone());
+        old.0.publish("failure");
+        assert!(matches!(rx.try_recv(), Ok(ClientEvent::Clipboard(7))));
+        assert_eq!(old.0.take(), Some("failure"));
+        // A full event queue cannot block the copy worker or lose its latest result.
+        tx.send(ClientEvent::Clipboard(7)).unwrap();
+        old.0.publish("latest failure");
+        assert_eq!(old.0.take(), Some("latest failure"));
+        rx.try_recv().unwrap();
+        let delayed = old.0.clone();
+        drop(old);
+        let current = ClipboardCompletion::new(8, tx);
+        delayed.publish("old owner");
+        assert!(rx.try_recv().is_err());
+        assert_eq!(current.0.take(), None);
+        current.0.publish("current owner");
+        assert!(matches!(rx.try_recv(), Ok(ClientEvent::Clipboard(8))));
+        assert_eq!(current.0.take(), Some("current owner"));
+    }
 
     #[test]
     fn switched_handshake_has_one_deadline_across_partial_messages() {

@@ -357,9 +357,11 @@ owner's pane. `agent list` includes `host`, `owner_session`, and `owner_pane` fo
 remote rows. Follow up with those owner selectors and `--host`, not the qualified
 local presentation row ID. Remote FILES views do not expose a stale local tree.
 
-### Kitty graphics preview
+<a id="kitty-graphics-preview"></a>
 
-Fork graphics builds report `transport=11` with
+### Kitty graphics
+
+Stable fork releases include Kitty graphics and report `transport=11` with
 `luvus --version --remote-session-protocol`. Use Kitty 0.28 or newer on the display
 machine and matching graphics builds on remote owners. An older managed owner
 can still display text, but cannot supply graphics. For an SSH-hosted display
@@ -399,7 +401,7 @@ not by installing, compiling or logging into tele. If the child's environment
 does not identify Kitty, start it with `TERM=xterm-kitty tele` or select tele's
 Kitty photo mode. Full application acceptance remains a user test.
 
-This is a graphics preview, not complete Kitty protocol support. Sixel, animation
+The supported Kitty graphics subset is a stable fork feature. Sixel, animation
 commands, relative placements, non-default virtual placement IDs, omitted
 placeholder coordinates, nonzero z-order, source-pixel cropping, stretched
 ordinary placements, compressed PNG and ordinary-image scrollback are not

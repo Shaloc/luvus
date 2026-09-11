@@ -2,6 +2,7 @@
 """Unix smoke test: real Luvus servers/PTY clients with a local SSH substitute.
 
 Run after cargo build: python3 scripts/test-remote-sessions.py
+Use --upstream-only for owner-routed agent input revision checks.
 Use --restart-only for the isolated server restart --all smoke test.
 Use --dimensions-only for the local split/close/resize regression.
 Use --session-discovery-only for owner inventory and session deletion regression.
@@ -116,6 +117,7 @@ def ssh_substitute():
 
 def main():
     repo = Path(__file__).resolve().parent.parent
+    upstream_only = "--upstream-only" in sys.argv[1:]
     restart_only = "--restart-only" in sys.argv[1:]
     agent_state_only = "--agent-state-only" in sys.argv[1:]
     agent_focus_only = "--agent-focus-only" in sys.argv[1:]
@@ -134,7 +136,7 @@ def main():
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -364,6 +366,37 @@ def main():
         api("config.patch", {"patch": {"layout": {"auto_workspace_rehome": False}}})
         print("PASS: automatic workspace rehome defaults off on both owners; live settings stay owner-local", flush=True)
         api("config.patch", {"patch": {"remote_hosts": ["fake-dev", "fake-old"]}})
+        if upstream_only:
+            for remote in (False, True):
+                pane = api("pane.list", remote=remote)["panes"][0]["pane"]
+                api("agent.report", {"pane": pane, "source": "smoke/upstream", "agent": "claude",
+                                     "status": "idle", "ttl_s": 120}, remote=remote)
+                selectors = ("--host", "fake-dev", "--session", "api") if remote else ("--session", "api")
+                def request(method, params):
+                    result = run(*selectors, "uhp", "proxy", okay=False,
+                                 input_text=json.dumps({"id": "upstream", "method": method, "params": params}) + "\n")
+                    return json.loads(result.stdout)
+                observed = request("agent.read", {"target": pane})["result"]
+                assert re.fullmatch("[a-f0-9]{32}", observed["terminal_id"]), observed
+                assert isinstance(observed["content_revision"], int), observed
+                other_pane = api("pane.list", remote=not remote)["panes"][0]["pane"]
+                other_terminal = api("agent.read", {"target": other_pane}, remote=not remote)["terminal_id"]
+                assert other_terminal != observed["terminal_id"]
+                rejected = request("agent.keys", {"target": pane, "keys": ["enter"],
+                                   "if_content_revision": observed["content_revision"],
+                                   "terminal_id": other_terminal})
+                assert rejected["error"]["code"] == "content_revision_conflict", rejected
+                assert observed["terminal_id"] in rejected["error"]["message"], rejected
+                # A marker makes the old revision stale on the resolved owner.
+                api("pane.run", {"pane": pane, "command": "printf 'UPSTREAM_FENCE_%s\\n' OWNER"}, remote=remote)
+                wait_for(lambda: "UPSTREAM_FENCE_OWNER" in api("pane.read", {"pane": pane}, remote=remote)["text"])
+                rejected = request("agent.keys", {"target": pane, "keys": ["enter"],
+                                   "if_content_revision": observed["content_revision"],
+                                   "terminal_id": observed["terminal_id"]})
+                assert rejected["error"]["code"] == "content_revision_conflict", rejected
+                assert "result" in request("agent.keys", {"target": pane, "keys": ["enter"]})
+            print("PASS: local and --host agent.read return owner coordinates; foreign identity and stale revision reject input; legacy keys remain supported", flush=True)
+            return
         missing = run("--host", "fake-dev", "--session", "search-stopped", "workspace", "list", okay=False)
         assert missing.returncode, "remote CLI must not start a stopped owner"
         absent_frame = run("--session", "search-stopped", "remote-client-bridge", "--existing",

@@ -1815,6 +1815,13 @@ pub struct PaneStatus {
     /// one-key answer. Captured **once** when the pane enters Blocked (not every
     /// tick), cleared when it leaves; `None` when the pane isn't blocked.
     pub blocked_hint: Option<String>,
+    /// Raw, non-debounced prompt-surface evidence. Prompt APIs consult this
+    /// separately from the presentation state's quiet-dwell hysteresis.
+    prompt_evidence: detect::PromptEvidence,
+    /// A server-owned launch whose CLI needs a proven composer before prompt
+    /// input. Existing panes retain the legacy permissive fallback when the
+    /// detector has neither ready nor blocked evidence.
+    prompt_evidence_required: bool,
     /// Explainable evidence from the last heuristic classification.
     pub identity_source: &'static str,
     pub state_source: &'static str,
@@ -1849,6 +1856,8 @@ impl PaneStatus {
             detected_bottom: Arc::from(""),
             force_detect: true,
             blocked_hint: None,
+            prompt_evidence: detect::PromptEvidence::Unknown,
+            prompt_evidence_required: false,
             identity_source: "command_fallback",
             state_source: "no_positive_state_evidence",
             rule_priority: None,
@@ -2862,6 +2871,8 @@ pub struct App {
     /// `(previous theme, selection revision)` restores an automatically replaced
     /// active theme only when the user has not selected another theme meanwhile.
     pub(crate) pending_theme_uninstalls: HashMap<String, Option<(String, u64)>>,
+    /// Pending removals waiting for configuration persistence, not worker completion.
+    pub(crate) deferred_theme_uninstalls: Vec<String>,
     pub(crate) theme_selection_revision: u64,
     /// Slider arrows in the modal: (control index, ±1 direction, rect).
     pub settings_arrow_rects: Vec<(usize, i32, Rect)>,
@@ -3270,6 +3281,7 @@ impl App {
             settings_ctl_rects: Vec::new(),
             settings_theme_remove_rects: Vec::new(),
             pending_theme_uninstalls: HashMap::new(),
+            deferred_theme_uninstalls: Vec::new(),
             theme_selection_revision: 0,
             settings_arrow_rects: Vec::new(),
             modules,
@@ -3959,6 +3971,7 @@ impl App {
             settings_ctl_rects: Vec::new(),
             settings_theme_remove_rects: Vec::new(),
             pending_theme_uninstalls: HashMap::new(),
+            deferred_theme_uninstalls: Vec::new(),
             theme_selection_revision: 0,
             settings_arrow_rects: Vec::new(),
             modules,

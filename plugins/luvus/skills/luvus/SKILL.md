@@ -395,6 +395,29 @@ luvus agent send reviewer "Review the diff. When done, run: luvus agent send lea
 After a no-wait handoff, end the turn. The report-back message starts a fresh
 turn. An external terminal has no caller pane, so do not invent one.
 
+With `--wait`, `agent prompt` (also `agent send`) requires a new `working` or
+`blocked` transition before the requested `--until` state can complete the wait.
+An unchanged status, title flicker, or quiet output alone cannot complete it.
+`observed_state` records the first active transition; `status` is the current state.
+The absolute `--timeout` covers both stages (default 300 seconds). Timeout returns
+`matched:false`, `evidence:"timeout"`, and a null `observed_state` if no transition
+was seen. Pane or terminal exit returns `agent_not_running` with `pane`, `queued`,
+`submitted`, `observed_state`, `reason:"pane_closed"`, `baseline_revision`, and
+`content_revision` under `error.data`. Timeout and pane exit during a wait use CLI
+exit code 2. Cancellation, timeout, and exit release pending wait ownership.
+Without `--wait`, the immediate `submitted:true`, `evidence:"queued"` response is
+unchanged and omits `observed_state`. Submission still means queue admission;
+state transitions do not confirm consumption of the prompt text. Do not resend
+automatically after a timeout or lost response because queued input may execute.
+For `agent.send` and `agent.prompt`, detected blocked prompt evidence—including
+in non-Codex panes—returns `agent_not_ready` and queues no input. Startup,
+sign-in, selection, and approval screens are examples, not an exhaustive list.
+A server-launched or restored Codex pane with an `agent_session` also returns
+`agent_not_ready` when prompt evidence is Unknown, unless live Codex composer
+geometry reports Ready. Existing Codex panes without that requirement retain the
+permissive Unknown-evidence fallback. Read the visible screen before deciding
+whether an explicit `agent keys` action is authorized.
+
 When waiting was requested, keep it bounded and read a bounded result:
 
 ```sh
@@ -421,6 +444,26 @@ For a blocked agent:
 `agent keys` accepts only a recognized agent pane and a non-empty list of known
 key names. It validates the entire list before queuing one ordered action; any
 invalid entry sends nothing, and a closed target returns `send_failed`.
+
+For UHP interactions that must match the inspected screen, use `agent.read`
+with `source:"visible"` and pass its `content_revision` as `if_content_revision`
+together with its `terminal_id` in `agent.keys` params. The revision is a
+non-negative integer; the terminal ID is exactly 32 lowercase hex characters.
+Both fields are optional as a pair; a one-sided or malformed pair is
+`invalid_request`. A deferred pane has `terminal_id:null` and cannot be fenced.
+An unavailable read snapshot has empty text and null coordinates.
+
+The server checks the pair and queues keys under the same engine lock used to
+capture the text. `content_revision_conflict` means no keys were queued: re-read
+and reassess the authorized action, never retry the same pair. Generic response
+`revision` / request `if_revision` are global event coordinates, not the pane's
+content counter. Without the pair, behavior is unchanged. Older servers omit the
+coordinates or reject the new fields; omit the pair only when legacy unfenced
+admission is acceptable. These are UHP params, not CLI flags.
+
+The fence covers queue admission only. Already queued input and child-side
+changes not yet observed remain outside it. Cursor/SGR output can make a pair
+stale even if the dialog text looks unchanged.
 
 ## Control panes, tabs, and workspaces
 

@@ -380,7 +380,8 @@ impl App {
                 }
                 app.schedule_config_save(Instant::now());
                 app.flush_config_reloads(saved);
-                app.finish_remote_config_refresh() || !saved
+                let theme_changed = app.flush_theme_uninstalls(saved);
+                app.finish_remote_config_refresh() || !saved || theme_changed
             })
         });
         let state = &mut self.config_persistence;
