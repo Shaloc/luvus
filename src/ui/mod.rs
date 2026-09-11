@@ -1837,6 +1837,9 @@ mod bar_projection_tests {
     #[test]
     fn workspace_projection_selects_by_stable_id_without_rendering_outer_chrome() {
         let _env = crate::persist::test_env("workspace-only-projection");
+        // A shell startup message can contain the ordinary word "default".
+        // Give the session chrome a distinct marker instead of matching PTY prose.
+        crate::session::apply_explicit_name("z9q7").unwrap();
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
         let projected_id = app.workspaces[0].id.clone();
@@ -1863,7 +1866,13 @@ mod bar_projection_tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(!rendered.contains(app.catalog.workspaces));
-        assert!(!rendered.contains(&crate::session::display_name()));
+        assert!(!rendered.contains("z9q7"));
+        let desktop_text = desktop_buffer
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(desktop_text.contains("z9q7"));
     }
 }
 

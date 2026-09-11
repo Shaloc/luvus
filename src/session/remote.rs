@@ -1600,7 +1600,7 @@ pub(crate) fn request_control_in_scope(
     request_on_control_in_scope(connection, method, params, timeout, response_limit, &scope)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn request_on_control(
     connection: ControlConnection,
     method: &str,
