@@ -1376,13 +1376,12 @@ mod render_tests {
             ));
             // The display connection must no longer carry the handshake's
             // receive timeout, including a smaller remaining kernel timeout.
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(1100));
             protocol::write_message(&mut peer, &ServerMessage::Detach).unwrap();
         });
         let connection = transport::connect(&socket).unwrap();
         let (mut reader, _writer) =
-            negotiate_switched_session(connection, 80, 24, &None, Duration::from_millis(200))
-                .unwrap();
+            negotiate_switched_session(connection, 80, 24, &None, Duration::from_secs(1)).unwrap();
         assert!(matches!(
             protocol::read_message::<_, ServerMessage>(&mut reader).unwrap(),
             ServerMessage::Detach

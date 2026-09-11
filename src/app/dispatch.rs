@@ -8813,7 +8813,10 @@ mod tests {
             json!({"workspace_id":local_id}),
         ] {
             let result = app.dispatch("worktree.list", &selector).unwrap();
-            assert_eq!(result["worktrees"][0]["path"], root.display().to_string());
+            assert_eq!(
+                result["worktrees"][0]["path"],
+                root.canonicalize().unwrap().display().to_string()
+            );
         }
         assert!(app
             .dispatch("tab.get", &json!({"workspace_id":local_id}))

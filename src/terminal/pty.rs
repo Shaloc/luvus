@@ -9,7 +9,7 @@ use std::io::Read;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-#[cfg(all(test, unix))]
+#[cfg(test)]
 use std::sync::mpsc;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -1997,6 +1997,7 @@ mod reap_tests {
     /// the worker opens the PTY at the latest recorded size (docs/82).
     #[test]
     fn deferred_pane_applies_a_resize_racing_the_spawn() {
+        let _env = crate::persist::test_env("pty-racing-resize");
         let (tx, _rx) = mpsc::channel();
         let mut pane = Pane::spawn_deferred(
             PaneId::alloc(),

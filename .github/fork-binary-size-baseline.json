@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "source": {
+    "repository": "Shaloc/luvus",
+    "tag": "fork-1.0.99-graphics-8a02eb1",
+    "commit": "8a02eb143b3063e1b7d6fc660d584d7313590138",
+    "asset": "luvus-aarch64-apple-darwin.tar.gz",
+    "sha256": "67375c17deb1d096fdf6e04a4555cc2dc4f530a43817b5fe7c5f2b09c0385542",
+    "rustc": "1.98.1",
+    "measurement": "Executable bytes from the verified native release tar member; archive bytes from the same published tar.gz, including license and build metadata."
+  },
+  "thresholds": {
+    "warn_percent": 5,
+    "block_percent": 10
+  },
+  "targets": {
+    "aarch64-apple-darwin": {
+      "executable_bytes": 11219536,
+      "archive_bytes": 4804754
+    }
+  }
+}

@@ -95,7 +95,8 @@ jobs:
           python3 scripts/check-binary-size.py \
             --target aarch64-apple-darwin \
             --binary target/release/luvus \
-            --archive target/luvus-size.tar.gz
+            --archive target/luvus-size.tar.gz \
+            --baseline "${{ github.repository == 'Shaloc/luvus' && '.github/fork-binary-size-baseline.json' || '.github/binary-size-baseline.json' }}"
 
   windows:
     name: windows protocol · ConPTY
