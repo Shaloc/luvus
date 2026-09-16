@@ -110,11 +110,25 @@ fn main() -> Result<()> {
     if is_backend_discovery_request(&args) {
         std::process::exit(cli::run(&args)?);
     }
-    // Private foreground route used only by scheduled worker panes. Keep it
+    // Private foreground routes used only by ORCH worker panes. Keep them
     // ahead of migrations and TUI/server routing: it must run exactly one
     // adapter process, settle its ORCH task, and exit.
+    if args.get(1).map(String::as_str) == Some("__task-worker") {
+        std::process::exit(orch::worker::run(&args)?);
+    }
     if args.get(1).map(String::as_str) == Some("__automation-worker") {
         std::process::exit(automation::run_worker(&args)?);
+    }
+    // A server restart initiated inside one of its panes cannot synchronously
+    // survive that server closing the pane's PTY. `restart_session_via_helper`
+    // launches this private route in a detached process group first.
+    if args.get(1).map(String::as_str) == Some("__restart-session-helper") {
+        if args.len() != 2 {
+            return Err(anyhow!("invalid internal session restart invocation"));
+        }
+        let selected = session::active_name();
+        session::restart_session(selected.as_deref()).map_err(anyhow::Error::msg)?;
+        return Ok(());
     }
 
     // One-time local cleanup of the old default-on skill installation. This
@@ -684,12 +698,11 @@ fn report_server_runtime(running: &ServerRuntime) -> Result<()> {
         ));
     }
     if running.version != binary {
-        eprintln!(
+        return Err(anyhow!(
             "luvus v{binary} installed, but the running server is v{} — \
              run `luvus server restart` to load it (your session is saved and restored).",
             running.version
-        );
-        thread::sleep(Duration::from_millis(2000));
+        ));
     }
     Ok(())
 }
@@ -1064,11 +1077,11 @@ fn server_cmd(args: &[String]) -> Result<()> {
         "status" => server_status(context),
         "update-manifest" => update_manifest(context),
         other => {
-            eprintln!("{}: {other}", context.text("unknown server command"));
+            eprintln!("{}: {}", context.text("unknown server command"), other);
             eprintln!(
                 "{}",
                 i18n::cli::help(
-                    "usage: luvus server <start|stop|restart|status|update-manifest>",
+                    "usage: luvus server <start|stop|restart [--all]|status|update-manifest>",
                     context.language(),
                 )
             );
@@ -1119,9 +1132,26 @@ mod restart_all_tests {
     }
 }
 
+fn restart_all_targets(
+    current: &str,
+    mut sessions: Vec<session::SessionInfo>,
+) -> Vec<session::SessionInfo> {
+    sessions.retain(|info| info.running);
+    sessions.sort_by_key(|info| info.name == current);
+    sessions
+}
+
 fn server_restart_all(context: i18n::cli::Context, json: bool) -> Result<()> {
     let inventory = session::list_server_sessions()?;
-    let results = session::restart_running_sessions(&inventory, session::restart_session);
+    let current = session::display_name();
+    let targets = restart_all_targets(&current, inventory.clone());
+    let results = session::restart_running_sessions(&targets, |name| {
+        if name.unwrap_or(session::DEFAULT_SESSION_NAME) == current {
+            session::restart_session_via_helper(name)
+        } else {
+            session::restart_session(name)
+        }
+    });
     let failed = results.iter().filter(|(_, result)| result.is_err()).count();
     if json {
         let rows: Vec<_> = results
@@ -1371,11 +1401,21 @@ fn print_server_card(
     socket: &Path,
 ) {
     let session = session::display_name();
+    print_server_card_for(context, state, version, socket, &session);
+}
+
+fn print_server_card_for(
+    context: i18n::cli::Context,
+    state: &str,
+    version: Option<&str>,
+    socket: &Path,
+    session: &str,
+) {
     let socket = socket.display().to_string();
     let version = version.map(|value| format!("v{value}"));
     let mut rows = vec![
         (context.text("status"), state),
-        (context.text("session"), session.as_str()),
+        (context.text("session"), session),
     ];
     if let Some(version) = version.as_deref() {
         rows.push((context.text("version"), version));
@@ -1386,10 +1426,14 @@ fn print_server_card(
 
 fn print_detached_status(context: i18n::cli::Context) {
     let session = session::display_name();
+    print_detached_status_for(context, &session);
+}
+
+fn print_detached_status_for(context: i18n::cli::Context, session: &str) {
     let runtime = format!("{} + {}", context.text("server"), context.text("panes"));
     let rows = [
         (context.text("status"), context.text("detached")),
-        (context.text("session"), session.as_str()),
+        (context.text("session"), session),
         (runtime.as_str(), context.text("running")),
     ];
     cli::print_status_card("Luvus session", &rows);
@@ -1604,6 +1648,11 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     };
     app.events = events.clone();
     app.set_color_mode(ipc::protocol::truecolor_supported());
+    // This process owns the terminal here, so measure cells once at startup the
+    // way an attaching client reports them after its handshake. Without this a
+    // local session that never resizes would split on the fallback aspect.
+    let (cell_width_px, cell_height_px) = ipc::protocol::local_cell_pixels();
+    app.set_client_cell_pixels(cell_width_px, cell_height_px);
     let pending = if app.config.theme == "terminal" {
         let probe = terminal::theme_probe::probe();
         if let Some(colors) = probe.colors.as_ref() {
@@ -1779,7 +1828,17 @@ fn send_input_event(tx: &Sender<AppEvent>, event: Event) -> bool {
 }
 
 fn app_event(event: Event) -> Option<AppEvent> {
+    app_event_with_image(event, crate::terminal::clipboard::read_image)
+}
+
+fn app_event_with_image(
+    event: Event,
+    image: impl FnOnce() -> Option<crate::terminal::clipboard::ClipboardImage>,
+) -> Option<AppEvent> {
     match crate::terminal::host_key::normalize_platform_modifiers(event) {
+        Event::Key(k) if crate::terminal::clipboard::png::is_image_paste_key(&k) => image()
+            .map(AppEvent::ClipboardImage)
+            .or(Some(AppEvent::Key(k))),
         Event::Key(k) => Some(AppEvent::Key(k)),
         Event::Mouse(m) => Some(AppEvent::Mouse(m)),
         Event::Resize(_, _) => Some(AppEvent::Resize),
@@ -1809,10 +1868,83 @@ mod tests {
     use ratatui::Terminal;
 
     #[test]
+    fn stale_server_version_fails_before_binary_attach() {
+        let error = report_server_runtime(&ServerRuntime {
+            version: "0.13.4".into(),
+            transport_protocol: Some(ipc::protocol::PROTOCOL_VERSION),
+        })
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("running server is v0.13.4"));
+        assert!(message.contains("luvus server restart"));
+    }
+
+    #[test]
+    fn matching_server_version_allows_binary_attach() {
+        report_server_runtime(&ServerRuntime {
+            version: env!("CARGO_PKG_VERSION").into(),
+            transport_protocol: Some(ipc::protocol::PROTOCOL_VERSION),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn restart_all_targets_only_running_sessions_and_puts_selected_last() {
+        let info = |name: &str, running: bool| session::SessionInfo {
+            name: name.to_string(),
+            default: name == session::DEFAULT_SESSION_NAME,
+            running,
+            socket_path: String::new(),
+            session_dir: String::new(),
+            endpoint: session::SessionEndpoint {
+                transport: "test",
+                address: String::new(),
+            },
+        };
+        let targets = restart_all_targets(
+            "alpha",
+            vec![
+                info(session::DEFAULT_SESSION_NAME, true),
+                info("alpha", true),
+                info("stopped", false),
+                info("beta", true),
+            ],
+        );
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.name.as_str())
+                .collect::<Vec<_>>(),
+            [session::DEFAULT_SESSION_NAME, "beta", "alpha"]
+        );
+    }
+
+    #[test]
     fn send_server_stop_reports_absent_when_no_sockets() {
         let _env = crate::persist::test_env("stop-absent");
         crate::persist::ensure_session_dir();
         assert!(!send_server_stop().expect("absent server is not an error"));
+    }
+
+    #[test]
+    fn local_image_paste_uses_owner_staging_and_falls_back_to_the_key() {
+        let key = ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('v'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        );
+        let image = crate::terminal::clipboard::ClipboardImage {
+            extension: "png".into(),
+            bytes: crate::terminal::clipboard::png::encode_rgba_png(1, 1, |_, _| [1, 2, 3, 255])
+                .unwrap(),
+        };
+        assert!(matches!(
+            app_event_with_image(Event::Key(key), || Some(image.clone())),
+            Some(AppEvent::ClipboardImage(staged)) if staged.bytes == image.bytes
+        ));
+        assert!(matches!(
+            app_event_with_image(Event::Key(key), || None),
+            Some(AppEvent::Key(fallback)) if fallback == key
+        ));
     }
 
     #[test]

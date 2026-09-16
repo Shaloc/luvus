@@ -43,7 +43,7 @@ See [effective permissions](/docs/uhp/remote-access/#effective-permissions).
 One request per connection, newline-terminated, and one JSON reply:
 
 ```json
-→ {"id":"1","method":"pane.split","params":{"down":true}}
+→ {"id":"1","method":"pane.split","params":{"direction":"auto"}}
 ← {"id":"1","result":{"type":"ok","pane":"7"}}
 ```
 
@@ -88,7 +88,7 @@ Luvus release number.
 | runtime and agents | `session.snapshot` · `agent.start` · `agent.prompt` · `agent.wait` · `events.subscribe` |
 | panes | `pane.list` · `pane.get` · `pane.current` · `pane.layout` · `pane.neighbor` · `pane.edges` · `pane.split` · `pane.move` · `pane.swap` · `pane.focus` · `pane.focus_direction` · `pane.resize` · `pane.zoom` · `pane.rename` · `pane.run` · `pane.send_input` · `pane.read` · `pane.status` · `pane.processes` · `pane.close` · `attach.pane` |
 | layouts | `layout.export` · `layout.apply` · `layout.set_split_ratio` |
-| agents | `agent.list` · `agent.get` · `agent.explain` · `agent.report` · `agent.release` · `agent.start` · `agent.prompt` · `agent.wait` · `agent.name` · `agent.fork` · `agent.send` · `agent.keys` · `agent.read` · `agent.sessions` · `agent.resume` · `pane.report_session` · `pane.report_event` |
+| agents | `agent.list` · `agent.get` · `agent.explain` · `agent.report` · `agent.release` · `agent.start` · `agent.prompt` · `agent.wait` · `agent.name` · `agent.fork` · `agent.send` · `agent.keys` · `agent.read` · `agent.sessions` · `agent.resume` · `pane.report_session` · `pane.release_session` · `pane.report_event` |
 | search | `search` · `search.capabilities` · `search.query` · `search.activate` |
 | files | `files.tree` · `files.open` · `files.reveal` · `files.refresh` |
 | git | `git.status` · `git.branches` · `git.log` · `git.open` |
@@ -96,20 +96,21 @@ Luvus release number.
 | diff | `diff.refresh` · `diff.list` · `diff.open` · `diff.get` · `diff.navigate` · `diff.note.add` · `diff.note.apply` · `diff.note.list` · `diff.note.edit` · `diff.note.resolve` · `diff.note.reopen` · `diff.note.remove` · `diff.note.send` |
 | terminal | `terminal.backend.inventory` · `terminal.backend.snapshot` · `terminal.backend.validate` · `terminal.backend.processes` · `terminal.backend.capture` · `terminal.backend.observe` · `terminal.backend.control` · `terminal.backend.type_literal` · `terminal.backend.submit_text` · `terminal.backend.send_key` · `terminal.backend.set_title` · `terminal.backend.notify` · `terminal.backend.create` · `terminal.backend.close` · `terminal.backend.wait_change` · `terminal.backend.wait_output` · `terminal.backend.events.subscribe` |
 | worktrees | `worktree.list` · `worktree.create` · `worktree.open` · `worktree.remove` |
-| orchestration | `task.add` · `task.list` · `task.get` · `task.claim` · `task.next` · `task.start` · `task.heartbeat` · `task.update` · `task.done` · `task.merge` · `task.release` · `lease.acquire` · `lease.list` · `lease.release` |
+| orchestration | `task.add` · `task.list` · `task.get` · `task.claim` · `task.next` · `task.start` · `task.heartbeat` · `task.update` · `task.done` · `task.retry` · `task.merge` · `task.release` · `lease.acquire` · `lease.list` · `lease.release` |
 | agent automation | `automation.create` · `automation.list` · `automation.get` · `automation.update` · `automation.enable` · `automation.disable` · `automation.rebind` · `automation.delete` · `automation.run` · `automation.history` · `automation.preview` · `automation.health` |
 | modules | `module.list` · `module.info` · `module.link` · `module.unlink` · `module.enable` · `module.disable` · `module.action.list` · `module.action.invoke` · `module.pane.open` · `module.pane.focus` · `module.pane.close` · `module.config_dir` · `module.settings.list` · `module.settings.get` · `module.settings.set` · `module.log.list` |
 | themes | `theme.list` · `theme.path` · `theme.use` · `theme.reload` |
-| ui / server | `ui.sidebar` · `ui.dock.push` · `ui.dock.list` · `ui.dock.move` · `ui.bar.push` · `ui.bar.list` · `ui.bar.move` · `ui.bar.remove` · `ui.notification.push` · `ui.notification.clear` · `ui.toast` · `ping` · `server.stop` · `events.subscribe` · `events.wait` |
+| ui / server | `ui.sidebar` · `ui.agent_title.push` · `ui.agent_title.clear` · `ui.dock.push` · `ui.dock.list` · `ui.dock.move` · `ui.bar.push` · `ui.bar.list` · `ui.bar.move` · `ui.bar.remove` · `ui.notification.push` · `ui.notification.clear` · `ui.toast` · `ping` · `server.stop` · `events.subscribe` · `events.wait` |
 
 Parameter shapes mirror the CLI flags (`luvus task add --paths x` →
 `{"paths": ["x"]}`). For CLI commands, an omitted pane uses
-`$LUVUS_PANE_ID` when available; a raw API request with no pane uses the
-currently focused pane. Methods with a focus default also treat an explicit
-`null` pane as omitted. A well-formed explicit ID that does not name a live
-pane fails with `not_found`; malformed or out-of-range IDs fail with
-`invalid_request` before any mutation. Pane IDs accept an unsigned 32-bit JSON
-integer or its decimal string form.
+`$LUVUS_PANE_ID` when available. Except for the project-scoped task methods
+described below, a raw API request with no pane uses the currently focused
+pane. Methods with a focus default also treat an explicit `null` pane as
+omitted. A well-formed explicit ID that does not name a live pane fails with
+`not_found`; malformed or out-of-range IDs fail with `invalid_request` before
+any mutation. Pane IDs accept an unsigned 32-bit JSON integer or its decimal
+string form.
 
 `task.add` accepts a short `title` and an optional multiline `prompt` containing
 the detailed worker briefing. `task.get`, `task.list`, and task events return
@@ -119,11 +120,25 @@ or clear its prompt through `task.update` with a string or `null`; prompt edits
 fail closed after the task starts. Capability limits publish the exact UTF-8
 byte budgets as `task_title_bytes` and `task_prompt_bytes`.
 
+`task.add` binds the task to the selected workspace's project and returns a
+`project` object containing its preferred `workspace_id` and durable root.
+Include `workspace_id` when project selection is ambiguous. The sole focused
+Git project remains implicitly selectable beside a non-Git launch-directory
+workspace. A request originating inside a Luvus pane may instead include its
+stable `pane` id. `task.next` filters the ready queue to that project, and path
+leases collide only between tasks in the same project. Git worktrees share the
+repository common directory, so they still coordinate with each other while
+unrelated repositories do not.
+
 For `task.heartbeat`, the canonical UHP `context` field is the fraction of the
 model context window already consumed. `0.6` means 60% of that window has been
 used, not 60% task progress. Send work progress through the `note` field of
-`task.update` and omit the heartbeat when context-window usage is unknown. The
-CLI exposes the same field as the clearer `--context-used` flag.
+`task.update` and omit the heartbeat when context-window usage is unknown.
+Notes may contain ordinary LF line breaks; other terminal control characters
+are rejected. Manual worker launch passes the complete briefing directly to the
+agent process instead of typing it through the shell, so stored prompt and note
+line breaks remain intact. The CLI exposes the same field as the clearer
+`--context-used` flag.
 
 `pane.report_session` binds an exact built-in agent session to its owning pane.
 The identity-only form remains compatible with existing integrations:
@@ -142,6 +157,15 @@ pane owns that exact session.
 {"id":"usage","method":"pane.report_session","params":{"pane":"9","agent":"opencode","session_id":"ses_123","usage":{"model":"anthropic/claude-sonnet-4","tokens_in":1200,"tokens_out":340,"cache_read":800,"cache_write":40,"cost":0.42,"updated_at":1788330000000}}}
 ```
 
+`pane.release_session` removes only an exact `{pane, agent, session_id}`
+binding. Repeating an already completed release is harmless. A delayed release
+for an older session fails with `ownership_conflict` instead of clearing the
+newer owner:
+
+```json
+{"id":"release","method":"pane.release_session","params":{"pane":"9","agent":"opencode","session_id":"ses_123"}}
+```
+
 `agent.list` rows identify their workspace three ways. `workspace` is a 0-based
 position that changes when workspaces are reordered or an earlier one closes,
 `workspace_name` is the user-editable label, and `workspace_id` is the stable id
@@ -152,11 +176,21 @@ also published by `workspace.list` and `workspace.get`. Filter or correlate on
 `mode: "workspace"`; omitted mode means worktree. Either mode may include a
 stable `workspace_id`; worktree mode creates its branch from that workspace's
 repository, while workspace mode creates a dedicated branchless task tab there.
-`branch` is valid only in worktree mode, and `task.merge` returns
-`merge_unavailable` for a workspace worker.
+The workspace must belong to the task's recorded project. `branch` is valid
+only in worktree mode, and `task.merge` returns
+`merge_unavailable` for a workspace worker. `task.start` also accepts
+`focus: false` to create and start the worker without changing the operator's
+current workspace, tab, pane focus, or zoom state.
+
+`task.retry` accepts `{"id":"t1"}` for terminal `done`, `failed`, `review`, or
+`blocked` work. Manual tasks return to `queued` with an incremented `attempt`
+and bounded `previous_attempts`. Automation-owned tasks return a new
+`automation_run` whose `retry_of` points to the preserved original record.
+Retrying from `review` or `blocked` finishes the superseded source run as
+`cancelled` so it cannot block the retry.
 
 ```json
-{"id":"1","method":"task.start","params":{"id":"t3","mode":"workspace","workspace_id":"workspace_example","agent":"codex"}}
+{"id":"1","method":"task.start","params":{"id":"t3","mode":"workspace","workspace_id":"workspace_example","agent":"codex","focus":false}}
 ```
 
 ## Agent automation
@@ -301,7 +335,19 @@ not change focus:
 logical area. Headless clients therefore receive deterministic geometry that
 does not depend on the latest attached terminal size. `pane.edges` reports
 which outer edges the pane touches. Directional queries use the same geometric
-selection as the TUI.
+selection as the TUI. `pane.split` takes optional `direction`: omitted or `"auto"` splits the longer
+physical side of the target pane using the last interactive client size. Cell
+pixels come from the display client when the host reports them; otherwise Luvus
+uses a documented 2:1 cell height/width. With no painted client it splits side
+by side. `"right"` and `"down"` force a direction (`"stack"` is an alias for
+`"down"`). Older servers reject `"auto"` and treat an omitted direction as
+right, so callers that want the server default should omit the field.
+
+`direction` is now validated: any other value, or a non-string, returns
+`invalid_request`. Earlier servers silently treated an unrecognized value as
+`"right"`, so a caller that sent something like `"vertical"` used to get a
+side-by-side split and now gets an error. Send `"right"` explicitly, or omit the
+field, to keep that behavior.
 
 `layout.export` returns the complete binary split tree and focused pane.
 `layout.apply` accepts that tree plus an optional focus. It succeeds only when
@@ -463,6 +509,21 @@ Installation is not a remote UHP operation.
 Local Settings language and theme changes fan out to connected hosts' running
 owners through surgical `config.patch` requests. Incoming language/theme patches
 apply live and persist without rebroadcast or remote discovery.
+
+Every snapshot terminal row includes `pane_id`, nullable `agent_name`, and nullable
+`title`. The title is the cached terminal or module-provided presentation title;
+it is also projected to remote agent rows. Module title changes emit the existing
+`agent.history_changed` event.
+`agent_name` is the operator alias set by `agent.name` or `pane.rename`; a terminal-backend title
+does not mask it. This differs from the presentation name in `agent.get` and
+`agent.list`, which prefer a backend title. Clearing an alias returns JSON
+`null`; native `kind:"view"` rows omit `agent_name`. Workspace and tab indices
+remain 1-based in this snapshot (agent-list workspace indices are 0-based).
+`agent.name` changes aliases without emitting an event or advancing
+`event_sequence`. `pane.rename` updates the same alias map, emits `pane.renamed`,
+and advances the sequence, including when clearing a name. Refresh snapshots to
+observe aliases; the sequence is not an alias ETag because `agent.name` is silent.
+Older servers may omit the field; retain pane-ID display as a fallback.
 
 `pane.processes` returns the already-cached executable names from Luvus's shared
 off-loop process scan. Full argument vectors are never exposed because they can
@@ -1015,9 +1076,36 @@ rendering.
 | Method | Params | Result |
 |---|---|---|
 | `ui.sidebar` | `{side?: "left"\|"right", width?: int, visible?: bool}` | `{width, visible}` for that side |
+| `ui.agent_title.push` | `{owner?, module_token?, titles: Title[]}` | `{type:"ok", changed}` |
+| `ui.agent_title.clear` | `{owner?, module_token?, pane?, agent?, session_id?}` | `{type:"ok", changed}` |
 | `ui.dock.push` | `{id, title?, placement?: "left"\|"right", rows: Row[]}` | `{type:"ok"}` |
 | `ui.dock.list` | `{}` | `{docks: [{id, side}]}` |
 | `ui.dock.move` | `{id, side: "left"\|"right"}` | `{type:"ok"}` |
+
+`ui.agent_title.push` lets a module supply AGENTS sidebar session titles without
+Luvus parsing any agent's native store. Each `Title` is:
+
+```json
+{ "pane": "3", "agent": "pi", "session_id": "01a0…", "title": "Ship desktop" }
+```
+
+A row needs `pane` and/or `agent`+`session_id`. `agent` must name a built-in
+Luvus adapter. Empty `title` clears that key. Live rows still prefer an OSC title; otherwise they use a pane title, then a
+session title. Resumable All/history rows use the session title. Luvus pane
+aliases (`=name`) are never used as titles. Module commands include their owner
+and per-server `module_token` automatically. Luvus accepts a module owner only
+with that token, so one module cannot publish or clear another module's titles.
+`clear` with no filters drops every title owned by the authenticated module.
+Direct local control-API calls may omit both fields; those calls can mutate only
+unowned titles, and an unfiltered clear is a no-op. Luvus clears an owner's
+titles when that module is disabled, unlinked, or uninstalled, and a disabled
+module cannot publish. A module's token stays valid for as long as it remains
+registered on that server, so toggling a module does not strand a module process
+that is still running; the token is dropped on unlink or uninstall. The CLI
+wrappers are `luvus ui agent-title push|clear` (`push` also
+reads `--titles` from stdin). Raw local API clients acting for a module must pass
+the injected `LUVUS_MODULE_TOKEN` as `module_token`; module scripts calling the
+CLI do not handle it themselves.
 
 A `Row` is:
 

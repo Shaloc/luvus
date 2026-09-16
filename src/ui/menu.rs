@@ -548,6 +548,11 @@ pub(super) fn draw_session_menu(
         .map(|item| {
             use crate::app::SessionMenuItem::*;
             let text = match *item {
+                Start(index) => format!(
+                    "{} · {}",
+                    cat.menu_start_session,
+                    menu.targets[index].label(cat)
+                ),
                 Stop(index) => format!(
                     "{} · {}",
                     cat.menu_stop_session,
@@ -790,6 +795,7 @@ fn orch_label(item: OrchMenuItem, cat: &Catalog) -> String {
         OrchMenuItem::Jump => cap_first(cat.scroll_jump),
         OrchMenuItem::Details => cap_first(cat.board_details),
         OrchMenuItem::Done => cap_first(cat.task_done),
+        OrchMenuItem::Retry => cap_first(cat.board_retry),
         OrchMenuItem::Merge => cap_first(cat.act_merge),
         OrchMenuItem::Release => cap_first(cat.board_release),
         OrchMenuItem::CopyId => format!("{} ID", cap_first(cat.act_copy)),
@@ -966,6 +972,7 @@ mod label_case_tests {
             OrchMenuItem::Jump,
             OrchMenuItem::Details,
             OrchMenuItem::Done,
+            OrchMenuItem::Retry,
             OrchMenuItem::Merge,
             OrchMenuItem::Release,
             OrchMenuItem::CopyId,
@@ -1003,7 +1010,7 @@ mod label_case_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, FileMenu, FileMenuItem, PopupId};
+    use crate::app::{App, FileMenu, FileMenuItem, PopupId, SessionMenu, SessionMenuItem};
     use crate::event::AppEvent;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -1273,5 +1280,49 @@ mod tests {
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         assert_eq!(app.menu_scroll.offset_of(PopupId::File), 0);
         assert!(rect_of(&app, FileMenuItem::OpenReadonly).height > 0);
+    }
+
+    #[test]
+    fn stopped_session_menu_renders_start_and_delete_for_keyboard_and_mouse() {
+        let _env = crate::persist::test_env("session-actions-render");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 20, tx).unwrap();
+        app.session_menu = Some(SessionMenu {
+            targets: vec![crate::app::session_menu::SessionMenuTarget {
+                name: "review".into(),
+                remote: None,
+                running: false,
+                current: false,
+            }],
+            confirming: None,
+            anchor: (4, 4),
+            items: Vec::new(),
+            selected: 0,
+        });
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+        let theme = app.theme.clone();
+        let catalog = app.catalog;
+
+        draw_session_menu(&mut target, area, &mut app, catalog, &theme);
+
+        let items = &app.session_menu.as_ref().unwrap().items;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, SessionMenuItem::Start(0));
+        assert_eq!(items[1].0, SessionMenuItem::Delete(0));
+        assert_ne!(items[0].1, items[1].1);
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains(catalog.menu_start_session));
+        assert!(text.contains("Delete"));
+        assert_eq!(
+            buffer.cell((items[0].1.x, items[0].1.y)).unwrap().bg,
+            theme.accent,
+            "the keyboard-selected Start row is highlighted"
+        );
     }
 }

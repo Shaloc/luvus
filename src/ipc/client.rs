@@ -48,6 +48,11 @@ fn read_handshake_message<R: Read>(reader: &mut R) -> Result<ServerMessage> {
     protocol::read_message(reader).map_err(|error| HandshakeIoError(error).into())
 }
 
+fn read_welcome_message<R: Read>(reader: &mut R) -> Result<ServerMessage> {
+    let (version, error) = protocol::read_welcome_message(reader).map_err(HandshakeIoError)?;
+    Ok(ServerMessage::Welcome { version, error })
+}
+
 fn write_handshake_message<W: Write>(writer: &mut W, message: &ClientMessage) -> Result<()> {
     protocol::write_message(writer, message).map_err(|error| HandshakeIoError(error).into())
 }
@@ -162,7 +167,7 @@ where
     )?;
 
     let mut reader = BufReader::new(reader);
-    match read_handshake_message(&mut reader)? {
+    match read_welcome_message(&mut reader)? {
         // The one user-facing handshake failure is an old server after an
         // upgrade — tell them the fix, not just the symptom.
         ServerMessage::Welcome { error: Some(e), .. } => {
@@ -257,6 +262,7 @@ where
     // pane even after `?25l`, so composition does not follow chrome.
     let mut last_cursor = None;
     let graphics_enabled = std::env::var("TERM").is_ok_and(|term| term.contains("kitty"));
+    send_cell_pixels(&mut writer)?;
     if graphics_enabled {
         send_graphics_size(&mut writer)?;
     }
@@ -268,6 +274,9 @@ where
         let message = match event {
             Ok(ClientEvent::Clipboard(epoch)) if epoch == generation => continue,
             Ok(ClientEvent::Input(message)) => {
+                if matches!(message, ClientMessage::Resize { .. }) {
+                    let _ = send_cell_pixels(&mut writer);
+                }
                 if graphics_enabled && matches!(message, ClientMessage::Resize { .. }) {
                     let _ = send_graphics_size(&mut writer);
                 }
@@ -406,6 +415,7 @@ where
                 let (reader, next_writer) = connection;
                 writer = Box::new(next_writer);
                 graphics.apply(Vec::new(), &mut std::io::stdout())?;
+                send_cell_pixels(&mut writer)?;
                 if graphics_enabled {
                     send_graphics_size(&mut writer)?;
                 }
@@ -441,6 +451,17 @@ where
     };
     graphics.apply(Vec::new(), &mut std::io::stdout())?;
     Ok(exit)
+}
+
+fn send_cell_pixels(writer: &mut impl Write) -> io::Result<()> {
+    let (cell_width, cell_height) = protocol::local_cell_pixels();
+    protocol::write_message(
+        writer,
+        &ClientMessage::CellPixels {
+            cell_width,
+            cell_height,
+        },
+    )
 }
 
 fn send_graphics_size(writer: &mut impl Write) -> io::Result<()> {
@@ -540,7 +561,7 @@ fn negotiate_switched_session(
             rows,
         },
     )?;
-    match read_handshake_message(&mut reader)? {
+    match read_welcome_message(&mut reader)? {
         ServerMessage::Welcome { error: None, .. } => {}
         ServerMessage::Welcome {
             error: Some(error), ..
@@ -661,9 +682,7 @@ fn input_message_with_clipboard(
     event: Event,
     read_image: impl FnOnce() -> Option<crate::terminal::clipboard::ClipboardImage>,
 ) -> Option<ClientMessage> {
-    if matches!(&event, Event::Key(key) if key.code == crossterm::event::KeyCode::Char('v')
-        && key.modifiers == crossterm::event::KeyModifiers::CONTROL
-        && key.kind == crossterm::event::KeyEventKind::Press)
+    if matches!(&event, Event::Key(key) if crate::terminal::clipboard::png::is_image_paste_key(key))
         || matches!(&event, Event::Paste(text) if text.is_empty())
     {
         if let Some(image) = read_image() {
@@ -1437,7 +1456,10 @@ mod render_tests {
             assert!(write_input_with_clipboard(&mut bytes, event, || Some(
                 crate::terminal::clipboard::ClipboardImage {
                     extension: "png".into(),
-                    bytes: b"\x89PNG\r\n\x1a\ntest".to_vec(),
+                    bytes: crate::terminal::clipboard::png::encode_rgba_png(1, 1, |_, _| [
+                        1, 2, 3, 255
+                    ])
+                    .unwrap(),
                 }
             )));
             assert!(

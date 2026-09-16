@@ -157,7 +157,10 @@ skill through their native adapters:
 - **Claude Code:** `~/.claude/skills/luvus/`
 - **Codex:** `~/.agents/skills/luvus/`
 - **Kilo Code:** `~/.agents/skills/luvus/`
-- **opencode:** `${XDG_CONFIG_HOME:-~/.config}/opencode/skills/luvus/`
+- **Devin:** `~/.agents/skills/luvus/`
+- **Letta Code:** `~/.letta/skills/luvus/`
+- **opencode** (including the `opencode2` compatibility alias):
+  `${XDG_CONFIG_HOME:-~/.config}/opencode/skills/luvus/`
 
 The command makes no network request and never replaces a skill directory it
 does not own. Luvus does not add a global `AGENTS.md` pointer. Supported agents
@@ -172,8 +175,8 @@ one never enables the other.
 
 The messaging **commands themselves work with every agent luvus detects**
 (claude, codex, gemini, opencode, kimi, grok, aider, and more), whether or not
-that agent has the skill installed. The skill just teaches an agent to reach for
-them on its own.
+that agent has the skill installed. The skill just teaches an agent to reach
+for them on its own.
 
 Inspect the logical skill state or print the canonical instructions bundled
 with the running Luvus binary:

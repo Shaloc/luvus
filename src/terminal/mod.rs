@@ -9,6 +9,7 @@ mod graphics_diacritics;
 #[cfg(any(windows, test))]
 pub mod host_input;
 pub mod host_key;
+pub mod keyboard;
 pub mod pty;
 pub mod theme_probe;
 pub mod vt;

@@ -839,6 +839,7 @@ impl App {
                     .unwrap_or_else(|| {
                         self.workspaces.push(Workspace {
                             cell_pixels: pane.cell_pixels(),
+                            graphics_enabled: false,
                             id: crate::ids::public_id("workspace"),
                             name: ws_name(&cwd),
                             cwd: cwd.clone(),

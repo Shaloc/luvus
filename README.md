@@ -51,8 +51,9 @@ remain active with this setting off.
 - **Git and GitHub:** View status, branches, commits, contributors, pull
   requests, issues, and repository activity without leaving Luvus.
 - **Worktrees and orchestration:** Create worktrees, coordinate dependent tasks,
-  reserve file paths, assign agents, schedule timezone-aware recurring work,
-  run quality gates, and merge completed work.
+  keep task queues and path leases scoped to their projects, assign agents,
+  schedule timezone-aware recurring work, run quality gates, and merge completed
+  work.
 - **Remote and multi-client use:** Register SSH-config hosts, target remote
   panes and worktrees with `--host`, merge same-name local and remote
   workspaces with hostname tags, or use the raw SSH attach escape hatch.
@@ -62,7 +63,7 @@ remain active with this setting off.
   remote panes, including terminal-browser's inline pixel output and tele-style
   scrolling Unicode image placeholders. Image updates
   reuse display IDs without repainting unchanged text; pane clipping and menus
-  compose with the images. Requires Kitty 0.28 or newer and transport 11 builds
+  compose with the images. Requires Kitty 0.28 or newer and transport 11 or newer builds
   on the display machine and remote owners. See the [graphics support and limits](https://github.com/Shaloc/luvus/blob/main/website/src/content/docs/docs/guides/remote.mdx#kitty-graphics).
 - **Extensible surfaces:** Install modules with actions, events, settings,
   startup hooks, panes, sidebar docks, and Top or Bottom Luvus Bar widgets.
@@ -144,6 +145,7 @@ Keyboard → Keyboard Shortcuts → Input Sources** to free `Ctrl+Space`.
 | GitHub Copilot CLI | ✓ | ✓ | ✓ |
 | Codex | ✓ | ✓ | ✓ |
 | Antigravity CLI | ✓ | ✓ | session only |
+| Letta Code | ✓ | ✓ with integration | session only |
 | opencode | ✓ | ✓ | ✓ |
 | Kimi | ✓ | ✓ | ✓ |
 | Qoder CLI | ✓ | ✓ with integration | session only |
@@ -155,6 +157,7 @@ Keyboard → Keyboard Shortcuts → Input Sources** to free `Ctrl+Space`.
 | Fx | ✓ | ✓ | No |
 | Cursor | ✓ | resume command | No |
 | Kilo Code | ✓ | exact-ID resume | No |
+| Devin | ✓ | exact-ID resume | No |
 | Gemini · Aider · Amp · Droid · Qwen · Kiro | ✓ | No | No |
 
 Live status needs no agent integration. See the

@@ -11,7 +11,7 @@ use crate::app::{App, DiffMenu, DiffMenuItem, DockKind, Tab, ViewKind};
 use crate::diff::{DiffKey, DiffListRow, DiffLoad, DiffView, FilesMode};
 use crate::event::AppEvent;
 use crate::ids::PaneId;
-use crate::layout::{Axis, TileLayout};
+use crate::layout::TileLayout;
 
 use super::files::OpenTarget;
 
@@ -694,7 +694,7 @@ impl App {
                 ws.active_tab = ws.tabs.len() - 1;
             }
             OpenTarget::Preview | OpenTarget::Pane => {
-                self.layout_mut().split_focused(Axis::Col, id);
+                self.split_focused_auto(id);
                 self.layout_mut().focus = id;
             }
         }
@@ -2108,6 +2108,7 @@ mod tests {
         let id = PaneId::alloc();
         app.workspaces.push(crate::app::Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name: cwd
                 .file_name()

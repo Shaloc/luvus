@@ -634,23 +634,27 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("Contributors"));
-        let contributors = CHANGELOG[0]
+
+        let contributor_labels = CHANGELOG[0]
             .2
-            .split("## Contributors")
-            .nth(1)
-            .expect("latest release credits");
-        let first = contributors
+            .split_once("## Contributors")
+            .expect("latest release has contributors")
+            .1
             .lines()
-            .find_map(|line| line.strip_prefix("- "))
-            .expect("at least one credit");
-        let expected = crate::changelog::inline(first)
-            .iter()
-            .map(|segment| segment.text.as_str())
-            .collect::<String>();
-        assert!(
-            text.contains(&expected),
-            "latest release credit is rendered: {expected}"
-        );
+            .skip_while(|line| line.trim().is_empty())
+            .take_while(|line| !line.starts_with("## "))
+            .filter_map(|line| line.strip_prefix("- "))
+            .map(|line| {
+                crate::changelog::inline(line)
+                    .into_iter()
+                    .map(|seg| seg.text)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(!contributor_labels.is_empty());
+        for contributor in contributor_labels {
+            assert!(text.contains(&contributor), "missing {contributor}");
+        }
     }
 
     /// Commit and PR references in the notes are clickable, which is the whole

@@ -33,7 +33,7 @@ import tempfile
 import time
 import unicodedata
 
-IMAGE = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aN1sAAAAASUVORK5CYII=")
+IMAGE = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=")
 SELECTORS = ("LUVUS_SOCKET_PATH", "LUVUS_SESSION", "LUVUS_REMOTE_HOST", "LUVUS_REMOTE_SESSION",
              "LUVUS_PANE_ID", "LUVUS_API_ADDRESS", "LUVUS_SHELL")
 
@@ -387,6 +387,12 @@ def main():
                                    "terminal_id": other_terminal})
                 assert rejected["error"]["code"] == "content_revision_conflict", rejected
                 assert observed["terminal_id"] in rejected["error"]["message"], rejected
+                title = "owner-remote-title" if remote else "owner-local-title"
+                assert "result" in request("ui.agent_title.push", {"titles": [{"pane": pane, "title": title}]})
+                snapshot = request("session.snapshot", {})["result"]
+                panes = [p for ws in snapshot["workspaces"] for tab in ws["tabs"] for p in tab["panes"]]
+                assert next(p for p in panes if p["pane_id"] == pane)["title"] == title
+                assert "result" in request("ui.agent_title.clear", {"pane": pane})
                 # A marker makes the old revision stale on the resolved owner.
                 api("pane.run", {"pane": pane, "command": "printf 'UPSTREAM_FENCE_%s\\n' OWNER"}, remote=remote)
                 wait_for(lambda: "UPSTREAM_FENCE_OWNER" in api("pane.read", {"pane": pane}, remote=remote)["text"])
@@ -1332,7 +1338,7 @@ def main():
                         return any(base64.b64decode(value) == payload for value in
                                    re.findall(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)", copied))
                     wait_for(clipboard_recovered)
-                    assert (root / "clipboard-copy").read_bytes() == payload
+                    wait_for(lambda: (root / "clipboard-copy").exists() and (root / "clipboard-copy").read_bytes() == payload)
                     tab_count = len(api("tab.list", remote=True)["tabs"])
                     os.write(master, b"\x02c")
                     wait_for(lambda: len(api("tab.list", remote=True)["tabs"]) == tab_count + 1)
@@ -1753,7 +1759,7 @@ def main():
                 wait_for(copied)
                 # Native fallback must also have landed in our private helper,
                 # never in an installed clipboard command or a real display.
-                assert (root / "clipboard-copy").read_bytes() == payload
+                wait_for(lambda: (root / "clipboard-copy").exists() and (root / "clipboard-copy").read_bytes() == payload)
 
             row("child OSC52 copy forwards exact bytes to display client", clipboard)
 
@@ -1773,7 +1779,7 @@ def main():
                         return any(base64.b64decode(value) == expected for value in
                                    re.findall(rb"\x1b\]52;c;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)", output))
                     wait_for(copied)
-                    assert (root / "clipboard-copy").read_bytes() == expected
+                    wait_for(lambda: (root / "clipboard-copy").exists() and (root / "clipboard-copy").read_bytes() == expected)
                 row("real Neovim OSC52 + register yank reaches display clipboard", nvim_yank)
             else:
                 print(f"SKIP: {mode}: Neovim executable is unavailable", flush=True)
@@ -2244,8 +2250,14 @@ def main():
                                      for w in api("session.snapshot", session="default")["workspaces"]))
                 os.write(master, b"\x02t")
                 menu = drain(master, 1.5)
-                assert menu.count(b"default") == 1, menu[-7000:]
-                assert b"remote-fake-dev-default" not in menu
+                # Cached rows and discovery can repaint the same word several
+                # times. Count the composed screen, not bytes across frames.
+                import pyte
+                menu_screen = pyte.Screen(120, 30)
+                pyte.ByteStream(menu_screen).feed(bytes(menu))
+                visible = "\n".join(menu_screen.display)
+                assert len(re.findall(r"\bdefault\b", visible)) == 1, visible
+                assert "remote-fake-dev-default" not in visible
                 os.write(master, b"\x1b")
                 drain(master)
                 print("PASS: merged remote Agents status/click/worktree/close, default grouping, "

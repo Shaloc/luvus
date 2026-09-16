@@ -215,6 +215,7 @@ impl ClientSender {
 }
 
 struct ClientState {
+    cell_pixels: Option<(u16, u16)>,
     graphics: Option<(u16, u16)>,
     last_graphics: Vec<crate::terminal::graphics::Graphic>,
     sender: ClientSender,
@@ -265,6 +266,7 @@ impl ClientState {
         Self {
             sender,
             graphics: None,
+            cell_pixels: None,
             last_graphics: Vec::new(),
             size,
             terminal_colors,
@@ -278,6 +280,10 @@ impl ClientState {
             workspace_id,
             projection: None,
         }
+    }
+
+    fn layout_cell_pixels(&self) -> Option<(u16, u16)> {
+        self.cell_pixels.or(self.graphics)
     }
 
     fn surface_active(&self) -> bool {
@@ -877,6 +883,19 @@ fn apply(
                 projection.seen_frame = None;
                 return app.acknowledge_agent_view(pane);
             }
+            if let ClientInput::CellPixels {
+                cell_width,
+                cell_height,
+            } = input
+            {
+                let Some(client) = clients.get_mut(&id) else {
+                    return false;
+                };
+                client.cell_pixels =
+                    (cell_width > 0 && cell_height > 0).then_some((cell_width, cell_height));
+                client.force_full = true;
+                return client.surface_active();
+            }
             if let ClientInput::Graphics {
                 cell_width,
                 cell_height,
@@ -950,9 +969,10 @@ fn apply(
                 // Actual scoped input has just promoted this display to the
                 // workspace geometry owner. A pane created by that input must
                 // inherit its pixels before the next frame, not the old viewer's.
-                app.workspaces[workspace_index].cell_pixels = client.graphics;
+                app.workspaces[workspace_index].cell_pixels = client.layout_cell_pixels();
+                app.workspaces[workspace_index].graphics_enabled = client.graphics.is_some();
                 let previous_cell_pixels = app.display_cell_pixels;
-                app.display_cell_pixels = client.graphics;
+                app.display_cell_pixels = client.layout_cell_pixels();
                 // Rebuild exactly this projection's hit geometry and PTY sizes
                 // before applying its input. The ordinary foreground viewport
                 // is forced to rebuild its own geometry on its next input.
@@ -975,7 +995,8 @@ fn apply(
                     ClientInput::Paste(text) => AppEvent::Paste(text),
                     ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                     ClientInput::Command(command) => AppEvent::ClientCommand(command),
-                    ClientInput::Graphics { .. }
+                    ClientInput::CellPixels { .. }
+                    | ClientInput::Graphics { .. }
                     | ClientInput::Resize(..)
                     | ClientInput::ProjectionInterest { .. }
                     | ClientInput::ProjectionPresented { .. } => unreachable!("handled above"),
@@ -1051,9 +1072,10 @@ fn apply(
             // geometry and PTY dimensions synchronously.
             // A capability update can precede this input without an intervening
             // render even when the foreground and character size are unchanged.
-            app.display_cell_pixels = client.graphics;
+            app.display_cell_pixels = client.layout_cell_pixels();
             if let Some(workspace) = app.workspaces.get_mut(app.active_ws) {
-                workspace.cell_pixels = client.graphics;
+                workspace.cell_pixels = client.layout_cell_pixels();
+                workspace.graphics_enabled = client.graphics.is_some();
             }
             let promoted = *foreground != Some(id);
             if promoted {
@@ -1084,7 +1106,8 @@ fn apply(
                 ClientInput::Paste(text) => AppEvent::Paste(text),
                 ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                 ClientInput::Command(command) => AppEvent::ClientCommand(command),
-                ClientInput::Graphics { .. }
+                ClientInput::CellPixels { .. }
+                | ClientInput::Graphics { .. }
                 | ClientInput::Resize(..)
                 | ClientInput::ProjectionInterest { .. }
                 | ClientInput::ProjectionPresented { .. } => unreachable!("handled above"),
@@ -1542,7 +1565,7 @@ fn render_client(
     let mut graphics = Vec::new();
     if owns_size {
         if client.workspace_id.is_none() {
-            app.display_cell_pixels = client.graphics;
+            app.display_cell_pixels = client.layout_cell_pixels();
         }
         {
             let workspace_index = match client.workspace_id.as_deref() {
@@ -1551,11 +1574,12 @@ fn render_client(
             };
             if let Some(workspace) = workspace_index.and_then(|index| app.workspaces.get_mut(index))
             {
-                workspace.cell_pixels = client.graphics;
+                workspace.cell_pixels = client.layout_cell_pixels();
+                workspace.graphics_enabled = client.graphics.is_some();
                 if let Some(tab) = workspace.tabs.get(workspace.active_tab) {
                     for (id, pane) in &app.panes {
                         if tab.layout.contains(*id) {
-                            pane.set_cell_pixels(client.graphics);
+                            pane.set_cell_pixels(client.layout_cell_pixels());
                         }
                     }
                 }
@@ -1803,13 +1827,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                             crate::logging::Field::ProtocolVersion(u64::from(version)),
                         ],
                     );
-                    let _ = protocol::write_message(
-                        &mut writer,
-                        &ServerMessage::Welcome {
-                            version: protocol::PROTOCOL_VERSION,
-                            error: Some("protocol version mismatch".into()),
-                        },
-                    );
+                    let _ = protocol::write_version_mismatch(&mut writer, Some(version));
                     return;
                 }
                 (version, cols, rows, None, false)
@@ -1848,7 +1866,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             }) => {
                 if !matches!(
                     version,
-                    protocol::PROJECTION_PROTOCOL_VERSION | protocol::PROTOCOL_VERSION
+                    protocol::PROJECTION_PROTOCOL_VERSION | 11 | protocol::PROTOCOL_VERSION
                 ) || workspace_id.len() > 128
                 {
                     let _ = protocol::write_message(
@@ -1959,6 +1977,22 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
 
     loop {
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::CellPixels {
+                cell_width,
+                cell_height,
+            }) if version >= 12 => {
+                if (cell_width == 0 && cell_height == 0)
+                    || ((1..=512).contains(&cell_width) && (1..=512).contains(&cell_height))
+                {
+                    let _ = app_tx.send(AppEvent::ClientInput {
+                        id,
+                        input: ClientInput::CellPixels {
+                            cell_width,
+                            cell_height,
+                        },
+                    });
+                }
+            }
             Ok(ClientMessage::Graphics {
                 cell_width,
                 cell_height,
@@ -2124,6 +2158,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 | ClientMessage::HelloProjection { .. }
                 | ClientMessage::ProjectionInterest { .. }
                 | ClientMessage::ProjectionPresented { .. }
+                | ClientMessage::CellPixels { .. }
                 | ClientMessage::TerminalColors(_),
             ) => {}
         }
@@ -2986,6 +3021,48 @@ mod tests {
                 .unwrap();
             assert_eq!(after, before);
             assert!(fixture.app.bar.hits.contains(&hit));
+        }
+
+        #[test]
+        fn physical_cells_do_not_enable_graphics_or_claim_passive_geometry() {
+            let _env = crate::persist::test_env("projection-physical-cells");
+            let mut fixture = Fixture::new();
+            fixture.clients.get_mut(&2).unwrap().projection = Some(Default::default());
+            fixture.input(
+                2,
+                ClientInput::CellPixels {
+                    cell_width: 8,
+                    cell_height: 24,
+                },
+            );
+            assert_eq!(fixture.clients[&2].layout_cell_pixels(), Some((8, 24)));
+            assert_eq!(fixture.clients[&2].graphics, None);
+            assert!(!fixture.clients[&2].surface_active());
+            assert_eq!(fixture.foreground, Some(1));
+            assert_eq!(
+                fixture.app.workspace_cell_pixels(fixture.target_index()),
+                None
+            );
+            fixture.input(
+                2,
+                ClientInput::ProjectionInterest {
+                    epoch: 1,
+                    active: true,
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            fixture.render();
+            assert_eq!(
+                fixture.app.workspace_cell_pixels(fixture.target_index()),
+                Some((8, 24))
+            );
+            assert!(!fixture.app.workspaces[fixture.target_index()].graphics_enabled);
+            assert_eq!(
+                fixture.app.panes[&fixture.target_pane()].cell_pixels(),
+                Some((8, 24))
+            );
+            assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
         }
 
         struct Fixture {
@@ -4035,6 +4112,10 @@ mod tests {
     #[test]
     fn kitty_changed_image_sends_graphics_with_an_empty_text_diff() {
         let _env = crate::persist::test_env("kitty-graphic-diff");
+        crate::config::save(&crate::config::Config {
+            shell: "/bin/cat".into(),
+            ..Default::default()
+        });
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(100, 30, tx).unwrap();
         app.server_mode = true;
@@ -4074,7 +4155,11 @@ mod tests {
                 };
                 assert!(
                     diff.runs.is_empty(),
-                    "image-only update has no changed text cells"
+                    "image-only update has no changed text cells: {:?}",
+                    diff.runs
+                        .iter()
+                        .map(|run| (run.start, &run.symbols))
+                        .collect::<Vec<_>>()
                 );
             }
         }

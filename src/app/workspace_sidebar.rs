@@ -226,6 +226,7 @@ mod tests {
         remote.workspace_id = "linked-remote".into();
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: "linked".into(),
             name: "branch".into(),
             cwd: "/repo/linked".into(),

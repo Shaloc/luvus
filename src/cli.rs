@@ -197,7 +197,7 @@ tabs:
 
 panes / agents:
   pane list                  list panes and read-only history metrics in the current tab
-  pane split [<id>] [--down] [--no-focus]   split a pane (default: side by side, creates a workspace if empty)
+  pane split [<id>] [--auto|--right|--down] [--no-focus]   split a pane (default: auto by size, creates a workspace if empty)
   pane focus <id>            focus a pane (jumps to its workspace/tab)
   pane move [<id>] (--tab <n> | --new-tab)  move a pane within its workspace
   pane run [<id>] <cmd...>   run a command in a pane
@@ -208,7 +208,7 @@ panes / agents:
   pane name <name>           name a pane so you can mention it (--pane <id>; --clear)
   pane close [<id>]          close a pane
   agent list                 list every agent across all workspaces/tabs
-  agent start <name> --kind <k> [--pane <id> | --anchor <id>] [--down] [--timeout <s>] [-- <args>]
+  agent start <name> --kind <k> [--pane <id> | --anchor <id>] [--auto|--right|--down] [--timeout <s>] [-- <args>]
                              spawn beside an anchor or reuse a pane, wait until ready, name it
   agent fork <target> [--name <alias>] [--no-focus]
                              fork a supported agent's session into a sibling pane
@@ -268,6 +268,10 @@ appearance:
   ui dock push --id <id> [--title <t>] [--side left|right] [--rows <json>]
                              feed a module's sidebar dock its rows (JSON array,
                              or piped on stdin). See docs/29 + the website
+  ui agent-title push [--titles <json>]
+                             set AGENTS sidebar titles for live and resumable rows
+  ui agent-title clear [--pane <id>|--agent <id> --session-id <id>]
+                             clear module-provided AGENTS sidebar titles
   ui notification push --text <text> [--level info|success|warning|error]
   ui notification clear [--dedupe-key <key>]
   ui toast <text>            flash a one-line message in the UI
@@ -325,19 +329,20 @@ worktrees:
   worktree remove <path>     remove a worktree (its branch is kept)
 
 orchestration (multiple agents on one project, docs/22):
-  task add \"<title>\" [--prompt <text>|--prompt-file <path>] [--paths <glob>...] [--dep <id>...] [--gate <cmd>]
+  task add \"<title>\" [--prompt <text>|--prompt-file <path>] [--paths <glob>...] [--dep <id>...] [--gate <cmd>] [--workspace-id <id>]
   task list                  list all tasks + their status/assignee
   task get <id>              show one task
   task claim <id>            claim a task for this pane (deps must be done)
   task next [--start] [--agent <cmd>] [--mode worktree|workspace] [--workspace-id <id>]
                              claim the next ready task (--start creates a worker)
-  task start <id> [--branch <b>] [--agent <cmd>] [--mode worktree|workspace] [--workspace-id <id>]
-                             start a worker (worktree default; workspace shares checkout)
+  task start <id> [--branch <b>] [--agent <cmd>] [--mode worktree|workspace] [--workspace-id <id>] [--no-focus]
+                             start a worker (worktree default; --no-focus preserves the view)
   task heartbeat <id> --context-used <0..1>
                              report model context-window use, not task progress
                              (>85% blocks done; --context remains accepted)
   task update <id> [--prompt <text>|--prompt-file <path>] [--status <s>] [--output <o>] [--note <n>]
   task done <id>             mark done + release its leases
+  task retry <id>            queue a fresh attempt without deleting previous work
   task merge <id>            integrate the task's branch into luvus/integration
                              (isolated worktree, conflicts block the task)
   task release <id>          return a claimed task to the queue
@@ -409,7 +414,7 @@ server:
   server restart --all [--json]  restart all running sessions on this host
   server update-manifest     fetch the latest agent-detection rules from luvus.dev
                              (applies live if the server is up; else on next start)
-  integration install|uninstall <claude|copilot|codex|antigravity|opencode|kimi|qodercli|grok|hermes|omp>
+  integration install|uninstall <claude|copilot|codex|antigravity|letta|opencode|kimi|qodercli|grok|hermes|omp>
                              add/remove luvus's session-resume hook (uninstall
                              removes only luvus's hook, never the agent)
 ";
@@ -835,7 +840,7 @@ fn write_topic_help_english(
             detailed_section("bars:\n", "\nappearance:\n"),
         ),
         "ui" => (
-            "luvus ui <sidebar|dock|notification|toast> [args]",
+            "luvus ui <sidebar|dock|agent-title|notification|toast> [args]",
             detailed_section("appearance:\n", "\nmodules (extensions):\n"),
         ),
         "module" => (
@@ -2279,7 +2284,34 @@ fn agent_wait_fallback(response: &Value, uses_statuses: bool) -> AgentWaitFallba
 #[derive(Debug, PartialEq)]
 enum AgentStartTarget {
     Existing(String),
-    Split { anchor: Option<String>, down: bool },
+    Split {
+        anchor: Option<String>,
+        /// Present only for an explicit `--auto`/`--right`/`--down`. Omitted
+        /// direction lets an older server keep its left/right default.
+        direction: Option<&'static str>,
+    },
+}
+
+/// The explicit split direction in `args`, or `None` when the caller passed no
+/// direction flag. `None` deliberately leaves `direction` off the wire so an
+/// older server keeps its own left/right default instead of rejecting `"auto"`.
+/// `--stack` is the documented alias for `--down`.
+fn split_direction_flag(args: &[String], usage: &str) -> Result<Option<&'static str>> {
+    let down = args.iter().any(|a| a == "--down" || a == "--stack");
+    let right = args.iter().any(|a| a == "--right");
+    let auto = args.iter().any(|a| a == "--auto");
+    if usize::from(down) + usize::from(right) + usize::from(auto) > 1 {
+        return Err(anyhow!("{usage}"));
+    }
+    Ok(if down {
+        Some("down")
+    } else if right {
+        Some("right")
+    } else if auto {
+        Some("auto")
+    } else {
+        None
+    })
 }
 
 fn parse_agent_start_target(args: &[String], caller: Option<String>) -> Result<AgentStartTarget> {
@@ -2290,22 +2322,26 @@ fn parse_agent_start_target(args: &[String], caller: Option<String>) -> Result<A
             "agent start accepts either --pane <id> or --anchor <id>, not both"
         ));
     }
+    let direction = split_direction_flag(
+        args,
+        "agent start accepts only one of --auto, --right, or --down",
+    )?;
     Ok(match pane {
         Some(pane) => AgentStartTarget::Existing(pane),
         None => AgentStartTarget::Split {
             anchor: anchor.or(caller),
-            down: args.iter().any(|a| a == "--down"),
+            direction,
         },
     })
 }
 
-/// `luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--down] [--timeout S] [-- <extra…>]` —
+/// `luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--auto|--right|--down] [--timeout S] [-- <extra…>]` —
 /// spawn a coding agent in a sibling pane (or a given one), wait until detection
 /// recognizes it, and give it a name, all in one command. Exit 0 when it becomes
 /// ready, 2 if it did not within the timeout (the pane and name still exist).
 fn agent_start_cmd(args: &[String]) -> Result<i32> {
     let name = args.get(3).cloned().ok_or_else(|| {
-        anyhow!("usage: luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--down] [--timeout S] [-- <extra>]")
+        anyhow!("usage: luvus agent start <name> --kind <kind> [--pane <id> | --anchor <id>] [--auto|--right|--down] [--timeout S] [-- <extra>]")
     })?;
     let separator = args.iter().position(|arg| arg == "--");
     let options = &args[..separator.unwrap_or(args.len())];
@@ -2324,14 +2360,13 @@ fn agent_start_cmd(args: &[String]) -> Result<i32> {
         AgentStartTarget::Existing(pane) => {
             params.insert("pane".into(), json!(pane));
         }
-        AgentStartTarget::Split { anchor, down } => {
+        AgentStartTarget::Split { anchor, direction } => {
             if let Some(anchor) = anchor {
                 params.insert("anchor".into(), json!(anchor));
             }
-            params.insert(
-                "direction".into(),
-                json!(if down { "down" } else { "right" }),
-            );
+            if let Some(direction) = direction {
+                params.insert("direction".into(), json!(direction));
+            }
         }
     }
     if let Some(timeout) = flag(options, "--timeout") {
@@ -2359,7 +2394,7 @@ fn validate_agent_start_options(args: &[String]) -> Result<()> {
                 }
                 index += 2;
             }
-            "--down" => index += 1,
+            "--down" | "--stack" | "--right" | "--auto" => index += 1,
             option if option.starts_with("--") => {
                 return Err(anyhow!("unknown agent start option: {option}"));
             }
@@ -3225,6 +3260,53 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                 _ => ("ui.dock.list".into(), json!({})),
             }
         }
+        ("ui", "agent-title") => {
+            let sub = rest.first().map(String::as_str).unwrap_or("");
+            let mut obj = serde_json::Map::new();
+            if let Ok(owner) = std::env::var("LUVUS_MODULE_ID") {
+                obj.insert("owner".into(), json!(owner));
+            }
+            if let Ok(token) = std::env::var(crate::module::runtime::MODULE_TOKEN_ENV) {
+                obj.insert("module_token".into(), json!(token));
+            }
+            match sub {
+                "push" => {
+                    let titles_str = match flag(args, "--titles") {
+                        Some(s) => s,
+                        None => {
+                            use std::io::Read;
+                            let mut s = String::new();
+                            let _ = std::io::stdin().read_to_string(&mut s);
+                            s
+                        }
+                    };
+                    let titles: Value = if titles_str.trim().is_empty() {
+                        json!([])
+                    } else {
+                        serde_json::from_str(&titles_str)
+                            .map_err(|e| anyhow!("--titles must be a JSON array: {e}"))?
+                    };
+                    if !titles.is_array() {
+                        return Err(anyhow!("--titles must be a JSON array"));
+                    }
+                    obj.insert("titles".into(), titles);
+                    ("ui.agent_title.push".into(), Value::Object(obj))
+                }
+                "clear" => {
+                    if let Some(pane) = flag(args, "--pane") {
+                        obj.insert("pane".into(), json!(pane));
+                    }
+                    if let Some(agent) = flag(args, "--agent") {
+                        obj.insert("agent".into(), json!(agent));
+                    }
+                    if let Some(session_id) = flag(args, "--session-id") {
+                        obj.insert("session_id".into(), json!(session_id));
+                    }
+                    ("ui.agent_title.clear".into(), Value::Object(obj))
+                }
+                _ => return Err(anyhow!("usage: luvus ui agent-title push|clear")),
+            }
+        }
         ("bar", sub) => {
             let mut obj = serde_json::Map::new();
             if let Ok(owner) = std::env::var("LUVUS_MODULE_ID") {
@@ -3541,8 +3623,10 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
 
         ("pane", "split") => {
             let mut obj = serde_json::Map::new();
-            if args.iter().any(|a| a == "--down" || a == "--stack") {
-                obj.insert("direction".to_string(), json!("down"));
+            if let Some(direction) =
+                split_direction_flag(args, "pass only one of --auto, --right, or --down")?
+            {
+                obj.insert("direction".to_string(), json!(direction));
             }
             if args.iter().any(|a| a == "--no-focus") {
                 obj.insert("focus".to_string(), json!(false));
@@ -4130,6 +4214,13 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             if let Some(g) = flag(args, "--gate") {
                 obj.insert("gate".into(), json!(g));
             }
+            if let Some(workspace_id) = flag(args, "--workspace-id") {
+                obj.insert("workspace_id".into(), json!(workspace_id));
+            }
+            let pv = pane();
+            if !pv.is_null() {
+                obj.insert("pane".into(), pv);
+            }
             ("task.add".into(), Value::Object(obj))
         }
         ("task", "get") => ("task.get".into(), one("id", arg0())),
@@ -4187,6 +4278,9 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             if let Some(workspace_id) = flag(args, "--workspace-id") {
                 obj.insert("workspace_id".into(), json!(workspace_id));
             }
+            if args.iter().any(|arg| arg == "--no-focus") {
+                obj.insert("focus".into(), json!(false));
+            }
             ("task.start".into(), Value::Object(obj))
         }
         ("task", "claim") => {
@@ -4201,6 +4295,7 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
             ("task.claim".into(), Value::Object(obj))
         }
         ("task", "done") => ("task.done".into(), one("id", arg0())),
+        ("task", "retry") => ("task.retry".into(), one("id", arg0())),
         ("task", "delete") => ("task.delete".into(), one("id", arg0())),
         ("task", "merge") => ("task.merge".into(), one("id", arg0())),
         ("task", "release") => ("task.release".into(), one("id", arg0())),
@@ -5112,6 +5207,19 @@ mod tests {
         assert_eq!(m, "pane.split");
         assert_eq!(p.get("direction").and_then(|v| v.as_str()), Some("down"));
 
+        let (m, p) = parse(&argv("luvus pane split")).unwrap();
+        assert_eq!(m, "pane.split");
+        assert!(p.get("direction").is_none());
+
+        let (m, p) = parse(&argv("luvus pane split --auto")).unwrap();
+        assert_eq!(m, "pane.split");
+        assert_eq!(p.get("direction").and_then(|v| v.as_str()), Some("auto"));
+
+        let (m, p) = parse(&argv("luvus pane split --right")).unwrap();
+        assert_eq!(m, "pane.split");
+        assert_eq!(p.get("direction").and_then(|v| v.as_str()), Some("right"));
+        assert!(parse(&argv("luvus pane split --auto --down")).is_err());
+
         let (m, p) = parse(&argv("luvus pane run 3 echo hi")).unwrap();
         assert_eq!(m, "pane.run");
         assert_eq!(p.get("pane").and_then(|v| v.as_str()), Some("3"));
@@ -5449,6 +5557,25 @@ mod tests {
         let (m, _) = parse(&argv("luvus ui dock list")).unwrap();
         assert_eq!(m, "ui.dock.list");
 
+        let titles_argv: Vec<String> = vec![
+            "luvus".into(),
+            "ui".into(),
+            "agent-title".into(),
+            "push".into(),
+            "--titles".into(),
+            r#"[{"pane":"3","title":"Ship desktop"}]"#.into(),
+        ];
+        let (m, p) = parse(&titles_argv).unwrap();
+        assert_eq!(m, "ui.agent_title.push");
+        assert_eq!(p["titles"][0]["title"].as_str(), Some("Ship desktop"));
+        let (m, p) = parse(&argv(
+            "luvus ui agent-title clear --agent pi --session-id sess-1",
+        ))
+        .unwrap();
+        assert_eq!(m, "ui.agent_title.clear");
+        assert_eq!(p.get("agent").and_then(|v| v.as_str()), Some("pi"));
+        assert!(parse(&argv("luvus ui agent-title")).is_err());
+
         // `ui sidebar` now takes an optional side.
         let (m, p) = parse(&argv("luvus ui sidebar --side right --width 30")).unwrap();
         assert_eq!(m, "ui.sidebar");
@@ -5459,6 +5586,7 @@ mod tests {
     fn maps_luvus_bar_and_notification_commands() {
         let _env = crate::persist::test_env("cli-bar");
         std::env::set_var("LUVUS_MODULE_ID", "you.ci");
+        std::env::set_var(crate::module::runtime::MODULE_TOKEN_ENV, "module-token");
         let args = vec![
             "luvus".into(),
             "bar".into(),
@@ -5475,6 +5603,18 @@ mod tests {
         assert_eq!(params["owner"], "you.ci");
         assert_eq!(params["content"].as_array().unwrap().len(), 2);
 
+        let (method, params) = parse(&argv(
+            r#"luvus ui agent-title push --titles [{"agent":"pi","session_id":"s1","title":"Title"}]"#,
+        ))
+        .unwrap();
+        assert_eq!(method, "ui.agent_title.push");
+        assert_eq!(params["owner"], "you.ci");
+        assert_eq!(params["module_token"], "module-token");
+        let (method, params) = parse(&argv("luvus ui agent-title clear")).unwrap();
+        assert_eq!(method, "ui.agent_title.clear");
+        assert_eq!(params["owner"], "you.ci");
+        assert_eq!(params["module_token"], "module-token");
+
         let (method, params) =
             parse(&argv("luvus bar move --id status --region bottom-right")).unwrap();
         assert_eq!(method, "ui.bar.move");
@@ -5488,6 +5628,7 @@ mod tests {
         assert_eq!(params["ttl_ms"], 6000);
         assert_eq!(params["owner"], "you.ci");
         std::env::remove_var("LUVUS_MODULE_ID");
+        std::env::remove_var(crate::module::runtime::MODULE_TOKEN_ENV);
 
         let (method, params) = parse(&argv(
             "luvus bar move --id core:focused-pane --region bottom-right",
@@ -5525,6 +5666,11 @@ mod tests {
             Some(1)
         );
         assert_eq!(p.get("gate").and_then(|v| v.as_str()), Some("cargo"));
+
+        let (method, params) =
+            parse(&argv("luvus task add scoped --workspace-id workspace-a")).unwrap();
+        assert_eq!(method, "task.add");
+        assert_eq!(params["workspace_id"], "workspace-a");
 
         let prompt_args = [
             "luvus",
@@ -5592,6 +5738,9 @@ mod tests {
         assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("t3"));
         let (m, _) = parse(&argv("luvus task done t3")).unwrap();
         assert_eq!(m, "task.done");
+        let (m, p) = parse(&argv("luvus task retry t3")).unwrap();
+        assert_eq!(m, "task.retry");
+        assert_eq!(p.get("id").and_then(|v| v.as_str()), Some("t3"));
 
         let (m, p) = parse(&argv("luvus lease acquire src/auth/** --task t1")).unwrap();
         assert_eq!(m, "lease.acquire");
@@ -5617,6 +5766,10 @@ mod tests {
             p.get("workspace_id").and_then(|v| v.as_str()),
             Some("workspace-a")
         );
+
+        let (m, p) = parse(&argv("luvus task start t2 --no-focus")).unwrap();
+        assert_eq!(m, "task.start");
+        assert_eq!(p.get("focus").and_then(|v| v.as_bool()), Some(false));
 
         let (m, p) = parse(&argv("luvus task next --start --agent claude")).unwrap();
         assert_eq!(m, "task.next");
@@ -6244,7 +6397,7 @@ mod tests {
             .unwrap(),
             AgentStartTarget::Split {
                 anchor: Some("4".into()),
-                down: true,
+                direction: Some("down"),
             }
         );
         assert_eq!(
@@ -6255,11 +6408,38 @@ mod tests {
             .unwrap(),
             AgentStartTarget::Split {
                 anchor: Some("7".into()),
-                down: false,
+                direction: None,
+            }
+        );
+        assert_eq!(
+            parse_agent_start_target(
+                &argv("luvus agent start worker --kind codex --auto"),
+                Some("7".into())
+            )
+            .unwrap(),
+            AgentStartTarget::Split {
+                anchor: Some("7".into()),
+                direction: Some("auto"),
+            }
+        );
+        assert_eq!(
+            parse_agent_start_target(
+                &argv("luvus agent start worker --kind codex --right"),
+                Some("7".into())
+            )
+            .unwrap(),
+            AgentStartTarget::Split {
+                anchor: Some("7".into()),
+                direction: Some("right"),
             }
         );
         assert!(parse_agent_start_target(
             &argv("luvus agent start worker --kind codex --pane 9 --anchor 4"),
+            None
+        )
+        .is_err());
+        assert!(parse_agent_start_target(
+            &argv("luvus agent start worker --kind codex --auto --down"),
             None
         )
         .is_err());

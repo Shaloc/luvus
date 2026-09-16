@@ -22,6 +22,7 @@ use crate::event::AppEvent;
 use crate::ids::PaneId;
 use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::TerminalRuntime;
+use crate::terminal::keyboard::KeyboardProtocol;
 use crate::terminal::vt::{create_engine, VtEngine, VtEngineKind};
 
 pub(crate) mod input;
@@ -72,15 +73,21 @@ fn write_input_action(writer: &mut dyn Write, action: InputAction) -> std::io::R
     writer.flush()
 }
 
-/// Pane keyboard modes that jointly determine PTY key encoding. Keep Kitty's
-/// disambiguation and report-all flags separate: the former deliberately leaves
-/// Tab and Backspace in their legacy forms.
-#[derive(Clone, Copy, Default)]
+/// Pane keyboard modes that jointly determine PTY key encoding. DECCKM is
+/// independent from the negotiated legacy/Kitty keyboard protocol.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KeyEncodingModes {
     pub application_cursor: bool,
-    pub disambiguate_escape_codes: bool,
-    pub report_all_keys_as_escape_codes: bool,
-    pub report_associated_text: bool,
+    pub protocol: KeyboardProtocol,
+}
+
+impl KeyEncodingModes {
+    pub(crate) fn from_engine(engine: &dyn VtEngine) -> Self {
+        Self {
+            application_cursor: engine.application_cursor(),
+            protocol: engine.keyboard_protocol(),
+        }
+    }
 }
 
 /// A pane app's mouse-tracking state (all four DECSET-derived flags in one
@@ -1068,12 +1075,7 @@ impl Pane {
     pub fn key_encoding_modes(&self) -> KeyEncodingModes {
         self.engine
             .lock()
-            .map(|e| KeyEncodingModes {
-                application_cursor: e.application_cursor(),
-                disambiguate_escape_codes: e.disambiguate_escape_codes(),
-                report_all_keys_as_escape_codes: e.report_all_keys_as_escape_codes(),
-                report_associated_text: e.report_associated_text(),
-            })
+            .map(|e| KeyEncodingModes::from_engine(&*e))
             .unwrap_or_default()
     }
 
@@ -1239,6 +1241,14 @@ fn apply_pane_env(
     // be overridden — no spoofing the module/pane identity).
     for (k, v) in extra_env {
         cmd.env(k, v);
+    }
+    // A persistent Luvus server may have been started through an SSH bridge.
+    // Its panes own fresh local PTYs, so inheriting the bridge's connection
+    // identity makes terminal applications misclassify those PTYs as SSH
+    // terminals long after the originating connection is gone. Keep
+    // SSH_AUTH_SOCK: forwarded agent access is still useful inside panes.
+    for key in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+        cmd.env_remove(key);
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("LUVUS_ENV", "1");
@@ -2072,8 +2082,10 @@ mod reap_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        child_poll_finished, path_with_server_binary, wrap_paste, write_input_action, InputAction,
+        apply_pane_env, child_poll_finished, path_with_server_binary, wrap_paste,
+        write_input_action, CommandBuilder, InputAction, PaneId,
     };
+    use std::ffi::OsStr;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -2130,6 +2142,36 @@ mod tests {
         assert!(child_poll_finished(Ok(Some(
             portable_pty::ExitStatus::with_exit_code(0)
         ))));
+    }
+
+    #[test]
+    fn pane_env_drops_ssh_terminal_identity_but_keeps_agent_forwarding() {
+        let mut command = CommandBuilder::new("shell");
+        let extra_env = [
+            (
+                "SSH_CONNECTION".to_string(),
+                "client connection".to_string(),
+            ),
+            ("SSH_CLIENT".to_string(), "client identity".to_string()),
+            ("SSH_TTY".to_string(), "windows-pty".to_string()),
+            ("SSH_AUTH_SOCK".to_string(), "forwarded-agent".to_string()),
+        ];
+
+        apply_pane_env(
+            &mut command,
+            PaneId(1),
+            std::path::Path::new("."),
+            &extra_env,
+        );
+
+        for key in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
+            assert_eq!(command.get_env(key), None, "{key} must not reach panes");
+        }
+        assert_eq!(
+            command.get_env("SSH_AUTH_SOCK"),
+            Some(OsStr::new("forwarded-agent")),
+            "SSH agent forwarding remains available"
+        );
     }
 
     #[test]

@@ -3,3 +3,4 @@
 {"event":"automation.run_started","sequence":3,"data":{"automation_id":"a1","run_id":"r1","task_id":"t4","scheduled_at":1788393600,"status":"running"}}
 {"event":"agent.history_changed","sequence":4,"data":{}}
 {"event":"agent.pin_changed","sequence":5,"data":{"pane":"7","pinned":true}}
+{"event":"task.retried","sequence":4,"data":{"id":"t4","attempt":2}}

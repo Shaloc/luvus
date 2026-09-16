@@ -58,6 +58,7 @@ pub struct RemoteAgentMeta {
     pub tab: usize,
     pub focused: bool,
     pub name: Option<String>,
+    pub title: Option<String>,
     pub session: Option<String>,
     pub terminal_id: Option<String>,
     pub cwd: String,
@@ -103,6 +104,10 @@ fn parse_remote_agents(workspace: &Value) -> Vec<RemoteAgentMeta> {
                     .or_else(|| pane.get("focused"))
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                title: pane
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 name: pane
                     .get("agent_name")
                     .and_then(Value::as_str)
@@ -205,12 +210,14 @@ pub struct RemoteDisplay {
     pub server_generation: Option<String>,
     pub projection: bool,
     pub graphics: bool,
+    pub cell_pixels: bool,
 }
 
 #[derive(Default)]
 pub struct RemoteProjection {
     frame_deadline: Option<crate::session::remote::ConnectionDeadline>,
     cell_pixels: Option<(u16, u16)>,
+    layout_cell_pixels: Option<(u16, u16)>,
     display: RemoteDisplay,
     epoch: u64,
     active: bool,
@@ -522,6 +529,7 @@ impl App {
         );
         self.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name: target.session.clone(),
             cwd: PathBuf::new(),
@@ -1198,6 +1206,7 @@ impl App {
         );
         self.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name: meta.name,
             cwd: PathBuf::from(meta.cwd),
@@ -1324,6 +1333,7 @@ impl App {
         // an input sender, so force it to be sent after this handshake.
         view.last_size = (0, 0);
         view.projection.cell_pixels = None;
+        view.projection.layout_cell_pixels = None;
         view.projection.frame_deadline = None;
         let target = RemoteSession {
             host: view.target.host.clone(),
@@ -1829,11 +1839,31 @@ impl App {
             return;
         };
         let rect = self.remote_workspace_rect(self.active_ws);
-        let cell_pixels = self.workspace_cell_pixels(self.active_ws);
+        let layout_cell_pixels = self.workspace_cell_pixels(self.active_ws);
+        let cell_pixels = self.workspaces[self.active_ws]
+            .graphics_enabled
+            .then_some(layout_cell_pixels)
+            .flatten();
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
         let size = (rect.width.max(1), rect.height.max(1));
+        if view.projection.display.cell_pixels
+            && view.projection.layout_cell_pixels != layout_cell_pixels
+        {
+            if let Some(input) = &view.input {
+                let (cell_width, cell_height) = layout_cell_pixels.unwrap_or((0, 0));
+                if input
+                    .send(ClientMessage::CellPixels {
+                        cell_width,
+                        cell_height,
+                    })
+                    .is_ok()
+                {
+                    view.projection.layout_cell_pixels = layout_cell_pixels;
+                }
+            }
+        }
         if view.projection.display.graphics && view.projection.cell_pixels != cell_pixels {
             if let Some(input) = &view.input {
                 // The bridge outlives local display clients. Zero/zero revokes
@@ -2037,17 +2067,25 @@ pub(super) fn parse_remote_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let snapshot = RemoteSessionSnapshot {
         display: RemoteDisplay {
+            cell_pixels: response
+                .get("result")
+                .and_then(|r| r.get("remote_display"))
+                .is_some_and(|display| {
+                    display.get("transport").and_then(Value::as_u64) == Some(12)
+                }),
             graphics: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|display| {
-                    display.get("transport").and_then(Value::as_u64) == Some(11)
-                        && display
-                            .get("capabilities")
-                            .and_then(Value::as_array)
-                            .is_some_and(|caps| {
-                                caps.iter().any(|cap| cap.as_str() == Some("graphics.v1"))
-                            })
+                    matches!(
+                        display.get("transport").and_then(Value::as_u64),
+                        Some(11 | 12)
+                    ) && display
+                        .get("capabilities")
+                        .and_then(Value::as_array)
+                        .is_some_and(|caps| {
+                            caps.iter().any(|cap| cap.as_str() == Some("graphics.v1"))
+                        })
                 }),
             location,
             server_generation: response
@@ -2061,7 +2099,7 @@ pub(super) fn parse_remote_snapshot(
                 .is_some_and(|display| {
                     matches!(
                         display.get("transport").and_then(Value::as_u64),
-                        Some(10 | 11)
+                        Some(10..=12)
                     ) && display
                         .get("capabilities")
                         .and_then(Value::as_array)
@@ -2277,8 +2315,10 @@ fn run_projection(
             &mut input,
             &if display.projection {
                 ClientMessage::HelloProjection {
-                    version: if display.graphics {
+                    version: if display.cell_pixels {
                         protocol::PROTOCOL_VERSION
+                    } else if display.graphics {
+                        11
                     } else {
                         protocol::PROJECTION_PROTOCOL_VERSION
                     },
@@ -2870,6 +2910,7 @@ pub(crate) mod tests {
         );
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: "workspace_local_projection".into(),
             name: "api".into(),
             cwd: remote_path.clone(),
@@ -4371,7 +4412,8 @@ pub(crate) mod tests {
         app.named_session_menu = None;
         let image = crate::terminal::clipboard::ClipboardImage {
             extension: "png".into(),
-            bytes: b"\x89PNG\r\n\x1a\ntest".to_vec(),
+            bytes: crate::terminal::clipboard::png::encode_rgba_png(1, 1, |_, _| [1, 2, 3, 255])
+                .unwrap(),
         };
         app.handle_event(AppEvent::ClipboardImage(image));
         assert!(
@@ -4802,6 +4844,7 @@ pub(crate) mod tests {
             unreachable!()
         };
         view.projection.display.graphics = true;
+        app.workspaces[app.active_ws].graphics_enabled = true;
         app.workspaces[app.active_ws].cell_pixels = Some((8, 16));
         app.resize_active_remote_projection();
         assert!(receiver.try_iter().any(|message| matches!(

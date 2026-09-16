@@ -5,6 +5,7 @@ pub(crate) static BUILTINS: &[&AgentDescriptor] = &[
     &super::codex::DESCRIPTOR,
     &super::gemini::DESCRIPTOR,
     &super::antigravity::DESCRIPTOR,
+    &super::letta::DESCRIPTOR,
     &super::aider::DESCRIPTOR,
     &super::opencode::DESCRIPTOR,
     &super::copilot::DESCRIPTOR,
@@ -22,6 +23,7 @@ pub(crate) static BUILTINS: &[&AgentDescriptor] = &[
     &super::omp::DESCRIPTOR,
     &super::pi::DESCRIPTOR,
     &super::fx::DESCRIPTOR,
+    &super::devin::DESCRIPTOR,
 ];
 
 // Preserve the current Settings and CLI presentation order independently of
@@ -31,6 +33,7 @@ static INTEGRATIONS: &[&AgentDescriptor] = &[
     &super::copilot::DESCRIPTOR,
     &super::codex::DESCRIPTOR,
     &super::antigravity::DESCRIPTOR,
+    &super::letta::DESCRIPTOR,
     &super::opencode::DESCRIPTOR,
     &super::kimi::DESCRIPTOR,
     &super::qodercli::DESCRIPTOR,
@@ -142,6 +145,8 @@ mod tests {
 
         assert!(find("antigravity").unwrap().automation.is_none());
         assert!(find("amp").unwrap().automation.is_none());
+        assert!(find("devin").unwrap().automation.is_none());
+        assert!(find("letta").unwrap().automation.is_none());
 
         let pi = find("pi").unwrap().automation.unwrap();
         assert!(pi.supports(AutomationAccess::ReadOnly));
@@ -152,6 +157,11 @@ mod tests {
         assert!(!kilo.supports(AutomationAccess::ReadOnly));
         assert!(!kilo.supports(AutomationAccess::Workspace));
         assert!(kilo.supports(AutomationAccess::FullAccess));
+
+        let opencode = find("opencode2").unwrap().automation.unwrap();
+        assert!(!opencode.supports(AutomationAccess::ReadOnly));
+        assert!(!opencode.supports(AutomationAccess::Workspace));
+        assert!(opencode.supports(AutomationAccess::FullAccess));
     }
 
     #[test]
@@ -191,6 +201,7 @@ mod tests {
         assert_eq!(find("CURSOR").map(|agent| agent.id), Some("cursor"));
         assert_eq!(find("agy").map(|agent| agent.id), Some("antigravity"));
         assert_eq!(find("KILOCODE").map(|agent| agent.id), Some("kilo"));
+        assert_eq!(find("LETTA-CODE").map(|agent| agent.id), Some("letta"));
         assert_eq!(
             find("ANTIGRAVITY-CLI").map(|agent| agent.id),
             Some("antigravity")
@@ -217,8 +228,9 @@ mod tests {
             ("codex", &["codex"][..], &[][..]),
             ("gemini", &["gemini"][..], &[][..]),
             ("antigravity", &["antigravity-cli"][..], &["agy"][..]),
+            ("letta", &["letta-code"][..], &["letta"][..]),
             ("aider", &["aider"][..], &[][..]),
-            ("opencode", &["opencode"][..], &[][..]),
+            ("opencode", &["opencode", "opencode2"][..], &[][..]),
             ("copilot", &["copilot"][..], &[][..]),
             ("kimi", &["kimi"][..], &[][..]),
             (
@@ -246,6 +258,7 @@ mod tests {
             ("omp", &["oh-my-pi", "omp-coding-agent"][..], &["omp"][..]),
             ("pi", &["pi-coding-agent"][..], &["pi"][..]),
             ("fx", &[][..], &["fx"][..]),
+            ("devin", &[][..], &["devin"][..]),
         ];
         assert_eq!(actual, expected);
         assert!(BUILTINS.iter().all(|descriptor| {
@@ -269,6 +282,7 @@ mod tests {
                 "codex",
                 "gemini",
                 "antigravity",
+                "letta",
                 "opencode",
                 "copilot",
                 "kimi",
@@ -282,6 +296,7 @@ mod tests {
                 "omp",
                 "pi",
                 "fx",
+                "devin",
             ]
         );
 
@@ -338,6 +353,7 @@ mod tests {
                 "copilot",
                 "codex",
                 "antigravity",
+                "letta",
                 "opencode",
                 "kimi",
                 "qodercli",

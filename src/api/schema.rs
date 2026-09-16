@@ -78,6 +78,20 @@ mod tests {
     }
 
     #[test]
+    fn task_start_request_contract_can_preserve_focus() {
+        let bundle = schema_bundle();
+        let params = &bundle["request"]["$defs"]["taskStartParams"];
+
+        assert_eq!(params["additionalProperties"], false);
+        assert_eq!(params["properties"]["focus"]["type"], "boolean");
+        assert!(!params["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "focus"));
+    }
+
+    #[test]
     fn schema_bundle_publishes_one_uhp_contract_with_terminal_components() {
         let bundle = schema_bundle();
         assert_eq!(bundle["protocol"]["name"], "luvus-uhp");
@@ -128,6 +142,13 @@ mod tests {
         assert!(definitions["taskAddParams"]["properties"]["prompt"]
             .get("maxLength")
             .is_none());
+        assert_eq!(
+            definitions["taskAddParams"]["properties"]["workspace_id"]["type"],
+            "string"
+        );
+        assert!(definitions["taskAddParams"]["properties"]
+            .get("pane")
+            .is_some());
         assert_eq!(
             definitions["taskUpdateParams"]["properties"]["prompt"]["type"],
             json!(["string", "null"])
@@ -207,6 +228,7 @@ mod tests {
             "task.needs_compaction",
             "task.ready",
             "task.released",
+            "task.retried",
             "task.started",
             "task.updated",
             "terminal.closed",
@@ -347,6 +369,9 @@ mod tests {
         assert!(!task_required.contains("prompt"));
         assert!(!task_required.contains("mode"));
         assert!(!task_required.contains("workspace_worker"));
+        assert!(!task_required.contains("project"));
+        assert!(task_required.contains("attempt"));
+        assert!(task_required.contains("previous_attempts"));
         assert_eq!(
             task["properties"]["mode"]["enum"],
             json!(["worktree", "workspace"])
@@ -356,9 +381,22 @@ mod tests {
             "#/$defs/workspace_worker"
         );
         assert_eq!(
+            task["properties"]["project"]["$ref"],
+            "#/$defs/task_project"
+        );
+        assert_eq!(
             task["properties"]["prompt"]["type"],
             json!(["string", "null"])
         );
+        assert_eq!(task["properties"]["attempt"]["minimum"], 1);
+        assert_eq!(
+            task["properties"]["previous_attempts"]["maxItems"],
+            crate::orch::MAX_TASK_ATTEMPTS
+        );
+
+        let task_retried = &definitions["task_retried"];
+        assert_eq!(task_retried["additionalProperties"], false);
+        assert_eq!(task_retried["properties"]["attempt"]["minimum"], 2);
 
         let workspace_worker = &definitions["workspace_worker"];
         let workspace_worker_required: std::collections::BTreeSet<_> = workspace_worker["required"]

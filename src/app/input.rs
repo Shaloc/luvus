@@ -3,6 +3,9 @@
 
 use super::*;
 use crate::files::view_text_w;
+use crate::terminal::keyboard::KeyboardProtocol;
+#[cfg(test)]
+use crate::terminal::keyboard::KittyKeyboardFlags;
 use unicode_width::UnicodeWidthChar;
 
 /// Keep the command overlay useful when a just-spawned child has not appeared
@@ -311,6 +314,10 @@ impl App {
             );
             return false;
         }
+        // Input-only requests do not mutate projected application state. Their
+        // resulting PTY bytes will schedule the real frame, so rendering here
+        // only projects an unchanged surface once per submitted command.
+        let projects_immediately = req.method != "pane.run";
         if req.method == "terminal.backend.create" {
             self.start_backend_create(req);
             return true;
@@ -346,7 +353,7 @@ impl App {
         };
         let response = self.handle_api(&req);
         self.reply_after_automation_save(req, response);
-        true
+        projects_immediately
     }
 
     /// Park `task.merge` until its off-loop Git job returns. This preserves the
@@ -673,9 +680,13 @@ impl App {
             AppEvent::NamedSessionOperationFinished {
                 generation,
                 label,
+                target,
+                action,
                 result,
             } => {
-                self.apply_named_session_operation_finished(generation, label, result);
+                self.apply_named_session_operation_finished(
+                    generation, label, target, action, result,
+                );
                 return true;
             }
             other => other,
@@ -923,6 +934,9 @@ impl App {
                 // A resize (or a same-size resize event a terminal emits on a
                 // move/expose) may have damaged the screen — force a full repaint.
                 self.force_redraw = true;
+                if let Some((width, height)) = crate::platform::terminal_cell_pixels() {
+                    self.set_client_cell_pixels(width, height);
+                }
                 true
             }
             AppEvent::PtyInputRejected(id) => {
@@ -945,7 +959,9 @@ impl App {
                 // so a saturated pane wakes the loop at the render rate, not
                 // once per PTY read.
                 if let Some(s) = self.status.get_mut(&id) {
-                    s.last_activity = Instant::now();
+                    let now = Instant::now();
+                    s.last_activity = now;
+                    s.quiet_check_at = Some(now + ACTIVITY_WINDOW);
                 }
                 self.detection_dirty.insert(id);
                 if self.panes.contains_key(&id) {
@@ -3284,9 +3300,7 @@ impl App {
                         &key,
                         newline,
                         modes.application_cursor,
-                        modes.disambiguate_escape_codes,
-                        modes.report_all_keys_as_escape_codes,
-                        modes.report_associated_text,
+                        modes.protocol,
                     ) {
                         pane.send(&bytes);
                     }
@@ -4323,9 +4337,7 @@ impl App {
                             &prefix,
                             &newline,
                             modes.application_cursor,
-                            modes.disambiguate_escape_codes,
-                            modes.report_all_keys_as_escape_codes,
-                            modes.report_associated_text,
+                            modes.protocol,
                         ) {
                             pane.send(&bytes);
                         }
@@ -4424,14 +4436,9 @@ impl App {
                     .focused()
                     .map(|pane| pane.key_encoding_modes())
                     .unwrap_or_default();
-                if let Some(bytes) = encode_key_with_modes(
-                    &key,
-                    newline,
-                    modes.application_cursor,
-                    modes.disambiguate_escape_codes,
-                    modes.report_all_keys_as_escape_codes,
-                    modes.report_associated_text,
-                ) {
+                if let Some(bytes) =
+                    encode_key_with_modes(&key, newline, modes.application_cursor, modes.protocol)
+                {
                     if let Some(p) = self.focused() {
                         // Typing snaps the view back to the live bottom, so you
                         // always see what you type (like every terminal).
@@ -4552,8 +4559,6 @@ fn mouse_wheel_seq(up: bool, col: u16, row: u16, sgr: bool) -> Vec<u8> {
 /// real terminal would send them — some apps (`less`) only recognize the SS3
 /// form once they've turned the mode on. Unnegotiated Alt+character stays
 /// ESC+char; after Kitty disambiguate it is CSI-u so `Alt+/` is not two keys.
-/// `report_all` is tracked separately because disambiguation alone deliberately
-/// leaves Tab and Backspace in their legacy forms.
 #[cfg(test)]
 fn encode_key(
     key: &KeyEvent,
@@ -4561,16 +4566,21 @@ fn encode_key(
     app_cursor: bool,
     disambiguate: bool,
 ) -> Option<Vec<u8>> {
-    encode_key_with_modes(key, newline, app_cursor, disambiguate, false, false)
+    let protocol = if disambiguate {
+        KeyboardProtocol::Kitty {
+            flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+        }
+    } else {
+        KeyboardProtocol::Legacy
+    };
+    encode_key_with_modes(key, newline, app_cursor, protocol)
 }
 
 fn encode_key_with_modes(
     key: &KeyEvent,
     newline: &[u8],
     app_cursor: bool,
-    disambiguate: bool,
-    report_all: bool,
-    report_text: bool,
+    protocol: KeyboardProtocol,
 ) -> Option<Vec<u8>> {
     // AltGr arrives as Ctrl+Alt on Windows (`keys::is_ctrl_chord`) and types a
     // character — it is neither a Ctrl chord nor an `ESC`-prefixed Alt key.
@@ -4578,7 +4588,9 @@ fn encode_key_with_modes(
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     // Kitty's report-all mode implies disambiguation, even when the child did
     // not also set the dedicated disambiguation bit.
-    let disambiguate = disambiguate || report_all;
+    let disambiguate = protocol.disambiguates_escape_codes();
+    let report_all = protocol.reports_all_keys();
+    let report_text = protocol.reports_associated_text();
     // True exactly when `is_ctrl_chord` refused a Ctrl+Alt press as AltGr. Only
     // the `Char` arm may act on it: every other key keeps both modifiers, so
     // `Ctrl+Alt+Enter` is still a modified Enter and sends the newline sequence.
@@ -4681,15 +4693,16 @@ fn encode_key_with_modes(
                 }
             }
         }
-        // Shift/Alt+Enter means "new line, don't submit" in every agent CLI.
-        // A terminal sends a bare `CR` for both Enter and Shift+Enter, so this
-        // only ever fires when the terminal disambiguates modified keys — either
-        // via the keyboard protocol (`main::push_key_protocol`, macOS/Linux) or
-        // native console records (Windows). The bytes are configurable
-        // (`config::shift_enter`); the default `ESC CR` is what agents expect out
-        // of the box (Claude Code's `/terminal-setup`).
-        KeyCode::Enter if shift || alt => newline.to_vec(),
+        // Preserve modified Enter identities after the child negotiates Kitty
+        // disambiguation. Some agents assign Shift+Enter and Alt+Enter distinct
+        // actions, so collapsing both to the configured newline would lose an
+        // identity the protocol explicitly preserves.
+        KeyCode::Enter if disambiguate && (shift || alt) => csi_u_code(13, key.modifiers),
         KeyCode::Enter if report_all => csi_u_code(13, key.modifiers),
+        // Legacy input cannot reliably distinguish modified Enter variants.
+        // Keep the configurable compatibility sequence for agents that use
+        // either Shift+Enter or Alt+Enter as their newline chord.
+        KeyCode::Enter if shift || alt => newline.to_vec(),
         KeyCode::Enter => vec![b'\r'],
         KeyCode::Tab => {
             if report_all {
@@ -4869,6 +4882,7 @@ fn csi_tilde_key(code: u8, modifiers: KeyModifiers) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::terminal::keyboard::KittyKeyboardFlags;
 
     #[test]
     fn negotiated_associated_text_reaches_focused_pane_input() {
@@ -4988,6 +5002,7 @@ mod tests {
                 .push(Tab::panes(TileLayout::new(focus)));
             app.workspaces.push(Workspace {
                 cell_pixels: None,
+                graphics_enabled: false,
                 id: crate::ids::public_id("workspace"),
                 name: format!("workspace-{position}"),
                 cwd: std::path::PathBuf::from(format!("/tmp/workspace-{position}")),
@@ -5107,6 +5122,32 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("an empty server still answers its control API");
         assert!(resp.contains("pong"), "got a real pong, not EOF: {resp}");
+    }
+
+    #[test]
+    fn pane_run_waits_for_pty_output_before_requesting_a_render() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let (reply, response) = std::sync::mpsc::channel();
+        let request = crate::ipc::api::ApiRequest {
+            id: "pane-run".into(),
+            method: "pane.run".into(),
+            params: json!({"pane": pane.0.to_string(), "command": "true"}),
+            reply,
+        };
+
+        assert!(
+            !app.handle_event(AppEvent::Api(request)),
+            "queueing terminal input does not change the projected surface"
+        );
+        let response: serde_json::Value = serde_json::from_str(
+            &response
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("pane.run returns its API response"),
+        )
+        .unwrap();
+        assert_eq!(response["result"]["type"], "ok");
     }
 
     #[test]
@@ -5283,6 +5324,7 @@ mod tests {
         let open_root = closed_root.join("still-open");
         app.workspaces.push(crate::app::Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name: "still-open".into(),
             cwd: open_root.clone(),
@@ -5356,12 +5398,10 @@ mod tests {
         assert!(crate::platform::same_path(&app.ws().cwd, &open_root));
     }
 
-    // Agents treat Enter as "submit" and Shift+Enter as "new line". A terminal
-    // sends a bare CR for both, so luvus asks for the disambiguating keyboard
-    // protocol and forwards the modified form as `ESC CR` — the sequence agent
-    // CLIs already understand.
+    // Legacy input cannot preserve distinct Shift/Alt+Enter identities, so it
+    // keeps the configured compatibility sequence while plain Enter submits.
     #[test]
-    fn shift_enter_sends_a_newline_not_a_submit() {
+    fn legacy_modified_enter_sends_a_newline_not_a_submit() {
         // The default newline sequence is `ESC CR`.
         let nl = b"\x1b\r";
         let enter =
@@ -5390,6 +5430,58 @@ mod tests {
                 false
             ),
             Some(b"\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_modes_preserve_modified_enter_identity() {
+        let encode = |modifiers, protocol| {
+            encode_key_with_modes(
+                &KeyEvent::new(KeyCode::Enter, modifiers),
+                b"\x1b\r",
+                false,
+                protocol,
+            )
+        };
+
+        for protocol in [
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+            },
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            },
+        ] {
+            assert_eq!(
+                encode(KeyModifiers::SHIFT, protocol),
+                Some(b"\x1b[13;2u".to_vec())
+            );
+            assert_eq!(
+                encode(KeyModifiers::ALT, protocol),
+                Some(b"\x1b[13;3u".to_vec())
+            );
+            assert_eq!(
+                encode(KeyModifiers::SHIFT | KeyModifiers::ALT, protocol),
+                Some(b"\x1b[13;4u".to_vec())
+            );
+        }
+        assert_eq!(
+            encode(
+                KeyModifiers::NONE,
+                KeyboardProtocol::Kitty {
+                    flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+                },
+            ),
+            Some(b"\r".to_vec())
+        );
+        assert_eq!(
+            encode(
+                KeyModifiers::NONE,
+                KeyboardProtocol::Kitty {
+                    flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+                },
+            ),
+            Some(b"\x1b[13u".to_vec())
         );
     }
 
@@ -5530,107 +5622,112 @@ mod tests {
 
     #[test]
     fn tab_and_backspace_require_report_all_for_csi_u() {
-        let encode = |code, modifiers, disambiguate, report_all| {
-            encode_key_with_modes(
-                &KeyEvent::new(code, modifiers),
-                b"\x1b\r",
-                false,
-                disambiguate,
-                report_all,
-                false,
-            )
+        let encode = |code, modifiers, protocol| {
+            encode_key_with_modes(&KeyEvent::new(code, modifiers), b"\x1b\r", false, protocol)
         };
 
-        for disambiguate in [false, true] {
+        for protocol in [
+            KeyboardProtocol::Legacy,
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+            },
+        ] {
             assert_eq!(
-                encode(KeyCode::Tab, KeyModifiers::CONTROL, disambiguate, false),
+                encode(KeyCode::Tab, KeyModifiers::CONTROL, protocol),
                 Some(b"\t".to_vec())
             );
             assert_eq!(
-                encode(KeyCode::BackTab, KeyModifiers::NONE, disambiguate, false),
+                encode(KeyCode::BackTab, KeyModifiers::NONE, protocol),
                 Some(b"\x1b[Z".to_vec())
             );
             assert_eq!(
-                encode(KeyCode::Backspace, KeyModifiers::ALT, disambiguate, false),
+                encode(KeyCode::Backspace, KeyModifiers::ALT, protocol),
                 Some(vec![0x1b, 0x7f])
             );
         }
 
+        let report_all = KeyboardProtocol::Kitty {
+            flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        };
         assert_eq!(
-            encode(KeyCode::Tab, KeyModifiers::CONTROL, false, true),
+            encode(KeyCode::Tab, KeyModifiers::CONTROL, report_all),
             Some(b"\x1b[9;5u".to_vec())
         );
         assert_eq!(
-            encode(KeyCode::Tab, KeyModifiers::ALT, false, true),
+            encode(KeyCode::Tab, KeyModifiers::ALT, report_all),
             Some(b"\x1b[9;3u".to_vec())
         );
         assert_eq!(
-            encode(KeyCode::BackTab, KeyModifiers::NONE, false, true),
+            encode(KeyCode::BackTab, KeyModifiers::NONE, report_all),
             Some(b"\x1b[9;2u".to_vec())
         );
         assert_eq!(
-            encode(KeyCode::Backspace, KeyModifiers::ALT, false, true),
+            encode(KeyCode::Backspace, KeyModifiers::ALT, report_all),
             Some(b"\x1b[127;3u".to_vec())
         );
         assert_eq!(
-            encode(KeyCode::Backspace, KeyModifiers::CONTROL, false, true),
+            encode(KeyCode::Backspace, KeyModifiers::CONTROL, report_all),
             Some(b"\x1b[127;5u".to_vec())
         );
         assert_eq!(
-            encode(KeyCode::Enter, KeyModifiers::NONE, false, true),
+            encode(KeyCode::Enter, KeyModifiers::NONE, report_all),
             Some(b"\x1b[13u".to_vec())
         );
         assert_eq!(
-            encode(KeyCode::Char('a'), KeyModifiers::NONE, false, true),
+            encode(KeyCode::Char('a'), KeyModifiers::NONE, report_all),
             Some(b"\x1b[97u".to_vec())
         );
         assert_eq!(
-            encode(KeyCode::Char('A'), KeyModifiers::SHIFT, false, true),
+            encode(KeyCode::Char('A'), KeyModifiers::SHIFT, report_all),
             Some(b"\x1b[97;2u".to_vec())
         );
         assert_eq!(
-            encode(KeyCode::Char('7'), KeyModifiers::CONTROL, false, true),
+            encode(KeyCode::Char('7'), KeyModifiers::CONTROL, report_all),
             Some(b"\x1b[47;5u".to_vec())
         );
     }
 
     #[test]
     fn disambiguate_and_report_all_encode_esc_and_modified_chars() {
-        let encode = |code, modifiers, disambiguate, report_all| {
-            encode_key_with_modes(
-                &KeyEvent::new(code, modifiers),
-                b"\x1b\r",
-                false,
-                disambiguate,
-                report_all,
-                false,
-            )
+        let encode = |code, modifiers, protocol| {
+            encode_key_with_modes(&KeyEvent::new(code, modifiers), b"\x1b\r", false, protocol)
         };
 
         assert_eq!(
-            encode(KeyCode::Esc, KeyModifiers::NONE, false, false),
+            encode(KeyCode::Esc, KeyModifiers::NONE, KeyboardProtocol::Legacy),
             Some(vec![0x1b])
         );
-        for modes in [(true, false), (false, true)] {
+        for protocol in [
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+            },
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            },
+        ] {
             assert_eq!(
-                encode(KeyCode::Esc, KeyModifiers::NONE, modes.0, modes.1),
+                encode(KeyCode::Esc, KeyModifiers::NONE, protocol),
                 Some(b"\x1b[27u".to_vec())
             );
             assert_eq!(
-                encode(KeyCode::Esc, KeyModifiers::ALT, modes.0, modes.1),
+                encode(KeyCode::Esc, KeyModifiers::ALT, protocol),
                 Some(b"\x1b[27;3u".to_vec())
             );
             assert_eq!(
-                encode(KeyCode::Char('a'), KeyModifiers::SUPER, modes.0, modes.1),
+                encode(KeyCode::Char('a'), KeyModifiers::SUPER, protocol),
                 Some(b"\x1b[97;9u".to_vec())
             );
         }
         assert_eq!(
-            encode(KeyCode::Esc, KeyModifiers::ALT, false, false),
+            encode(KeyCode::Esc, KeyModifiers::ALT, KeyboardProtocol::Legacy),
             Some(vec![0x1b, 0x1b])
         );
         assert_eq!(
-            encode(KeyCode::Char('a'), KeyModifiers::SUPER, false, false),
+            encode(
+                KeyCode::Char('a'),
+                KeyModifiers::SUPER,
+                KeyboardProtocol::Legacy
+            ),
             Some(b"a".to_vec())
         );
     }

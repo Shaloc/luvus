@@ -986,6 +986,15 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         } else {
                             format!("[{}] {}", target.host, agent.agent)
                         };
+                        let meta = if app.config.layout.agent_title {
+                            agent
+                                .title
+                                .as_ref()
+                                .map(|title| format!("  [{}] {title}", target.host))
+                                .unwrap_or(meta)
+                        } else {
+                            meta
+                        };
                         let presentation = (agent.state, name, focused, meta);
                         let hit = (target.clone(), agent.pane.clone(), rect);
                         app.remote_agent_rects.push(hit);
@@ -1100,7 +1109,14 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     } else {
                         format!("[{host}] {}", session.agent)
                     };
-                    (agent, format!("[{host}] {project}"))
+                    let title = app
+                        .config
+                        .layout
+                        .agent_title
+                        .then_some(session.title.as_deref())
+                        .flatten()
+                        .unwrap_or(project);
+                    (agent, format!("[{host}] {title}"))
                 } else {
                     let si = if scoped {
                         resumable_scoped[visible_index]
@@ -1111,14 +1127,24 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     session_rects.push((si, row));
                     (
                         session.agent.clone(),
-                        session
-                            .cwd
-                            .file_name()
-                            .and_then(|name| name.to_str())
-                            .unwrap_or("project")
+                        app.config
+                            .layout
+                            .agent_title
+                            .then(|| {
+                                app.agent_row_title_for_session(&session.agent, &session.session_id)
+                            })
+                            .flatten()
+                            .unwrap_or_else(|| {
+                                session
+                                    .cwd
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("project")
+                            })
                             .to_string(),
                     )
                 };
+                let meta = format!("  {proj}");
                 let label = " resume  ";
                 let prefix_w = 1 + crate::ui::display_width(label);
                 let name = crate::ui::truncate(&agent, (cw as usize).saturating_sub(prefix_w));
@@ -1136,7 +1162,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         f,
                         y + 1,
                         Line::from(Span::styled(
-                            crate::ui::truncate(&format!("  {proj}"), cw as usize),
+                            crate::ui::truncate(&meta, cw as usize),
                             Style::new().fg(t.overlay0),
                         )),
                     );
@@ -1907,6 +1933,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["a1"],
             "closed-workspace schedules do not leak into the remaining scope"
+        );
+    }
+
+    #[test]
+    fn agent_title_shows_module_title_not_alias() {
+        let _env = crate::persist::test_env("agent-module-title");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.agent_title = true;
+        let id = app.layout().focus;
+        {
+            let status = app.status.get_mut(&id).unwrap();
+            status.agent = "pi".into();
+            status.agent_session = Some(crate::app::AgentSession {
+                agent: "pi".into(),
+                session_id: "sess-1".into(),
+            });
+        }
+        app.agent_names.insert("chezmoi".into(), id);
+        assert!(app.set_agent_row_title_for_session(
+            "pi".into(),
+            "sess-1".into(),
+            Some("Ship desktop".into()),
+        ));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            buffer_contains(&term, "Ship desktop"),
+            "idle live rows show the module-provided session title"
+        );
+        assert!(
+            !buffer_contains(&term, "=chezmoi"),
+            "a Luvus pane alias must not stand in for the session title"
+        );
+    }
+
+    #[test]
+    fn resumable_rows_show_module_session_title() {
+        let _env = crate::persist::test_env("resumable-module-title");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        app.config.layout.agent_title = true;
+        app.agents_active_only = false;
+        app.resumable = vec![crate::agent::SessionInfo {
+            agent: "pi".into(),
+            session_id: "sess-closed".into(),
+            cwd: std::path::PathBuf::from("/tmp/proj"),
+            updated: std::time::SystemTime::UNIX_EPOCH,
+        }];
+        assert!(app.set_agent_row_title_for_session(
+            "pi".into(),
+            "sess-closed".into(),
+            Some("Closed session name".into()),
+        ));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "resume"));
+        assert!(
+            buffer_contains(&term, "Closed session name"),
+            "All history rows show the module-provided title"
         );
     }
 }

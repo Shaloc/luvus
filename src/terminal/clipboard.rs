@@ -10,12 +10,14 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 pub mod kitten;
+pub(crate) mod png;
 
 pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClipboardImage {
     pub extension: String,
+    #[serde(deserialize_with = "deserialize_image_bytes")]
     pub bytes: Vec<u8>,
 }
 
@@ -26,7 +28,7 @@ impl ClipboardImage {
         }
         let bytes = &self.bytes;
         match self.extension.as_str() {
-            "png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "png" => png::validate_png(bytes).is_ok(),
             "jpg" => bytes.starts_with(b"\xff\xd8\xff"),
             "gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
             "webp" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
@@ -74,7 +76,7 @@ fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<
     success.then_some(bytes)
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(target_os = "linux")]
 fn image_from(command: Command, extension: &str) -> Option<ClipboardImage> {
     let image = ClipboardImage {
         extension: extension.to_string(),
@@ -83,15 +85,22 @@ fn image_from(command: Command, extension: &str) -> Option<ClipboardImage> {
     image.valid().then_some(image)
 }
 
+#[cfg(windows)]
 pub fn read_image() -> Option<ClipboardImage> {
-    #[cfg(any(target_os = "linux", windows))]
+    crate::platform::clipboard_image()
+        .map(|bytes| ClipboardImage {
+            extension: "png".into(),
+            bytes,
+        })
+        .filter(ClipboardImage::valid)
+}
+
+#[cfg(not(windows))]
+pub fn read_image() -> Option<ClipboardImage> {
+    #[cfg(target_os = "linux")]
     {
-        if cfg!(windows) || std::env::var_os("WSL_DISTRO_NAME").is_some() {
-            let mut command = Command::new(if cfg!(windows) {
-                "powershell"
-            } else {
-                "powershell.exe"
-            });
+        if std::env::var_os("WSL_DISTRO_NAME").is_some() {
+            let mut command = Command::new("powershell.exe");
             command.args(["-NoProfile", "-NonInteractive", "-STA", "-Command",
                 "Add-Type -AssemblyName System.Windows.Forms; $clip=[Windows.Forms.Clipboard]::GetImage(); if ($null -eq $clip) { exit 1 }; $buffer=New-Object IO.MemoryStream; try { $clip.Save($buffer,[Drawing.Imaging.ImageFormat]::Png); $data=$buffer.ToArray(); [Console]::OpenStandardOutput().Write($data,0,$data.Length) } finally { $clip.Dispose(); $buffer.Dispose() }"]);
             if let Some(image) = image_from(command, "png") {
@@ -208,11 +217,65 @@ pub fn stage(image: &ClipboardImage) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+fn deserialize_image_bytes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<u8>, D::Error> {
+    use serde::de::{Error, SeqAccess, Visitor};
+    struct ImageBytes;
+    impl<'de> Visitor<'de> for ImageBytes {
+        type Value = Vec<u8>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "at most {MAX_IMAGE_BYTES} clipboard bytes")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let length = seq.size_hint().unwrap_or(0);
+            if length > MAX_IMAGE_BYTES {
+                return Err(A::Error::custom("clipboard image exceeds size limit"));
+            }
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|_| A::Error::custom("clipboard image allocation failed"))?;
+            while let Some(byte) = seq.next_element()? {
+                if bytes.len() == MAX_IMAGE_BYTES {
+                    return Err(A::Error::custom("clipboard image exceeds size limit"));
+                }
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+    deserializer.deserialize_seq(ImageBytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn wire_image_rejects_oversized_length_before_reading_payload() {
+        let image = ClipboardImage {
+            extension: "png".into(),
+            bytes: Vec::new(),
+        };
+        let mut bytes = bincode::serde::encode_to_vec(&image, bincode::config::standard()).unwrap();
+        assert_eq!(bytes.pop(), Some(0));
+        bytes.extend(
+            bincode::serde::encode_to_vec(MAX_IMAGE_BYTES + 1, bincode::config::standard())
+                .unwrap(),
+        );
+        let error = bincode::serde::decode_from_slice::<ClipboardImage, _>(
+            &bytes,
+            bincode::config::standard(),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("clipboard image exceeds"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn ssh_kitty_reads_desktop_image_without_a_linux_display() {
         use std::os::unix::fs::PermissionsExt;
@@ -243,7 +306,9 @@ mod tests {
         let dir = crate::persist::config_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let helper = dir.join("kitten");
-        std::fs::write(&helper, "#!/bin/sh\n[ \"$1\" = clipboard ] && [ \"$2\" = --get-clipboard ] || exit 1\nprintf '\\211PNG\\r\\n\\032\\nfixture'\n").unwrap();
+        let png = png::encode_rgba_png(1, 1, |_, _| [1, 2, 3, 255]).unwrap();
+        let escaped: String = png.iter().map(|byte| format!("\\{byte:03o}")).collect();
+        std::fs::write(&helper, format!("#!/bin/sh\n[ \"$1\" = clipboard ] && [ \"$2\" = --get-clipboard ] || exit 1\nprintf '{escaped}'\n")).unwrap();
         std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::env::set_var("PATH", &dir);
         std::env::set_var("TERM", "xterm-kitty");
@@ -260,7 +325,8 @@ mod tests {
         let _env = crate::persist::test_env("clipboard-images");
         let image = ClipboardImage {
             extension: "png".into(),
-            bytes: b"\x89PNG\r\n\x1a\ntest".to_vec(),
+            bytes: crate::terminal::clipboard::png::encode_rgba_png(1, 1, |_, _| [1, 2, 3, 255])
+                .unwrap(),
         };
         let path = stage(&image).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), image.bytes);

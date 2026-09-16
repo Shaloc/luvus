@@ -141,7 +141,7 @@ pub(crate) fn draw_session_menu(
         return;
     }
 
-    if loading {
+    if loading && item_count == 2 {
         f.render_widget(
             Paragraph::new(Span::styled(
                 format!(" {}", app.catalog.session_loading),
@@ -165,9 +165,9 @@ pub(crate) fn draw_session_menu(
     let available = content.bottom().saturating_sub(top + 1) as usize;
     f.render_widget(
         Paragraph::new(format!(
-            " r {} · d {} · {} [{}]",
+            " r {} · a {} · {} [{}]",
             app.catalog.act_refresh,
-            app.catalog.act_delete,
+            app.catalog.mobile_actions,
             app.catalog.session_merge,
             if app.remote_merge_enabled { "✓" } else { " " }
         ))
@@ -517,6 +517,20 @@ fn draw_row(
 }
 
 fn session_state(app: &App, row: &crate::app::session_menu::NamedSessionRow) -> String {
+    let key = row.remote.as_ref().map_or_else(
+        || format!("local/{}", row.name),
+        |remote| remote.canonical_name(),
+    );
+    if let Some(action) = app.pending_named_session_actions.get(&key) {
+        return match action {
+            crate::app::session_menu::NamedSessionAction::Stop => {
+                app.catalog.session_stopping.to_string()
+            }
+            crate::app::session_menu::NamedSessionAction::Delete => {
+                app.catalog.session_deleting.to_string()
+            }
+        };
+    }
     let mut state = if let Some(remote) = &row.remote {
         let status = if app
             .remote_host_status

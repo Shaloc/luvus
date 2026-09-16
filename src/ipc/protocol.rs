@@ -13,7 +13,11 @@ use serde::{Deserialize, Serialize};
 use crate::sound::SoundSignal;
 use crate::terminal::theme_probe::TerminalColors;
 
-pub const PROTOCOL_VERSION: u32 = 11;
+pub fn local_cell_pixels() -> (u16, u16) {
+    crate::platform::terminal_cell_pixels().unwrap_or((0, 0))
+}
+
+pub const PROTOCOL_VERSION: u32 = 12;
 pub const PROJECTION_PROTOCOL_VERSION: u32 = 10;
 pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 
@@ -22,7 +26,7 @@ pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 pub fn supports_version(version: u32) -> bool {
     matches!(
         version,
-        LEGACY_PROTOCOL_VERSION | PROJECTION_PROTOCOL_VERSION | PROTOCOL_VERSION
+        LEGACY_PROTOCOL_VERSION | PROJECTION_PROTOCOL_VERSION | 11 | PROTOCOL_VERSION
     )
 }
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -81,6 +85,11 @@ pub enum ClientMessage {
     /// Opt-in only on transport 11, after Welcome/Ready. Re-sent on resize.
     /// Zero/zero revokes the capability; a single zero is invalid.
     Graphics {
+        cell_width: u16,
+        cell_height: u16,
+    },
+    /// Transport 12: physical cell geometry, independent of Kitty graphics.
+    CellPixels {
         cell_width: u16,
         cell_height: u16,
     },
@@ -167,8 +176,8 @@ pub struct ProjectionState {
 pub const PROJECTION_CAPABILITY: &str = "projection.v1";
 
 pub fn remote_display_capabilities() -> serde_json::Value {
-    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, PROTOCOL_VERSION],
-        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1"]})
+    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, PROTOCOL_VERSION],
+        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1"]})
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -521,6 +530,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_handshake_decodes_both_released_welcome_shapes() {
+        for peer in [9, 12, V0141_PROTOCOL_VERSION] {
+            let mut bytes = Vec::new();
+            write_version_mismatch(&mut bytes, Some(peer)).unwrap();
+            assert_eq!(bytes[4], u8::from(peer == V0141_PROTOCOL_VERSION));
+            let (version, error) = read_welcome_message(&mut &bytes[..]).unwrap();
+            assert_eq!(version, PROTOCOL_VERSION);
+            assert_eq!(error.as_deref(), Some("protocol version mismatch"));
+        }
+    }
+
+    #[test]
+    fn cell_pixels_append_without_changing_previous_wire_ordinals() {
+        let message = ClientMessage::CellPixels {
+            cell_width: 8,
+            cell_height: 24,
+        };
+        let bytes = bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+        assert_eq!(bytes, [16, 8, 24]);
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert!(matches!(
+            decoded,
+            ClientMessage::CellPixels {
+                cell_width: 8,
+                cell_height: 24
+            }
+        ));
+    }
+
+    #[test]
     fn transport_nine_wire_discriminants_remain_frozen() {
         for (message, expected) in [
             (
@@ -566,7 +606,8 @@ mod tests {
         assert!(supports_version(10));
         assert!(!supports_version(8));
         assert!(supports_version(11));
-        assert!(!supports_version(12));
+        assert!(supports_version(12));
+        assert!(!supports_version(13));
     }
 
     #[test]
@@ -1002,5 +1043,59 @@ mod size_probe {
             "DIFF, full-screen redraw : {d3} bytes  ({}x smaller)",
             full / d3.max(1)
         );
+    }
+}
+
+const V0141_PROTOCOL_VERSION: u32 = 17;
+/// The only historical pre-negotiation server shape that shipped with
+/// `Welcome` outside variant zero. This decoder is shared by local, federated,
+/// and SSH-backed clients so every attach path reports an actionable mismatch.
+#[derive(Deserialize)]
+enum WelcomeHandshakeMessage {
+    Welcome { version: u32, error: Option<String> },
+    V0141Welcome { version: u32, error: Option<String> },
+}
+
+#[allow(dead_code)]
+#[derive(Serialize)]
+enum V0141HandshakeMessage {
+    ShellSidebars,
+    Welcome { version: u32, error: Option<String> },
+}
+
+/// Decode the frozen variant-zero `Welcome` and the released v0.14.1
+/// variant-one shape before the peers have agreed on a protocol version.
+pub(crate) fn read_welcome_message<R: Read>(
+    reader: &mut R,
+) -> std::io::Result<(u32, Option<String>)> {
+    let message: WelcomeHandshakeMessage = read_message(reader)?;
+    Ok(match message {
+        WelcomeHandshakeMessage::Welcome { version, error }
+        | WelcomeHandshakeMessage::V0141Welcome { version, error } => (version, error),
+    })
+}
+
+/// Write a protocol-mismatch response in the shape the peer can decode.
+pub(crate) fn write_version_mismatch<W: Write>(
+    writer: &mut W,
+    peer_version: Option<u32>,
+) -> std::io::Result<()> {
+    let error = Some("protocol version mismatch".to_string());
+    if peer_version == Some(V0141_PROTOCOL_VERSION) {
+        write_message(
+            writer,
+            &V0141HandshakeMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                error,
+            },
+        )
+    } else {
+        write_message(
+            writer,
+            &ServerMessage::Welcome {
+                version: PROTOCOL_VERSION,
+                error,
+            },
+        )
     }
 }

@@ -40,6 +40,53 @@ pub fn option_modifier_pressed() -> bool {
     false
 }
 
+/// Read and normalize a local Windows clipboard image after an explicit paste
+/// gesture. Other platforms preserve their existing terminal and agent-native
+/// clipboard behavior and never probe the clipboard here.
+#[cfg(windows)]
+pub fn clipboard_image() -> Option<Vec<u8>> {
+    windows::clipboard_image()
+}
+
+/// Pixel size of one terminal cell on the local display, when the host reports it.
+///
+/// Unix uses `TIOCGWINSZ` `ws_xpixel`/`ws_ypixel`. Windows uses the current
+/// console font. Many hosts leave these fields at zero; callers must fall back.
+#[cfg(unix)]
+pub fn terminal_cell_pixels() -> Option<(u16, u16)> {
+    unix_terminal_cell_pixels()
+}
+
+#[cfg(windows)]
+pub fn terminal_cell_pixels() -> Option<(u16, u16)> {
+    windows::terminal_cell_pixels()
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn terminal_cell_pixels() -> Option<(u16, u16)> {
+    None
+}
+
+#[cfg(unix)]
+fn unix_terminal_cell_pixels() -> Option<(u16, u16)> {
+    for fd in [libc::STDOUT_FILENO, libc::STDERR_FILENO, libc::STDIN_FILENO] {
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } != 0 {
+            continue;
+        }
+        if size.ws_col == 0 || size.ws_row == 0 || size.ws_xpixel == 0 || size.ws_ypixel == 0 {
+            continue;
+        }
+        let width = size.ws_xpixel / size.ws_col;
+        let height = size.ws_ypixel / size.ws_row;
+        if width == 0 || height == 0 {
+            continue;
+        }
+        return Some((width, height));
+    }
+    None
+}
+
 /// Do two paths name the same folder? (docs/43 WIN-6.)
 ///
 /// Node lookup used to compare `PathBuf`s with `==`, so any difference in
@@ -1121,19 +1168,43 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("test executable directory");
         let executable = dir.join("luvus");
         let _ = std::fs::remove_file(&executable);
-        std::fs::copy("/bin/sleep", &executable).expect("luvus-named executable");
+        // Copying a macOS platform binary such as /bin/sleep out of /bin is
+        // SIGKILL'd by AMFI (exit 137), so the kill guard never sees a live
+        // process. Compile a tiny unsigned helper named `luvus` instead.
+        let mut compile = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(&executable)
+            .args(["-x", "c", "-"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn cc for luvus-named helper");
+        {
+            use std::io::Write;
+            let mut stdin = compile.stdin.take().expect("cc stdin");
+            stdin
+                .write_all(b"#include <unistd.h>\nint main(void) { for (;;) pause(); }\n")
+                .expect("write helper source");
+        }
+        let output = compile.wait_with_output().expect("wait cc");
+        assert!(
+            output.status.success(),
+            "cc failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let mut child = std::process::Command::new(&executable)
             .arg("30")
             .spawn()
             .expect("spawn luvus-named process");
 
         let mut stoppable = false;
-        for _ in 0..20 {
+        for _ in 0..50 {
             if super::is_stoppable_luvus_pid(child.id()) {
                 stoppable = true;
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
 
         let _ = child.kill();

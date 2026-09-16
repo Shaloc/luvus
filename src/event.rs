@@ -15,6 +15,10 @@ use crate::terminal::theme_probe::TerminalColors;
 /// the server boundary lets the server select that client's geometry before it
 /// performs hit-testing or forwards bytes to a pane.
 pub enum ClientInput {
+    CellPixels {
+        cell_width: u16,
+        cell_height: u16,
+    },
     Graphics {
         cell_width: u16,
         cell_height: u16,
@@ -187,6 +191,8 @@ pub enum AppEvent {
     NamedSessionOperationFinished {
         generation: u64,
         label: String,
+        target: crate::app::session_menu::SessionMenuTarget,
+        action: crate::app::session_menu::NamedSessionAction,
         result: Result<(), String>,
     },
     /// A selected named session is ready for this client to attach.

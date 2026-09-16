@@ -7,6 +7,12 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 use super::App;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NamedSessionAction {
+    Stop,
+    Delete,
+}
+
 pub(super) const NEW_SESSION_ROWS: usize = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,6 +53,13 @@ pub struct SessionMenuTarget {
 }
 
 impl SessionMenuTarget {
+    pub(crate) fn key(&self) -> String {
+        self.remote.as_ref().map_or_else(
+            || format!("local/{}", self.name),
+            |remote| remote.canonical_name(),
+        )
+    }
+
     pub fn label(&self, catalog: &crate::i18n::Catalog) -> String {
         let host = self
             .remote
@@ -65,15 +78,15 @@ impl super::SessionMenu {
         self.targets
             .iter()
             .enumerate()
-            .filter_map(|(index, target)| {
-                if target.current {
-                    None
+            .flat_map(|(index, target)| {
+                if target.current && target.running {
+                    Vec::new()
                 } else if target.running {
-                    Some(Stop(index))
-                } else if target.name != crate::session::DEFAULT_SESSION_NAME {
-                    Some(Delete(index))
+                    vec![Stop(index)]
+                } else if target.name == crate::session::DEFAULT_SESSION_NAME {
+                    vec![Start(index)]
                 } else {
-                    None
+                    vec![Start(index), Delete(index)]
                 }
             })
             .collect()
@@ -186,7 +199,7 @@ impl App {
         let Some(menu) = self.named_session_menu.as_ref() else {
             return;
         };
-        if menu.loading || menu.preparing || menu.prompt.is_some() {
+        if menu.preparing || menu.prompt.is_some() {
             return;
         }
         let Some(row_data) = index
@@ -198,7 +211,14 @@ impl App {
         let menu = super::SessionMenu {
             anchor: (col, row),
             items: Vec::new(),
-            targets: context_targets(row_data, &self.remote_host_status),
+            targets: context_targets(row_data, &self.remote_host_status)
+                .into_iter()
+                .filter(|target| {
+                    !self
+                        .pending_named_session_actions
+                        .contains_key(&target.key())
+                })
+                .collect(),
             confirming: None,
             selected: 0,
         };
@@ -216,6 +236,16 @@ impl App {
             return;
         }
         match item {
+            Start(index) => {
+                let target = menu.targets[index].clone();
+                self.session_menu = None;
+                if let Some(remote) = target.remote {
+                    self.prepare_remote_session(remote, self.remote_merge_enabled, false);
+                } else {
+                    self.prepare_named_session(target.name, false);
+                }
+                return;
+            }
             Explanation => return,
             Cancel => {
                 self.session_menu = None;
@@ -255,6 +285,13 @@ impl App {
             self.catalog.menu_stop_session
         };
         let label = format!("{verb} · {}", target.label(self.catalog));
+        let action = if deleting {
+            NamedSessionAction::Delete
+        } else {
+            NamedSessionAction::Stop
+        };
+        self.pending_named_session_actions
+            .insert(target.key(), action);
         let tx = self.app_tx.clone();
         std::thread::spawn(move || {
             let result = match (target.remote.as_ref(), deleting) {
@@ -268,6 +305,8 @@ impl App {
             let _ = tx.send(crate::event::AppEvent::NamedSessionOperationFinished {
                 generation,
                 label,
+                target,
+                action,
                 result,
             });
         });
@@ -325,26 +364,111 @@ impl App {
         &mut self,
         generation: u64,
         label: String,
+        target: SessionMenuTarget,
+        action: NamedSessionAction,
         result: Result<(), String>,
     ) {
-        let toast = match &result {
-            Ok(()) => format!("{label} ✓"),
-            Err(error) => format!("{label}: {error}"),
-        };
-        self.show_toast(toast);
-        let Some(menu) = self.named_session_menu.as_mut() else {
-            return;
-        };
-        if menu.generation != generation {
-            return;
-        }
-        menu.preparing = false;
+        self.pending_named_session_actions.remove(&target.key());
+        self.show_toast(match &result {
+            Ok(()) => format!(
+                "{label}: {}",
+                if action == NamedSessionAction::Delete {
+                    self.catalog.session_deleted
+                } else {
+                    self.catalog.session_stopped
+                }
+            ),
+            Err(error) => format!(
+                "{label}: {}: {error}",
+                if action == NamedSessionAction::Delete {
+                    self.catalog.session_delete_failed
+                } else {
+                    self.catalog.session_stop_failed
+                }
+            ),
+        });
         if let Err(error) = result {
-            menu.error = Some(error);
+            if let Some(menu) = self
+                .named_session_menu
+                .as_mut()
+                .filter(|m| m.generation == generation)
+            {
+                menu.preparing = false;
+                menu.error = Some(error);
+            }
             return;
         }
-        menu.loading = true;
-        self.refresh_named_sessions(generation);
+        let deleting = action == NamedSessionAction::Delete;
+        // This owner result supersedes earlier discovery even if the selector
+        // was reopened while the operation ran. It never navigates a new client.
+        let preparing_replacement = self
+            .named_session_menu
+            .as_ref()
+            .is_some_and(|menu| menu.preparing && menu.generation != generation);
+        if !preparing_replacement {
+            self.named_session_generation = self.named_session_generation.wrapping_add(1);
+        }
+        if let Some(cache) = self.named_session_cache.as_mut() {
+            if let Some(remote) = target.remote.as_ref() {
+                if deleting {
+                    cache.remote.sessions.retain(|r| r != remote);
+                }
+                for host in &mut cache.host_status {
+                    if host.host == remote.host {
+                        if deleting {
+                            host.sessions.retain(|s| s.name != target.name);
+                        } else if let Some(session) =
+                            host.sessions.iter_mut().find(|s| s.name == target.name)
+                        {
+                            session.running = false;
+                        }
+                    }
+                }
+            } else if deleting {
+                cache.sessions.retain(|s| s.name != target.name);
+            } else if let Some(session) = cache.sessions.iter_mut().find(|s| s.name == target.name)
+            {
+                session.running = false;
+            }
+            self.remote_host_status.clone_from(&cache.host_status);
+        }
+        if preparing_replacement {
+            return;
+        }
+        if let Some(menu) = self.named_session_menu.as_mut() {
+            let selected = menu
+                .cursor
+                .checked_sub(NEW_SESSION_ROWS)
+                .and_then(|i| menu.rows.get(i))
+                .map(|r| r.name.clone());
+            menu.generation = self.named_session_generation;
+            menu.loading = false;
+            if generation == self.named_session_generation.wrapping_sub(1) {
+                menu.preparing = false;
+            }
+            if let Some(cache) = self.named_session_cache.as_ref() {
+                menu.rows = session_rows(cache, &crate::session::display_name());
+                menu.remote_targets.clone_from(&cache.remote.sessions);
+            } else {
+                // A first discovery may not have finished; update only a row
+                // that proves the same exact owner, leaving merged peers intact.
+                menu.rows.retain_mut(|row| {
+                    if row.remote == target.remote && row.name == target.name && !row.merged {
+                        if deleting {
+                            return false;
+                        }
+                        row.running = false;
+                    }
+                    true
+                });
+            }
+            menu.cursor = selected
+                .and_then(|name| menu.rows.iter().position(|r| r.name == name))
+                .map_or(
+                    menu.cursor.min(menu.rows.len() + NEW_SESSION_ROWS - 1),
+                    |i| i + NEW_SESSION_ROWS,
+                );
+        }
     }
 
     pub fn open_named_session_menu(&mut self) {
@@ -355,13 +479,30 @@ impl App {
         self.switcher = false;
         self.named_session_generation = self.named_session_generation.wrapping_add(1);
         let generation = self.named_session_generation;
+        let rows = self
+            .named_session_cache
+            .as_ref()
+            .map(|cache| session_rows(cache, &crate::session::display_name()))
+            .unwrap_or_default();
+        let cursor = rows
+            .iter()
+            .position(|row| row.current)
+            .map_or(0, |i| i + NEW_SESSION_ROWS);
         self.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
-            remote_targets: Vec::new(),
+            remote_targets: self
+                .named_session_cache
+                .as_ref()
+                .map(|cache| cache.remote.sessions.clone())
+                .unwrap_or_default(),
             generation,
-            rows: Vec::new(),
-            hosts: Vec::new(),
-            cursor: 0,
+            rows,
+            hosts: self
+                .named_session_cache
+                .as_ref()
+                .map(|cache| cache.hosts.clone())
+                .unwrap_or_default(),
+            cursor,
             scroll: 0,
             loading: true,
             prompt: None,
@@ -392,6 +533,7 @@ impl App {
         menu.loading = false;
         match result {
             Ok(discovery) => {
+                self.named_session_cache = Some(discovery.clone());
                 menu.rows = session_rows(&discovery, &current);
                 menu.remote_targets = discovery.remote.sessions.clone();
                 menu.hosts = discovery.hosts;
@@ -542,7 +684,7 @@ impl App {
             .map_or(0, |menu| menu.rows.len() + NEW_SESSION_ROWS);
         match key.code {
             KeyCode::Char('r') => self.open_named_session_menu(),
-            KeyCode::Delete | KeyCode::Char('d') => {
+            KeyCode::Delete | KeyCode::Char('d') | KeyCode::Char('a') => {
                 if let Some(menu) = self.named_session_menu.as_ref() {
                     let cursor = menu.cursor;
                     let rect = self
@@ -649,7 +791,7 @@ impl App {
         let Some(menu) = self.named_session_menu.as_mut() else {
             return;
         };
-        if menu.loading || menu.preparing {
+        if menu.preparing {
             return;
         }
         if index == 0 {
@@ -737,6 +879,11 @@ impl App {
         let Some(menu) = self.named_session_menu.as_mut() else {
             return;
         };
+        // A cached row may be activated before discovery returns. Fence that
+        // discovery while this exact launch owns the selector.
+        self.named_session_generation = self.named_session_generation.wrapping_add(1);
+        menu.generation = self.named_session_generation;
+        menu.loading = false;
         menu.preparing = true;
         menu.error = None;
         let generation = menu.generation;
@@ -771,6 +918,11 @@ impl App {
         let Some(menu) = self.named_session_menu.as_mut() else {
             return;
         };
+        // A cached row may be activated before discovery returns. Fence that
+        // discovery while this exact launch owns the selector.
+        self.named_session_generation = self.named_session_generation.wrapping_add(1);
+        menu.generation = self.named_session_generation;
+        menu.loading = false;
         menu.preparing = true;
         menu.error = None;
         let generation = menu.generation;
@@ -946,8 +1098,6 @@ mod tests {
         NamedSessionPrompt, NamedSessionRow,
     };
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use std::sync::mpsc::Receiver;
-    use std::time::Duration;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -960,16 +1110,6 @@ mod tests {
         info
     }
 
-    fn loaded_generation(rx: &Receiver<crate::event::AppEvent>) -> u64 {
-        match rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("session refresh should complete")
-        {
-            crate::event::AppEvent::NamedSessionsLoaded { generation, .. } => generation,
-            _ => panic!("expected a named-session refresh"),
-        }
-    }
-
     fn discovery(sessions: Vec<crate::session::SessionInfo>) -> NamedSessionDiscovery {
         NamedSessionDiscovery {
             sessions,
@@ -979,6 +1119,79 @@ mod tests {
             host_error: None,
             host_status: Vec::new(),
         }
+    }
+
+    #[test]
+    fn cached_current_row_is_actionable_during_discovery() {
+        let _env = crate::persist::test_env("session-cache-activate");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        app.named_session_menu = Some(NamedSessionMenu {
+            client_id: None,
+            remote_targets: Vec::new(),
+            hosts: Vec::new(),
+            generation: 1,
+            rows: vec![NamedSessionRow {
+                name: "default".into(),
+                running: true,
+                current: true,
+                remote: None,
+                merged: false,
+            }],
+            cursor: super::NEW_SESSION_ROWS,
+            scroll: 0,
+            loading: true,
+            prompt: None,
+            error: None,
+            preparing: false,
+        });
+        app.activate_named_session_row(super::NEW_SESSION_ROWS);
+        assert!(
+            app.named_session_menu.is_none(),
+            "cached selection must not wait for remote discovery"
+        );
+    }
+
+    #[test]
+    fn deleting_cached_remote_owner_preserves_same_name_on_other_owners() {
+        use crate::session::remote::{HostSession, HostStatus, RemoteSession};
+        let _env = crate::persist::test_env("session-cache-owner-actions");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        let removed = RemoteSession::new("build", "review").unwrap();
+        let retained = RemoteSession::new("live", "review").unwrap();
+        let mut cache = discovery(vec![info("review", false)]);
+        cache.remote.sessions = vec![removed.clone(), retained.clone()];
+        cache.host_status = ["build", "live"]
+            .into_iter()
+            .map(|host| HostStatus {
+                host: host.into(),
+                error: None,
+                sessions: vec![HostSession {
+                    name: "review".into(),
+                    running: false,
+                }],
+            })
+            .collect();
+        app.named_session_cache = Some(cache);
+        app.apply_named_session_operation_finished(
+            1,
+            "review".into(),
+            super::SessionMenuTarget {
+                name: "review".into(),
+                remote: Some(removed),
+                running: false,
+                current: false,
+            },
+            super::NamedSessionAction::Delete,
+            Ok(()),
+        );
+        let cache = app.named_session_cache.as_ref().unwrap();
+        assert_eq!(cache.sessions.len(), 1);
+        assert_eq!(cache.sessions[0].name, "review");
+        assert_eq!(cache.remote.sessions, [retained]);
+        assert!(cache.host_status[0].sessions.is_empty());
+        assert_eq!(cache.host_status[1].sessions.len(), 1);
     }
 
     #[test]
@@ -1273,6 +1486,7 @@ mod tests {
         let _env = crate::persist::test_env("named-session-stop-reopened-refresh");
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        app.named_session_generation = 8;
         app.named_session_menu = Some(NamedSessionMenu {
             client_id: None,
             remote_targets: Vec::new(),
@@ -1290,11 +1504,25 @@ mod tests {
             loading: false,
             prompt: None,
             error: None,
-            preparing: false,
+            preparing: true,
         });
 
-        app.apply_named_session_operation_finished(7, "review".into(), Ok(()));
+        app.apply_named_session_operation_finished(
+            7,
+            "review".into(),
+            super::SessionMenuTarget {
+                name: "review".into(),
+                remote: None,
+                running: true,
+                current: false,
+            },
+            super::NamedSessionAction::Stop,
+            Ok(()),
+        );
 
+        assert_eq!(app.named_session_generation, 8);
+        assert!(app.named_session_menu.as_ref().unwrap().preparing);
+        assert_eq!(app.named_session_menu.as_ref().unwrap().generation, 8);
         assert_eq!(
             app.named_session_menu.as_ref().unwrap().rows.len(),
             1,
@@ -1306,7 +1534,7 @@ mod tests {
     }
 
     #[test]
-    fn session_operation_refreshes_without_removing_other_merged_owners() {
+    fn session_operation_updates_owner_without_discovery() {
         let _env = crate::persist::test_env("named-session-stop-current-refresh");
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(100, 30, tx).unwrap();
@@ -1330,11 +1558,25 @@ mod tests {
             preparing: false,
         });
 
-        app.apply_named_session_operation_finished(5, "review".into(), Ok(()));
+        app.apply_named_session_operation_finished(
+            5,
+            "review".into(),
+            super::SessionMenuTarget {
+                name: "review".into(),
+                remote: None,
+                running: true,
+                current: false,
+            },
+            super::NamedSessionAction::Stop,
+            Ok(()),
+        );
 
-        assert!(app.named_session_menu.as_ref().unwrap().loading);
+        assert!(!app.named_session_menu.as_ref().unwrap().loading);
         assert_eq!(app.named_session_menu.as_ref().unwrap().rows.len(), 1);
-        assert_eq!(loaded_generation(&rx), 5);
+        assert!(!app.named_session_menu.as_ref().unwrap().rows[0].running);
+        assert!(!rx
+            .try_iter()
+            .any(|event| matches!(event, crate::event::AppEvent::NamedSessionsLoaded { .. })));
     }
 
     #[test]
@@ -1362,7 +1604,18 @@ mod tests {
             preparing: false,
         });
 
-        app.apply_named_session_operation_finished(3, "review".into(), Err("server busy".into()));
+        app.apply_named_session_operation_finished(
+            3,
+            "review".into(),
+            super::SessionMenuTarget {
+                name: "review".into(),
+                remote: None,
+                running: true,
+                current: false,
+            },
+            super::NamedSessionAction::Stop,
+            Err("server busy".into()),
+        );
 
         let menu = app.named_session_menu.as_ref().unwrap();
         assert_eq!(menu.rows.len(), 1);
@@ -1466,7 +1719,10 @@ mod tests {
             selected: 0,
         };
         use crate::app::SessionMenuItem::*;
-        assert_eq!(menu.actions(), [Delete(0), Delete(1), Stop(2)]);
+        assert_eq!(
+            menu.actions(),
+            [Start(0), Delete(0), Start(1), Delete(1), Stop(2)]
+        );
         menu.confirming = Some(1);
         assert_eq!(menu.actions(), [Explanation, Cancel, ConfirmDelete(1)]);
         assert_eq!(menu.targets[1].name, "review");
@@ -1524,7 +1780,10 @@ mod tests {
         app.open_session_menu(2, 5, 6);
         assert_eq!(
             app.session_menu.as_ref().unwrap().actions(),
-            [crate::app::SessionMenuItem::Delete(0)]
+            [
+                crate::app::SessionMenuItem::Start(0),
+                crate::app::SessionMenuItem::Delete(0)
+            ]
         );
         app.session_menu_action(crate::app::SessionMenuItem::Delete(0));
         assert_eq!(app.session_menu.as_ref().unwrap().confirming, Some(0));
@@ -1539,6 +1798,10 @@ mod tests {
         );
         app.named_session_menu.as_mut().unwrap().rows[0].name = "default".into();
         app.open_session_menu(2, 5, 6);
-        assert!(app.session_menu.is_none(), "default cannot be deleted");
+        assert_eq!(
+            app.session_menu.as_ref().unwrap().actions(),
+            [crate::app::SessionMenuItem::Start(0)],
+            "default can only be started"
+        );
     }
 }

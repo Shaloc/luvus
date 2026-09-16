@@ -332,6 +332,8 @@ pub fn ensure_server_session_dir() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Create a private owner directory without following a symlink or accepting
+/// another user's directory.
 pub(crate) fn ensure_private_server_dir(dir: &std::path::Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]

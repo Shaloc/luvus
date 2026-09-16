@@ -1455,15 +1455,15 @@ static HELP: &[Translation] = &[
         "현재 탭의 패널과 읽기 전용 기록 지표 나열"
     ),
     tr!(
-        "split a pane (default: side by side, creates a workspace if empty)",
-        "dividir un panel (predeterminado: lado a lado, crea un espacio de trabajo si está vacío)",
-        "dividir um painel (padrão: lado a lado, cria um espaço de trabalho se estiver vazio)",
-        "diviser un volet (par défaut : côte à côte, crée un espace de travail si vide)",
-        "Bereich teilen (Standard: nebeneinander, erstellt bei Leerstand einen Arbeitsbereich)",
-        "bagi panel (bawaan: berdampingan, membuat ruang kerja jika kosong)",
-        "拆分窗格（默认：左右并排，空状态时创建工作区）",
-        "ペインを分割（既定：横並び、空の場合はワークスペースを作成）",
-        "패널 분할 (기본값: 좌우 분할, 비어 있으면 작업 공간 생성)"
+        "split a pane (default: auto by size, creates a workspace if empty)",
+        "dividir un panel (predeterminado: automático según el tamaño, crea un espacio de trabajo si está vacío)",
+        "dividir um painel (padrão: automático pelo tamanho, cria um espaço de trabalho se estiver vazio)",
+        "diviser un volet (par défaut : automatique selon la taille, crée un espace de travail si vide)",
+        "Bereich teilen (Standard: automatisch nach Größe, erstellt bei Leerstand einen Arbeitsbereich)",
+        "bagi panel (bawaan: otomatis menurut ukuran, membuat ruang kerja jika kosong)",
+        "拆分窗格（默认：按长宽自动选择方向，空状态时创建工作区）",
+        "ペインを分割（既定：サイズに応じて自動、空の場合はワークスペースを作成）",
+        "패널 분할 (기본값: 크기에 따라 자동 분할, 비어 있으면 작업 공간 생성)"
     ),
     tr!(
         "focus a pane (jumps to its workspace/tab)",
@@ -2016,6 +2016,28 @@ static HELP: &[Translation] = &[
         "모듈의 사이드바 도킹에 행 전달 (JSON 배열,"
     ),
     tr!(
+        "set AGENTS sidebar titles for live and resumable rows",
+        "definir títulos de la barra AGENTS para filas vivas y reanudables",
+        "definir títulos da barra AGENTS para linhas ativas e retomáveis",
+        "définir les titres de la barre AGENTS pour les lignes actives et reprises",
+        "AGENTS-Seitenleistentitel für Live- und fortsetzbare Zeilen setzen",
+        "atur judul bilah sisi AGENTS untuk baris live dan yang dapat dilanjutkan",
+        "设置 AGENTS 侧栏标题（活动与可恢复行）",
+        "AGENTS サイドバーのライブ行と履歴行のタイトルを設定",
+        "AGENTS 사이드바 타이틀을 실행 및 재개 행에 설정"
+    ),
+    tr!(
+        "clear module-provided AGENTS sidebar titles",
+        "borrar títulos de AGENTS aportados por un módulo",
+        "limpar títulos de AGENTS fornecidos por um módulo",
+        "effacer les titres AGENTS fournis par un module",
+        "von einem Modul gesetzte AGENTS-Titel löschen",
+        "hapus judul bilah sisi AGENTS dari modul",
+        "清除模块提供的 AGENTS 侧栏标题",
+        "モジュールが提供した AGENTS サイドバータイトルを消去",
+        "모듈이 제공한 AGENTS 사이드바 타이틀 지우기"
+    ),
+    tr!(
         "or piped on stdin). See docs/29 + the website",
         "o por stdin). Consulta docs/29 y el sitio web",
         "ou via stdin). Veja docs/29 e o site",
@@ -2412,15 +2434,15 @@ static HELP: &[Translation] = &[
         "준비된 다음 작업 할당 (--start로 워커 생성)"
     ),
     tr!(
-        "start a worker (worktree default; workspace shares checkout)",
-        "iniciar un trabajador (worktree predeterminado; workspace comparte el checkout)",
-        "iniciar um worker (worktree padrão; workspace compartilha o checkout)",
-        "démarrer un worker (worktree par défaut ; workspace partage le checkout)",
-        "Worker starten (Worktree ist Standard; Workspace teilt den Checkout)",
-        "jalankan worker (default worktree; workspace berbagi checkout)",
-        "启动工作进程（默认 worktree；workspace 共享检出目录）",
-        "ワーカーを起動（既定は worktree、workspace はチェックアウトを共有）",
-        "워커 시작 (기본값 worktree, workspace는 체크아웃 공유)"
+        "start a worker (worktree default; --no-focus preserves the view)",
+        "iniciar un trabajador (worktree predeterminado; --no-focus conserva la vista)",
+        "iniciar um worker (worktree padrão; --no-focus mantém a vista)",
+        "démarrer un worker (worktree par défaut ; --no-focus conserve la vue)",
+        "Worker starten (Worktree ist Standard; --no-focus behält die Ansicht bei)",
+        "jalankan worker (default worktree; --no-focus mempertahankan tampilan)",
+        "启动工作进程（默认 worktree；--no-focus 保留当前视图）",
+        "ワーカーを起動（既定は worktree、--no-focus で現在の表示を維持）",
+        "워커 시작 (기본값 worktree, --no-focus로 현재 보기 유지)"
     ),
     tr!(
         "report model context-window use, not task progress",
@@ -2454,6 +2476,17 @@ static HELP: &[Translation] = &[
         "标记完成并释放租约",
         "完了にして予約を解放",
         "완료 표시 및 임대 해제"
+    ),
+    tr!(
+        "queue a fresh attempt without deleting previous work",
+        "poner en cola un nuevo intento sin eliminar el trabajo anterior",
+        "colocar uma nova tentativa na fila sem excluir o trabalho anterior",
+        "mettre en file une nouvelle tentative sans supprimer le travail précédent",
+        "einen neuen Versuch einreihen, ohne frühere Arbeit zu löschen",
+        "antrekan percobaan baru tanpa menghapus pekerjaan sebelumnya",
+        "在不删除先前工作的情况下排队新的尝试",
+        "以前の作業を削除せずに新しい試行をキューへ追加",
+        "이전 작업을 삭제하지 않고 새 시도 대기열 추가"
     ),
     tr!(
         "integrate the task's branch into luvus/integration",

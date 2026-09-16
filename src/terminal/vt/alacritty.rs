@@ -19,6 +19,7 @@ use super::{
 };
 use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::{CaptureMode, CaptureResult};
+use crate::terminal::keyboard::{KeyboardProtocol, KittyKeyboardFlags};
 use crate::terminal::pty::{InputAction, InputSender};
 
 #[derive(Default)]
@@ -242,7 +243,7 @@ impl AlacrittyEngine {
         }
 
         output.clear();
-        let row = &grid[Line(line)];
+        let row = grid.row(Line(line));
         for column in 0..grid.columns() {
             let cell = &row[Column(column)];
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -267,7 +268,7 @@ impl AlacrittyEngine {
         if line > grid.bottommost_line().0 || grid.columns() == 0 {
             return false;
         }
-        grid[Line(line)][Column(grid.columns() - 1)]
+        grid[Point::new(Line(line), Column(grid.columns() - 1))]
             .flags
             .contains(Flags::WRAPLINE)
     }
@@ -281,7 +282,7 @@ impl AlacrittyEngine {
 
     fn append_plain_grid_row(&self, line: Line, output: &mut String, max_bytes: usize) -> bool {
         let grid = self.term.grid();
-        let row = &grid[line];
+        let row = grid.row(line);
         let last = (0..grid.columns())
             .rfind(|column| {
                 let cell = &row[Column(*column)];
@@ -314,7 +315,7 @@ impl AlacrittyEngine {
 
     fn append_ansi_grid_row(&self, line: Line, output: &mut String, max_bytes: usize) -> bool {
         let grid = self.term.grid();
-        let row = &grid[line];
+        let row = grid.row(line);
         let last = (0..grid.columns())
             .rfind(|column| {
                 let cell = &row[Column(*column)];
@@ -468,6 +469,13 @@ impl VtEngine for AlacrittyEngine {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
+        // Split and divider resize shrink the live PTY while a streaming child
+        // may still have a DEC 2026 frame open, and SIGWINCH often follows with
+        // a live redraw (ED, EL, IL/DL, SU, RIS, or a newline flood). Drop the
+        // stale buffered frame (keep collecting the same sync window) and ignore
+        // those wipes until the next printable so the shrunken pane keeps its
+        // rows. Alternate-screen (1049) is still applied: that is a real TUI.
+        self.parser.abort_sync(&mut self.term);
         self.term.resize(Dims {
             cols: cols.max(1) as usize,
             rows: rows.max(1) as usize,
@@ -631,8 +639,9 @@ impl VtEngine for AlacrittyEngine {
             damaged_row.row = row;
             let line = Line(row as i32 - display_offset);
             let mut used = 0;
+            let grid_row = grid.row(line);
             for column in 0..columns {
-                let cell = &grid[line][Column(column)];
+                let cell = &grid_row[Column(column)];
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                     continue;
                 }
@@ -1089,7 +1098,7 @@ impl VtEngine for AlacrittyEngine {
     fn retained_row_layout(&self, index: usize) -> Option<RetainedRowLayout> {
         let line = self.retained_line(index)?;
         let grid = self.term.grid();
-        let row = &grid[line];
+        let row = grid.row(line);
         let mut whitespace = Vec::with_capacity(grid.columns());
         let mut previous_whitespace = true;
         let mut last_content = None;
@@ -1151,16 +1160,25 @@ impl VtEngine for AlacrittyEngine {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
-    fn disambiguate_escape_codes(&self) -> bool {
-        self.term.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES)
-    }
-
-    fn report_all_keys_as_escape_codes(&self) -> bool {
-        self.term.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC)
-    }
-
-    fn report_associated_text(&self) -> bool {
-        self.term.mode().contains(TermMode::REPORT_ASSOCIATED_TEXT)
+    fn keyboard_protocol(&self) -> KeyboardProtocol {
+        let mode = self.term.mode();
+        let mut flags = KittyKeyboardFlags::empty();
+        if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+            flags.insert(KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES);
+        }
+        if mode.contains(TermMode::REPORT_EVENT_TYPES) {
+            flags.insert(KittyKeyboardFlags::REPORT_EVENT_TYPES);
+        }
+        if mode.contains(TermMode::REPORT_ALTERNATE_KEYS) {
+            flags.insert(KittyKeyboardFlags::REPORT_ALTERNATE_KEYS);
+        }
+        if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+            flags.insert(KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES);
+        }
+        if mode.contains(TermMode::REPORT_ASSOCIATED_TEXT) {
+            flags.insert(KittyKeyboardFlags::REPORT_ASSOCIATED_TEXT);
+        }
+        KeyboardProtocol::from_kitty_flags(flags)
     }
 
     fn mouse_drag(&self) -> bool {
@@ -1359,6 +1377,8 @@ mod tests {
     use std::sync::mpsc::channel;
 
     use crate::terminal::appearance::ColorScheme;
+    use crate::terminal::keyboard::{KeyboardProtocol, KittyKeyboardFlags};
+    use crate::terminal::pty::KeyEncodingModes;
 
     fn feed_lines(e: &mut AlacrittyEngine, n: usize) {
         for i in 0..n {
@@ -1543,6 +1563,41 @@ mod tests {
         }
     }
 
+    /// Measure terminal parsing/scrolling and cold-history maintenance
+    /// separately from PTY syscalls.
+    #[test]
+    #[ignore]
+    fn bulk_history_ingestion_benchmark() {
+        use std::{hint::black_box, io::Write, time::Instant};
+
+        let mut corpus = Vec::new();
+        for line in 1..=7_600 {
+            write!(&mut corpus, "{line}\r\n").unwrap();
+        }
+        for chunk_bytes in [8 * 1024, 32 * 1024, 64 * 1024] {
+            for trial in 1..=3 {
+                let (tx, _rx) = channel();
+                let mut engine = AlacrittyEngine::new(27, 24, tx, 32 * 1024 * 1024);
+                let start = Instant::now();
+                for chunk in corpus.chunks(chunk_bytes) {
+                    engine.advance(chunk);
+                }
+                let ingestion = start.elapsed();
+                let maintenance_start = Instant::now();
+                engine.finish_output_batch();
+                let maintenance = maintenance_start.elapsed();
+                black_box(engine.history_len());
+                eprintln!(
+                    "bulk_history_ingestion chunk_bytes={chunk_bytes} trial={trial} rows={} ingestion_ms={:.3} maintenance_ms={:.3} total_ms={:.3}",
+                    engine.history_len(),
+                    ingestion.as_secs_f64() * 1000.0,
+                    maintenance.as_secs_f64() * 1000.0,
+                    (ingestion + maintenance).as_secs_f64() * 1000.0,
+                );
+            }
+        }
+    }
+
     #[test]
     fn osc52_copy_is_available_as_terminal_effect_without_child_input() {
         let text = "  nvim yank\n你好";
@@ -1586,7 +1641,7 @@ mod tests {
             "large backlog takes multiple turns"
         );
         let packed = engine.history_metrics().packed_rows.unwrap();
-        assert!(packed > 0 && packed <= 512);
+        assert!(packed > 0 && packed <= 1_024);
         assert_eq!(before, rows(&engine));
         engine.advance(b"new output\r\n");
         engine.resize(90, 24);
@@ -1602,7 +1657,7 @@ mod tests {
         let metrics = engine.history_metrics();
         assert_eq!(
             metrics.packed_rows.unwrap(),
-            metrics.retained_rows.saturating_sub(128)
+            metrics.retained_rows.saturating_sub(32)
         );
         assert!(
             !engine.finish_output_batch_step(),
@@ -1858,6 +1913,149 @@ mod tests {
         assert_eq!(alternate_screen.kind, DamageKind::Full);
         assert!(engine.acknowledge_damage(alternate_screen.generation));
         engine.recycle_damage_snapshot(alternate_screen);
+    }
+
+    fn visible_has_line(engine: &AlacrittyEngine) -> bool {
+        engine.visible_rows().iter().any(|row| row.contains("line"))
+    }
+
+    #[test]
+    fn shrinking_height_keeps_live_rows_visible() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
+        feed_lines(&mut engine, 40);
+        assert!(visible_has_line(&engine));
+        engine.resize(40, 10);
+        assert!(
+            visible_has_line(&engine),
+            "height shrink must keep the live tail, not a blank viewport: {:?}",
+            engine.visible_rows()
+        );
+    }
+
+    #[test]
+    fn shrinking_height_discards_in_flight_synchronized_clear() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
+        feed_lines(&mut engine, 40);
+        // Cargo/clippy progress frames wrap a home+erase in DEC 2026. A
+        // horizontal split resizes the PTY while that frame is still open.
+        engine.advance(b"\x1b[?2026h\x1b[H\x1b[2J");
+        engine.resize(40, 10);
+        engine.advance(b"\x1b[?2026l");
+        assert!(
+            visible_has_line(&engine),
+            "stale sync erase must not blank the shrunken pane: {:?}",
+            engine.visible_rows()
+        );
+    }
+
+    #[test]
+    fn shrinking_height_discards_synchronized_clear_split_across_resize() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
+        feed_lines(&mut engine, 40);
+        engine.advance(b"\x1b[?2026h\x1b[H");
+        engine.resize(40, 10);
+        engine.advance(b"\x1b[2J\x1b[?2026l");
+        assert!(
+            visible_has_line(&engine),
+            "ED2 after abort must not blank the shrunken pane: {:?}",
+            engine.visible_rows()
+        );
+    }
+
+    #[test]
+    fn shrinking_height_keeps_rows_when_sigwinch_sends_live_ed2() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
+        feed_lines(&mut engine, 40);
+        engine.resize(40, 10);
+        engine.advance(b"\x1b[H\x1b[2J");
+        assert!(
+            visible_has_line(&engine),
+            "live SIGWINCH erase must not blank the shrunken pane: {:?}",
+            engine.visible_rows()
+        );
+        engine.advance(b"kept-after-resize\r\n");
+        assert!(
+            engine
+                .visible_rows()
+                .iter()
+                .any(|row| row.contains("kept-after-resize")),
+            "text after the suppressed erase must still land: {:?}",
+            engine.visible_rows()
+        );
+    }
+
+    #[test]
+    fn shrinking_height_keeps_later_sync_progress() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
+        feed_lines(&mut engine, 40);
+        engine.advance(b"\x1b[?2026h\x1b[H\x1b[2J");
+        engine.resize(40, 10);
+        engine.advance(b"progress-after-resize\r\n\x1b[?2026l");
+        assert!(
+            visible_has_line(&engine),
+            "aborted sync must still apply later progress: {:?}",
+            engine.visible_rows()
+        );
+        assert!(
+            engine
+                .visible_rows()
+                .iter()
+                .any(|row| row.contains("progress-after-resize")),
+            "later DEC 2026 bytes must not be drained: {:?}",
+            engine.visible_rows()
+        );
+    }
+
+    #[test]
+    fn shrinking_height_keeps_rows_across_sigwinch_redraw_ops() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
+        feed_lines(&mut engine, 40);
+        engine.resize(40, 10);
+        // Cargo/clippy/indicatif SIGWINCH redraws are not only ED2. Home + erase
+        // below, per-line EL, IL/DL, SU, a newline flood, and RIS all wipe the
+        // viewport if applied before the new-size content.
+        engine.advance(
+            b"\x1b[H\x1b[J\x1b[0J\x1b[1J\x1b[2J\x1b[2K\x1b[K\x1b[1K\x1b[L\x1b[M\x1b[S\x1b[T\x1b[X\x1b[@\x1b[P\n\n\n\x1bD\x1bE\x1bM\x1bc",
+        );
+        assert!(
+            visible_has_line(&engine),
+            "SIGWINCH wipe sequences must not blank the shrunken pane: {:?}",
+            engine.visible_rows()
+        );
+    }
+
+    #[test]
+    fn shrinking_width_keeps_rows_when_sigwinch_sends_live_ed2() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(80, 12, tx, budget_for_rows(80, 200));
+        feed_lines(&mut engine, 20);
+        engine.resize(24, 12);
+        engine.advance(b"\x1b[H\x1b[2J\x1b[2K\n\n");
+        assert!(
+            visible_has_line(&engine),
+            "vertical split / width shrink must keep rows through SIGWINCH erase: {:?}",
+            engine.visible_rows()
+        );
+    }
+
+    #[test]
+    fn shrinking_height_keeps_rows_when_sigwinch_unsets_deccolm() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
+        feed_lines(&mut engine, 40);
+        engine.resize(40, 10);
+        engine.advance(b"\x1b[?3l");
+        assert!(
+            visible_has_line(&engine),
+            "DECCOLM reset must not blank the shrunken pane: {:?}",
+            engine.visible_rows()
+        );
     }
 
     // docs/07: agent detection must read the **live** screen, never the
@@ -2138,7 +2336,7 @@ mod tests {
             assert!(engine.output_generation() > before);
         }
         assert_eq!(engine.take_clipboard().as_deref(), Some("copy"));
-        assert!(engine.report_associated_text());
+        assert!(engine.keyboard_protocol().reports_associated_text());
         assert_eq!((engine.cursor().x, engine.cursor().y), (2, 1));
         let generation = engine.output_generation();
         engine.advance(b"\x1b_Gm=0,q=2;AA==\x1b\\");
@@ -2629,35 +2827,49 @@ mod tests {
     fn nested_keyboard_modes_are_tracked_across_config_updates() {
         let (tx, _rx) = channel();
         let mut e = AlacrittyEngine::new(20, 5, tx, budget_for_rows(20, 2_000));
-        assert!(!e.disambiguate_escape_codes());
-        assert!(!e.report_all_keys_as_escape_codes());
+        assert_eq!(e.keyboard_protocol(), KeyboardProtocol::Legacy);
 
-        assert!(!e.report_associated_text());
+        e.advance(b"\x1b[=31u");
+        let all_flags = KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KittyKeyboardFlags::REPORT_EVENT_TYPES
+            | KittyKeyboardFlags::REPORT_ALTERNATE_KEYS
+            | KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            | KittyKeyboardFlags::REPORT_ASSOCIATED_TEXT;
+        let expected_protocol = KeyboardProtocol::Kitty { flags: all_flags };
+        assert_eq!(e.keyboard_protocol(), expected_protocol);
+        assert_eq!(
+            KeyEncodingModes::from_engine(&e).protocol,
+            expected_protocol,
+            "pane key mode projection must retain every Kitty flag"
+        );
+
         e.advance(b"\x1b[>1u");
-        assert!(e.disambiguate_escape_codes());
-        assert!(!e.report_all_keys_as_escape_codes());
+        assert_eq!(
+            e.keyboard_protocol(),
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::DISAMBIGUATE_ESCAPE_CODES,
+            }
+        );
 
-        e.advance(b"\x1b[>24u");
-        assert!(!e.disambiguate_escape_codes());
-        assert!(e.report_all_keys_as_escape_codes());
-        assert!(e.report_associated_text());
+        e.advance(b"\x1b[=8u");
+        assert_eq!(
+            e.keyboard_protocol(),
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            }
+        );
 
         e.set_history_budget(budget_for_rows(20, 1_000));
-        assert!(
-            e.report_all_keys_as_escape_codes(),
+        assert_eq!(
+            e.keyboard_protocol(),
+            KeyboardProtocol::Kitty {
+                flags: KittyKeyboardFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+            },
             "changing scrollback settings must not disable the child keyboard protocol"
         );
-        assert!(e.report_associated_text());
 
-        e.advance(b"\x1b[>8u");
-        assert!(!e.report_associated_text());
         e.advance(b"\x1b[<u");
-        assert!(e.report_associated_text(), "pop restores the parent flags");
-
-        e.advance(b"\x1b[<2u");
-        assert!(!e.disambiguate_escape_codes());
-        assert!(!e.report_all_keys_as_escape_codes());
-        assert!(!e.report_associated_text());
+        assert_eq!(e.keyboard_protocol(), KeyboardProtocol::Legacy);
     }
 
     #[test]

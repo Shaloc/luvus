@@ -29,7 +29,8 @@ mod board;
 mod config_persistence;
 mod cwd;
 pub use board::{
-    agent_choices, automation_agent_choices, automation_agent_choices_for, task_agent_choices,
+    agent_choices, automation_agent_choices, automation_agent_choices_for,
+    automation_agent_supports, task_agent_choices, TaskRetryResult,
 };
 pub(crate) mod diff;
 mod dispatch;
@@ -264,6 +265,92 @@ pub struct DockMenu {
 pub struct ModuleDock {
     pub title: String,
     pub rows: Vec<DockRow>,
+}
+
+/// One volatile AGENTS-row title and its authenticated publishing module.
+/// `None` is reserved for direct local control-API calls.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct AgentRowTitle {
+    pub(crate) owner: Option<String>,
+    pub(crate) text: String,
+}
+
+pub(crate) const MAX_AGENT_ROW_TITLE_BYTES: usize = 256;
+pub(crate) const MAX_AGENT_ROW_TITLES: usize = 256;
+pub(crate) const MAX_AGENT_ROW_TITLE_AGENT_BYTES: usize = 64;
+
+pub(crate) fn agent_session_title_count(
+    titles: &HashMap<String, HashMap<String, AgentRowTitle>>,
+) -> usize {
+    titles.values().map(HashMap::len).sum()
+}
+
+pub(crate) fn set_owned_agent_row_title(
+    titles: &mut HashMap<PaneId, AgentRowTitle>,
+    pane: PaneId,
+    text: Option<String>,
+    owner: Option<&str>,
+) -> Result<bool, String> {
+    if let Some(existing) = titles.get(&pane) {
+        if existing.owner.as_deref() != owner {
+            return Err("agent row title belongs to another publisher".into());
+        }
+    }
+    match text {
+        Some(text) => {
+            let title = AgentRowTitle {
+                owner: owner.map(String::from),
+                text,
+            };
+            if titles.get(&pane) == Some(&title) {
+                Ok(false)
+            } else {
+                titles.insert(pane, title);
+                Ok(true)
+            }
+        }
+        None => Ok(titles.remove(&pane).is_some()),
+    }
+}
+
+pub(crate) fn set_owned_agent_session_title(
+    titles: &mut HashMap<String, HashMap<String, AgentRowTitle>>,
+    agent: String,
+    session_id: String,
+    text: Option<String>,
+    owner: Option<&str>,
+) -> Result<bool, String> {
+    let existing = titles
+        .get(&agent)
+        .and_then(|sessions| sessions.get(&session_id));
+    if let Some(existing) = existing {
+        if existing.owner.as_deref() != owner {
+            return Err("agent row title belongs to another publisher".into());
+        }
+    }
+    match text {
+        Some(text) => {
+            let title = AgentRowTitle {
+                owner: owner.map(String::from),
+                text,
+            };
+            if existing == Some(&title) {
+                return Ok(false);
+            }
+            titles.entry(agent).or_default().insert(session_id, title);
+            Ok(true)
+        }
+        None => {
+            let Some(sessions) = titles.get_mut(&agent) else {
+                return Ok(false);
+            };
+            let changed = sessions.remove(&session_id).is_some();
+            if sessions.is_empty() {
+                titles.remove(&agent);
+            }
+            Ok(changed)
+        }
+    }
 }
 
 /// One sidebar's live state: shown/hidden, width, and its ordered docks.
@@ -1111,6 +1198,7 @@ pub struct SessionMenu {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionMenuItem {
+    Start(usize),
     Stop(usize),
     Delete(usize),
     ConfirmDelete(usize),
@@ -1482,7 +1570,7 @@ impl OrchForm {
             }
             OrchFormField::Agent => {
                 let choices = if self.kind == OrchFormKind::Automation {
-                    crate::app::automation_agent_choices_for(self.access)
+                    crate::app::automation_agent_choices()
                 } else {
                     crate::app::task_agent_choices()
                 };
@@ -1515,13 +1603,6 @@ impl OrchForm {
                     .unwrap_or(0);
                 self.access = choices
                     [(index + if backwards { choices.len() - 1 } else { 1 }) % choices.len()];
-                let agents = crate::app::automation_agent_choices_for(self.access);
-                if !agents
-                    .iter()
-                    .any(|agent| agent.eq_ignore_ascii_case(&self.agent))
-                {
-                    self.agent = agents.first().copied().unwrap_or_default().to_string();
-                }
             }
             _ => {}
         }
@@ -1713,6 +1794,7 @@ pub enum OrchMenuItem {
     Jump,
     Details,
     Done,
+    Retry,
     Merge,
     Release,
     CopyId,
@@ -1725,6 +1807,7 @@ pub struct Workspace {
     /// Transient font metrics of this workspace's actual geometry owner.
     /// None means no negotiated graphical display; never restored from disk.
     pub(crate) cell_pixels: Option<(u16, u16)>,
+    pub(crate) graphics_enabled: bool,
     /// Stable public identity across display reordering and restarts.
     pub id: String,
     pub name: String,
@@ -1771,6 +1854,10 @@ pub struct PaneStatus {
     pub state: State,
     pub agent: String,
     pub last_activity: Instant,
+    /// One exact follow-up after recent output leaves `ACTIVITY_WINDOW`.
+    /// PTY events move this deadline forward; detection clears it after the
+    /// boundary is inspected, avoiding a 100 ms poll throughout the window.
+    quiet_check_at: Option<Instant>,
     /// When the user last sent input (keystrokes/paste) to this pane. Lets
     /// detection tell a user typing (whose echo is also output) apart from the
     /// agent generating (docs/07). Defaults old so unfocused/new panes aren't
@@ -1837,6 +1924,7 @@ impl PaneStatus {
             state: State::Idle,
             agent,
             last_activity: Instant::now(),
+            quiet_check_at: None,
             // Old by default so a freshly spawned pane's first output isn't gated
             // as "the user is typing".
             last_input: Instant::now()
@@ -2300,6 +2388,18 @@ pub struct App {
     /// Bumped on every open and close of the open-worktree list, so a scan
     /// result carrying an older value is stale and ignored.
     worktree_open_generation: u64,
+    /// Bumped by every Go to edit, directory change, and picker close, so a
+    /// completion scan carrying an older value is stale and ignored.
+    picker_go_to_generation: u64,
+    /// A Go to listing is still draining on [`IoJobs`], including superseded
+    /// ones whose result will be discarded. Tab must not admit another until
+    /// this clears, or obsolete scans fill the shared eight-job budget.
+    picker_go_to_inflight: bool,
+    /// Tab was pressed while a superseded listing was still draining. `Some`
+    /// keeps the last Tab/BackTab direction so the deferred scan does not
+    /// always cycle forward. When that listing lands, start one scan for the
+    /// field as it is then.
+    picker_go_to_rescan: Option<bool>,
     /// Clickable targets in the open-worktree list, set by the renderer each
     /// frame. Rows precede the modal body in hit-test order, so a click lands on
     /// the row under it and only a click on neither is "outside".
@@ -2319,8 +2419,9 @@ pub struct App {
     pub pane_menu: Option<PaneMenu>,
     /// Active AGENTS-list context menu (right-click a row); `None` when closed.
     pub agent_menu: Option<AgentMenu>,
-    /// Context menu on a session row (right-click → Stop session).
+    /// Context menu on a named-session row.
     pub session_menu: Option<SessionMenu>,
+    /// A stopped named session awaiting explicit delete confirmation.
     /// Live agents pinned to the top of the AGENTS list (right-click → Pin).
     /// Per-session: pane ids are reallocated each run, so this is not persisted;
     /// pruned when a pane closes.
@@ -2453,6 +2554,11 @@ pub struct App {
     /// On-demand named-session menu. Its filesystem/process discovery runs only
     /// while opening or activating this surface, never on an idle timer.
     pub named_session_menu: Option<session_menu::NamedSessionMenu>,
+    /// Last validated projection retained between selector opens. Refresh stays
+    /// user-triggered, but warm opens do not wait for filesystem/socket probes.
+    pub(crate) named_session_cache: Option<session_menu::NamedSessionDiscovery>,
+    /// Lifecycle work already running off-loop, keyed by validated session name.
+    pub(crate) pending_named_session_actions: HashMap<String, session_menu::NamedSessionAction>,
     pub named_session_button_rect: Option<Rect>,
     pub named_session_menu_rect: Option<Rect>,
     pub named_session_close_rect: Option<Rect>,
@@ -2553,6 +2659,11 @@ pub struct App {
     cwd_git_hits: HashMap<PaneId, (PathBuf, u8)>,
     /// Resumable agent sessions discovered on disk (for the AGENTS sidebar).
     pub resumable: Vec<crate::agent::SessionInfo>,
+    /// Module-provided AGENTS sidebar titles for live panes. OSC still wins.
+    pub(crate) agent_title_panes: HashMap<PaneId, AgentRowTitle>,
+    /// Module-provided titles for native sessions (live idle fallback and All/history).
+    /// The nested shape permits borrowed, allocation-free lookups while rendering.
+    pub(crate) agent_title_sessions: HashMap<String, HashMap<String, AgentRowTitle>>,
     /// A resumable-session disk scan is running on a worker thread; don't start
     /// another until its `SessionsScanned` result arrives.
     sessions_scan_inflight: bool,
@@ -2762,6 +2873,10 @@ pub struct App {
     pub menu_scroll: MenuScroll,
     app_tx: Sender<AppEvent>,
     pub last_pane_area: Rect,
+    /// Pixel size of one cell on the interactive display client. `0` means the
+    /// host did not report it; auto-split then uses the documented 2:1 fallback.
+    pub cell_width_px: u16,
+    pub cell_height_px: u16,
     // Hit-test geometry from the last render, for mouse clicks.
     pub pane_rects: Vec<(PaneId, Rect)>,
     /// Each pane's **content** rect (inside the border/title) — maps a mouse
@@ -2878,6 +2993,9 @@ pub struct App {
     pub settings_arrow_rects: Vec<(usize, i32, Rect)>,
     /// Installed modules (docs/13) and the ring buffer of their command logs.
     pub modules: crate::module::ModuleRegistry,
+    /// Per-server credentials injected only into processes Luvus starts for each
+    /// module. Public API owner fields are accepted only with the matching token.
+    pub(crate) module_tokens: HashMap<String, String>,
     pub module_logs: Vec<crate::module::ModuleCommandLog>,
     /// Live module panes by pane id, untracked automatically on close (MOD-2).
     pub module_panes: HashMap<PaneId, crate::module::ModulePaneRecord>,
@@ -2896,6 +3014,20 @@ pub struct ModuleSettingEdit {
     pub title: String,
     pub buffer: String,
     pub secret: bool,
+}
+
+/// One publisher credential per registered module, valid for this server's
+/// lifetime. Every registered module gets one regardless of its enabled state,
+/// so toggling a module cannot strand a still-running module process with a
+/// stale token. Authorization is enforced per request against `is_runnable()`.
+fn module_tokens_for(
+    modules: &crate::module::ModuleRegistry,
+) -> Result<HashMap<String, String>, String> {
+    modules
+        .modules
+        .iter()
+        .map(|module| crate::terminal::backend::random_id().map(|token| (module.id.clone(), token)))
+        .collect()
 }
 
 fn child_appearance(
@@ -2932,6 +3064,7 @@ impl App {
         let direct_keymap = keys::build_direct_keymap(&config.direct_keybindings);
         let prefix = keys::PrefixSpec::parse(&config.prefix).unwrap_or_default();
         let modules = crate::module::registry::load();
+        let module_tokens = module_tokens_for(&modules).map_err(anyhow::Error::msg)?;
         let mut bar = crate::bar::BarState::default();
         bar.sync_modules(&modules);
 
@@ -2977,6 +3110,7 @@ impl App {
             editors: crate::platform::editor_choices(),
             workspaces: vec![Workspace {
                 cell_pixels: None,
+                graphics_enabled: false,
                 id: crate::ids::public_id("workspace"),
                 name,
                 worktree: worktree_membership(&cwd),
@@ -3023,6 +3157,9 @@ impl App {
             worktree_prompt_rect: None,
             worktree_open: None,
             worktree_open_generation: 0,
+            picker_go_to_generation: 0,
+            picker_go_to_inflight: false,
+            picker_go_to_rescan: None,
             worktree_open_rects: Vec::new(),
             tab_rename: None,
             tab_menu: None,
@@ -3086,6 +3223,8 @@ impl App {
             pending_session_switch: None,
             has_attached_client: false,
             named_session_menu: None,
+            named_session_cache: None,
+            pending_named_session_actions: HashMap::new(),
             named_session_button_rect: None,
             named_session_menu_rect: None,
             named_session_close_rect: None,
@@ -3129,6 +3268,8 @@ impl App {
             cwd_scan_inflight: false,
             cwd_git_hits: HashMap::new(),
             resumable: Vec::new(),
+            agent_title_panes: HashMap::new(),
+            agent_title_sessions: HashMap::new(),
             sessions_scan_inflight: false,
             proc_commands: HashMap::new(),
             proc_scan_inflight: false,
@@ -3235,6 +3376,8 @@ impl App {
             menu_scroll: MenuScroll::default(),
             app_tx,
             last_pane_area: Rect::ZERO,
+            cell_width_px: 0,
+            cell_height_px: 0,
             pane_rects: Vec::new(),
             pane_content_rects: Vec::new(),
             scroll_pane: None,
@@ -3285,6 +3428,7 @@ impl App {
             theme_selection_revision: 0,
             settings_arrow_rects: Vec::new(),
             modules,
+            module_tokens,
             module_logs: Vec::new(),
             module_panes: HashMap::new(),
             module_startup_done: std::collections::HashSet::new(),
@@ -3334,6 +3478,7 @@ impl App {
         let shell = crate::platform::resolve_shell(&config.shell);
         let history_budget_bytes = config.scrollback_bytes();
         let modules = crate::module::registry::load();
+        let module_tokens = module_tokens_for(&modules).ok()?;
         let mut panes = HashMap::new();
         let mut status = HashMap::new();
         let mut module_panes: HashMap<PaneId, crate::module::ModulePaneRecord> = HashMap::new();
@@ -3515,7 +3660,7 @@ impl App {
                     // installed + runnable; otherwise it falls back to a shell.
                     let restored = ps.module.as_ref().and_then(|(mid, ep)| {
                         restore_module_pane(
-                            &modules,
+                            (&modules, &module_tokens),
                             mid,
                             ep,
                             id,
@@ -3626,6 +3771,7 @@ impl App {
             let active_tab = ws.active_tab.min(tabs.len() - 1);
             workspaces.push(Workspace {
                 cell_pixels: None,
+                graphics_enabled: false,
                 id: ws.id,
                 name: ws.name,
                 worktree: worktree_membership(&ws.cwd),
@@ -3713,6 +3859,9 @@ impl App {
             worktree_prompt_rect: None,
             worktree_open: None,
             worktree_open_generation: 0,
+            picker_go_to_generation: 0,
+            picker_go_to_inflight: false,
+            picker_go_to_rescan: None,
             worktree_open_rects: Vec::new(),
             tab_rename: None,
             tab_menu: None,
@@ -3776,6 +3925,8 @@ impl App {
             pending_session_switch: None,
             has_attached_client: false,
             named_session_menu: None,
+            named_session_cache: None,
+            pending_named_session_actions: HashMap::new(),
             named_session_button_rect: None,
             named_session_menu_rect: None,
             named_session_close_rect: None,
@@ -3819,6 +3970,8 @@ impl App {
             cwd_scan_inflight: false,
             cwd_git_hits: HashMap::new(),
             resumable: Vec::new(),
+            agent_title_panes: HashMap::new(),
+            agent_title_sessions: HashMap::new(),
             sessions_scan_inflight: false,
             proc_commands: HashMap::new(),
             proc_scan_inflight: false,
@@ -3925,6 +4078,8 @@ impl App {
             menu_scroll: MenuScroll::default(),
             app_tx,
             last_pane_area: Rect::ZERO,
+            cell_width_px: 0,
+            cell_height_px: 0,
             pane_rects: Vec::new(),
             pane_content_rects: Vec::new(),
             scroll_pane: None,
@@ -3975,6 +4130,7 @@ impl App {
             theme_selection_revision: 0,
             settings_arrow_rects: Vec::new(),
             modules,
+            module_tokens,
             module_logs: Vec::new(),
             module_panes,
             module_startup_done: std::collections::HashSet::new(),
@@ -5055,6 +5211,84 @@ impl App {
         let _ = self.split_pane(pane, axis, true);
     }
 
+    /// Split the focused pane along its longer side.
+    fn split_auto(&mut self) {
+        let pane = self.layout().focus;
+        let axis = self.auto_split_axis_for(pane);
+        let _ = self.split_pane(pane, axis, true);
+    }
+
+    /// Has an interactive client painted a usable pane area yet? Automatic splits
+    /// only trust reported cell geometry once one has; before that the square
+    /// logical area keeps the historical left/right default.
+    fn has_painted_area(&self) -> bool {
+        self.last_pane_area.width > 1 && self.last_pane_area.height > 1
+    }
+
+    /// Geometry used when choosing an automatic split. Prefer the last rendered
+    /// pane area so a live client decides; fall back to the square logical area
+    /// used by headless topology queries.
+    fn split_area(&self) -> Rect {
+        if self.has_painted_area() {
+            self.last_pane_area
+        } else {
+            crate::api::topology::logical_area()
+        }
+    }
+
+    pub(crate) fn set_client_cell_pixels(&mut self, width: u16, height: u16) {
+        self.cell_width_px = width;
+        self.cell_height_px = height;
+    }
+
+    fn painted_cell_aspect(&self) -> f32 {
+        if let Some((width, height)) = self
+            .workspace_cell_pixels(self.active_ws)
+            .filter(|(w, h)| *w > 0 && *h > 0)
+        {
+            return f32::from(height) / f32::from(width);
+        }
+        if self.cell_width_px > 0 && self.cell_height_px > 0 {
+            f32::from(self.cell_height_px) / f32::from(self.cell_width_px)
+        } else {
+            crate::layout::CELL_ASPECT_HEIGHT_OVER_WIDTH
+        }
+    }
+
+    /// Axis that cuts the longer physical side of `pane` in its current tab.
+    /// Painted clients use reported cell pixels when available, else the
+    /// documented 2:1 fallback. The square logical area used before any client
+    /// has painted keeps the historical left/right split.
+    fn auto_split_axis_for(&self, pane: PaneId) -> Axis {
+        let painted = self.has_painted_area();
+        let area = self.split_area();
+        let rect = self
+            .pane_location(pane)
+            .and_then(|(workspace, tab)| {
+                self.workspaces[workspace].tabs[tab]
+                    .layout
+                    .pane_rect(area, pane)
+            })
+            .unwrap_or(area);
+        if painted {
+            crate::layout::auto_split_axis_with_cell_aspect(
+                rect.width,
+                rect.height,
+                self.painted_cell_aspect(),
+            )
+        } else {
+            crate::layout::auto_split_axis(rect.width, rect.height)
+        }
+    }
+
+    /// Attach a newly allocated leaf beside the focused pane, choosing the split
+    /// axis from that pane's current aspect ratio.
+    fn split_focused_auto(&mut self, new_id: PaneId) {
+        let focus = self.layout().focus;
+        let axis = self.auto_split_axis_for(focus);
+        self.layout_mut().split_focused(axis, new_id);
+    }
+
     /// Spawn and attach a sibling beside `target`, preserving inactive view state
     /// when the caller requests a background operation.
     fn spawn_and_attach_new_pane(
@@ -5292,6 +5526,23 @@ impl App {
     /// folder with no error anywhere — indistinguishable from luvus ignoring
     /// them. A toast is raised here so every caller reports it the same way.
     pub fn create_workspace_at(&mut self, cwd: PathBuf) -> bool {
+        self.create_workspace_at_with_focus(cwd, true)
+    }
+
+    /// Open a static workspace while optionally preserving the current selection.
+    ///
+    /// Automatic attach-open uses `focus = false`: the new workspace must exist in
+    /// the sidebar, but attaching another client must not move every client away
+    /// from the workspace the server already had selected. Remember the selection
+    /// by stable ID so this stays correct if workspace ordering changes later.
+    fn create_workspace_at_with_focus(&mut self, cwd: PathBuf, focus: bool) -> bool {
+        let previous_selection = if focus {
+            None
+        } else {
+            self.workspaces
+                .get(self.active_ws)
+                .map(|ws| (ws.id.clone(), self.zoomed))
+        };
         let name = ws_name(&cwd);
         let branch = git_branch(&cwd);
         let cell_pixels = self.display_cell_pixels;
@@ -5302,6 +5553,7 @@ impl App {
         self.forget_closed_workspace_path(&cwd);
         self.workspaces.push(Workspace {
             cell_pixels,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name,
             worktree: worktree_membership(&cwd),
@@ -5324,6 +5576,16 @@ impl App {
             crate::logging::EventKind::WorkspaceOpen,
             &[crate::logging::Field::WorkspaceIndex(ws as u64)],
         );
+        if let Some((previous_active_id, previous_zoomed)) = previous_selection {
+            if let Some(previous_active) = self
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == previous_active_id)
+            {
+                self.active_ws = previous_active;
+                self.zoomed = previous_zoomed;
+            }
+        }
         true
     }
 
@@ -7238,6 +7500,53 @@ impl App {
         changed
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_agent_row_title_for_session(
+        &mut self,
+        agent: String,
+        session_id: String,
+        title: Option<String>,
+    ) -> bool {
+        set_owned_agent_session_title(
+            &mut self.agent_title_sessions,
+            agent,
+            session_id,
+            title,
+            None,
+        )
+        .expect("the test helper writes only unowned title keys")
+    }
+
+    pub(crate) fn clear_agent_row_titles_for_owner(&mut self, owner: &str) -> bool {
+        let pane_count = self.agent_title_panes.len();
+        self.agent_title_panes
+            .retain(|_, title| title.owner.as_deref() != Some(owner));
+        let session_count = agent_session_title_count(&self.agent_title_sessions);
+        self.agent_title_sessions.retain(|_, sessions| {
+            sessions.retain(|_, title| title.owner.as_deref() != Some(owner));
+            !sessions.is_empty()
+        });
+        let changed = pane_count != self.agent_title_panes.len()
+            || session_count != agent_session_title_count(&self.agent_title_sessions);
+        if changed {
+            self.emit_event("agent.history_changed", json!({}));
+        }
+        changed
+    }
+
+    pub(crate) fn agent_row_title_for_session(
+        &self,
+        agent: &str,
+        session_id: &str,
+    ) -> Option<&str> {
+        let agent = crate::agent::canonical_builtin(agent)?;
+        self.agent_title_sessions
+            .get(agent)?
+            .get(session_id)
+            .map(|title| title.text.as_str())
+            .filter(|title| !title.is_empty())
+    }
+
     /// Remove a resumable session from the sidebar list. Hides it for the rest of
     /// the run (so the periodic rescan doesn't bring it back) — it does NOT touch
     /// the agent's stored session on disk.
@@ -7279,6 +7588,7 @@ impl App {
             let branch = git_branch(&s.cwd);
             self.workspaces.push(Workspace {
                 cell_pixels,
+                graphics_enabled: false,
                 id: crate::ids::public_id("workspace"),
                 name: ws_name(&s.cwd),
                 cwd: s.cwd.clone(),
@@ -7746,6 +8056,7 @@ impl App {
         self.emit_backend_terminal_event(id, "terminal.closed", serde_json::json!({}));
         self.backend_terminal_index.retain(|_, pane| *pane != id);
         self.backend_labels.remove(&id);
+        self.agent_title_panes.remove(&id);
         self.cancel_backend_revision_waits(id);
         let reported = self
             .reported_usage
@@ -7805,6 +8116,7 @@ impl App {
     }
 
     fn close_pane(&mut self, id: PaneId) {
+        crate::orch::worker::discard(id);
         let owner = self.pane_location(id);
         let durable = self
             .automation
@@ -7929,6 +8241,7 @@ impl App {
             removed = true;
         }
         if removed {
+            self.repair_active_workspace_after_removal(workspace_index);
             self.emit_event(
                 "workspace.closed",
                 serde_json::json!({"workspace": workspace_index.to_string()}),
@@ -7939,11 +8252,6 @@ impl App {
                     workspace_index as u64,
                 )],
             );
-        }
-        if self.workspaces.is_empty() {
-            self.all_workspaces_closed();
-        } else if self.active_ws >= self.workspaces.len() {
-            self.active_ws = self.workspaces.len() - 1;
         }
     }
 
@@ -8013,6 +8321,7 @@ impl App {
         if was_remote {
             self.rebalance_remote_effect_leaders();
         }
+        self.repair_active_workspace_after_removal(index);
         self.emit_event(
             "workspace.closed",
             serde_json::json!({"workspace": index.to_string()}),
@@ -8021,8 +8330,16 @@ impl App {
             crate::logging::EventKind::WorkspaceClose,
             &[crate::logging::Field::WorkspaceIndex(index as u64)],
         );
+    }
+
+    /// Restore a valid active selection before workspace-removal observers run.
+    /// Module hooks build their context synchronously during `emit_event`, so
+    /// publishing the shortened list with the old index can panic immediately.
+    fn repair_active_workspace_after_removal(&mut self, removed_index: usize) {
         if self.workspaces.is_empty() {
             self.all_workspaces_closed();
+        } else if self.active_ws > removed_index {
+            self.active_ws -= 1;
         } else if self.active_ws >= self.workspaces.len() {
             self.active_ws = self.workspaces.len() - 1;
         }
@@ -8190,7 +8507,7 @@ pub(crate) fn worktree_membership(cwd: &std::path::Path) -> Option<crate::git::W
 /// Re-spawn a saved module pane if its module is still installed + runnable;
 /// returns the pane + its tracking record, or `None` to fall back to a shell.
 fn restore_module_pane(
-    modules: &crate::module::ModuleRegistry,
+    module_runtime: (&crate::module::ModuleRegistry, &HashMap<String, String>),
     mid: &str,
     ep: &str,
     id: PaneId,
@@ -8198,6 +8515,7 @@ fn restore_module_pane(
     history_budget_bytes: usize,
     appearance: crate::terminal::appearance::PaneAppearance,
 ) -> Option<(Pane, crate::module::ModulePaneRecord)> {
+    let (modules, module_tokens) = module_runtime;
     let m = modules.find(mid).filter(|m| m.is_runnable())?;
     let argv = m
         .manifest
@@ -8208,6 +8526,9 @@ fn restore_module_pane(
     let ctx = serde_json::json!({ "invocation_source": "restore" });
     let env = crate::module::runtime::env(
         m,
+        // A snapshot may name the module by its install shorthand, which
+        // `find` accepts but the token map (keyed by manifest id) does not.
+        module_tokens.get(m.id.as_str())?,
         &ctx,
         vec![("LUVUS_MODULE_ENTRYPOINT_ID".to_string(), ep.to_string())],
     );
@@ -8227,7 +8548,7 @@ fn restore_module_pane(
     Some((
         pane,
         crate::module::ModulePaneRecord {
-            module_id: mid.to_string(),
+            module_id: m.id.clone(),
             entrypoint: ep.to_string(),
         },
     ))
@@ -8809,6 +9130,9 @@ mod tests {
             cursor: 0,
             creating: None,
             going_to: None,
+            go_to_cycle: None,
+            go_to_generation: 0,
+            go_to_scanning: None,
             error: None,
             is_repo,
             show_hidden: false,
@@ -9803,6 +10127,86 @@ mod tests {
     }
 
     #[test]
+    fn closing_an_auto_opened_workspace_keeps_restored_focus_renderable() {
+        let _env = crate::persist::test_env("close-auto-opened-workspace");
+        let root = std::env::temp_dir().join(format!(
+            "luvus-close-auto-opened-workspace-{}",
+            std::process::id()
+        ));
+        let retained = root.join("retained");
+        let automatic = root.join("automatic");
+        std::fs::create_dir_all(&retained).unwrap();
+        std::fs::create_dir_all(&automatic).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        assert!(app.create_workspace_at(retained.clone()));
+        let selected_id = app.ws().id.clone();
+        let snapshot = crate::persist::snapshot(&app);
+        drop(app);
+
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        let mut app = App::from_snapshot(snapshot, tx2).expect("workspaces restore");
+        assert_eq!(app.ws().id, selected_id);
+
+        let open = |app: &mut App, focus: bool| {
+            let (reply, _rx) = mpsc::channel();
+            let response = app.handle_api(&ApiRequest {
+                id: "1".into(),
+                method: "workspace.open".into(),
+                params: json!({
+                    "path": automatic.display().to_string(),
+                    "focus": focus,
+                }),
+                reply,
+            });
+            let response: Value = serde_json::from_str(&response).unwrap();
+            assert!(response.get("error").is_none(), "open failed: {response}");
+        };
+
+        open(&mut app, false);
+        assert_eq!(
+            app.ws().id,
+            selected_id,
+            "automatic creation preserves the restored selection"
+        );
+        let automatic_pane = app
+            .workspaces
+            .iter()
+            .find(|workspace| crate::platform::same_path(&workspace.cwd, &automatic))
+            .map(|workspace| workspace.tabs[workspace.active_tab].layout.focus)
+            .expect("automatic workspace exists");
+
+        // A background shell can exit before the next detection tick. Closing it
+        // must leave the restored selection valid for the immediate render.
+        app.handle_event(AppEvent::PtyExit(automatic_pane));
+        assert_eq!(app.ws().id, selected_id);
+        assert!(app.panes.contains_key(&app.layout().focus));
+
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        // The explicitly focused form follows the same close path and must also
+        // fall back to a surviving workspace without waiting for repair.
+        open(&mut app, true);
+        let focused = app.layout().focus;
+        app.handle_event(AppEvent::PtyExit(focused));
+        assert!(app.active_ws < app.workspaces.len());
+        assert!(app.ws().active_tab < app.ws().tabs.len());
+        assert!(app.panes.contains_key(&app.layout().focus));
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn workspace_terminal_cwd_follows_the_focused_pane() {
         let _env = crate::persist::test_env("workspace-focused-pane-cwd");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -10072,6 +10476,92 @@ mod tests {
     }
 
     #[test]
+    fn reported_session_release_is_idempotent_identity_fenced_and_persistent() {
+        let _env = crate::persist::test_env("reported-session-release");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let report = |session: &str| {
+            json!({
+                "pane": pane.0.to_string(),
+                "agent": "opencode",
+                "session_id": session,
+                "usage": {
+                    "model": "openai/gpt-5",
+                    "tokens_in": 10,
+                    "tokens_out": 5,
+                    "cache_read": 2,
+                    "cache_write": 1,
+                    "cost": 0.01,
+                    "updated_at": 100
+                }
+            })
+        };
+        let release = |agent: &str, session: &str| {
+            json!({
+                "pane": pane.0.to_string(),
+                "agent": agent,
+                "session_id": session,
+            })
+        };
+
+        assert_eq!(
+            api_call(&mut app, "pane.report_session", report("ses_a"))["result"]["type"],
+            "ok"
+        );
+        let stale = api_call(
+            &mut app,
+            "pane.release_session",
+            release("opencode", "ses_old"),
+        );
+        assert_eq!(stale["error"]["code"], "ownership_conflict");
+        assert_eq!(
+            app.status[&pane].agent_session.as_ref().unwrap().session_id,
+            "ses_a"
+        );
+
+        assert_eq!(
+            api_call(&mut app, "pane.report_session", report("ses_b"))["result"]["type"],
+            "ok"
+        );
+        let delayed = api_call(
+            &mut app,
+            "pane.release_session",
+            release("opencode", "ses_a"),
+        );
+        assert_eq!(delayed["error"]["code"], "ownership_conflict");
+        assert_eq!(
+            app.status[&pane].agent_session.as_ref().unwrap().session_id,
+            "ses_b"
+        );
+
+        let released = api_call(
+            &mut app,
+            "pane.release_session",
+            release("opencode2", "ses_b"),
+        );
+        assert_eq!(released["result"]["released"], true);
+        assert!(app.status[&pane].agent_session.is_none());
+        assert!(!app
+            .reported_usage
+            .contains_key(&crate::mission::UsageKey::new("opencode", "ses_b")));
+
+        let repeated = api_call(
+            &mut app,
+            "pane.release_session",
+            release("opencode", "ses_b"),
+        );
+        assert_eq!(repeated["result"]["released"], false);
+
+        let snapshot = persist::snapshot(&app);
+        let (restored_tx, _restored_rx) = std::sync::mpsc::channel();
+        let restored = App::from_snapshot(snapshot, restored_tx).unwrap();
+        assert!(restored.status[&restored.layout().focus]
+            .agent_session
+            .is_none());
+    }
+
+    #[test]
     fn reported_session_has_one_owner_and_closing_that_pane_prunes_its_usage() {
         let _env = crate::persist::test_env("reported-session-owner");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -10293,6 +10783,7 @@ mod tests {
         let common_dir = PathBuf::from("/tmp/luvus-group/.git");
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name: "parent".into(),
             cwd: PathBuf::from("/tmp/luvus-group"),
@@ -10309,6 +10800,7 @@ mod tests {
         });
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name: "child".into(),
             cwd: PathBuf::from("/tmp/luvus-group-child"),
@@ -10393,6 +10885,7 @@ mod tests {
         let target_id = crate::ids::public_id("workspace");
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: target_id.clone(),
             name: "target".into(),
             cwd: app.workspaces[0].cwd.clone(),
@@ -10426,6 +10919,7 @@ mod tests {
         let target_id = crate::ids::public_id("workspace");
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: target_id.clone(),
             name: "target".into(),
             cwd: app.workspaces[0].cwd.clone(),
@@ -10454,6 +10948,7 @@ mod tests {
         let survivor_id = crate::ids::public_id("workspace");
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: survivor_id.clone(),
             name: "survivor".into(),
             cwd: app.workspaces[0].cwd.clone(),
@@ -10573,6 +11068,65 @@ mod tests {
         let old: persist::PaneSnap =
             serde_json::from_str(r#"{"cwd":"/tmp/x","command":"sh"}"#).unwrap();
         assert_eq!(old.agent_launch, None);
+    }
+
+    /// A Devin pane restores from the exact binding Luvus persisted (it has no
+    /// session discovery), and the restore never replays the `-- <briefing>`
+    /// the pane was launched with: only the options before the separator come
+    /// back.
+    #[test]
+    fn devin_restores_its_exact_binding_without_replaying_the_briefing() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let focus = app.layout().focus;
+        let st = app.status.get_mut(&focus).unwrap();
+        st.agent = "devin".into();
+        st.agent_session = Some(AgentSession {
+            agent: "devin".into(),
+            session_id: "quiet-meadow".into(),
+        });
+        app.proc_commands.insert(
+            focus,
+            vec!["devin --permission-mode auto -- fix the login bug".into()],
+        );
+
+        let snap = persist::snapshot(&app);
+        let ps = snap
+            .workspaces
+            .iter()
+            .flat_map(|w| &w.tabs)
+            .flat_map(|t| &t.panes)
+            .find(|(id, _)| *id == focus.0)
+            .map(|(_, ps)| ps)
+            .unwrap();
+        assert_eq!(
+            ps.agent_session,
+            Some(("devin".to_string(), "quiet-meadow".to_string()))
+        );
+        assert_eq!(
+            ps.agent_launch.as_deref(),
+            Some(
+                &[
+                    "--permission-mode".to_string(),
+                    "auto".into(),
+                    "--".into(),
+                    "fix".into(),
+                    "the".into(),
+                    "login".into(),
+                    "bug".into(),
+                ][..]
+            )
+        );
+
+        let (agent, sid) = ps.agent_session.clone().unwrap();
+        assert_eq!(
+            crate::agent::resume_for(&agent, &sid, ps.agent_launch.as_deref(), true).as_deref(),
+            Some("devin --resume 'quiet-meadow' '--permission-mode' 'auto'\r")
+        );
+        assert_eq!(
+            crate::agent::resume_for(&agent, &sid, ps.agent_launch.as_deref(), false).as_deref(),
+            Some("devin --resume 'quiet-meadow'\r")
+        );
     }
 
     /// The captured CLI options are **per pane**, not one global set (docs/62).
@@ -11112,6 +11666,7 @@ mod tests {
 
         app.detect_tick(first);
         let extracted = app.detection_extractions;
+        let considered = app.detection_panes_considered;
         assert!(extracted > 0, "the first tick inspects every pane");
 
         app.detect_tick(first + Duration::from_millis(200));
@@ -11119,12 +11674,15 @@ mod tests {
             app.detection_extractions, extracted,
             "an unchanged pane does not rebuild title or bottom text"
         );
-        assert!(app.detection_skips > 0);
+        assert_eq!(
+            app.detection_panes_considered, considered,
+            "event-driven detection does not revisit a quiet pane between audits"
+        );
 
         if let Some(pane) = app.panes.get(&pane) {
             pane.engine.lock().unwrap().advance(b"new output\r\n");
         }
-        app.detect_tick(first + Duration::from_millis(400));
+        app.detect_tick(first + Duration::from_secs(3));
         assert_eq!(app.detection_extractions, extracted + 1);
     }
 
@@ -13281,6 +13839,184 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_routes_tasks_and_leases_by_project() {
+        let _env = crate::persist::test_env("orch-project-scope");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let workspace_a = app.ws().id.clone();
+        let other_root = crate::persist::config_dir().join("other-project");
+        std::fs::create_dir_all(&other_root).unwrap();
+        assert!(app.create_workspace_at(other_root));
+        let workspace_b = app.ws().id.clone();
+        let pane_b = app.layout().focus;
+
+        fn call(app: &mut App, method: &str, params: Value) -> Value {
+            let (reply, _rx) = mpsc::channel();
+            let response = app.handle_api(&ApiRequest {
+                id: "1".into(),
+                method: method.into(),
+                params,
+                reply,
+            });
+            serde_json::from_str(&response).unwrap()
+        }
+
+        let ambiguous = call(&mut app, "task.add", json!({"title":"ambiguous"}));
+        assert_eq!(ambiguous["error"]["code"], "workspace_required");
+
+        let task_a = call(
+            &mut app,
+            "task.add",
+            json!({"title":"A", "paths":["src/**"], "workspace_id":workspace_a}),
+        );
+        let task_b = call(
+            &mut app,
+            "task.add",
+            json!({"title":"B", "paths":["src/**"], "workspace_id":workspace_b}),
+        );
+        assert_eq!(
+            task_a["result"]["task"]["project"]["workspace_id"],
+            workspace_a
+        );
+        assert_eq!(
+            task_b["result"]["task"]["project"]["workspace_id"],
+            workspace_b
+        );
+
+        let ambiguous_next = call(&mut app, "task.next", json!({}));
+        assert_eq!(ambiguous_next["error"]["code"], "workspace_required");
+
+        let wrong_project = call(
+            &mut app,
+            "task.start",
+            json!({"id":"t1", "mode":"workspace", "workspace_id":workspace_b}),
+        );
+        assert_eq!(wrong_project["error"]["code"], "workspace_mismatch");
+
+        // `task.next` must validate its focused-pane fallback against the
+        // selected workspace before claiming the next task.
+        app.active_ws = 0;
+        let mismatched_next = call(&mut app, "task.next", json!({"workspace_id":workspace_b}));
+        assert_eq!(mismatched_next["error"]["code"], "workspace_mismatch");
+        assert_eq!(
+            app.orch.task("t2").unwrap().status,
+            crate::orch::TaskStatus::Queued
+        );
+
+        let next_b = call(
+            &mut app,
+            "task.next",
+            json!({"workspace_id":workspace_b, "pane":pane_b.0.to_string()}),
+        );
+        assert_eq!(next_b["result"]["task"]["id"], "t2");
+
+        app.orch
+            .add_task("legacy".into(), vec![], vec![], None)
+            .unwrap();
+        app.active_ws = 0;
+        let rejected_legacy = call(&mut app, "task.next", json!({"workspace_id":workspace_b}));
+        assert_eq!(rejected_legacy["error"]["code"], "workspace_mismatch");
+        let legacy = app.orch.task("t3").unwrap();
+        assert_eq!(legacy.status, crate::orch::TaskStatus::Queued);
+        assert!(legacy.project.is_none());
+        let persisted = serde_json::to_value(&app.orch).unwrap();
+        assert!(persisted["tasks"][2]["project"].is_null());
+
+        let lease_b = call(
+            &mut app,
+            "lease.acquire",
+            json!({"task":"t2", "paths":["src/**"], "pane":pane_b.0.to_string()}),
+        );
+        assert!(lease_b.get("result").is_some(), "{lease_b}");
+
+        let start_a = call(
+            &mut app,
+            "task.start",
+            json!({"id":"t1", "mode":"workspace"}),
+        );
+        assert_eq!(start_a["result"]["workspace_id"], workspace_a);
+        assert_eq!(start_a["result"]["task"]["status"], "running");
+        assert_eq!(app.orch.leases.len(), 2);
+        assert!(app.orch.leases.iter().any(|lease| lease.pane == pane_b.0));
+        assert!(app.orch.leases.iter().any(|lease| lease.pane != pane_b.0));
+    }
+
+    #[test]
+    fn orchestration_uses_the_focused_repository_beside_a_non_repo_workspace() {
+        let _env = crate::persist::test_env("orch-focused-repository");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.workspaces[0].cwd = crate::persist::config_dir().join("launch-home");
+        app.workspaces[0].worktree = None;
+        assert!(app.ws().worktree.is_none());
+
+        let repo = crate::persist::config_dir().join("solo");
+        let repo_id = crate::ids::public_id("workspace");
+        app.workspaces.push(Workspace {
+            remote: None,
+            cell_pixels: None,
+            graphics_enabled: false,
+            id: repo_id.clone(),
+            name: "solo".into(),
+            cwd: repo.clone(),
+            branch: Some("main".into()),
+            git_ahead_behind: None,
+            worktree: Some(crate::git::WorktreeMembership {
+                common_dir: repo.join(".git"),
+                linked: false,
+            }),
+            tabs: vec![],
+            active_tab: 0,
+            pinned: false,
+        });
+        app.active_ws = 1;
+
+        let call = |app: &mut App, method: &str, params: Value| {
+            let (reply, _rx) = mpsc::channel();
+            let response = app.handle_api(&ApiRequest {
+                id: "1".into(),
+                method: method.into(),
+                params,
+                reply,
+            });
+            serde_json::from_str::<Value>(&response).unwrap()
+        };
+        let added = call(&mut app, "task.add", json!({"title":"repository work"}));
+        assert_eq!(added["result"]["task"]["project"]["workspace_id"], repo_id);
+
+        app.active_ws = 0;
+        let ambiguous = call(&mut app, "task.add", json!({"title":"ambiguous"}));
+        assert_eq!(ambiguous["error"]["code"], "workspace_required");
+
+        let other_repo = crate::persist::config_dir().join("other-project");
+        app.workspaces.push(Workspace {
+            remote: None,
+            cell_pixels: None,
+            graphics_enabled: false,
+            id: crate::ids::public_id("workspace"),
+            name: "other-project".into(),
+            cwd: other_repo.clone(),
+            branch: None,
+            git_ahead_behind: None,
+            worktree: None,
+            tabs: vec![],
+            active_tab: 0,
+            pinned: false,
+        });
+        app.active_ws = 1;
+        let multiple_non_git = call(&mut app, "task.add", json!({"title":"non-Git ambiguity"}));
+        assert_eq!(multiple_non_git["error"]["code"], "workspace_required");
+
+        app.workspaces[2].branch = Some("main".into());
+        app.workspaces[2].worktree = Some(crate::git::WorktreeMembership {
+            common_dir: other_repo.join(".git"),
+            linked: false,
+        });
+        let two_repositories = call(&mut app, "task.add", json!({"title":"still ambiguous"}));
+        assert_eq!(two_repositories["error"]["code"], "workspace_required");
+    }
+
+    #[test]
     fn task_update_rejects_all_fields_after_merge_starts() {
         let _env = crate::persist::test_env("orch-update-complete");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -13382,9 +14118,42 @@ mod tests {
             "focus:false kept the active workspace on reopen"
         );
 
+        // Adding a previously unknown folder must preserve the same selection.
+        // The already-open assertion above used to pass while this case still
+        // activated the appended workspace unconditionally.
+        let background = std::env::temp_dir().join(format!(
+            "luvus-attach-open-background-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&background).unwrap();
+        let selected_id = app.ws().id.clone();
+        let before = app.workspaces.len();
+        app.zoomed = true;
+        open(&mut app, &background, false);
+        assert_eq!(app.workspaces.len(), before + 1, "new folder is added");
+        assert_eq!(
+            app.ws().id,
+            selected_id,
+            "focus:false preserves selection when it creates a workspace"
+        );
+        assert!(
+            app.zoomed,
+            "focus:false preserves the selected workspace's zoom state"
+        );
+        assert!(app
+            .workspaces
+            .iter()
+            .any(|workspace| crate::platform::same_path(&workspace.cwd, &background)));
+
+        // Explicit open keeps the existing focus behavior for the same folder.
+        open(&mut app, &background, true);
+        assert!(crate::platform::same_path(&app.ws().cwd, &background));
+
         // An explicit open (focus:true) still focuses the folder.
         open(&mut app, &first, true);
         assert_eq!(app.ws().cwd, first, "explicit open still focuses");
+        drop(app);
+        let _ = std::fs::remove_dir_all(background);
     }
 
     #[test]
@@ -13447,6 +14216,78 @@ mod tests {
 
         drop(restored);
         let _ = std::fs::remove_dir_all(other);
+    }
+
+    #[test]
+    fn module_agent_title_owners_cannot_overwrite_or_clear_each_other() {
+        let _env = crate::persist::test_env("module-agent-title-owners");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        set_owned_agent_session_title(
+            &mut app.agent_title_sessions,
+            "pi".into(),
+            "shared".into(),
+            Some("Alpha".into()),
+            Some("module.alpha"),
+        )
+        .unwrap();
+        assert!(set_owned_agent_session_title(
+            &mut app.agent_title_sessions,
+            "pi".into(),
+            "shared".into(),
+            Some("Beta".into()),
+            Some("module.beta"),
+        )
+        .is_err());
+        set_owned_agent_session_title(
+            &mut app.agent_title_sessions,
+            "pi".into(),
+            "beta-only".into(),
+            Some("Beta".into()),
+            Some("module.beta"),
+        )
+        .unwrap();
+        assert!(app.clear_agent_row_titles_for_owner("module.alpha"));
+        assert!(app.agent_row_title_for_session("pi", "shared").is_none());
+        assert_eq!(
+            app.agent_row_title_for_session("pi", "beta-only"),
+            Some("Beta")
+        );
+    }
+
+    #[test]
+    fn module_agent_titles_apply_to_live_and_resumable_without_using_alias() {
+        let _env = crate::persist::test_env("module-agent-titles");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        {
+            let status = app.status.get_mut(&pane).unwrap();
+            status.agent = "pi".into();
+            status.agent_session = Some(AgentSession {
+                agent: "pi".into(),
+                session_id: "live-1".into(),
+            });
+        }
+        app.agent_names.insert("chezmoi".into(), pane);
+        assert!(app.set_agent_row_title_for_session(
+            "pi".into(),
+            "live-1".into(),
+            Some("Live module title".into()),
+        ));
+        assert!(app.set_agent_row_title_for_session(
+            "pi".into(),
+            "old-1".into(),
+            Some("History title".into()),
+        ));
+        assert_eq!(app.pane_title(pane).as_deref(), Some("Live module title"));
+        assert_eq!(app.agent_name_for(pane), Some("chezmoi"));
+        assert_eq!(
+            app.agent_row_title_for_session("pi", "old-1"),
+            Some("History title")
+        );
+        assert!(app.set_agent_row_title_for_session("pi".into(), "live-1".into(), None));
+        assert!(app.pane_title(pane).is_none());
     }
 
     #[test]
@@ -14865,6 +15706,7 @@ mod tests {
         let second_cwd = crate::persist::config_dir().join("second-workspace");
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name: "second".into(),
             cwd: second_cwd.clone(),
@@ -14975,6 +15817,7 @@ mod tests {
         let second = PaneId::alloc();
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name: "beta".into(),
             cwd: PathBuf::from("/tmp/luvus-mission-beta"),
@@ -15025,6 +15868,7 @@ mod tests {
         app.status.insert(second, second_status);
         app.workspaces.push(Workspace {
             cell_pixels: None,
+            graphics_enabled: false,
             id: crate::ids::public_id("workspace"),
             name: "beta".into(),
             cwd: PathBuf::from("/tmp/luvus-mission-beta"),

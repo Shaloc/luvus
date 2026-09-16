@@ -84,10 +84,11 @@ for an agent to receive it:
 `luvus skill enable` makes no network request. It installs the same bundled
 skill into detected native skill locations without overwriting external or
 modified content. The shared `~/.agents/skills/luvus/` copy serves Codex,
-GitHub Copilot CLI, Gemini CLI, Pi, Cursor, Amp, Droid, fx, and Kilo Code. Dedicated
-adapters serve Claude Code, OpenCode, Kimi Code CLI, Grok Build, Hermes CLI,
-Qwen Code, and Kiro. Aider has no native Agent Skills installation surface, so
-use `luvus skill show` when an Aider conversation needs the instructions.
+GitHub Copilot CLI, Gemini CLI, Pi, Cursor, Amp, Droid, fx, Kilo Code, and
+Devin. Dedicated adapters serve Claude Code, OpenCode,
+Kimi Code CLI, Grok Build, Hermes CLI, Letta Code, Qwen Code, and Kiro. Aider has no
+native Agent Skills installation surface, so use `luvus skill show` when an
+Aider conversation needs the instructions.
 
 Start a new agent conversation after installation, or use that agent's skill
 reload command when it provides one. To remove unchanged Luvus-managed copies:
@@ -134,9 +135,21 @@ Branch-backed dependencies unblock only after they are merged into the shared
 integration history.
 `task release` requeues active work and releases its path leases, but it does
 not stop the worker pane or discard its worktree.
+`task retry <id>` queues a fresh attempt for terminal `done`, `failed`,
+`review`, or `blocked` work while preserving the old pane, branch, worktree,
+output, and notes. Inspect dependents first because retry is rejected after a
+dependent leaves the queue. Retrying an automation-owned task creates a new
+immutable run from the original run snapshot.
 Use `task add --prompt <text>` or `--prompt-file <path>` for the detailed worker
 briefing. A manual task's prompt can be replaced with `task update` only while
 the task is queued and unassigned; inspect it before starting the worker.
+Tasks belong to the project selected at creation. Inside a Luvus pane the CLI
+supplies that pane automatically. Outside a pane, pass the stable
+`--workspace-id` when multiple repositories or multiple non-Git projects are
+open. The sole focused Git project remains unambiguous when another workspace
+is only a non-Git launch directory. `task next` stays within that project, and
+path leases overlap only among tasks in the same project, including different
+worktrees of one repository.
 Use `task update --note` for work progress. `task heartbeat --context-used
 <0..1>` reports only the fraction of the model context window already consumed,
 where `0.6` means 60% consumed, not 60% task progress. Omit the heartbeat when
@@ -147,7 +160,9 @@ compatibility alias; UHP keeps the stable `context` field.
 `mode=workspace` creates a dedicated task tab in an existing shared checkout;
 it has no task branch or merge action. If start returns `lease_conflict`,
 resolve or release the named holder before retrying. Leases coordinate declared
-task paths but do not sandbox a workspace-mode agent.
+task paths but do not sandbox a workspace-mode agent. Use `task start
+... --no-focus` to stage the worker without changing the operator's current
+workspace, tab, pane focus, or zoom state.
 
 Tab positions are 1-based. Workspace indexes shown by the CLI are 0-based.
 Pane IDs and agent names are discovery results. Never convert between these
@@ -380,6 +395,10 @@ Target a named session without attaching its TUI:
 luvus --session <name> pane list
 ```
 
+Each named session owns an independent workspace tree. An explicit selector for
+another server discards the inherited pane id because pane identities are
+session-scoped.
+
 ## Panes and agents
 
 Discover the exact target first:
@@ -458,10 +477,13 @@ discovery rather than inferring support from an agent name.
   `luvus integration install antigravity` hook reports only the exact
   conversation id needed for `agy --conversation <id>` restore; screen
   detection remains authoritative for state.
-- OpenCode detection and legacy JSON session discovery work without setup.
-  `luvus integration install opencode` adds a TUI-local plugin that reports
-  only the root session selected in that pane plus structured usage. Without
-  it, Mission Control leaves OpenCode usage unavailable instead of guessing.
+- OpenCode V2 uses the canonical `opencode` identity; `opencode2` remains a
+  compatibility alias. `luvus integration install opencode` selects the V1 or
+  V2 TUI-local plugin contract, reports only the root session selected in that
+  pane, and never scans V2's live SQLite database. Exact known IDs resume with
+  `opencode --session <id>`. Its reviewed unattended command,
+  `opencode run --auto`, is available only for an explicit `full_access`
+  automation.
 - Kilo Code is detected through the official `kilo` and `kilocode` commands.
   Resume and fork use Kilo's native commands only when Luvus already has the
   exact session ID; Luvus does not scan or guess sessions from Kilo's database.
@@ -470,6 +492,10 @@ discovery rather than inferring support from an agent name.
 - `luvus integration install hermes` adds exact per-pane session ownership for
   restart resume. Hermes detection still works without it, but Luvus does not
   scan Hermes's private history database or guess a session.
+- `luvus integration install letta` adds one quiet `SessionStart` hook that
+  reports only the exact Letta conversation ID selected in that pane. Detection
+  remains native, and Luvus does not inspect Letta memory, credentials,
+  conversations, or cloud state.
 
 Do not claim every shell command resumes after restart. Do not guess native
 session IDs. List sessions and use the exact returned identifier.
@@ -563,6 +589,14 @@ read-only Access denies it. Rename retains the owner name validation and
 `pane.renamed` event. An empty name clears the pane alias.
 
 ## Remote use
+
+For a fleet display, `session.snapshot` terminal rows include `pane_id` plus
+nullable `agent_name` from the operator alias map. Backend titles do not mask
+aliases; native view rows omit the field. Refresh snapshots after alias changes.
+`agent.name` emits no event and does not advance `event_sequence`; `pane.rename`
+updates the same alias map, emits `pane.renamed`, and advances the sequence,
+including when clearing a name. Use pane IDs for routing and as display fallback
+when an older server omits the alias field.
 
 Observe/control `terminal.frame` messages replace the previous capture at the
 frame's own `content_revision`. The acknowledgment revision is not an emitted

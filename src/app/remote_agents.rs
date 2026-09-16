@@ -11,6 +11,8 @@ use crate::ipc::protocol::ClientMessage;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentHistoryRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub key: [u8; 32],
     pub agent: String,
     pub cwd: String,
@@ -43,6 +45,7 @@ mod tests {
 
     fn agent(pane: u32, pinned: bool) -> RemoteAgentMeta {
         RemoteAgentMeta {
+            title: None,
             pane: pane.to_string(),
             agent: "codex".into(),
             state: crate::ui::theme::State::Blocked,
@@ -365,6 +368,7 @@ mod tests {
         ));
         let remote = remote_view(&mut app, view);
         remote.history.push(AgentHistoryRow {
+            title: None,
             key,
             agent: "codex".into(),
             cwd: "/srv/api".into(),
@@ -499,6 +503,7 @@ mod tests {
         pinned.focused = true;
         remote.agents = vec![pinned];
         remote.history.push(AgentHistoryRow {
+            title: None,
             key,
             agent: "codex".into(),
             cwd: "/srv/api".into(),
@@ -725,6 +730,9 @@ impl App {
                     == Some(workspace)
             })
             .map(|session| AgentHistoryRow {
+                title: self
+                    .agent_row_title_for_session(&session.agent, &session.session_id)
+                    .map(str::to_string),
                 key: history_key(session),
                 agent: session.agent.clone(),
                 cwd: session.cwd.display().to_string(),

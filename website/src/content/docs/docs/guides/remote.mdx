@@ -316,13 +316,15 @@ it. The list loads asynchronously; choose a row or cancel. For a remote
 workspace it comes from its owner host, not the local filesystem. Use workspace
 **+** / **Open Workspace** to browse an arbitrary directory instead.
 
-**Ctrl+V** reads a clipboard image on the display client, sends the bytes to the
+**Ctrl+V** or **Ctrl+Shift+V** reads a clipboard image on the display client, sends the bytes to the
 pane's owner, and pastes a private owner-local file path. Empty terminal paste
 events also try image paste. Images are limited to 16 MiB and remain in the
 owner session's `clipboard/` directory so agents can read them after detach.
 PNG, JPEG, GIF, WebP and BMP are supported where the OS clipboard exposes them.
-Linux uses `wl-paste` or `xclip`; macOS uses `osascript`; Windows/WSL uses
-PowerShell. Missing tools or no image preserves normal input. Ctrl+Enter is
+Linux uses `wl-paste` or `xclip`; macOS uses `osascript`; Windows uses the native
+clipboard API and normalizes PNG/DIB images to PNG; WSL uses PowerShell. PNG
+images are validated before staging (16 MiB, 8192 pixels per dimension and
+12 million pixels in total). Missing tools or no image preserves normal input. Ctrl+Enter is
 unchanged. In Kitty, a headless SSH display client can use the optional official
 `kitten clipboard` executable on that client host to request PNG clipboard bytes
 over [OSC 5522](https://sw.kovidgoyal.net/kitty/clipboard/). Kitty controls access
@@ -361,8 +363,10 @@ local presentation row ID. Remote FILES views do not expose a stale local tree.
 
 ### Kitty graphics
 
-Stable fork releases include Kitty graphics and report `transport=11` with
-`luvus --version --remote-session-protocol`. Use Kitty 0.28 or newer on the display
+Stable fork releases include Kitty graphics from transport 11 onward. Current
+builds report `transport=12` with `luvus --version --remote-session-protocol`
+and separately negotiate physical cell dimensions for automatic split direction.
+Plain terminals can report cell dimensions without enabling Kitty graphics. Use Kitty 0.28 or newer on the display
 machine and matching graphics builds on remote owners. An older managed owner
 can still display text, but cannot supply graphics. For an SSH-hosted display
 client, preserve `TERM=xterm-kitty`; changing TERM in the child pane alone does
@@ -630,13 +634,17 @@ ssh devbox luvus session list
 ssh devbox luvus session list --json
 ```
 
-Inside a remote TUI, `Ctrl+Space t` opens the session switcher. Choosing a
+Inside a remote TUI, `Ctrl+Space t` focuses the session switcher. Choosing a
 different session starts it when needed and moves only the current client. The
-previous session and its panes stay alive.
+previous session and its panes stay alive. Press `a` on a selected row to open
+the same actions available by right click.
 
-To stop another running session from the switcher, right-click it and select
+To stop another running session from the switcher, open its actions and select
 **Stop**. This ends that session and its live panes without detaching the
-current client. The current session cannot be stopped from this menu.
+current client. A stopped session offers **Start**; a stopped named session also
+offers **Delete**, with confirmation, to remove its saved state. The current
+session cannot be stopped from this menu, and the default session cannot be
+deleted.
 
 ## Detach and reconnect
 
@@ -684,9 +692,16 @@ With `luvus --remote`, the local attached client owns effects that should happen
 where you are sitting:
 
 - copied text goes to the local clipboard
+- on Windows, an explicit image paste reads the local clipboard and stages the
+  private PNG on the remote Luvus server before pasting that remote path into
+  the focused pane
 - notifications and sounds play locally
 - detected links open in the local browser
 - each attached client uses its own terminal size and mobile or desktop layout
+
+Image bytes travel inside the existing encrypted SSH connection. Luvus does not
+open another port or write the image to the local machine's Luvus server. If no
+supported image is present, the original paste key continues unchanged.
 
 With the raw `luvus --remote` transport, the global finder searches that remote
 Luvus home. In managed remote and merge mode, the local finder also queries the
@@ -852,3 +867,20 @@ extract the archive, and install its binary into your chosen PATH directory.
 Check `luvus --version --remote-session-protocol` on each host: managed remote
 connections need compatible fork protocols. Installing a binary does
 not restart any existing server; restart is a separate, explicit operation.
+
+
+### Session actions and automatic splits
+
+The session selector displays cached local and remote rows immediately while it
+refreshes them in the background. Press **a** on a row for actions: start a stopped
+owner, stop a running owner, or delete a stopped named session after confirmation.
+For merged rows, actions identify the exact local or remote owner. Stopped default
+sessions can be started but cannot be deleted. An unavailable host does not become
+an actionable owner from stale discovery.
+
+Automatic pane splits use the owning display's physical cell dimensions when
+available, including managed remote projections. Passive clients do not claim
+layout ownership. Transport 9–11 owners retain their existing compatible display
+behavior; upgrade both ends to transport 12 for independent cell-size negotiation.
+Module-provided agent titles appear in remote live and history rows, while operator
+aliases remain separate snapshot fields.

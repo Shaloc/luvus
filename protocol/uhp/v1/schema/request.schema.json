@@ -18,7 +18,7 @@
         "workspace.list", "workspace.get", "workspace.new", "workspace.open", "workspace.focus", "workspace.rename", "workspace.pin", "workspace.move", "workspace.move_block", "workspace.report_metadata", "workspace.close",
         "node.list", "node.new", "node.open", "node.focus", "node.rename", "node.pin", "node.close",
         "tab.list", "tab.get", "tab.new", "tab.focus", "tab.move", "tab.swap", "tab.rename", "tab.close",
-        "pane.list", "pane.get", "pane.current", "pane.layout", "pane.neighbor", "pane.edges", "pane.split", "pane.move", "pane.swap", "pane.focus", "pane.focus_direction", "pane.resize", "pane.zoom", "pane.rename", "pane.run", "pane.send_input", "pane.read", "pane.status", "pane.processes", "pane.report_session", "pane.report_event", "pane.close", "attach.pane",
+        "pane.list", "pane.get", "pane.current", "pane.layout", "pane.neighbor", "pane.edges", "pane.split", "pane.move", "pane.swap", "pane.focus", "pane.focus_direction", "pane.resize", "pane.zoom", "pane.rename", "pane.run", "pane.send_input", "pane.read", "pane.status", "pane.processes", "pane.report_session", "pane.release_session", "pane.report_event", "pane.close", "attach.pane",
         "layout.export", "layout.apply", "layout.set_split_ratio",
         "agent.list", "agent.get", "agent.explain", "agent.report", "agent.release", "agent.start", "agent.prompt", "agent.wait", "agent.name", "agent.fork", "agent.send", "agent.keys", "agent.read", "agent.sessions", "agent.resume",
         "search", "search.capabilities", "search.query", "search.activate",
@@ -27,12 +27,12 @@
         "mission.snapshot", "mission.refresh", "mission.open",
         "diff.refresh", "diff.list", "diff.open", "diff.get", "diff.navigate", "diff.note.add", "diff.note.apply", "diff.note.list", "diff.note.edit", "diff.note.resolve", "diff.note.reopen", "diff.note.remove", "diff.note.send",
         "worktree.list", "worktree.create", "worktree.open", "worktree.remove",
-        "task.add", "task.list", "task.get", "task.claim", "task.next", "task.start", "task.heartbeat", "task.update", "task.done", "task.merge", "task.release", "task.delete",
+        "task.add", "task.list", "task.get", "task.claim", "task.next", "task.start", "task.heartbeat", "task.update", "task.done", "task.retry", "task.merge", "task.release", "task.delete",
         "automation.create", "automation.list", "automation.get", "automation.update", "automation.enable", "automation.disable", "automation.rebind", "automation.delete", "automation.run", "automation.history", "automation.preview", "automation.health",
         "lease.acquire", "lease.list", "lease.release",
         "module.list", "module.info", "module.link", "module.unlink", "module.uninstall", "module.enable", "module.disable", "module.action.list", "module.action.invoke", "module.pane.open", "module.pane.focus", "module.pane.close", "module.config_dir", "module.settings.list", "module.settings.get", "module.settings.set", "module.log.list",
         "theme.list", "theme.path", "theme.use", "theme.reload", "manifest.reload",
-        "ui.sidebar", "ui.dock.push", "ui.dock.list", "ui.dock.move", "ui.bar.push", "ui.bar.list", "ui.bar.move", "ui.bar.remove", "ui.notification.push", "ui.notification.clear", "ui.toast",
+        "ui.sidebar", "ui.agent_title.push", "ui.agent_title.clear", "ui.dock.push", "ui.dock.list", "ui.dock.move", "ui.bar.push", "ui.bar.list", "ui.bar.move", "ui.bar.remove", "ui.notification.push", "ui.notification.clear", "ui.toast",
         "terminal.backend.inventory", "terminal.backend.snapshot", "terminal.backend.validate", "terminal.backend.processes", "terminal.backend.capture", "terminal.backend.observe", "terminal.backend.control", "terminal.backend.type_literal", "terminal.backend.submit_text", "terminal.backend.send_key", "terminal.backend.set_title", "terminal.backend.notify", "terminal.backend.create", "terminal.backend.close", "terminal.backend.wait_change", "terminal.backend.wait_output", "terminal.backend.events.subscribe"
       ]
     },
@@ -154,6 +154,14 @@
         }
       }
     },
+    "paneReleaseSessionParams": {
+      "type": "object", "additionalProperties": false, "required": ["agent", "session_id"],
+      "properties": {
+        "pane": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "integer", "minimum": 0 }] },
+        "agent": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "session_id": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[A-Za-z0-9._:/-]+$" }
+      }
+    },
     "taskAddParams": {
       "type": "object", "additionalProperties": false, "required": ["title"],
       "properties": {
@@ -161,7 +169,9 @@
         "prompt": { "type": "string", "$comment": "Consumers must enforce a 32768-byte UTF-8 limit." },
         "paths": { "type": "array", "items": { "type": "string" } },
         "deps": { "type": "array", "items": { "type": "string" } },
-        "gate": { "type": "string" }
+        "gate": { "type": "string" },
+        "workspace_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "pane": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "integer", "minimum": 0 }] }
       }
     },
     "taskUpdateParams": {
@@ -174,6 +184,12 @@
         "note": { "type": "string" }
       }
     },
+    "taskRetryParams": {
+      "type": "object", "additionalProperties": false, "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
     "taskStartParams": {
       "type": "object", "additionalProperties": false, "required": ["id"],
       "properties": {
@@ -181,7 +197,8 @@
         "branch": { "type": "string", "minLength": 1, "maxLength": 255 },
         "agent": { "type": "string", "minLength": 1, "maxLength": 4096 },
         "mode": { "enum": ["worktree", "workspace"] },
-        "workspace_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+        "workspace_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "focus": { "type": "boolean" }
       },
       "allOf": [
         { "if": { "properties": { "mode": { "const": "workspace" } }, "required": ["mode"] },
@@ -335,10 +352,14 @@
       "then": { "properties": { "params": { "$ref": "#/$defs/integrationChangeParams" } } } },
     { "if": { "properties": { "method": { "const": "pane.report_session" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/paneReportSessionParams" } } } },
+    { "if": { "properties": { "method": { "const": "pane.release_session" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/paneReleaseSessionParams" } } } },
     { "if": { "properties": { "method": { "const": "task.add" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/taskAddParams" } } } },
     { "if": { "properties": { "method": { "const": "task.update" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/taskUpdateParams" } } } },
+    { "if": { "properties": { "method": { "const": "task.retry" } } },
+      "then": { "properties": { "params": { "$ref": "#/$defs/taskRetryParams" } } } },
     { "if": { "properties": { "method": { "const": "task.start" } } },
       "then": { "properties": { "params": { "$ref": "#/$defs/taskStartParams" } } } },
     { "if": { "properties": { "method": { "const": "task.next" } } },

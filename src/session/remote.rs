@@ -1127,7 +1127,7 @@ fn verified_version_output(
     });
     if !remote_protocol || !transport_protocol {
         return Err(format!(
-            "SSH host `{host}` has Luvus {version}, but it is not a compatible modified remote-session build; install a build supporting remote-session=2 and transport 9, 10 or {} there, or use `luvus host add {host} --install`",
+            "SSH host `{host}` has Luvus {version}, but it is not a compatible modified remote-session build; install a build supporting remote-session=2 and transport 9, 10, 11 or {} there, or use `luvus host add {host} --install`",
             crate::ipc::protocol::PROTOCOL_VERSION
         ));
     }
@@ -1924,17 +1924,13 @@ mod tests {
     fn exit_status(code: i32) -> ExitStatus {
         #[cfg(unix)]
         {
-            Command::new("sh")
-                .args(["-c", &format!("exit {code}")])
-                .status()
-                .unwrap()
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(code << 8)
         }
         #[cfg(windows)]
         {
-            Command::new("cmd")
-                .args(["/C", &format!("exit {code}")])
-                .status()
-                .unwrap()
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code as u32)
         }
     }
 
