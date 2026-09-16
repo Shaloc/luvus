@@ -1306,6 +1306,7 @@ mod tests {
         assert!(!text.contains("codex"), "{text}");
         app.bar.sync_modules(&app.modules);
         assert!(app.bar.declaration(CORE_FOCUSED_PANE).is_some());
+        app.flush_config_for_test(&_rx);
         let saved = crate::config::load();
         assert_eq!(
             saved
