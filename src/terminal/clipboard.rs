@@ -40,6 +40,7 @@ impl ClipboardImage {
 
 /// External clipboard helpers are optional and bounded. A missing image leaves
 /// Ctrl+V untouched, so text-paste shortcuts and child bindings keep working.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn capture(mut command: Command) -> Option<Vec<u8>> {
     capture_with_timeout(&mut command, Duration::from_secs(1))
 }
@@ -164,6 +165,7 @@ pub fn read_image() -> Option<ClipboardImage> {
 /// official helper is the only reader of the controlling TTY during its OSC
 /// 5522 transaction. It implements MIME negotiation, chunking and permission
 /// denial; never query clipboard data on startup or relax Kitty permissions.
+#[cfg(not(windows))]
 fn read_kitty_image() -> Option<ClipboardImage> {
     if !std::env::var("TERM").is_ok_and(|term| term.contains("kitty"))
         && std::env::var_os("KITTY_WINDOW_ID").is_none()
@@ -252,7 +254,6 @@ fn deserialize_image_bytes<'de, D: serde::Deserializer<'de>>(
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn wire_image_rejects_oversized_length_before_reading_payload() {
         let image = ClipboardImage {
@@ -276,6 +277,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn ssh_kitty_reads_desktop_image_without_a_linux_display() {
         use std::os::unix::fs::PermissionsExt;
