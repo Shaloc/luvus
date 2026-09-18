@@ -789,6 +789,31 @@ The equivalent Luvus form places passthrough options after its host argument:
 luvus --remote alice@203.0.113.10 -p 2222 -i ~/.ssh/work_ed25519
 ```
 
+### Ordinary SSH works but opening many remote workspaces fails
+
+Managed remote views keep independent workspace display channels. On Unix,
+Luvus pools those channels into private OpenSSH masters, with at most eight
+live display channels per master. Sixteen workspaces therefore use two display
+SSH connections, plus the separate control connection. This avoids putting all
+channels under one server `MaxSessions` limit (commonly ten). The pool's
+owner-only channel leases are shared by Luvus processes using the same home;
+idle masters exit after 30 seconds. Windows keeps independent SSH transports.
+
+Display handshakes are admitted one at a time per configured host across those
+processes, and the admission lease is released after the protocol handshake.
+This avoids a burst of workspace connections hitting `MaxStartups`, which
+limits unauthenticated SSH connections. Cancellation interrupts queued starts.
+A failed display reconnects independently; a failed topology connection still
+refreshes the session and fences old owner state. Healthy displays are not
+cancelled just because one workspace connection failed.
+
+Apply this fix on the display machine (for example the Mac running Luvus).
+Updating only the remote owner cannot change how the display starts SSH.
+No server SSH limits, authentication policy, or user SSH configuration are
+changed. If the host enforces a `MaxSessions` value below eight, its policy may
+prevent the configured pooling capacity; inspect SSH diagnostics for channel
+refusal rather than raising server limits automatically.
+
 ### Luvus is not found on the remote host
 
 Confirm that it is installed for the same remote account:

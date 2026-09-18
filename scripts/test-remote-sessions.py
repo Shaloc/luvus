@@ -2,6 +2,7 @@
 """Unix smoke test: real Luvus servers/PTY clients with a local SSH substitute.
 
 Run after cargo build: python3 scripts/test-remote-sessions.py
+Use --ssh-admission-only for 16-workspace SSH startup admission.
 Use --upstream-only for owner-routed agent input revision checks.
 Use --restart-only for the isolated server restart --all smoke test.
 Use --dimensions-only for the local split/close/resize regression.
@@ -14,7 +15,9 @@ Use --colors-only for child color queries and composed local/remote backgrounds 
 Use --reconnect-only for remote owner restart and automatic reconnection.
 That mode uses a real VT decoder: uv run --with pyte==0.8.2 scripts/test-remote-sessions.py target/debug/luvus --reconnect-only
 All homes, sockets, files and child processes are isolated below target/.
-No production server or actual SSH destination is accessed.
+No production server or actual SSH destination is accessed by default.
+The separate test-ssh-pool.py harness opts display channels into its isolated
+loopback SSH daemon; its generated config and fixture marker are validated.
 """
 
 import base64
@@ -50,9 +53,10 @@ def fixture_root():
 
 
 def ssh_substitute():
-    args = sys.argv[1:]
+    original_args = sys.argv[1:]
+    args = original_args[:]
     while args and args[0].startswith("-"):
-        args = args[2:] if args[0] == "-o" else args[1:]
+        args = args[2:] if args[0] in ("-o", "-S") else args[1:]
     host, *command = args
     root = fixture_root()
     with (root / "ssh-calls").open("a") as log:
@@ -72,6 +76,46 @@ def ssh_substitute():
     assert command and Path(command[0]).name == "luvus", command
     binary = Path(os.environ.get("LUVUS_SMOKE_REMOTE_BINARY", os.environ["LUVUS_SMOKE_BINARY"])).resolve()
     assert binary.is_relative_to(Path(__file__).resolve().parent.parent / "target") and binary.is_file(), binary
+    real_config = os.environ.get("LUVUS_TEST_SSH_POOL_CONFIG")
+    if real_config and "remote-client-bridge" in command:
+        config = Path(real_config).resolve()
+        assert config.parent.parent == Path(__file__).resolve().parent.parent / "target"
+        assert config.parent.name.startswith("ssh-pool-real-")
+        assert (config.parent / ".isolated-sshd").read_text() == str(config.parent)
+        with (root / "ssh-pool-commands").open("a") as log:
+            log.write(json.dumps({"pid": os.getpid(), "args": original_args}) + "\n")
+        os.execv("/usr/bin/ssh", ["ssh", "-F", str(config),
+                 "-o", "SendEnv=LUVUS_SMOKE_ROOT LUVUS_SMOKE_BINARY LUVUS_SMOKE_REMOTE_BINARY",
+                 *original_args])
+    if os.environ.get("LUVUS_SMOKE_SSH_ADMISSION") and "remote-client-bridge" in command:
+        # Model this host's MaxStartups=10 with nonzero authentication latency.
+        # Count only unauthenticated connections, not established streams.
+        import fcntl
+        def admission(update):
+            with (root / "ssh-admission.lock").open("a+") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                path = root / "ssh-admission.json"
+                state = json.loads(path.read_text()) if path.exists() else {"pending": 0, "peak": 0, "rejected": 0, "started": 0}
+                accepted = update(state)
+                path.write_text(json.dumps(state))
+                return state, accepted
+        def enter(state):
+            if state["pending"] >= 10:
+                state["rejected"] += 1
+                return False
+            else:
+                state["pending"] += 1
+                state["peak"] = max(state["peak"], state["pending"])
+                return True
+        state, accepted = admission(enter)
+        if not accepted:
+            print("Connection closed by 192.0.2.1 port 22", file=sys.stderr)
+            raise SystemExit(255)
+        time.sleep(0.5)
+        def leave(state):
+            state["pending"] -= 1
+            state["started"] += 1
+        admission(leave)
     if os.environ.get("LUVUS_SMOKE_NETWORK_RECONNECT"):
         kind = next((arg for arg in command if arg in ("remote-control-bridge", "remote-client-bridge")), None)
         if kind:
@@ -115,8 +159,28 @@ def ssh_substitute():
     os.execv(str(binary), command)
 
 
+def real_ssh_bridge():
+    root = fixture_root()
+    args = shlex.split(os.environ["SSH_ORIGINAL_COMMAND"])
+    assert args == ["luvus", "--session", "api", "remote-client-bridge", "--existing"], args
+    import fcntl
+    with (root / "ssh-admission.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        path = root / "ssh-admission.json"
+        state = json.loads(path.read_text()) if path.exists() else {"started": 0, "rejected": 0}
+        state["started"] += 1
+        path.write_text(json.dumps(state))
+    binary = os.environ.get("LUVUS_SMOKE_REMOTE_BINARY", os.environ["LUVUS_SMOKE_BINARY"])
+    for key in list(os.environ):
+        if key.startswith("LUVUS_"):
+            del os.environ[key]
+    os.environ.update(HOME=str(root / "remote-home"), LUVUS_HOME=str(root / "remote-state"))
+    os.execv(binary, [binary, *args[1:]])
+
+
 def main():
     repo = Path(__file__).resolve().parent.parent
+    ssh_admission_only = "--ssh-admission-only" in sys.argv[1:]
     upstream_only = "--upstream-only" in sys.argv[1:]
     restart_only = "--restart-only" in sys.argv[1:]
     agent_state_only = "--agent-state-only" in sys.argv[1:]
@@ -136,7 +200,7 @@ def main():
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -187,6 +251,8 @@ def main():
         # Tool runners commonly export NO_COLOR. This private display must
         # actually emit SGR colors for end-to-end color assertions.
         env.pop("NO_COLOR", None)
+    if ssh_admission_only:
+        env["LUVUS_SMOKE_SSH_ADMISSION"] = "1"
     if network_reconnect_only:
         env["LUVUS_SMOKE_NETWORK_RECONNECT"] = "1"
     if graphics_only:
@@ -205,6 +271,8 @@ def main():
     for key, suffix in (("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data"),
                         ("XDG_CACHE_HOME", "cache"), ("XDG_STATE_HOME", "state")):
         env[key] = str(root / "local-home" / suffix)
+    if os.environ.get("LUVUS_TEST_SSH_POOL_CONFIG"):
+        env["LUVUS_TEST_SSH_POOL_CONFIG"] = os.environ["LUVUS_TEST_SSH_POOL_CONFIG"]
     remote_env = dict(env, HOME=str(root / "remote-home"), LUVUS_HOME=str(root / "remote-state"))
     for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
         remote_env[key] = remote_env[key].replace("local-home", "remote-home")
@@ -365,6 +433,37 @@ def main():
         assert api("config.get", remote=True)["config"]["layout"]["auto_workspace_rehome"] is False
         api("config.patch", {"patch": {"layout": {"auto_workspace_rehome": False}}})
         print("PASS: automatic workspace rehome defaults off on both owners; live settings stay owner-local", flush=True)
+        if ssh_admission_only:
+            for i in range(15):
+                path = root / f"workspace-{i}"
+                path.mkdir()
+                api("workspace.new", {"path": str(path)}, remote=True)
+            api("config.patch", {"patch": {"remote_hosts": ["fake-dev"]}})
+            run("session", "remote", "add", "fake-dev", "api", "--merge")
+            wait_for(lambda: len(projected()) == 16)
+            def admitted():
+                p = root / "ssh-admission.json"
+                import fcntl
+                with (root / "ssh-admission.lock").open("a+") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_SH)
+                    state = json.loads(p.read_text()) if p.exists() else {}
+                assert not state.get("rejected"), f"SSH Connection Failed: connection closed during 16-workspace attach: {state}"
+                return state if state.get("started", 0) >= 16 else None
+            state = wait_for(admitted)
+            print("PASS: 16 remote workspaces connect without an SSH startup rejection", state, flush=True)
+            if os.environ.get("LUVUS_TEST_SSH_POOL_CONFIG"):
+                channels = [json.loads(line) for line in (root / "ssh-pool-commands").read_text().splitlines()]
+                assert len(channels) == 16, channels
+                os.kill(channels[0]["pid"], signal.SIGKILL)
+                def recovered():
+                    state = admitted()
+                    return state is not None and state.get("started", 0) >= 17
+                wait_for(recovered)
+                for healthy in channels[1:]:
+                    os.kill(healthy["pid"], 0)
+                assert len((root / "ssh-pool-commands").read_text().splitlines()) == 17
+                print("PASS: one killed display channel reconnects; all 15 healthy SSH client processes survive", flush=True)
+            return
         api("config.patch", {"patch": {"remote_hosts": ["fake-dev", "fake-old"]}})
         if upstream_only:
             for remote in (False, True):
@@ -2316,7 +2415,7 @@ def main():
                 run("--session", name, "remote-server-command", "stop", remote=remote, okay=False)
         # Graphics checkpoints are replayed in real Kitty after owner teardown.
         # Other successful fixtures are disposable; failures retain evidence.
-        if sys.exc_info()[0] is None and not graphics_only:
+        if sys.exc_info()[0] is None and not graphics_only and not ssh_admission_only:
             assert_isolated(env)
             assert_isolated(remote_env)
             shutil.rmtree(root)
@@ -2325,6 +2424,9 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--isolated-ssh-bridge"]:
+        real_ssh_bridge()
+        raise SystemExit(0)
     if Path(sys.argv[0]).name == "ssh":
         ssh_substitute()
     elif Path(sys.argv[0]).name == "curl":

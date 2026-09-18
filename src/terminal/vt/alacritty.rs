@@ -243,7 +243,7 @@ impl AlacrittyEngine {
         }
 
         output.clear();
-        let row = grid.row(Line(line));
+        let row = &grid[Line(line)];
         for column in 0..grid.columns() {
             let cell = &row[Column(column)];
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
@@ -268,7 +268,7 @@ impl AlacrittyEngine {
         if line > grid.bottommost_line().0 || grid.columns() == 0 {
             return false;
         }
-        grid[Point::new(Line(line), Column(grid.columns() - 1))]
+        grid[Line(line)][Column(grid.columns() - 1)]
             .flags
             .contains(Flags::WRAPLINE)
     }
@@ -282,7 +282,7 @@ impl AlacrittyEngine {
 
     fn append_plain_grid_row(&self, line: Line, output: &mut String, max_bytes: usize) -> bool {
         let grid = self.term.grid();
-        let row = grid.row(line);
+        let row = &grid[line];
         let last = (0..grid.columns())
             .rfind(|column| {
                 let cell = &row[Column(*column)];
@@ -315,7 +315,7 @@ impl AlacrittyEngine {
 
     fn append_ansi_grid_row(&self, line: Line, output: &mut String, max_bytes: usize) -> bool {
         let grid = self.term.grid();
-        let row = grid.row(line);
+        let row = &grid[line];
         let last = (0..grid.columns())
             .rfind(|column| {
                 let cell = &row[Column(*column)];
@@ -469,13 +469,6 @@ impl VtEngine for AlacrittyEngine {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
-        // Split and divider resize shrink the live PTY while a streaming child
-        // may still have a DEC 2026 frame open, and SIGWINCH often follows with
-        // a live redraw (ED, EL, IL/DL, SU, RIS, or a newline flood). Drop the
-        // stale buffered frame (keep collecting the same sync window) and ignore
-        // those wipes until the next printable so the shrunken pane keeps its
-        // rows. Alternate-screen (1049) is still applied: that is a real TUI.
-        self.parser.abort_sync(&mut self.term);
         self.term.resize(Dims {
             cols: cols.max(1) as usize,
             rows: rows.max(1) as usize,
@@ -639,9 +632,8 @@ impl VtEngine for AlacrittyEngine {
             damaged_row.row = row;
             let line = Line(row as i32 - display_offset);
             let mut used = 0;
-            let grid_row = grid.row(line);
             for column in 0..columns {
-                let cell = &grid_row[Column(column)];
+                let cell = &grid[line][Column(column)];
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                     continue;
                 }
@@ -979,6 +971,13 @@ impl VtEngine for AlacrittyEngine {
         self.title.lock().map_or(0, |title| title.generation)
     }
 
+    fn take_pending_clipboard(&mut self) -> Option<String> {
+        self.clipboard
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take())
+    }
+
     fn set_history_budget(&mut self, bytes: usize) {
         // `set_options` funnels into `Grid::update_history`, which *shrinks* the
         // retained history when the limit drops — so lowering the setting frees
@@ -1098,7 +1097,7 @@ impl VtEngine for AlacrittyEngine {
     fn retained_row_layout(&self, index: usize) -> Option<RetainedRowLayout> {
         let line = self.retained_line(index)?;
         let grid = self.term.grid();
-        let row = grid.row(line);
+        let row = &grid[line];
         let mut whitespace = Vec::with_capacity(grid.columns());
         let mut previous_whitespace = true;
         let mut last_content = None;
@@ -1563,41 +1562,6 @@ mod tests {
         }
     }
 
-    /// Measure terminal parsing/scrolling and cold-history maintenance
-    /// separately from PTY syscalls.
-    #[test]
-    #[ignore]
-    fn bulk_history_ingestion_benchmark() {
-        use std::{hint::black_box, io::Write, time::Instant};
-
-        let mut corpus = Vec::new();
-        for line in 1..=7_600 {
-            write!(&mut corpus, "{line}\r\n").unwrap();
-        }
-        for chunk_bytes in [8 * 1024, 32 * 1024, 64 * 1024] {
-            for trial in 1..=3 {
-                let (tx, _rx) = channel();
-                let mut engine = AlacrittyEngine::new(27, 24, tx, 32 * 1024 * 1024);
-                let start = Instant::now();
-                for chunk in corpus.chunks(chunk_bytes) {
-                    engine.advance(chunk);
-                }
-                let ingestion = start.elapsed();
-                let maintenance_start = Instant::now();
-                engine.finish_output_batch();
-                let maintenance = maintenance_start.elapsed();
-                black_box(engine.history_len());
-                eprintln!(
-                    "bulk_history_ingestion chunk_bytes={chunk_bytes} trial={trial} rows={} ingestion_ms={:.3} maintenance_ms={:.3} total_ms={:.3}",
-                    engine.history_len(),
-                    ingestion.as_secs_f64() * 1000.0,
-                    maintenance.as_secs_f64() * 1000.0,
-                    (ingestion + maintenance).as_secs_f64() * 1000.0,
-                );
-            }
-        }
-    }
-
     #[test]
     fn osc52_copy_is_available_as_terminal_effect_without_child_input() {
         let text = "  nvim yank\n你好";
@@ -1641,7 +1605,7 @@ mod tests {
             "large backlog takes multiple turns"
         );
         let packed = engine.history_metrics().packed_rows.unwrap();
-        assert!(packed > 0 && packed <= 1_024);
+        assert!(packed > 0 && packed <= 512);
         assert_eq!(before, rows(&engine));
         engine.advance(b"new output\r\n");
         engine.resize(90, 24);
@@ -1657,7 +1621,7 @@ mod tests {
         let metrics = engine.history_metrics();
         assert_eq!(
             metrics.packed_rows.unwrap(),
-            metrics.retained_rows.saturating_sub(32)
+            metrics.retained_rows.saturating_sub(128)
         );
         assert!(
             !engine.finish_output_batch_step(),
@@ -1913,149 +1877,6 @@ mod tests {
         assert_eq!(alternate_screen.kind, DamageKind::Full);
         assert!(engine.acknowledge_damage(alternate_screen.generation));
         engine.recycle_damage_snapshot(alternate_screen);
-    }
-
-    fn visible_has_line(engine: &AlacrittyEngine) -> bool {
-        engine.visible_rows().iter().any(|row| row.contains("line"))
-    }
-
-    #[test]
-    fn shrinking_height_keeps_live_rows_visible() {
-        let (tx, _rx) = channel();
-        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
-        feed_lines(&mut engine, 40);
-        assert!(visible_has_line(&engine));
-        engine.resize(40, 10);
-        assert!(
-            visible_has_line(&engine),
-            "height shrink must keep the live tail, not a blank viewport: {:?}",
-            engine.visible_rows()
-        );
-    }
-
-    #[test]
-    fn shrinking_height_discards_in_flight_synchronized_clear() {
-        let (tx, _rx) = channel();
-        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
-        feed_lines(&mut engine, 40);
-        // Cargo/clippy progress frames wrap a home+erase in DEC 2026. A
-        // horizontal split resizes the PTY while that frame is still open.
-        engine.advance(b"\x1b[?2026h\x1b[H\x1b[2J");
-        engine.resize(40, 10);
-        engine.advance(b"\x1b[?2026l");
-        assert!(
-            visible_has_line(&engine),
-            "stale sync erase must not blank the shrunken pane: {:?}",
-            engine.visible_rows()
-        );
-    }
-
-    #[test]
-    fn shrinking_height_discards_synchronized_clear_split_across_resize() {
-        let (tx, _rx) = channel();
-        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
-        feed_lines(&mut engine, 40);
-        engine.advance(b"\x1b[?2026h\x1b[H");
-        engine.resize(40, 10);
-        engine.advance(b"\x1b[2J\x1b[?2026l");
-        assert!(
-            visible_has_line(&engine),
-            "ED2 after abort must not blank the shrunken pane: {:?}",
-            engine.visible_rows()
-        );
-    }
-
-    #[test]
-    fn shrinking_height_keeps_rows_when_sigwinch_sends_live_ed2() {
-        let (tx, _rx) = channel();
-        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
-        feed_lines(&mut engine, 40);
-        engine.resize(40, 10);
-        engine.advance(b"\x1b[H\x1b[2J");
-        assert!(
-            visible_has_line(&engine),
-            "live SIGWINCH erase must not blank the shrunken pane: {:?}",
-            engine.visible_rows()
-        );
-        engine.advance(b"kept-after-resize\r\n");
-        assert!(
-            engine
-                .visible_rows()
-                .iter()
-                .any(|row| row.contains("kept-after-resize")),
-            "text after the suppressed erase must still land: {:?}",
-            engine.visible_rows()
-        );
-    }
-
-    #[test]
-    fn shrinking_height_keeps_later_sync_progress() {
-        let (tx, _rx) = channel();
-        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
-        feed_lines(&mut engine, 40);
-        engine.advance(b"\x1b[?2026h\x1b[H\x1b[2J");
-        engine.resize(40, 10);
-        engine.advance(b"progress-after-resize\r\n\x1b[?2026l");
-        assert!(
-            visible_has_line(&engine),
-            "aborted sync must still apply later progress: {:?}",
-            engine.visible_rows()
-        );
-        assert!(
-            engine
-                .visible_rows()
-                .iter()
-                .any(|row| row.contains("progress-after-resize")),
-            "later DEC 2026 bytes must not be drained: {:?}",
-            engine.visible_rows()
-        );
-    }
-
-    #[test]
-    fn shrinking_height_keeps_rows_across_sigwinch_redraw_ops() {
-        let (tx, _rx) = channel();
-        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
-        feed_lines(&mut engine, 40);
-        engine.resize(40, 10);
-        // Cargo/clippy/indicatif SIGWINCH redraws are not only ED2. Home + erase
-        // below, per-line EL, IL/DL, SU, a newline flood, and RIS all wipe the
-        // viewport if applied before the new-size content.
-        engine.advance(
-            b"\x1b[H\x1b[J\x1b[0J\x1b[1J\x1b[2J\x1b[2K\x1b[K\x1b[1K\x1b[L\x1b[M\x1b[S\x1b[T\x1b[X\x1b[@\x1b[P\n\n\n\x1bD\x1bE\x1bM\x1bc",
-        );
-        assert!(
-            visible_has_line(&engine),
-            "SIGWINCH wipe sequences must not blank the shrunken pane: {:?}",
-            engine.visible_rows()
-        );
-    }
-
-    #[test]
-    fn shrinking_width_keeps_rows_when_sigwinch_sends_live_ed2() {
-        let (tx, _rx) = channel();
-        let mut engine = AlacrittyEngine::new(80, 12, tx, budget_for_rows(80, 200));
-        feed_lines(&mut engine, 20);
-        engine.resize(24, 12);
-        engine.advance(b"\x1b[H\x1b[2J\x1b[2K\n\n");
-        assert!(
-            visible_has_line(&engine),
-            "vertical split / width shrink must keep rows through SIGWINCH erase: {:?}",
-            engine.visible_rows()
-        );
-    }
-
-    #[test]
-    fn shrinking_height_keeps_rows_when_sigwinch_unsets_deccolm() {
-        let (tx, _rx) = channel();
-        let mut engine = AlacrittyEngine::new(40, 24, tx, budget_for_rows(40, 200));
-        feed_lines(&mut engine, 40);
-        engine.resize(40, 10);
-        engine.advance(b"\x1b[?3l");
-        assert!(
-            visible_has_line(&engine),
-            "DECCOLM reset must not blank the shrunken pane: {:?}",
-            engine.visible_rows()
-        );
     }
 
     // docs/07: agent detection must read the **live** screen, never the
@@ -3233,5 +3054,17 @@ mod tests {
 
         engine.advance(b"\x1b[?2040$p");
         assert_eq!(recv_bytes(&rx), b"\x1b[?2040;0$y");
+    }
+
+    #[test]
+    fn osc52_store_forwards_clipboard_text() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut engine = AlacrittyEngine::new(80, 24, tx, budget_for_rows(80, 1000));
+        engine.advance(b"\x1b]52;c;aGVsbG8tb3NjNTI=\x07");
+        assert_eq!(
+            engine.take_pending_clipboard().as_deref(),
+            Some("hello-osc52")
+        );
+        assert!(engine.take_pending_clipboard().is_none());
     }
 }

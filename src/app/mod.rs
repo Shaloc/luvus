@@ -40,6 +40,7 @@ mod git;
 mod input;
 pub(crate) mod io_jobs;
 mod keys;
+pub(crate) mod line_edit;
 mod mission;
 mod modules;
 mod persistence;
@@ -605,6 +606,8 @@ pub struct CmdInspect {
 pub struct TabRename {
     pub target: TabMenuTarget,
     pub buffer: String,
+    /// Caret as a char index into `buffer` (see [`line_edit`]).
+    pub cursor: usize,
 }
 
 /// One row of the open-worktree modal (docs/18 WT): a checkout of the repo, as
@@ -1213,12 +1216,15 @@ pub struct WsRename {
     /// open if another workspace closes through the API.
     pub workspace_id: String,
     pub buffer: String,
+    /// Caret as a char index into `buffer` (see [`line_edit`]).
+    pub cursor: usize,
 }
 
 /// Cap a custom workspace name (same reasoning as [`TAB_NAME_MAX`]). Shared
 /// with the CLI so local validation and the socket mutation agree.
 pub(crate) const WS_NAME_MAX: usize = 40;
 const MAX_CLOSED_WORKSPACE_PATHS: usize = 128;
+const FOCUS_HISTORY_LIMIT: usize = 64;
 
 /// Why workspace metadata could not be changed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1234,6 +1240,8 @@ pub enum WorkspaceUpdateError {
 pub struct PaneRename {
     pub pane: PaneId,
     pub buffer: String,
+    /// Caret as a char index into `buffer` (see [`line_edit`]).
+    pub cursor: usize,
 }
 
 /// Cap a live pane name at the addressable-name length (`[a-z][a-z0-9_-]{0,31}`).
@@ -1854,10 +1862,6 @@ pub struct PaneStatus {
     pub state: State,
     pub agent: String,
     pub last_activity: Instant,
-    /// One exact follow-up after recent output leaves `ACTIVITY_WINDOW`.
-    /// PTY events move this deadline forward; detection clears it after the
-    /// boundary is inspected, avoiding a 100 ms poll throughout the window.
-    quiet_check_at: Option<Instant>,
     /// When the user last sent input (keystrokes/paste) to this pane. Lets
     /// detection tell a user typing (whose echo is also output) apart from the
     /// agent generating (docs/07). Defaults old so unfocused/new panes aren't
@@ -1924,7 +1928,6 @@ impl PaneStatus {
             state: State::Idle,
             agent,
             last_activity: Instant::now(),
-            quiet_check_at: None,
             // Old by default so a freshly spawned pane's first output isn't gated
             // as "the user is typing".
             last_input: Instant::now()
@@ -2283,6 +2286,13 @@ impl MenuScroll {
     }
 }
 
+pub const WORKTREE_CREATE_PENDING: &str = "__worktree_create_pending__";
+pub const WORKTREE_REMOVE_PENDING: &str = "__worktree_remove_pending__";
+
+fn is_worktree_create_pending(error: &(String, String)) -> bool {
+    error.1 == WORKTREE_CREATE_PENDING
+}
+
 pub struct App {
     pub panes: HashMap<PaneId, Pane>,
     /// One random value for this server lifetime. Harness runtimes from an old
@@ -2335,6 +2345,9 @@ pub struct App {
     config_baseline: crate::config::Config,
     config_persistence: config_persistence::ConfigPersistence,
     io_jobs: io_jobs::IoJobs,
+    worktree_provider_inflight: bool,
+    pending_worktree_provider: Option<crate::worktree::ProviderJob>,
+    ready_worktree_provider: Option<crate::worktree::ProviderResult>,
     automation_persistence: automation_persistence::AutomationPersistence,
     file_metadata_inflight: bool,
     file_metadata_cursor: usize,
@@ -2345,6 +2358,11 @@ pub struct App {
     /// Explicit normal-mode shortcuts. Empty by default so pane input remains
     /// authoritative unless the user opts a chord into Luvus handling.
     pub direct_keymap: keys::DirectKeymap,
+    /// Process-local pane jump history. Ordinary focus changes append to the
+    /// back stack and clear the forward stack, matching browser/Vim jump-list
+    /// branch semantics. Entries are bounded and are not persisted.
+    focus_history_back: Vec<PaneId>,
+    focus_history_forward: Vec<PaneId>,
     /// The parsed prefix chord (docs/64), from `config.prefix`. Default Ctrl+Space.
     pub prefix: keys::PrefixSpec,
     /// The open Settings modal, if any (`Some` ⇒ modal captures input).
@@ -3133,6 +3151,9 @@ impl App {
             config_baseline,
             config_persistence: config_persistence::ConfigPersistence::default(),
             io_jobs: io_jobs::IoJobs::default(),
+            worktree_provider_inflight: false,
+            pending_worktree_provider: None,
+            ready_worktree_provider: None,
             automation_persistence: automation_persistence::AutomationPersistence::default(),
             file_metadata_inflight: false,
             file_metadata_cursor: 0,
@@ -3140,6 +3161,8 @@ impl App {
             session_save_inflight: false,
             keymap,
             direct_keymap,
+            focus_history_back: Vec::new(),
+            focus_history_forward: Vec::new(),
             prefix,
             agent_names: HashMap::new(),
             settings: None,
@@ -3835,6 +3858,9 @@ impl App {
             config_baseline,
             config_persistence: config_persistence::ConfigPersistence::default(),
             io_jobs: io_jobs::IoJobs::default(),
+            worktree_provider_inflight: false,
+            pending_worktree_provider: None,
+            ready_worktree_provider: None,
             automation_persistence: automation_persistence::AutomationPersistence::default(),
             file_metadata_inflight: false,
             file_metadata_cursor: 0,
@@ -3842,6 +3868,8 @@ impl App {
             session_save_inflight: false,
             keymap,
             direct_keymap,
+            focus_history_back: Vec::new(),
+            focus_history_forward: Vec::new(),
             prefix,
             agent_names,
             settings: None,
@@ -4518,7 +4546,10 @@ impl App {
                 Some(WorkspaceSidebarRow::Workspace(workspace, _))
                     if key.code == KeyCode::Enter =>
                 {
-                    self.focus_workspace(*workspace);
+                    let workspace = *workspace;
+                    let tab = self.workspaces[workspace].active_tab;
+                    let pane = self.workspaces[workspace].tabs[tab].layout.focus;
+                    self.focus_location(workspace, tab, pane);
                     self.sidebar_focus = None;
                 }
                 _ => {}
@@ -5301,6 +5332,7 @@ impl App {
         spawn: impl FnOnce(&mut Self) -> Option<PaneId>,
     ) -> Option<PaneId> {
         let previous_zoom = self.zoomed;
+        let caller_focus = self.layout().focus;
         let previous_target_focus = self.workspaces[workspace].tabs[tab].layout.focus;
         let new_id = spawn(self)?;
         {
@@ -5312,6 +5344,10 @@ impl App {
             }
         }
         if focus {
+            if caller_focus != new_id {
+                Self::push_focus_history(&mut self.focus_history_back, caller_focus);
+                self.focus_history_forward.clear();
+            }
             self.focus_workspace(workspace);
             self.workspaces[workspace].active_tab = tab;
             self.scroll_pane = None;
@@ -5713,6 +5749,53 @@ impl App {
         if !crate::git::local::is_repo(repo) {
             return Err("not a git repository".into());
         }
+        let ready_matches = matches!(
+            self.ready_worktree_provider.as_ref(),
+            Some(crate::worktree::ProviderResult::Created(ready))
+                if ready.matches(repo, branch)
+        );
+        if ready_matches {
+            let Some(crate::worktree::ProviderResult::Created(ready)) =
+                self.ready_worktree_provider.take()
+            else {
+                unreachable!("matched created worktree result");
+            };
+            if self.create_workspace_at(ready.path.clone()) {
+                return Ok(ready.path);
+            }
+            if !ready.worktree_created {
+                return Err("provider returned a worktree whose workspace did not open".into());
+            }
+            let mut cleanup = crate::git::local::worktree_remove_force(repo, &ready.path);
+            if cleanup.is_ok() && ready.branch_created {
+                cleanup = crate::git::local::branch_delete_force(repo, branch);
+            }
+            let detail = cleanup
+                .err()
+                .map(|error| format!("; cleanup failed: {error}"))
+                .unwrap_or_default();
+            return Err(format!(
+                "worktree created but its workspace did not open{detail}"
+            ));
+        }
+        if self.ready_worktree_provider.is_some() {
+            self.discard_ready_worktree();
+            return Err("worktree target changed while the provider was running".into());
+        }
+        if let Some(job) = crate::worktree::module_job(
+            &self.config.worktree,
+            &self.modules,
+            &self.module_tokens,
+            crate::module::context::build(self, "worktree.provider"),
+            repo,
+            branch,
+        )? {
+            if self.worktree_provider_inflight || self.pending_worktree_provider.is_some() {
+                return Err("a worktree creation is already pending".into());
+            }
+            self.pending_worktree_provider = Some(job);
+            return Err(WORKTREE_CREATE_PENDING.into());
+        }
         // Nest under the **main** worktree's name, so every checkout of one repo
         // groups under a single folder even when you branch off another worktree.
         let base = worktrees_dir_for(repo);
@@ -5726,9 +5809,172 @@ impl App {
             path = base.join(format!("{slug}-{n}"));
             n += 1;
         }
-        crate::git::local::worktree_add(repo, &path, branch)?;
+        let path = crate::worktree::create_git(repo, &path, branch)?;
         self.create_workspace_at(path.clone());
         Ok(path)
+    }
+
+    pub(crate) fn remove_worktree_explicit(
+        &mut self,
+        repo: &std::path::Path,
+        path: &std::path::Path,
+        force: bool,
+    ) -> Result<(), String> {
+        let ready_matches = matches!(
+            self.ready_worktree_provider.as_ref(),
+            Some(crate::worktree::ProviderResult::Removed(ready))
+                if crate::platform::same_path(ready, path)
+        );
+        if ready_matches {
+            self.ready_worktree_provider.take();
+            self.finish_explicit_worktree_remove(path);
+            return Ok(());
+        }
+        if self.ready_worktree_provider.is_some() {
+            self.discard_ready_worktree();
+            return Err("worktree target changed while the provider was running".into());
+        }
+        let worktrees = crate::git::local::worktrees(repo)?;
+        let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let target = worktrees.iter().find(|worktree| {
+            !worktree.is_main
+                && std::fs::canonicalize(&worktree.path)
+                    .map(|candidate| crate::platform::same_path(&candidate, &canonical_path))
+                    .unwrap_or(false)
+        });
+        let Some(target) = target else {
+            return Err("worktree removal target is not a linked worktree".into());
+        };
+        if let Some(job) = crate::worktree::module_remove_job(
+            &self.config.worktree,
+            &self.modules,
+            &self.module_tokens,
+            crate::module::context::build(self, "worktree.provider.remove"),
+            crate::worktree::RemoveRequest {
+                repo: repo.to_path_buf(),
+                path: path.to_path_buf(),
+                branch: target.branch.clone(),
+                force,
+            },
+        )? {
+            if self.worktree_provider_inflight || self.pending_worktree_provider.is_some() {
+                return Err("a worktree provider operation is already pending".into());
+            }
+            self.pending_worktree_provider = Some(job);
+            return Err(WORKTREE_REMOVE_PENDING.into());
+        }
+        if force {
+            crate::git::local::worktree_remove_force(repo, path)?;
+            if path.exists() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        } else {
+            crate::git::local::worktree_remove(repo, path)?;
+        }
+        self.finish_explicit_worktree_remove(path);
+        Ok(())
+    }
+
+    fn finish_explicit_worktree_remove(&mut self, path: &std::path::Path) {
+        if let Some(parent) = path.parent() {
+            if parent.starts_with(crate::persist::config_dir().join("worktrees")) {
+                let _ = std::fs::remove_dir(parent);
+            }
+        }
+        if let Some(index) = self.workspaces.iter().position(|workspace| {
+            workspace.remote.is_none() && crate::platform::same_path(&workspace.cwd, path)
+        }) {
+            self.close_workspace(index);
+        }
+    }
+
+    fn schedule_pending_worktree_remove(
+        &mut self,
+        finish: impl FnOnce(&mut App, Result<(), String>) -> bool + Send + 'static,
+    ) -> Result<(), String> {
+        self.schedule_pending_worktree_provider(crate::worktree::ProviderKind::Remove, finish)
+    }
+
+    fn ready_created_worktree(&self) -> Option<&crate::worktree::CreatedWorktree> {
+        match self.ready_worktree_provider.as_ref() {
+            Some(crate::worktree::ProviderResult::Created(ready)) => Some(ready),
+            _ => None,
+        }
+    }
+
+    fn discard_ready_worktree(&mut self) {
+        let Some(ready) = self.ready_worktree_provider.take() else {
+            return;
+        };
+        let crate::worktree::ProviderResult::Created(ready) = ready else {
+            return;
+        };
+        if !ready.worktree_created {
+            return;
+        }
+        let mut cleanup = crate::git::local::worktree_remove_force(&ready.repo, &ready.path);
+        if cleanup.is_ok() && ready.branch_created {
+            cleanup = crate::git::local::branch_delete_force(&ready.repo, &ready.branch);
+        }
+        if let Err(error) = cleanup {
+            self.show_toast(format!("worktree cleanup failed: {error}"));
+        }
+    }
+
+    fn schedule_pending_worktree(
+        &mut self,
+        finish: impl FnOnce(&mut App, Result<(), String>) -> bool + Send + 'static,
+    ) -> Result<(), String> {
+        self.schedule_pending_worktree_provider(crate::worktree::ProviderKind::Create, finish)
+    }
+
+    fn schedule_pending_worktree_provider(
+        &mut self,
+        expected: crate::worktree::ProviderKind,
+        finish: impl FnOnce(&mut App, Result<(), String>) -> bool + Send + 'static,
+    ) -> Result<(), String> {
+        let job = self
+            .pending_worktree_provider
+            .take()
+            .ok_or_else(|| "worktree provider did not prepare a job".to_string())?;
+        let kind = job.kind();
+        if kind != expected {
+            return Err("worktree provider prepared the wrong operation".into());
+        }
+        self.worktree_provider_inflight = true;
+        self.io_jobs
+            .submit_parallel(self.app_tx.clone(), move |cancelled| {
+                let result = job.run(&cancelled);
+                Box::new(move |app| {
+                    app.worktree_provider_inflight = false;
+                    let result = result.and_then(|ready| {
+                        let matches = matches!(
+                            (&ready, kind),
+                            (
+                                crate::worktree::ProviderResult::Created(_),
+                                crate::worktree::ProviderKind::Create
+                            ) | (
+                                crate::worktree::ProviderResult::Removed(_),
+                                crate::worktree::ProviderKind::Remove
+                            )
+                        );
+                        if !matches {
+                            return Err(
+                                "worktree provider returned the wrong operation result".into()
+                            );
+                        }
+                        app.ready_worktree_provider = Some(ready);
+                        Ok(())
+                    });
+                    let changed = finish(app, result);
+                    app.start_pending_automation_runs(crate::automation::unix_now());
+                    changed
+                })
+            })
+            .inspect_err(|_| {
+                self.worktree_provider_inflight = false;
+            })
+            .map_err(str::to_string)
     }
 
     /// Open the new-worktree branch prompt (`Ctrl+Space G`) for the active workspace,
@@ -5749,7 +5995,12 @@ impl App {
             if tab.is_renameable() {
                 let buffer = tab.name.clone().unwrap_or_default();
                 if let Some(target) = self.tab_menu_target(workspace, index) {
-                    self.tab_rename = Some(TabRename { target, buffer });
+                    let cursor = buffer.chars().count();
+                    self.tab_rename = Some(TabRename {
+                        target,
+                        buffer,
+                        cursor,
+                    });
                 }
             }
         }
@@ -5770,19 +6021,11 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
+            _ => {
                 if let Some(r) = self.tab_rename.as_mut() {
-                    r.buffer.pop();
+                    line_edit::edit_line(&mut r.buffer, &mut r.cursor, key, TAB_NAME_MAX, |_| true);
                 }
             }
-            KeyCode::Char(c) => {
-                if let Some(r) = self.tab_rename.as_mut() {
-                    if r.buffer.chars().count() < TAB_NAME_MAX {
-                        r.buffer.push(c);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -6314,15 +6557,25 @@ impl App {
             self.show_toast("not a worktree");
             return;
         };
-        match crate::git::local::worktree_remove_force(&repo, &path) {
-            Ok(()) => {
-                if path.exists() {
-                    let _ = std::fs::remove_dir_all(&path);
+        match self.remove_worktree_explicit(&repo, &path, true) {
+            Ok(()) => self.show_toast("worktree deleted"),
+            Err(error) if error == WORKTREE_REMOVE_PENDING => {
+                self.show_toast("deleting worktree…");
+                let scheduled = self.schedule_pending_worktree_remove(move |app, result| {
+                    match result {
+                        Ok(()) => match app.remove_worktree_explicit(&repo, &path, true) {
+                            Ok(()) => app.show_toast("worktree deleted"),
+                            Err(error) => app.show_toast(format!("delete failed: {error}")),
+                        },
+                        Err(error) => app.show_toast(format!("delete failed: {error}")),
+                    }
+                    true
+                });
+                if let Err(error) = scheduled {
+                    self.show_toast(format!("delete failed: {error}"));
                 }
-                self.close_workspace(index);
-                self.show_toast("worktree deleted");
             }
-            Err(e) => self.show_toast(format!("delete failed: {e}")),
+            Err(error) => self.show_toast(format!("delete failed: {error}")),
         }
     }
 
@@ -6332,6 +6585,7 @@ impl App {
             self.ws_rename = Some(WsRename {
                 workspace_id: w.id.clone(),
                 buffer: w.name.clone(),
+                cursor: w.name.chars().count(),
             });
         }
     }
@@ -6360,7 +6614,12 @@ impl App {
             .find_map(|(name, target)| (*target == pane).then_some(name.as_str()))
             .unwrap_or("")
             .to_string();
-        self.pane_rename = Some(PaneRename { pane, buffer });
+        let cursor = buffer.chars().count();
+        self.pane_rename = Some(PaneRename {
+            pane,
+            buffer,
+            cursor,
+        });
     }
 
     /// Key handling while the pane-rename modal is open. `Enter` applies the name
@@ -6375,24 +6634,33 @@ impl App {
                     self.set_agent_name(r.pane, (!name.is_empty()).then_some(name));
                 }
             }
-            KeyCode::Backspace => {
+            _ => {
                 if let Some(r) = self.pane_rename.as_mut() {
-                    r.buffer.pop();
+                    let key = match key.code {
+                        KeyCode::Char(c) => {
+                            KeyEvent::new(KeyCode::Char(c.to_ascii_lowercase()), key.modifiers)
+                        }
+                        _ => key,
+                    };
+                    // Every edit must keep the name addressable: a letter first,
+                    // then letters, digits, `_`, or `-`. Deleting a leading letter
+                    // that would expose a digit is refused like a bad keystroke.
+                    let addressable = |name: &str| {
+                        let mut chars = name.chars();
+                        chars.next().is_none_or(|c| c.is_ascii_lowercase())
+                            && chars.all(|c| {
+                                c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-'
+                            })
+                    };
+                    line_edit::edit_line(
+                        &mut r.buffer,
+                        &mut r.cursor,
+                        key,
+                        PANE_NAME_MAX,
+                        addressable,
+                    );
                 }
             }
-            KeyCode::Char(c) => {
-                if let Some(r) = self.pane_rename.as_mut() {
-                    let c = c.to_ascii_lowercase();
-                    let char_ok =
-                        c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-';
-                    // A name must start with a letter.
-                    let first_ok = !r.buffer.is_empty() || c.is_ascii_lowercase();
-                    if char_ok && first_ok && r.buffer.chars().count() < PANE_NAME_MAX {
-                        r.buffer.push(c);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -6413,19 +6681,11 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
+            _ => {
                 if let Some(r) = self.ws_rename.as_mut() {
-                    r.buffer.pop();
+                    line_edit::edit_line(&mut r.buffer, &mut r.cursor, key, WS_NAME_MAX, |_| true);
                 }
             }
-            KeyCode::Char(c) => {
-                if let Some(r) = self.ws_rename.as_mut() {
-                    if r.buffer.chars().count() < WS_NAME_MAX {
-                        r.buffer.push(c);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -7071,6 +7331,12 @@ impl App {
 
     /// Key handling while the new-worktree prompt is open.
     pub fn handle_worktree_prompt_key(&mut self, key: KeyEvent) {
+        if self.worktree_provider_inflight
+            && self.worktree_error.as_deref() == Some("creating worktree…")
+            && key.code != KeyCode::Esc
+        {
+            return;
+        }
         match key.code {
             KeyCode::Esc => {
                 self.worktree_prompt = None;
@@ -7086,6 +7352,40 @@ impl App {
                             self.worktree_prompt = None;
                             self.worktree_repo = None;
                             self.worktree_error = None;
+                        }
+                        Err(e) if e == WORKTREE_CREATE_PENDING => {
+                            self.worktree_error = Some("creating worktree…".into());
+                            let expected_repo = repo.clone();
+                            let expected_branch = branch.clone();
+                            let scheduled = self.schedule_pending_worktree(move |app, result| {
+                                let still_pending =
+                                    app.worktree_repo.as_ref().is_some_and(|current| {
+                                        crate::platform::same_path(current, &expected_repo)
+                                    }) && app.worktree_prompt.as_deref()
+                                        == Some(expected_branch.as_str());
+                                if !still_pending {
+                                    app.discard_ready_worktree();
+                                    return true;
+                                }
+                                match result {
+                                    Ok(()) => match app.create_worktree(&repo, &branch) {
+                                        Ok(_) => {
+                                            app.worktree_prompt = None;
+                                            app.worktree_repo = None;
+                                            app.worktree_error = None;
+                                        }
+                                        Err(error) => {
+                                            app.discard_ready_worktree();
+                                            app.worktree_error = Some(error);
+                                        }
+                                    },
+                                    Err(error) => app.worktree_error = Some(error),
+                                }
+                                true
+                            });
+                            if let Err(error) = scheduled {
+                                self.worktree_error = Some(error);
+                            }
                         }
                         // Failure (branch already checked out, dirty tree, empty
                         // name…): keep the prompt open and show why, so it's never
@@ -7314,8 +7614,8 @@ impl App {
         {
             return Err(TabFocusError::PositionOutOfRange);
         }
-        self.focus_workspace(workspace);
-        self.workspaces[workspace].active_tab = index;
+        let pane = self.workspaces[workspace].tabs[index].layout.focus;
+        self.focus_location(workspace, index, pane);
         Ok(())
     }
 
@@ -7324,10 +7624,13 @@ impl App {
     }
 
     fn cycle_tab(&mut self, delta: isize) {
-        let ws = &mut self.workspaces[self.active_ws];
+        let workspace = self.active_ws;
+        let ws = &self.workspaces[workspace];
         let n = ws.tabs.len() as isize;
         if n > 0 {
-            ws.active_tab = (((ws.active_tab as isize + delta) % n + n) % n) as usize;
+            let tab = (((ws.active_tab as isize + delta) % n + n) % n) as usize;
+            let pane = ws.tabs[tab].layout.focus;
+            self.focus_location(workspace, tab, pane);
         }
     }
 
@@ -7658,8 +7961,40 @@ impl App {
         result
     }
 
+    fn push_focus_history(history: &mut Vec<PaneId>, id: PaneId) {
+        if history.last() == Some(&id) {
+            return;
+        }
+        if history.len() == FOCUS_HISTORY_LIMIT {
+            history.remove(0);
+        }
+        history.push(id);
+    }
+
+    fn set_focus_location(&mut self, workspace: usize, tab: usize, id: PaneId) {
+        self.focus_workspace(workspace);
+        self.workspaces[workspace].active_tab = tab;
+        self.workspaces[workspace].tabs[tab].layout.focus = id;
+        self.scroll_pane = None;
+        self.mode = Mode::Normal;
+    }
+
+    fn focus_location(&mut self, workspace: usize, tab: usize, id: PaneId) {
+        let current = self.focused_leaf().unwrap_or(id);
+        let location_changed = self.active_ws != workspace
+            || self.workspaces[workspace].active_tab != tab
+            || current != id;
+        if location_changed {
+            Self::push_focus_history(&mut self.focus_history_back, current);
+            self.focus_history_forward.clear();
+            self.set_focus_location(workspace, tab, id);
+        } else {
+            self.focus_workspace(workspace);
+            self.mode = Mode::Normal;
+        }
+    }
+
     fn focus_pane_global(&mut self, id: PaneId) {
-        let changed = self.layout().focus != id;
         let mut found = None;
         for (wi, ws) in self.workspaces.iter().enumerate() {
             for (ti, tab) in ws.tabs.iter().enumerate() {
@@ -7669,13 +8004,43 @@ impl App {
             }
         }
         if let Some((wi, ti)) = found {
-            self.focus_workspace(wi);
-            self.workspaces[wi].active_tab = ti;
-            self.workspaces[wi].tabs[ti].layout.focus = id;
-            if changed {
-                self.scroll_pane = None;
+            self.focus_location(wi, ti, id);
+        }
+    }
+
+    /// Move backward through pane focus history. Dead panes are discarded
+    /// lazily, so closing a tab or workspace cannot strand navigation.
+    fn focus_history_back(&mut self) {
+        let Some(current) = self.focused_leaf() else {
+            return;
+        };
+        while let Some(target) = self.focus_history_back.pop() {
+            if target == current {
+                continue;
             }
-            self.mode = Mode::Normal;
+            if let Some((workspace, tab)) = self.pane_location(target) {
+                Self::push_focus_history(&mut self.focus_history_forward, current);
+                self.set_focus_location(workspace, tab, target);
+                return;
+            }
+        }
+    }
+
+    /// Move forward after one or more history-back jumps. Any ordinary focus
+    /// change clears this stack and begins a new history branch.
+    fn focus_history_forward(&mut self) {
+        let Some(current) = self.focused_leaf() else {
+            return;
+        };
+        while let Some(target) = self.focus_history_forward.pop() {
+            if target == current {
+                continue;
+            }
+            if let Some((workspace, tab)) = self.pane_location(target) {
+                Self::push_focus_history(&mut self.focus_history_back, current);
+                self.set_focus_location(workspace, tab, target);
+                return;
+            }
         }
     }
 
@@ -7690,13 +8055,20 @@ impl App {
         }
         let n = self.workspaces.len() as isize;
         if n > 0 {
-            self.active_ws = (((self.active_ws as isize + delta) % n + n) % n) as usize;
+            let workspace = (((self.active_ws as isize + delta) % n + n) % n) as usize;
+            let tab = self.workspaces[workspace].active_tab;
+            let pane = self.workspaces[workspace].tabs[tab].layout.focus;
+            self.focus_pane_global(pane);
         }
     }
 
     fn focus_dir(&mut self, dir: Dir) {
         let area = self.last_pane_area;
+        let current = self.layout().focus;
         self.layout_mut().focus_dir(area, dir);
+        let next = self.layout().focus;
+        self.layout_mut().focus = current;
+        self.focus_pane_global(next);
     }
 
     /// Cycle focus within the current tab's leaf order, wrapping at both ends.
@@ -7710,9 +8082,7 @@ impl App {
         let idx = leaves.iter().position(|&id| id == focus).unwrap_or(0);
         let len = leaves.len() as isize;
         let next = leaves[((idx as isize + delta) % len + len) as usize % leaves.len()];
-        self.layout_mut().focus = next;
-        self.scroll_pane = None;
-        self.mode = Mode::Normal;
+        self.focus_pane_global(next);
     }
 
     fn focus_next_pane(&mut self) {
@@ -8116,6 +8486,8 @@ impl App {
     }
 
     fn close_pane(&mut self, id: PaneId) {
+        self.focus_history_back.retain(|pane| *pane != id);
+        self.focus_history_forward.retain(|pane| *pane != id);
         crate::orch::worker::discard(id);
         let owner = self.pane_location(id);
         let durable = self
@@ -8590,6 +8962,43 @@ mod tests {
 
     use crate::persist::TEST_ENV_LOCK as ENV_GUARD;
 
+    #[test]
+    fn worktree_create_pending_is_carried_in_the_error_message() {
+        assert!(is_worktree_create_pending(&(
+            "git_error".into(),
+            WORKTREE_CREATE_PENDING.into()
+        )));
+        assert!(!is_worktree_create_pending(&(
+            WORKTREE_CREATE_PENDING.into(),
+            "ordinary error".into()
+        )));
+    }
+
+    #[cfg(unix)]
+    fn api_call_with_workers(
+        app: &mut App,
+        events: &mpsc::Receiver<AppEvent>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> serde_json::Value {
+        let (reply, response) = mpsc::channel();
+        app.handle_event(AppEvent::Api(ApiRequest {
+            id: "test".into(),
+            method: method.into(),
+            params,
+            reply,
+        }));
+        loop {
+            if let Ok(response) = response.try_recv() {
+                return serde_json::from_str(&response).unwrap();
+            }
+            let event = events
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("API worker completion");
+            app.handle_event(event);
+        }
+    }
+
     /// Exercise guards for a restore/spawn failure that leaves no layout. Normal
     /// user close paths immediately create a neutral home terminal instead.
     fn force_empty_session(app: &mut App) {
@@ -8832,6 +9241,19 @@ mod tests {
             app.handle_event(key(' ', KeyModifiers::CONTROL)),
             "entering prefix mode must repaint"
         );
+    }
+
+    #[test]
+    fn pane_osc52_store_queues_pending_clipboard() {
+        let _env = crate::persist::test_env("pane-osc52-clipboard");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let id = app.layout().focus;
+        if let Ok(mut engine) = app.panes.get(&id).unwrap().engine.lock() {
+            engine.advance(b"\x1b]52;c;aGVsbG8tb3NjNTI=\x07");
+        }
+        assert!(app.handle_event(AppEvent::PtyData(id)));
+        assert_eq!(app.pending_clipboard.as_deref(), Some("hello-osc52"));
     }
 
     #[test]
@@ -9233,6 +9655,425 @@ mod tests {
             wt.to_str().unwrap(),
         ]);
         (base, repo, wt)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn api_worktree_create_uses_configured_module_provider() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env = crate::persist::test_env("module-provider-api-create");
+        let (base, repo, _sibling) = repo_with_sibling_worktree("module-provider-api-create");
+        let path = base.join("wt-topic");
+        let module = base.join("module");
+        std::fs::create_dir_all(&module).unwrap();
+        let fake = module.join("create-worktree");
+        std::fs::write(
+            &fake,
+            r#"#!/bin/sh
+if env | grep -q '^LUVUS_WORKTREE_'; then
+  printf '%s\n' 'legacy worktree request environment was set' >&2
+  exit 3
+fi
+request="$LUVUS_MODULE_STATE_DIR/request.json"
+cat > "$request"
+repo=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$request")
+branch=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["branch"])' "$request")
+branch_exists=$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["branch_exists"]).lower())' "$request")
+if [ "$branch" = hook-error ]; then
+  printf '%s\n' 'provider needs interactive approval' >&2
+  exit 2
+fi
+if [ "$branch_exists" = false ]; then create='-b'; fi
+safe=$(printf '%s' "$branch" | tr '/ ' '--')
+target="$(dirname "$repo")/wt-$safe"
+git -C "$repo" worktree add -q $create "$branch" "$target"
+if [ "$branch" = post-create-error ]; then
+  printf '%s\n' 'uncommitted provider work' > "$target/uncommitted.txt"
+  printf '%s\n' 'provider failed after creating the worktree' >&2
+  exit 2
+fi
+if [ "$branch" = invalid-json ]; then
+  printf '%s\n' 'uncommitted provider work' > "$target/uncommitted.txt"
+  printf '%s\n' 'provider log on stdout'
+  exit 0
+fi
+printf '%s\n' "{\"path\":\"$target\"}"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(
+            module.join("luvus-module.toml"),
+            r#"id = "example.worktree"
+name = "Worktree provider"
+version = "0.1.0"
+min_luvus_version = "0.14.0"
+[worktree_provider]
+command = ["./create-worktree"]
+remove_command = ["./remove-worktree"]
+"#,
+        )
+        .unwrap();
+        let remove = module.join("remove-worktree");
+        std::fs::write(
+            &remove,
+            r#"#!/bin/sh
+if env | grep -q '^LUVUS_WORKTREE_'; then
+  printf '%s\n' 'legacy worktree request environment was set' >&2
+  exit 3
+fi
+request="$LUVUS_MODULE_STATE_DIR/remove-request.json"
+cat > "$request"
+repo=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$request")
+path=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["path"])' "$request")
+branch=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["branch"])' "$request")
+force=$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["force"]).lower())' "$request")
+if [ "$branch" = stdout-remove ]; then
+  git -C "$repo" worktree remove "$path"
+  printf noise
+  exit 0
+fi
+if [ "$branch" = stdout-no-remove ]; then printf noise; exit 0; fi
+if [ "$branch" = no-remove ]; then exit 0; fi
+if [ "$force" = true ]; then force_arg='--force'; fi
+git -C "$repo" worktree remove $force_arg "$path"
+if [ "$branch" = post-remove-error ]; then
+  printf '%s\n' 'provider failed after removing the worktree' >&2
+  exit 2
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&remove, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let (tx, events) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.module_link_with(&module, true, None).unwrap();
+        let info = api_call(
+            &mut app,
+            "module.info",
+            serde_json::json!({"id":"example.worktree"}),
+        );
+        assert_eq!(info["result"]["worktree_provider"], true);
+        assert_eq!(info["result"]["worktree_remove_provider"], true);
+        app.workspaces[0].cwd = repo.clone();
+        app.config.worktree = crate::config::WorktreeConfig {
+            provider: "example.worktree".into(),
+        };
+        let (reply, response) = mpsc::channel();
+        app.handle_event(AppEvent::Api(ApiRequest {
+            id: "create".into(),
+            method: "worktree.create".into(),
+            params: serde_json::json!({"branch":"topic"}),
+            reply,
+        }));
+        assert!(response.try_recv().is_err(), "provider request is parked");
+        let ping = api_call(&mut app, "ping", serde_json::json!({}));
+        assert_eq!(ping["result"]["type"], "pong");
+        let response = loop {
+            if let Ok(response) = response.try_recv() {
+                break serde_json::from_str::<serde_json::Value>(&response).unwrap();
+            }
+            app.handle_event(
+                events
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .expect("provider completion"),
+            );
+        };
+        assert_eq!(
+            response["result"]["path"],
+            path.display().to_string(),
+            "{response}"
+        );
+        assert!(crate::platform::same_path(&app.ws().cwd, &path));
+        let request: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                crate::module::paths::state_dir("example.worktree").join("request.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(request["version"], 1);
+        assert_eq!(request["operation"], "create");
+        assert_eq!(request["repository"], repo.display().to_string());
+        assert_eq!(request["branch"], "topic");
+        assert_eq!(request["branch_exists"], false);
+
+        app.orch
+            .add_task("module worker".into(), vec![], vec![], None)
+            .unwrap();
+        let workspace_id = app.ws().id.clone();
+        let started = api_call_with_workers(
+            &mut app,
+            &events,
+            "task.start",
+            serde_json::json!({
+                "id":"t1",
+                "mode":"worktree",
+                "workspace_id":workspace_id
+            }),
+        );
+        assert_eq!(started["result"]["branch"], "luvus/t1");
+        assert_eq!(started["result"]["mode"], "worktree");
+        assert!(started["result"]["pane"].as_str().is_some());
+        let task_path = std::path::PathBuf::from(started["result"]["worktree"].as_str().unwrap());
+        assert!(crate::platform::same_path(&app.ws().cwd, &task_path));
+
+        let topic_workspace = app
+            .workspaces
+            .iter()
+            .find(|workspace| crate::platform::same_path(&workspace.cwd, &path))
+            .unwrap()
+            .id
+            .clone();
+        assert!(path.exists(), "topic worktree still exists before removal");
+        let listed = crate::git::local::worktrees(&repo).unwrap();
+        let canonical_topic = std::fs::canonicalize(&path).unwrap();
+        assert!(
+            listed.iter().any(|worktree| {
+                !worktree.is_main
+                    && std::fs::canonicalize(&worktree.path)
+                        .map(|candidate| crate::platform::same_path(&candidate, &canonical_topic))
+                        .unwrap_or(false)
+            }),
+            "topic worktree is registered: {listed:?}"
+        );
+        let removed = api_call_with_workers(
+            &mut app,
+            &events,
+            "worktree.remove",
+            serde_json::json!({"path":path}),
+        );
+        assert_eq!(removed["result"]["type"], "ok", "{removed}");
+        assert!(!path.exists());
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == topic_workspace));
+        let remove_request: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                crate::module::paths::state_dir("example.worktree").join("remove-request.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(remove_request["version"], 1);
+        assert_eq!(remove_request["operation"], "remove");
+        assert_eq!(
+            std::fs::canonicalize(remove_request["repository"].as_str().unwrap()).unwrap(),
+            std::fs::canonicalize(&repo).unwrap(),
+        );
+        assert_eq!(
+            std::path::Path::new(remove_request["path"].as_str().unwrap()),
+            std::path::Path::new(&path),
+        );
+        assert_eq!(remove_request["branch"], "topic");
+        assert_eq!(remove_request["force"], false);
+
+        let add_worktree = |branch: &str| {
+            let target = base.join(format!("wt-{branch}"));
+            let output = std::process::Command::new("git")
+                .args(["worktree", "add", "-q", "-b", branch])
+                .arg(&target)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            target
+        };
+        let stdout_removed = add_worktree("stdout-remove");
+        let stdout_workspace = app.workspaces[0].id.clone();
+        app.workspaces[0].cwd = stdout_removed.clone();
+        let removed_with_stdout = api_call_with_workers(
+            &mut app,
+            &events,
+            "worktree.remove",
+            serde_json::json!({"path":stdout_removed}),
+        );
+        assert_eq!(removed_with_stdout["result"]["type"], "ok");
+        assert!(!stdout_removed.exists());
+        assert!(!app
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.id == stdout_workspace));
+        crate::git::local::branch_delete_force(&repo, "stdout-remove").unwrap();
+        app.active_ws = app
+            .workspaces
+            .iter()
+            .position(|workspace| crate::platform::same_path(&workspace.cwd, &task_path))
+            .unwrap();
+
+        let failed_after_remove = add_worktree("post-remove-error");
+        let post_remove_result = api_call_with_workers(
+            &mut app,
+            &events,
+            "worktree.remove",
+            serde_json::json!({"path":failed_after_remove}),
+        );
+        assert_eq!(post_remove_result["result"]["type"], "ok");
+        assert!(!failed_after_remove.exists());
+        crate::git::local::branch_delete_force(&repo, "post-remove-error").unwrap();
+
+        for (branch, expected) in [
+            ("stdout-no-remove", "must not write to stdout"),
+            ("no-remove", "left the directory in place"),
+        ] {
+            let target = add_worktree(branch);
+            let failed_remove = api_call_with_workers(
+                &mut app,
+                &events,
+                "worktree.remove",
+                serde_json::json!({"path":target}),
+            );
+            assert!(
+                failed_remove["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains(expected),
+                "{failed_remove}"
+            );
+            assert!(target.exists());
+            crate::git::local::worktree_remove_force(&repo, &target).unwrap();
+            crate::git::local::branch_delete_force(&repo, branch).unwrap();
+        }
+
+        let revision_remove = add_worktree("revision-remove");
+        let expected_revision = crate::ipc::api::current_sequence(&app.events);
+        let (reply, revision_remove_response) = mpsc::channel();
+        app.handle_event(AppEvent::Api(ApiRequest {
+            id: "revision-remove".into(),
+            method: "worktree.remove".into(),
+            params: serde_json::json!({
+                "path":revision_remove,
+                "if_revision":expected_revision
+            }),
+            reply,
+        }));
+        assert!(revision_remove_response.try_recv().is_err());
+        app.emit_event("test.remove-revision", serde_json::json!({}));
+        let revision_removed = loop {
+            if let Ok(response) = revision_remove_response.try_recv() {
+                break serde_json::from_str::<serde_json::Value>(&response).unwrap();
+            }
+            app.handle_event(
+                events
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .expect("revisioned remove provider completion"),
+            );
+        };
+        assert_eq!(
+            revision_removed["result"]["type"], "ok",
+            "{revision_removed}"
+        );
+        assert!(!revision_remove.exists());
+        crate::git::local::branch_delete_force(&repo, "revision-remove").unwrap();
+
+        let fallback = add_worktree("fallback-remove");
+        app.modules
+            .find_mut("example.worktree")
+            .unwrap()
+            .manifest
+            .worktree_provider
+            .as_mut()
+            .unwrap()
+            .remove_command = None;
+        let fallback_result = api_call(
+            &mut app,
+            "worktree.remove",
+            serde_json::json!({"path":fallback}),
+        );
+        assert_eq!(fallback_result["result"]["type"], "ok");
+        assert!(!fallback.exists());
+        crate::git::local::branch_delete_force(&repo, "fallback-remove").unwrap();
+
+        app.modules.find_mut("example.worktree").unwrap().enabled = false;
+        let disabled = api_call(
+            &mut app,
+            "worktree.create",
+            serde_json::json!({"branch":"disabled-topic"}),
+        );
+        assert!(
+            disabled["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not enabled"),
+            "{disabled}"
+        );
+        app.modules.find_mut("example.worktree").unwrap().enabled = true;
+
+        let failed = api_call_with_workers(
+            &mut app,
+            &events,
+            "worktree.create",
+            serde_json::json!({"branch":"hook-error"}),
+        );
+        assert_eq!(
+            failed["error"]["message"],
+            "provider needs interactive approval"
+        );
+
+        for branch in ["post-create-error", "invalid-json"] {
+            let failed = api_call_with_workers(
+                &mut app,
+                &events,
+                "worktree.create",
+                serde_json::json!({"branch":branch}),
+            );
+            let message = failed["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains("ownership could not be proven"),
+                "{failed}"
+            );
+            let orphan = base.join(format!("wt-{branch}"));
+            assert!(orphan.exists());
+            assert_eq!(
+                std::fs::read_to_string(orphan.join("uncommitted.txt")).unwrap(),
+                "uncommitted provider work\n"
+            );
+            assert!(crate::git::local::branch_exists(&repo, branch));
+            crate::git::local::worktree_remove_force(&repo, &orphan).unwrap();
+            crate::git::local::branch_delete_force(&repo, branch).unwrap();
+        }
+
+        let expected_revision = crate::ipc::api::current_sequence(&app.events);
+        let (reply, revision_response) = mpsc::channel();
+        app.handle_event(AppEvent::Api(ApiRequest {
+            id: "revision".into(),
+            method: "worktree.create".into(),
+            params: serde_json::json!({
+                "branch":"revision-topic",
+                "if_revision":expected_revision
+            }),
+            reply,
+        }));
+        assert!(revision_response.try_recv().is_err());
+        app.emit_event("test.revision", serde_json::json!({}));
+        let conflict = loop {
+            if let Ok(response) = revision_response.try_recv() {
+                break serde_json::from_str::<serde_json::Value>(&response).unwrap();
+            }
+            app.handle_event(
+                events
+                    .recv_timeout(std::time::Duration::from_secs(3))
+                    .expect("revisioned provider completion"),
+            );
+        };
+        assert_eq!(conflict["error"]["code"], "revision_conflict");
+        assert!(!base.join("wt-revision-topic").exists());
+        assert!(!crate::git::local::branch_exists(&repo, "revision-topic"));
+
+        app.config.worktree.provider = "missing.provider".into();
+        let rejected = api_call(
+            &mut app,
+            "worktree.create",
+            serde_json::json!({"branch":"another-topic"}),
+        );
+        assert!(rejected["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not installed"));
+        let _ = std::fs::remove_dir_all(base);
     }
 
     /// Open the worktree list and apply its scan inline — the bounded worker's
@@ -10942,6 +11783,37 @@ mod tests {
     }
 
     #[test]
+    fn workspace_rename_arrows_move_the_caret_instead_of_typing_at_the_end() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.workspaces[0].name = "Recall issue".into();
+        app.open_ws_rename(0);
+        let press =
+            |app: &mut App, code| app.handle_ws_rename_key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        for _ in 0.."issue".len() {
+            press(&mut app, KeyCode::Left);
+        }
+        for c in "bot ".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        press(&mut app, KeyCode::Home);
+        press(&mut app, KeyCode::Delete);
+        press(&mut app, KeyCode::Char('r'));
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Char('s'));
+        let rename = app.ws_rename.as_ref().expect("rename modal stays open");
+        assert_eq!(rename.buffer, "recall bot issues");
+        assert!(
+            app.ws_menu.is_none() && app.sidebar_focus.is_none(),
+            "no navigation"
+        );
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.workspaces[0].name, "recall bot issues");
+    }
+
+    #[test]
     fn deferred_workspace_actions_abort_after_target_closes() {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -11666,7 +12538,6 @@ mod tests {
 
         app.detect_tick(first);
         let extracted = app.detection_extractions;
-        let considered = app.detection_panes_considered;
         assert!(extracted > 0, "the first tick inspects every pane");
 
         app.detect_tick(first + Duration::from_millis(200));
@@ -11674,15 +12545,12 @@ mod tests {
             app.detection_extractions, extracted,
             "an unchanged pane does not rebuild title or bottom text"
         );
-        assert_eq!(
-            app.detection_panes_considered, considered,
-            "event-driven detection does not revisit a quiet pane between audits"
-        );
+        assert!(app.detection_skips > 0);
 
         if let Some(pane) = app.panes.get(&pane) {
             pane.engine.lock().unwrap().advance(b"new output\r\n");
         }
-        app.detect_tick(first + Duration::from_secs(3));
+        app.detect_tick(first + Duration::from_millis(400));
         assert_eq!(app.detection_extractions, extracted + 1);
     }
 

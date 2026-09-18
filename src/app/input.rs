@@ -352,6 +352,67 @@ impl App {
             return true;
         };
         let response = self.handle_api(&req);
+        let pending = serde_json::from_str::<serde_json::Value>(&response)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/error/message")
+                    .and_then(|message| message.as_str())
+                    .map(str::to_string)
+            });
+        if pending.as_deref() == Some(WORKTREE_REMOVE_PENDING) {
+            let mut retry = req.clone();
+            if let Some(params) = retry.params.as_object_mut() {
+                // Removal is irreversible once the provider starts. The
+                // optimistic precondition was checked before launch, which is
+                // this mutation's linearization point; replay only applies the
+                // already-completed result to server-owned state.
+                params.remove("if_revision");
+            }
+            let parked = req.clone();
+            let scheduled = self.schedule_pending_worktree_remove(move |app, result| {
+                let response = match result {
+                    Ok(()) => app.handle_api(&retry),
+                    Err(message) => json!({"id":parked.id,"error":{
+                        "code":"git_error", "message":message
+                    }})
+                    .to_string(),
+                };
+                app.reply_after_automation_save(parked, response);
+                true
+            });
+            if let Err(message) = scheduled {
+                let _ = req.reply.send(
+                    json!({"id":req.id,"error":{"code":"busy","message":message}}).to_string(),
+                );
+            }
+            return true;
+        }
+        if pending.as_deref() == Some(WORKTREE_CREATE_PENDING) {
+            let retry = req.clone();
+            let parked = req.clone();
+            let scheduled = self.schedule_pending_worktree(move |app, result| {
+                let response = match result {
+                    Ok(()) => {
+                        let response = app.handle_api(&retry);
+                        app.discard_ready_worktree();
+                        response
+                    }
+                    Err(message) => json!({"id":parked.id,"error":{
+                        "code":"git_error", "message":message
+                    }})
+                    .to_string(),
+                };
+                app.reply_after_automation_save(parked, response);
+                true
+            });
+            if let Err(message) = scheduled {
+                let _ = req.reply.send(
+                    json!({"id":req.id,"error":{"code":"busy","message":message}}).to_string(),
+                );
+            }
+            return true;
+        }
         self.reply_after_automation_save(req, response);
         projects_immediately
     }
@@ -959,9 +1020,12 @@ impl App {
                 // so a saturated pane wakes the loop at the render rate, not
                 // once per PTY read.
                 if let Some(s) = self.status.get_mut(&id) {
-                    let now = Instant::now();
-                    s.last_activity = now;
-                    s.quiet_check_at = Some(now + ACTIVITY_WINDOW);
+                    s.last_activity = Instant::now();
+                }
+                if let Some(pane) = self.panes.get(&id) {
+                    if let Some(text) = pane.take_pending_clipboard() {
+                        self.pending_clipboard = Some(text);
+                    }
                 }
                 self.detection_dirty.insert(id);
                 if self.panes.contains_key(&id) {
@@ -3056,7 +3120,9 @@ impl App {
         if let Some((i, _)) = self.ws_rects.iter().find(|(_, rect)| hit(*rect)) {
             let i = (*i).min(self.workspaces.len().saturating_sub(1));
             self.sidebar_focus = None;
-            self.focus_workspace(i);
+            let tab = self.workspaces[i].active_tab;
+            let pane = self.workspaces[i].tabs[tab].layout.focus;
+            self.focus_location(i, tab, pane);
             return;
         }
         // Clicking a view-selector tab in the git tab switches section (docs/17).
@@ -3162,13 +3228,7 @@ impl App {
         }
         if let Some((id, _)) = self.pane_rects.iter().find(|(_, rect)| hit(*rect)) {
             let id = *id;
-            if self.layout().focus != id {
-                // Leave the old pane's viewport exactly where it is. Only drop
-                // keyboard ownership so subsequent input follows the new focus.
-                self.scroll_pane = None;
-            }
-            self.layout_mut().focus = id;
-            self.mode = Mode::Normal;
+            self.focus_pane_global(id);
         }
     }
 
@@ -3552,9 +3612,7 @@ impl App {
             return false;
         }
         pane.scroll_to_bottom(); // the app's coordinates are the live screen's
-        self.scroll_pane = None;
-        self.layout_mut().focus = id;
-        self.mode = Mode::Normal;
+        self.focus_pane_global(id);
         let g = crate::app::MouseGrab {
             pane: id,
             btn: base_btn + mouse_mod_bits(m.modifiers),
@@ -4362,13 +4420,10 @@ impl App {
                         return true;
                     }
                 }
-                // Fixed scrollback keys (like the digits above): scroll the
-                // focused pane's history. `[`/`]` page up/down (no Fn needed on a
-                // Mac), and so do PageUp/PageDown; Home/End jump to the top / live
-                // bottom (Fn+↑/↓/←/→ on a MacBook).
+                // Fixed physical scrollback keys: PageUp/PageDown move by a page;
+                // Home/End jump to the top / live bottom. Printable keys resolve
+                // through the configurable command map below.
                 let scroll_code = match key.code {
-                    KeyCode::Char('[') => Some(KeyCode::PageUp),
-                    KeyCode::Char(']') => Some(KeyCode::PageDown),
                     c @ (KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End) => {
                         Some(c)
                     }
@@ -5122,32 +5177,6 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("an empty server still answers its control API");
         assert!(resp.contains("pong"), "got a real pong, not EOF: {resp}");
-    }
-
-    #[test]
-    fn pane_run_waits_for_pty_output_before_requesting_a_render() {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut app = crate::app::App::new(80, 24, tx).unwrap();
-        let pane = app.layout().focus;
-        let (reply, response) = std::sync::mpsc::channel();
-        let request = crate::ipc::api::ApiRequest {
-            id: "pane-run".into(),
-            method: "pane.run".into(),
-            params: json!({"pane": pane.0.to_string(), "command": "true"}),
-            reply,
-        };
-
-        assert!(
-            !app.handle_event(AppEvent::Api(request)),
-            "queueing terminal input does not change the projected surface"
-        );
-        let response: serde_json::Value = serde_json::from_str(
-            &response
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .expect("pane.run returns its API response"),
-        )
-        .unwrap();
-        assert_eq!(response["result"]["type"], "ok");
     }
 
     #[test]

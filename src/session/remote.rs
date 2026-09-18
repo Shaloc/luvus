@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod bootstrap;
 mod input;
+pub(crate) mod pool;
 pub use input::RemoteInput;
 
 pub const REMOTE_HOST_ENV_VAR: &str = "LUVUS_REMOTE_HOST";

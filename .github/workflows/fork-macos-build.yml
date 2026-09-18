@@ -93,6 +93,8 @@ jobs:
           # Same checkout binary, private homes and fake SSH only; no real hosts.
           # Physical Kitty rendering is verified separately on the Linux fixture.
           NO_COLOR=1 python3 scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --graphics-only
+      - name: Isolated many-workspace SSH admission smoke
+        run: python3 scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --ssh-admission-only
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ steps.package.outputs.name }}

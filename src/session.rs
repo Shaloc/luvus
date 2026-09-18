@@ -289,7 +289,7 @@ fn socket_path_for(name: Option<&str>, file_name: &str, role: &str) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn socket_alias_path(logical: PathBuf, namespace: &str, role: &str) -> PathBuf {
+pub(crate) fn socket_alias_path(logical: PathBuf, namespace: &str, role: &str) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;
 
     // macOS allows only 103 bytes plus the terminating NUL in `sun_path`.
@@ -314,7 +314,7 @@ fn socket_alias_path(logical: PathBuf, namespace: &str, role: &str) -> PathBuf {
 }
 
 #[cfg(not(unix))]
-fn socket_alias_path(logical: PathBuf, _namespace: &str, _role: &str) -> PathBuf {
+pub(crate) fn socket_alias_path(logical: PathBuf, _namespace: &str, _role: &str) -> PathBuf {
     logical
 }
 

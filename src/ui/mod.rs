@@ -1078,20 +1078,28 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     }
     app.worktree_open_rects = worktree_open_rects;
     // The tab-rename modal (docs/28).
-    if let Some(buf) = app.tab_rename.as_ref().map(|r| r.buffer.clone()) {
-        let (c, x) = picker::draw_tab_rename(f, area, &buf, hover, cat, &t);
+    if let Some((buf, cursor)) = app
+        .tab_rename
+        .as_ref()
+        .map(|r| (r.buffer.clone(), r.cursor))
+    {
+        let (c, x) = picker::draw_tab_rename(f, area, &buf, cursor, hover, cat, &t);
         app.modal_commit_rect = c;
         app.modal_cancel_rect = x;
     }
     // The workspace-rename modal, then the right-click context menu (on top).
-    if let Some(buf) = app.ws_rename.as_ref().map(|r| r.buffer.clone()) {
-        let (c, x) = picker::draw_ws_rename(f, area, &buf, hover, cat, &t);
+    if let Some((buf, cursor)) = app.ws_rename.as_ref().map(|r| (r.buffer.clone(), r.cursor)) {
+        let (c, x) = picker::draw_ws_rename(f, area, &buf, cursor, hover, cat, &t);
         app.modal_commit_rect = c;
         app.modal_cancel_rect = x;
     }
     // The pane-rename modal (same look), from the pane / AGENTS right-click menu.
-    if let Some(buf) = app.pane_rename.as_ref().map(|r| r.buffer.clone()) {
-        let (c, x) = picker::draw_pane_rename(f, area, &buf, hover, cat, &t);
+    if let Some((buf, cursor)) = app
+        .pane_rename
+        .as_ref()
+        .map(|r| (r.buffer.clone(), r.cursor))
+    {
+        let (c, x) = picker::draw_pane_rename(f, area, &buf, cursor, hover, cat, &t);
         app.modal_commit_rect = c;
         app.modal_cancel_rect = x;
     }
@@ -1765,87 +1773,6 @@ mod retained_render_tests {
             partial.as_nanos(),
             full.as_nanos(),
             partial.as_secs_f64() / full.as_secs_f64()
-        );
-    }
-
-    fn rect_contains(buffer: &Buffer, rect: Rect, needle: &str) -> bool {
-        let mut line = String::new();
-        for y in rect.y..rect.bottom() {
-            line.clear();
-            for x in rect.x..rect.right() {
-                line.push_str(buffer[(x, y)].symbol());
-            }
-            if line.contains(needle) {
-                return true;
-            }
-        }
-        false
-    }
-
-    #[test]
-    fn horizontal_split_keeps_streaming_rows_when_sync_clear_is_in_flight() {
-        let _env = crate::persist::test_env("split-sync-clear");
-        let (app_tx, _app_rx) = mpsc::channel();
-        let mut app = App::new(100, 40, app_tx).expect("app starts");
-        let original = app.layout().focus;
-        let (response_tx, _response_rx) = mpsc::channel();
-        let engine = create_engine(
-            VtEngineKind::Alacritty,
-            100,
-            40,
-            response_tx,
-            4 * 1024 * 1024,
-            PaneAppearance::default(),
-        );
-        app.panes.get_mut(&original).expect("focused pane").engine = engine.clone();
-        {
-            let mut engine = engine.lock().expect("engine lock");
-            for i in 0..40 {
-                engine.advance(format!("line{i}\r\n").as_bytes());
-            }
-        }
-
-        let area = Rect::new(0, 0, 100, 40);
-        let mut before = Buffer::empty(area);
-        render_into(&mut RenderTarget::new(&mut before, area), &mut app);
-        {
-            let mut engine = engine.lock().expect("engine lock");
-            engine.advance(b"\x1b[?2026h\x1b[H\x1b[2J");
-        }
-        app.run_cmd(crate::app::Cmd::SplitDown);
-        let mut after = Buffer::empty(area);
-        render_into(&mut RenderTarget::new(&mut after, area), &mut app);
-        {
-            let mut engine = engine.lock().expect("engine lock");
-            engine.advance(b"\x1b[?2026l");
-        }
-        after.reset();
-        render_into(&mut RenderTarget::new(&mut after, area), &mut app);
-
-        let original_rect = app
-            .pane_content_rects
-            .iter()
-            .find_map(|(id, rect)| (*id == original).then_some(*rect))
-            .expect("original pane still has a content rect");
-        assert!(
-            rect_contains(&after, original_rect, "line"),
-            "horizontal split must keep the streaming pane's rows"
-        );
-
-        {
-            let mut engine = engine.lock().expect("engine lock");
-            engine.advance(b"\x1b[H\x1b[2J\x1b[2K\n\n\x1b[S\x1bc");
-        }
-        after.reset();
-        render_into(&mut RenderTarget::new(&mut after, area), &mut app);
-        let original_rect = app
-            .pane_content_rects
-            .iter()
-            .find_map(|(id, rect)| (*id == original).then_some(*rect))
-            .expect("original pane still has a content rect");
-        assert!(
-            rect_contains(&after, original_rect, "line"),
-            "SIGWINCH erase after the split must not blank the streaming pane"
         );
     }
 }

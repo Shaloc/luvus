@@ -215,6 +215,7 @@ pub struct RemoteDisplay {
 
 #[derive(Default)]
 pub struct RemoteProjection {
+    retry_delay: Option<Duration>,
     frame_deadline: Option<crate::session::remote::ConnectionDeadline>,
     cell_pixels: Option<(u16, u16)>,
     layout_cell_pixels: Option<(u16, u16)>,
@@ -1102,6 +1103,7 @@ impl App {
                 effect_leader,
                 self.app_tx.clone(),
                 self.remote_connection_scope(&target),
+                Duration::ZERO,
             );
         }
         if self.workspaces.iter().any(|workspace| {
@@ -1226,6 +1228,7 @@ impl App {
             effect_leader,
             self.app_tx.clone(),
             self.remote_connection_scope(target),
+            Duration::ZERO,
         );
     }
 
@@ -1322,6 +1325,7 @@ impl App {
             return;
         }
         view.input = Some(input);
+        view.projection.retry_delay = Some(REMOTE_RETRY_INITIAL);
         view.state = if view.projection.display.projection {
             RemoteViewState::Connecting
         } else {
@@ -1413,7 +1417,35 @@ impl App {
             host: view.target.host.clone(),
             session: view.target.session.clone(),
         };
-        self.retry_remote_session(&target, &error);
+        // A failed workspace display is not evidence that healthy sibling
+        // channels or the topology watcher have failed. Only that watcher owns
+        // session-wide recovery (including a changed owner generation).
+        if !crate::session::remote::failure_needs_attention(&error)
+            && self.config.remote_hosts.contains(&target.host)
+        {
+            if let Some(watcher) = self.remote_session_watchers.get(&target.canonical_name()) {
+                if !watcher.retry_pending {
+                    let delay = view.projection.retry_delay.unwrap_or(REMOTE_RETRY_INITIAL);
+                    let display = view.projection.display.clone();
+                    view.generation = view.generation.wrapping_add(1);
+                    *view.projection = RemoteProjection {
+                        display: display.clone(),
+                        retry_delay: Some((delay * 2).min(REMOTE_RETRY_MAX)),
+                        ..Default::default()
+                    };
+                    spawn_projection(
+                        pane,
+                        view.generation,
+                        view.target.clone(),
+                        display,
+                        view.effect_leader.clone(),
+                        self.app_tx.clone(),
+                        watcher.scope.clone(),
+                        delay,
+                    );
+                }
+            }
+        }
         self.discard_stale_remote_navigation();
         self.rebalance_remote_effect_leaders();
     }
@@ -1956,6 +1988,9 @@ fn outer_command(command: Cmd) -> bool {
             | Cmd::ToggleAgents
             | Cmd::ToggleAgentScope
             | Cmd::NextAttention
+            | Cmd::NextDoneAgent
+            | Cmd::FocusBack
+            | Cmd::FocusForward
             | Cmd::Switcher
             | Cmd::GlobalSearch
             | Cmd::Detach
@@ -2234,6 +2269,7 @@ fn watch_remote_session(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_projection(
     pane: PaneId,
     generation: u64,
@@ -2242,8 +2278,12 @@ fn spawn_projection(
     effect_leader: Arc<AtomicBool>,
     app_tx: mpsc::Sender<AppEvent>,
     scope: Arc<crate::session::remote::ConnectionScope>,
+    retry_delay: Duration,
 ) {
     std::thread::spawn(move || {
+        if !scope.wait_for_retry(retry_delay) {
+            return;
+        }
         let result = run_projection(
             pane,
             generation,
@@ -2277,8 +2317,9 @@ fn run_projection(
         host: target.host.clone(),
         session: target.session.clone(),
     };
-    let mut command =
-        crate::session::remote::bridge_command(&owner, "remote-client-bridge", display.location);
+    let mut connection =
+        crate::session::remote::pool::DisplayConnection::acquire(&target.host, scope)?;
+    let mut command = connection.command(&owner, display.location);
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -2361,6 +2402,7 @@ fn run_projection(
                 .map_err(|error| error.to_string())?;
         }
         drop(deadline);
+        connection.authenticated();
 
         let failed = app_tx.clone();
         let input_tx = RemoteInput::spawn(input, child.0.clone(), move |error| {
@@ -4285,8 +4327,6 @@ pub(crate) mod tests {
             assert_eq!(app.workspaces[app.active_ws].active_tab, 0);
         }
         for code in [
-            KeyCode::Char('['),
-            KeyCode::Char(']'),
             KeyCode::PageUp,
             KeyCode::PageDown,
             KeyCode::Home,
@@ -4660,6 +4700,82 @@ pub(crate) mod tests {
         let view = app.remote_workspace_view(app.active_ws).unwrap();
         assert_eq!(view.state, RemoteViewState::Disconnected);
         assert_eq!(view.generation, 2);
+    }
+
+    #[test]
+    fn one_display_failure_preserves_healthy_siblings_and_topology() {
+        let _env = crate::persist::test_env("remote-local-display-retry");
+        let mut app = remote_ui_app();
+        let (failed, _failed_input, _) = add_remote_workspace(&mut app);
+        let (healthy, healthy_input, _) = add_remote_workspace(&mut app);
+        let target = RemoteSession::new("dev-207", "api").unwrap();
+        app.config.remote_hosts.push(target.host.clone());
+        let scope = Arc::new(crate::session::remote::ConnectionScope::default());
+        app.remote_session_watchers.insert(
+            target.canonical_name(),
+            RemoteWatcher {
+                target: target.clone(),
+                generation: 5,
+                scope: scope.clone(),
+                refresh_projections: false,
+                retry_delay: Some(REMOTE_RETRY_INITIAL),
+                retry_pending: false,
+            },
+        );
+        let ViewKind::Remote(view) = app.views.get_mut(&failed).unwrap() else {
+            unreachable!()
+        };
+        // The queued retry is cancelled below; this test can never launch SSH.
+        view.projection.retry_delay = Some(Duration::from_secs(30));
+        app.apply_remote_projection_closed(
+            failed,
+            1,
+            "Connection closed by test-host port 22".into(),
+        );
+        assert!(app.remote_watcher_is_current(&target, 5));
+        assert!(!app.remote_session_watchers[&target.canonical_name()].retry_pending);
+        assert!(scope.wait_for_retry(Duration::ZERO));
+        let ViewKind::Remote(healthy) = &app.views[&healthy] else {
+            unreachable!()
+        };
+        assert_eq!(healthy.state, RemoteViewState::Ready);
+        assert!(healthy.input.is_some());
+        assert!(
+            healthy_input.try_recv().is_err(),
+            "healthy display must not receive Detach"
+        );
+        let ViewKind::Remote(failed_view) = &app.views[&failed] else {
+            unreachable!()
+        };
+        assert_eq!(failed_view.generation, 2);
+        assert!(failed_view.frame.is_some());
+        scope.cancel();
+    }
+
+    #[test]
+    fn focus_history_shortcuts_stay_on_the_display_client() {
+        let _env = crate::persist::test_env("remote-focus-history-keys");
+        let mut app = remote_ui_app();
+        let local = app.layout().focus;
+        let (remote, receiver, _) = add_remote_workspace(&mut app);
+        app.focus_pane_global(local);
+        app.focus_pane_global(remote);
+        app.handle_event(AppEvent::Key(app.prefix.key_event()));
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('['),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.layout().focus, local);
+        app.handle_event(AppEvent::Key(app.prefix.key_event()));
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.layout().focus, remote);
+        assert!(
+            receiver.try_recv().is_err(),
+            "history shortcuts must not be sent to the owner"
+        );
     }
 
     #[test]

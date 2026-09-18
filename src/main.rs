@@ -37,6 +37,7 @@ mod theme;
 mod uhp;
 mod ui;
 mod update;
+mod worktree;
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -178,25 +179,43 @@ fn main() -> Result<()> {
 
     if let Some(target) = session::remote::process_target() {
         match args.get(1).map(String::as_str) {
-            None | Some("client") => return managed_remote_attach(&target),
-            Some("attach") => return managed_remote_attach_pane(&args, &target),
+            None | Some("client") => {
+                ensure_interactive_launch_allowed()?;
+                return managed_remote_attach(&target);
+            }
+            Some("attach") => {
+                ensure_interactive_launch_allowed()?;
+                return managed_remote_attach_pane(&args, &target);
+            }
             Some("server") => return managed_remote_server_cmd(&args, &target),
             _ => {}
         }
     }
     match args.get(1).map(String::as_str) {
         Some("server") => return server_cmd(&args),
-        Some("client") => return ipc::client::run(&persist::client_socket_path()),
+        Some("client") => {
+            ensure_interactive_launch_allowed()?;
+            return ipc::client::run(&persist::client_socket_path());
+        }
         // Remote attach (docs/18 RA): the bridge runs on the remote host (via
         // ssh); `--remote <host>` launches it from the local side.
-        Some("--remote") => return remote_attach(&args),
+        Some("--remote") => {
+            ensure_interactive_launch_allowed()?;
+            return remote_attach(&args);
+        }
         // `attach <id>` (docs/18 WA-2): focus + zoom the pane, then open the TUI
         // straight into that fullscreen terminal.
-        Some("attach") => return attach_cmd(&args),
+        Some("attach") => {
+            ensure_interactive_launch_allowed()?;
+            return attach_cmd(&args);
+        }
         Some("integration") => {
             std::process::exit(integration::run(&args, i18n::cli::Context::configured())?)
         }
-        Some("--local") => return run_local(),
+        Some("--local") => {
+            ensure_interactive_launch_allowed()?;
+            return run_local();
+        }
         Some(_) if cli::is_cli(&args) => {
             let code = cli::run(&args)?;
             std::process::exit(code);
@@ -204,7 +223,18 @@ fn main() -> Result<()> {
         _ => {}
     }
     // Default: attach to the session server, spawning it if needed.
+    ensure_interactive_launch_allowed()?;
     autodetect_and_attach()
+}
+
+fn ensure_interactive_launch_allowed() -> Result<()> {
+    let inside_luvus = std::env::var_os("LUVUS_ENV").as_deref() == Some(std::ffi::OsStr::new("1"));
+    if inside_luvus && !config::load().allow_nested {
+        return Err(anyhow!(
+            "cannot open luvus inside a luvus pane; set `allow_nested` to `true` in config.json to allow nested clients"
+        ));
+    }
+    Ok(())
 }
 
 fn is_backend_discovery_request(args: &[String]) -> bool {
@@ -1887,6 +1917,20 @@ mod tests {
         })
         .unwrap();
     }
+    #[test]
+    fn nested_interactive_launch_requires_opt_in() {
+        let _env = crate::persist::test_env("nested-launch");
+        std::env::set_var("LUVUS_ENV", "1");
+
+        let error = ensure_interactive_launch_allowed().unwrap_err();
+        assert!(error.to_string().contains("allow_nested"));
+
+        crate::config::save(&crate::config::Config {
+            allow_nested: true,
+            ..Default::default()
+        });
+        assert!(ensure_interactive_launch_allowed().is_ok());
+    }
 
     #[test]
     fn restart_all_targets_only_running_sessions_and_puts_selected_last() {
@@ -2503,6 +2547,9 @@ mod tests {
     /// every draw path — catches panics and layout regressions without a tty.
     #[test]
     fn renders_chrome() {
+        // Default config keeps the runtime-status bar (`tab n/m`); a user's
+        // `bars.off` must not make this integration test depend on $LUVUS_HOME.
+        let _env = crate::persist::test_env("renders-chrome");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
         // Give the shell a moment to emit its prompt into the grid.

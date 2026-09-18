@@ -40,6 +40,15 @@ jobs:
           cargo build --locked
           python3 examples/uhp/terminal/live_conformance.py --luvus target/debug/luvus
           python3 examples/uhp/terminal/failure_conformance.py --luvus target/debug/luvus
+      - name: Validate bounded SSH display pooling
+        run: |
+          if ! test -x /usr/sbin/sshd; then
+            sudo apt-get update
+            sudo apt-get install --yes --no-install-recommends openssh-server
+          fi
+          sudo mkdir -p /run/sshd
+          python3 scripts/test-remote-sessions.py target/debug/luvus --ssh-admission-only
+          python3 scripts/test-ssh-pool.py target/debug/luvus
       - name: Test terminal support crates
         run: |
           cargo test --manifest-path vendor/vte/Cargo.toml --lib
