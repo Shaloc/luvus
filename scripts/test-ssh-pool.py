@@ -90,6 +90,8 @@ try:
     assert "no more sessions" not in ssh_log.lower()
     print("PASS: 16 display channels use 2 authenticated SSH connections, 8 channels each; MaxStartups=10 and MaxSessions=10", flush=True)
 finally:
+    if result is None or result.returncode:
+        print("Isolated sshd diagnostics:\n" + (root / "sshd.log").read_text(), flush=True)
     if smoke and (smoke / "ssh-pool-commands").exists():
         commands = [json.loads(line)["args"] for line in (smoke / "ssh-pool-commands").read_text().splitlines()]
         paths = {args[args.index("-S") + 1] for args in commands if "-S" in args}

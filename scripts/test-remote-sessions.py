@@ -330,8 +330,8 @@ def main():
             raise
         print("PASS:", label, flush=True)
 
-    def wait_for(check):
-        deadline = time.monotonic() + 10
+    def wait_for(check, timeout=10):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             value = check()
             if value:
@@ -449,7 +449,14 @@ def main():
                     state = json.loads(p.read_text()) if p.exists() else {}
                 assert not state.get("rejected"), f"SSH Connection Failed: connection closed during 16-workspace attach: {state}"
                 return state if state.get("started", 0) >= 16 else None
-            state = wait_for(admitted)
+            # All sixteen handshakes deliberately queue; slower CI SSH/PAM
+            # startup must not share the one-operation ten-second allowance.
+            try:
+                state = wait_for(admitted, timeout=60)
+            except Exception:
+                stats = root / "ssh-admission.json"
+                print("SSH admission diagnostics:", stats.read_text() if stats.exists() else "no authenticated display", flush=True)
+                raise
             print("PASS: 16 remote workspaces connect without an SSH startup rejection", state, flush=True)
             if os.environ.get("LUVUS_TEST_SSH_POOL_CONFIG"):
                 channels = [json.loads(line) for line in (root / "ssh-pool-commands").read_text().splitlines()]
