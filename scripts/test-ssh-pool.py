@@ -49,7 +49,9 @@ AllowUsers {user}
 PubkeyAuthentication yes
 PasswordAuthentication no
 ChallengeResponseAuthentication no
-UsePAM no
+# GitHub's runner account has a locked password. PAM account/session handling
+# permits its public-key login without unlocking or changing that account.
+UsePAM yes
 StrictModes yes
 MaxStartups 10:30:10
 MaxSessions 10
