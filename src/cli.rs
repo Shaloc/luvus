@@ -107,7 +107,7 @@ Usage:
 Commands:
   workspace    Open, organize, and switch projects
   tab          Create, reorder, rename, and close tabs
-  pane         Split, move, focus, run, inspect, and close panes
+  pane         Split, move, inspect, restart, and close panes
   agent        Start, fork, message, inspect, and resume coding agents
   files        Browse and open workspace files
   git          Inspect repository state and open the Git UI
@@ -206,6 +206,7 @@ panes / agents:
   pane status [<id>]         print a pane's agent status and history metrics (any workspace)
   pane processes [<id>]      list cached executable identities without exposing arguments
   pane name <name>           name a pane so you can mention it (--pane <id>; --clear)
+  pane restart [<id>]        restart one pane, resuming its known agent session
   pane close [<id>]          close a pane
   agent list                 list every agent across all workspaces/tabs
   agent start <name> --kind <k> [--pane <id> | --anchor <id>] [--auto|--right|--down] [--timeout <s>] [-- <args>]
@@ -3710,6 +3711,12 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("pane", "read") => ("pane.read".into(), with_pane(serde_json::Map::new())),
         ("pane", "status") => ("pane.status".into(), with_pane(serde_json::Map::new())),
         ("pane", "processes") => ("pane.processes".into(), with_pane(serde_json::Map::new())),
+        ("pane", "restart") => {
+            if rest.len() > 1 || rest.iter().any(|arg| arg.parse::<u32>().is_err()) {
+                return Err(anyhow!("usage: luvus pane restart [<id>]"));
+            }
+            ("pane.restart".into(), with_pane(serde_json::Map::new()))
+        }
         ("pane", "close") => ("pane.close".into(), with_pane(serde_json::Map::new())),
         // `pane name <name>` is a synonym for `agent name`: it aliases the pane so
         // you can mention it by name. The name never doubles as a pane id.
@@ -4753,6 +4760,22 @@ mod tests {
             write_topic_help(&mut output, topic, command, crate::i18n::cli::Language::En,).unwrap()
         );
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn pane_restart_parsing_validates_target_and_help() {
+        let (method, params) = parse(&argv("luvus pane restart 46")).unwrap();
+        assert_eq!(method, "pane.restart");
+        assert_eq!(params["pane"], "46");
+        assert!(parse(&argv("luvus pane restart")).is_ok());
+        for command in [
+            "luvus pane restart bad",
+            "luvus pane restart 46 47",
+            "luvus pane restart --all",
+        ] {
+            assert!(parse(&argv(command)).is_err());
+        }
+        assert!(rendered_topic_help("pane", Some("restart")).contains("pane restart [<id>]"));
     }
 
     #[test]

@@ -3613,6 +3613,68 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_pane_restart_button_and_confirmation_reach_only_the_owner() {
+        let _env = crate::persist::test_env("remote-pane-restart");
+        for workspace_only in [false, true] {
+            let (tx, _rx) = mpsc::channel();
+            let mut owner = App::new(180, 48, tx).unwrap();
+            let old = owner.layout().focus;
+            let sibling = owner
+                .split_pane(old, crate::layout::Axis::Row, false)
+                .unwrap();
+            let sibling_engine = owner.panes[&sibling].engine.clone();
+            let mut outer = remote_ui_app();
+            let (projection, receiver, _) = add_remote_workspace(&mut outer);
+            remote_ui_buffer(&mut outer, (180, 48));
+            let area = outer.pane_content_rects[0].1;
+            for confirm in [false, true] {
+                let frame =
+                    remote_ui_owner_frame(&mut owner, (area.width, area.height), workspace_only);
+                let ViewKind::Remote(view) = outer.views.get_mut(&projection).unwrap() else {
+                    unreachable!()
+                };
+                view.frame = Some(frame);
+                let buffer = remote_ui_buffer(&mut outer, (180, 48));
+                assert!(
+                    outer.pane_restart_rect.is_none(),
+                    "projection has no local PTY restart"
+                );
+                let hit = if confirm {
+                    owner.modal_commit_rect.unwrap()
+                } else {
+                    owner.pane_restart_rect.unwrap()
+                };
+                if !confirm {
+                    assert_eq!(buffer[(area.x + hit.x + 1, area.y + hit.y)].symbol(), "↻");
+                }
+                outer.handle_event(AppEvent::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(ratatui::crossterm::event::MouseButton::Left),
+                    column: area.x + hit.x + 1,
+                    row: area.y + hit.y,
+                    modifiers: KeyModifiers::NONE,
+                }));
+                let ClientMessage::Mouse(mouse) = receiver.try_recv().expect("owner restart input")
+                else {
+                    panic!("not mouse input")
+                };
+                assert!(hit.contains((mouse.column, mouse.row).into()));
+                owner.handle_event(AppEvent::Mouse(mouse));
+                if !confirm {
+                    assert_eq!(owner.pane_restart_confirm, Some(old));
+                }
+            }
+            assert!(!owner.panes.contains_key(&old));
+            assert_eq!(owner.layout().len(), 2);
+            assert!(Arc::ptr_eq(&owner.panes[&sibling].engine, &sibling_engine));
+            assert!(outer.views.contains_key(&projection));
+            assert!(outer.panes.is_empty());
+            assert!(outer
+                .dispatch("pane.restart", &json!({"pane":projection.0}))
+                .is_err());
+        }
+    }
+
+    #[test]
     fn remote_visible_tab_plus_and_mobile_menu_reach_owner_coordinates() {
         let _env = crate::persist::test_env("remote-ui-visible-controls");
         for workspace_only in [false, true] {

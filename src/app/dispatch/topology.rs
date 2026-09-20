@@ -4,6 +4,21 @@ use super::*;
 use super::{params::*, projection::*};
 
 impl App {
+    pub(super) fn api_pane_restart(&mut self, _method: &str, p: &Value) -> DispatchResult {
+        reject_api_fields(p, &["pane"])?;
+        if self.workspaces.is_empty() {
+            return Err(not_found());
+        }
+        let pane = self.resolve_pane_or_focus(p)?;
+        let new = self
+            .restart_pane(pane)
+            .map_err(|message| ("invalid_request".into(), message))?;
+        let (workspace, tab) = self.pane_location(new).ok_or_else(not_found)?;
+        Ok(json!({"type":"pane", "pane":new.0.to_string(),
+            "previous_pane":pane.0.to_string(), "workspace":workspace.to_string(),
+            "tab":(tab + 1).to_string()}))
+    }
+
     pub(super) fn api_pane_get(&mut self, method: &str, p: &Value) -> DispatchResult {
         let _ = (method, p);
         {

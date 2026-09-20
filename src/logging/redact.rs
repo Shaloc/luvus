@@ -510,6 +510,7 @@ pub enum EventKind {
     PaneClose,
     PtySpawnFailed,
     PtyInputRejected,
+    PtyThreadFailed,
     PtyExit,
     PtyResize,
     AgentIdentity,
@@ -565,6 +566,7 @@ impl EventKind {
             Self::PaneClose => "pane.close",
             Self::PtySpawnFailed => "pty.spawn_failed",
             Self::PtyInputRejected => "pty.input_rejected",
+            Self::PtyThreadFailed => "pty.thread_failed",
             Self::PtyExit => "pty.exit",
             Self::PtyResize => "pty.resize",
             Self::AgentIdentity => "agent.identity",
@@ -600,6 +602,7 @@ impl EventKind {
     pub const fn level(self) -> Level {
         match self {
             Self::ListenerBindFailed
+            | Self::PtyThreadFailed
             | Self::PtySpawnFailed
             | Self::ClientConnectFailed
             | Self::ClientHandshakeRejected
@@ -681,7 +684,7 @@ impl EventKind {
             E::TabOpen | E::TabClose => matches!(key, F::WorkspaceIndex | F::TabIndex),
             E::PaneOpen => matches!(key, F::PaneId | F::SpawnKind),
             E::PaneClose => matches!(key, F::PaneId),
-            E::PtyInputRejected => matches!(key, F::PaneId),
+            E::PtyInputRejected | E::PtyThreadFailed => matches!(key, F::PaneId),
             E::PtySpawnFailed => matches!(key, F::PaneId | F::SpawnKind | F::ErrorCode),
             E::PtyExit => matches!(key, F::PaneId | F::ExitClass),
             E::PtyResize => matches!(key, F::PaneId | F::Cols | F::Rows),

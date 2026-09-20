@@ -27,3 +27,4 @@
 {"id":"snapshot-empty","result":{"type":"session_snapshot","protocol":{"name":"luvus-uhp","major":1,"minor":0},"session":"default","server_generation":"example-generation","event_sequence":1,"workspaces":[]}}
 {"id":"alias-max","result":{"type":"session_snapshot","workspaces":[{"tabs":[{"panes":[{"pane_id":"7","kind":"terminal","agent_name":"a1_-1_-1_-1_-1_-1_-1_-1_-1_-1_-z"}]}]}],"protocol":{"name":"luvus-uhp","major":1,"minor":0},"session":"default","server_generation":"fixture","event_sequence":1}}
 {"id":"alias-legacy-missing","result":{"type":"session_snapshot","protocol":{"name":"luvus-uhp","major":1,"minor":0},"session":"default","server_generation":"example-generation","event_sequence":1,"workspaces":[{"tabs":[{"panes":[{"pane_id":"7","kind":"terminal"}]}]}]}}
+{"id":"pane-restart","result":{"type":"pane","pane":"10","previous_pane":"7","workspace":"0","tab":"1"}}

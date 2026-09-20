@@ -154,6 +154,16 @@ pub enum VtEngineKind {
     Alacritty,
 }
 
+/// Keep the PTY and engine on the same supported geometry. Alacritty needs
+/// two columns to store a wide glyph and its spacer, even when a split's
+/// visible content is only one column wide; rendering clips that viewport.
+pub(crate) fn clamp_terminal_size(cols: u16, rows: u16) -> (u16, u16) {
+    (
+        cols.max(alacritty_terminal::term::MIN_COLUMNS as u16),
+        rows.max(alacritty_terminal::term::MIN_SCREEN_LINES as u16),
+    )
+}
+
 /// Build the engine backing one pane.
 ///
 /// Every pane is constructed through here, so engine selection, and any

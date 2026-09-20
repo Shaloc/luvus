@@ -22,7 +22,7 @@ pub(super) fn draw_pane_titles(
             let focused = *id == focus;
             let bg = t.mantle;
             let inner_w = rect.width - 2;
-            let btn_w = title_buttons_w(focused, rect.width);
+            let btn_w = title_buttons_w(focused, rect.width, false);
             let title_w = inner_w.saturating_sub(btn_w);
             let (marker, name) = match view {
                 crate::app::ViewKind::File(v) => (
@@ -69,7 +69,7 @@ pub(super) fn draw_pane_titles(
                 title_rect,
             );
             title_rects.push((*id, title_rect));
-            draw_title_buttons(f, *rect, focused, app.zoomed, title_w, bg, t);
+            draw_title_buttons(f, *rect, focused, app.zoomed, false, bg, t);
             continue;
         }
         let Some(pane) = app.panes.get(id) else {
@@ -83,7 +83,7 @@ pub(super) fn draw_pane_titles(
         // the thin `▔` line visible on either side of the label.
         let bg = t.mantle;
         let inner_w = rect.width - 2; // inside the two corner cells
-        let btn_w = title_buttons_w(focused, rect.width);
+        let btn_w = title_buttons_w(focused, rect.width, !app.module_panes.contains_key(id));
         let title_w = inner_w.saturating_sub(btn_w);
         // A named pane (via `pane name` / `agent name`) shows its name here; an
         // unnamed pane shows its cwd path. So naming a pane visibly renames it.
@@ -115,7 +115,15 @@ pub(super) fn draw_pane_titles(
         // Keep the title geometry so clicks focus the pane and never become an
         // accidental divider resize on a stacked layout.
         title_rects.push((*id, title_rect));
-        draw_title_buttons(f, *rect, focused, app.zoomed, title_w, bg, t);
+        draw_title_buttons(
+            f,
+            *rect,
+            focused,
+            app.zoomed,
+            !app.module_panes.contains_key(id),
+            bg,
+            t,
+        );
     }
     title_rects
 }
@@ -124,9 +132,11 @@ pub(super) fn draw_pane_titles(
 /// plus the ⤢ zoom toggle when the pane is wide enough for both. Must match
 /// `pane_close_rect`/`pane_zoom_rect` in `ui/mod.rs`, or a tap lands off the
 /// glyph.
-fn title_buttons_w(focused: bool, width: u16) -> u16 {
+fn title_buttons_w(focused: bool, width: u16, restart: bool) -> u16 {
     if !focused {
         0
+    } else if restart && width >= 15 {
+        9
     } else if width >= 12 {
         6
     } else {
@@ -141,7 +151,7 @@ fn draw_title_buttons(
     rect: Rect,
     focused: bool,
     zoomed: bool,
-    title_w: u16,
+    restart: bool,
     bg: Color,
     t: &Theme,
 ) {
@@ -149,7 +159,16 @@ fn draw_title_buttons(
         return;
     }
     let style = Style::new().fg(t.subtext1).bg(bg).bold();
-    let bx = rect.x + 1 + title_w;
+    let bx = rect.x + rect.width - 1 - title_buttons_w(focused, rect.width, restart);
+    let bx = if restart && rect.width >= 15 {
+        f.render_widget(
+            Paragraph::new(Span::styled(" ↻ ", style)),
+            Rect::new(bx, rect.y, 3, 1),
+        );
+        bx + 3
+    } else {
+        bx
+    };
     let close = |f: &mut RenderTarget, x: u16| {
         f.render_widget(
             Paragraph::new(Span::styled(" × ", style)),
@@ -367,9 +386,12 @@ fn draw_one_pane(
         // When this lone pane is a *zoomed* split (not just the only pane), show a
         // ⤡ restore button so a phone can un-zoom without a keyboard (docs/18).
         let show_restore = app.zoomed && header.width >= 8;
+        let restart = !app.module_panes.contains_key(&id)
+            && header.width >= if show_restore { 11 } else { 8 };
         let path_budget = header
             .width
-            .saturating_sub(if show_restore { 8 } else { 5 });
+            .saturating_sub(if show_restore { 8 } else { 5 })
+            .saturating_sub(if restart { 3 } else { 0 });
         let title = Line::from(vec![
             Span::styled("▎", Style::new().fg(t.accent).bg(hbg)),
             Span::styled(
@@ -382,6 +404,17 @@ fn draw_one_pane(
             ),
         ]);
         f.render_widget(Paragraph::new(title), header);
+        if restart {
+            if let Some(rect) = super::pane_restart_rect(area, false, app.zoomed) {
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        " ↻ ",
+                        Style::new().fg(t.subtext1).bg(hbg).bold(),
+                    )),
+                    rect,
+                );
+            }
+        }
         if show_restore {
             let r = super::lone_zoom_rect(area);
             f.render_widget(
@@ -543,7 +576,16 @@ fn draw_one_pane(
                 None
             }
         }
-        Err(_) => None,
+        Err(_) => {
+            f.render_widget(
+                Paragraph::new(app.catalog.pane_output_failed)
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .style(Style::default().fg(t.coral))
+                    .wrap(ratatui::widgets::Wrap { trim: false }),
+                content,
+            );
+            None
+        }
     };
 
     if let Some(region) = composer_region {
@@ -841,6 +883,35 @@ fn draw_codex_composer(
 mod tests {
     use super::*;
     use crate::terminal::vt::CodexComposerRegion;
+
+    #[test]
+    fn poisoned_terminal_is_visible_and_keeps_its_pane_and_runtime() {
+        let _env = crate::persist::test_env("poisoned-pane-message");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 30, tx).unwrap();
+        let id = app.layout().focus;
+        let runtime = app.panes[&id].terminal_runtime().unwrap().terminal_id;
+        let engine = app.panes[&id].engine.clone();
+        assert!(std::thread::spawn(move || {
+            let _guard = engine.lock().unwrap();
+            panic!("injected terminal failure");
+        })
+        .join()
+        .is_err());
+        app.handle_event(crate::event::AppEvent::PtyThreadFailed(id));
+        let pane = &app.panes[&id];
+        assert_eq!(pane.terminal_runtime().unwrap().terminal_id, runtime);
+        assert!(!pane.child_exited());
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buffer = Buffer::empty(area);
+        crate::ui::render_into(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            text.contains("Terminal output failed."),
+            "failed pane must not stay blank"
+        );
+        assert!(text.contains("process may still be running."));
+    }
 
     #[test]
     fn pane_background_matches_child_query_and_preserves_explicit_colors() {

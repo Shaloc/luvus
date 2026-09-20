@@ -43,6 +43,7 @@ mod keys;
 pub(crate) mod line_edit;
 mod mission;
 mod modules;
+mod pane_restart;
 mod persistence;
 mod picker;
 mod preview;
@@ -2960,6 +2961,8 @@ pub struct App {
     pub tab_prev_rect: Option<Rect>,
     pub tab_next_rect: Option<Rect>,
     /// The focused pane's ✕ close button, for mouse hit-testing.
+    pub pane_restart_rect: Option<Rect>,
+    pub pane_restart_confirm: Option<PaneId>,
     pub pane_close_rect: Option<Rect>,
     /// The focused pane's ⤢ zoom/restore button (docs/18): a touch-reachable
     /// equivalent of `Ctrl+Space z`, so a split can be expanded to fullscreen on
@@ -3433,6 +3436,8 @@ impl App {
             new_ws_rect: None,
             tab_prev_rect: None,
             tab_next_rect: None,
+            pane_restart_rect: None,
+            pane_restart_confirm: None,
             pane_close_rect: None,
             pane_zoom_rect: None,
             sidebar_toggle_rect: None,
@@ -4142,6 +4147,8 @@ impl App {
             new_ws_rect: None,
             tab_prev_rect: None,
             tab_next_rect: None,
+            pane_restart_rect: None,
+            pane_restart_confirm: None,
             pane_close_rect: None,
             pane_zoom_rect: None,
             sidebar_toggle_rect: None,
@@ -8113,7 +8120,8 @@ impl App {
         fn hit(rc: Rect, c: u16, r: u16) -> bool {
             c >= rc.x && c < rc.right() && r >= rc.y && r < rc.bottom()
         }
-        self.pane_close_rect.is_some_and(|rc| hit(rc, c, r))
+        self.pane_restart_rect.is_some_and(|rc| hit(rc, c, r))
+            || self.pane_close_rect.is_some_and(|rc| hit(rc, c, r))
             || self.pane_zoom_rect.is_some_and(|rc| hit(rc, c, r))
             || self.pane_title_rects.iter().any(|(_, rc)| hit(*rc, c, r))
     }

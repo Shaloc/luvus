@@ -94,6 +94,7 @@ panes / agents:
   pane status [<id>]         print a pane's agent status and history metrics (any workspace)
   pane processes [<id>]      list cached executable identities without exposing arguments
   pane name <name>           name a pane so you can mention it (--pane <id>; --clear)
+  pane restart [<id>]        restart one pane, resuming its known agent session
   pane close [<id>]          close a pane
   agent list                 list every agent across all workspaces/tabs
   agent start <name> --kind <k> [--pane <id> | --anchor <id>] [--auto|--right|--down] [--timeout <s>] [-- <args>]
@@ -367,3 +368,22 @@ When the current screen is a detected startup, sign-in, selection, or approval
 surface, prompt submission returns `agent_not_ready` without queuing text or
 Enter. Inspect it with `agent read`; use `agent keys` only for an intentional
 interaction.
+
+### Restart one terminal pane
+
+Click **↻** at the top right of the focused pane, then confirm, or run
+`luvus pane restart <id>`. The CLI acts immediately. Restart hangs up that
+pane’s current process using the same lifecycle as closing a terminal. Its
+layout slot, name, pin, and working directory are preserved; other panes and
+the server keep running. Deliberately detached/nohup jobs follow the usual
+terminal-close behavior.
+
+A trusted, supported native agent session resumes using the existing launch-flag
+setting. Otherwise a fresh shell starts; arbitrary shell commands and terminal
+scrollback are not replayed. The replacement receives a new pane ID. Module panes
+must be reopened through their module; native file and diff views have no PTY to
+restart. The button is shown in desktop pane headers when space permits.
+
+For a remote pane, use the button in its remote frame or address its owner with
+`luvus --host <host> --session <name> pane restart <id>`. Install the updated
+binary and load it into the owning server once before using this control.

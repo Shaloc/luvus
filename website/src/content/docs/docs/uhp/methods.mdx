@@ -86,7 +86,7 @@ Luvus release number.
 | workspaces | `workspace.list` · `workspace.get` · `workspace.open` · `workspace.focus` · `workspace.rename` · `workspace.pin` · `workspace.move` · `workspace.move_block` · `workspace.report_metadata` · `workspace.close` |
 | tabs | `tab.list` · `tab.get` · `tab.new` · `tab.focus` · `tab.move` · `tab.swap` · `tab.rename` · `tab.close` |
 | runtime and agents | `session.snapshot` · `agent.start` · `agent.prompt` · `agent.wait` · `events.subscribe` |
-| panes | `pane.list` · `pane.get` · `pane.current` · `pane.layout` · `pane.neighbor` · `pane.edges` · `pane.split` · `pane.move` · `pane.swap` · `pane.focus` · `pane.focus_direction` · `pane.resize` · `pane.zoom` · `pane.rename` · `pane.run` · `pane.send_input` · `pane.read` · `pane.status` · `pane.processes` · `pane.close` · `attach.pane` |
+| panes | `pane.list` · `pane.get` · `pane.current` · `pane.layout` · `pane.neighbor` · `pane.edges` · `pane.split` · `pane.move` · `pane.swap` · `pane.focus` · `pane.focus_direction` · `pane.resize` · `pane.zoom` · `pane.rename` · `pane.run` · `pane.send_input` · `pane.read` · `pane.status` · `pane.processes` · `pane.restart` · `pane.close` · `attach.pane` |
 | layouts | `layout.export` · `layout.apply` · `layout.set_split_ratio` |
 | agents | `agent.list` · `agent.get` · `agent.explain` · `agent.report` · `agent.release` · `agent.start` · `agent.prompt` · `agent.wait` · `agent.name` · `agent.fork` · `agent.send` · `agent.keys` · `agent.read` · `agent.sessions` · `agent.resume` · `pane.report_session` · `pane.release_session` · `pane.report_event` |
 | search | `search` · `search.capabilities` · `search.query` · `search.activate` |
@@ -1281,3 +1281,19 @@ subscribe-first snapshot reconciliation.
 - `ping` returns the server's version, binary-client transport protocol, and
   selected session name, useful for health checks, exact-build upgrade
   detection, and routing verification.
+
+### `pane.restart`
+
+Write operation with `workspace` scope; non-idempotent. Accepts only an optional
+`pane` ID (default: focused pane). Validates the target before changing state,
+then replaces that terminal in its existing layout slot. The current process is
+hung up; a trusted native agent conversation resumes when supported, otherwise a
+shell starts. Sibling panes, the selected workspace/tab, and the server survive.
+Native views and module panes are rejected. Remote callers must address the
+owning host/session; projected local IDs cannot target remote terminals.
+
+The result is `{"type":"pane","pane":"NEW","previous_pane":"OLD",` plus
+`"workspace":"0","tab":"1"}` (workspace 0-based, tab 1-based). Acceptance
+precedes asynchronous PTY startup, as for `pane.split`. Consumers must use the new
+pane ID; the old terminal lifetime is closed. Existing `pane.closed` and
+`pane.created` events announce the replacement. Native session IDs stay private.

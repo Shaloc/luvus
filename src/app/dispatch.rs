@@ -191,6 +191,7 @@ impl App {
             // output. Returns matches with the scroll offset that lands on each,
             // plus the total found (which may exceed the returned, capped, list).
             "search" => self.api_search(method, p),
+            "pane.restart" => self.api_pane_restart(method, p),
             "pane.close" => self.api_pane_close(method, p),
             // A **global** single-pane status lookup (any workspace) — `pane.list` is
             // scoped to the active workspace, so `luvus wait agent-status` polls this.

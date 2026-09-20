@@ -140,17 +140,19 @@ pub(super) fn start(
     thread::Builder::new()
         .name(format!("luvus-pty-actor-{}", id.0))
         .spawn(move || {
-            actor_loop(
-                id,
-                master,
-                input,
-                wake,
-                engine,
-                app_tx,
-                data_pending,
-                content_revision,
-                cancelled,
-            );
+            super::run_guarded(id, app_tx.clone(), || {
+                actor_loop(
+                    id,
+                    master,
+                    input,
+                    wake,
+                    engine,
+                    app_tx,
+                    data_pending,
+                    content_revision,
+                    cancelled,
+                );
+            });
         })?;
     Ok(())
 }

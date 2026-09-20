@@ -210,6 +210,18 @@ impl TileLayout {
         true
     }
 
+    /// Replace a terminal lifetime without changing its slot or split ratios.
+    pub fn replace_pane(&mut self, old: PaneId, new: PaneId) -> bool {
+        if !self.contains(old) || self.contains(new) {
+            return false;
+        }
+        swap_leaf_ids(&mut self.root, old, new);
+        if self.focus == old {
+            self.focus = new;
+        }
+        true
+    }
+
     /// Replace the tree only when it contains every current pane exactly once.
     /// This makes `layout.apply` atomic and preserves all pane-owned state.
     pub fn apply_tree(&mut self, tree: &LayoutTree, focus: PaneId) -> Result<(), &'static str> {

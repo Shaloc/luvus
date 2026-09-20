@@ -710,3 +710,13 @@ website describes a newer release.
   authorization and a read-only target check.
 - Never stop or restart a Luvus server as a normal control step. Do so only
   after an explicit request and a warning that every managed pane is affected.
+
+### Recovering one terminal
+
+`luvus pane restart <id>` hangs up only that pane and replaces it in the same
+layout slot. It resumes a trusted supported native agent session or starts a
+shell; it does not replay arbitrary commands or scrollback. Ask the user before
+interrupting a running task. Use the returned new pane ID for subsequent calls.
+Other panes and the server remain alive. For remote panes, address the owning
+host/session; do not send a projected local pane ID. Module panes use their own
+reopen action. The desktop ↻ header button offers the same action with a prompt.

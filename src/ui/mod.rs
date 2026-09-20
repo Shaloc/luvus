@@ -354,6 +354,7 @@ fn render_projection_preserving_state(
     let files_area = app.files_area;
     let workspaces_area = app.workspaces_area;
     let agents_area = app.agents_area;
+    let pane_restart_rect = app.pane_restart_rect;
     let pane_close_rect = app.pane_close_rect;
     let pane_zoom_rect = app.pane_zoom_rect;
     let tab_prev_rect = app.tab_prev_rect;
@@ -506,6 +507,7 @@ fn render_projection_preserving_state(
     app.files_area = files_area;
     app.workspaces_area = workspaces_area;
     app.agents_area = agents_area;
+    app.pane_restart_rect = pane_restart_rect;
     app.pane_close_rect = pane_close_rect;
     app.pane_zoom_rect = pane_zoom_rect;
     app.tab_prev_rect = tab_prev_rect;
@@ -554,6 +556,7 @@ pub(crate) fn retained_pty_eligible(app: &App) -> bool {
         && app.tab_rename.is_none()
         && app.tab_menu.is_none()
         && app.ws_rename.is_none()
+        && app.pane_restart_confirm.is_none()
         && app.pane_rename.is_none()
         && app.ws_menu.is_none()
         && app.pane_menu.is_none()
@@ -876,6 +879,16 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     let focused_rect = bordered
         .then(|| rects.iter().find(|(id, _)| *id == focus).map(|(_, r)| *r))
         .flatten();
+    app.pane_restart_rect =
+        if !app.compact && app.panes.contains_key(&focus) && !app.module_panes.contains_key(&focus)
+        {
+            rects
+                .iter()
+                .find(|(id, _)| *id == focus)
+                .and_then(|(_, rect)| pane_restart_rect(*rect, bordered, app.zoomed))
+        } else {
+            None
+        };
     app.pane_close_rect = focused_rect.and_then(|r| pane_close_rect(r, bordered));
     // Zoom button: the split-title ⤢ when bordered, else the lone-header ⤡ that
     // restores a *zoomed* single pane (so a phone can un-zoom).
@@ -1058,6 +1071,11 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     let hover = app.hover;
     app.modal_commit_rect = None;
     app.modal_cancel_rect = None;
+    if let Some(id) = app.pane_restart_confirm {
+        let (commit, cancel) = picker::draw_pane_restart(f, area, id, cat, &t);
+        app.modal_commit_rect = commit;
+        app.modal_cancel_rect = cancel;
+    }
     // The new-worktree branch prompt (docs/18 WT).
     app.worktree_prompt_rect = None;
     if let Some(buf) = app.worktree_prompt.clone() {
@@ -1258,6 +1276,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
         || app.tab_rename.is_some()
         || app.tab_menu.is_some()
         || app.ws_rename.is_some()
+        || app.pane_restart_confirm.is_some()
         || app.pane_rename.is_some()
         || app.ws_menu.is_some()
         || app.pane_menu.is_some()
@@ -1493,6 +1512,24 @@ fn pane_content(rect: Rect, bordered: bool, mobile: bool) -> Option<Rect> {
         return None;
     }
     Some(c)
+}
+
+/// Restart sits left of zoom/close on splits, or at the lone header's right.
+fn pane_restart_rect(area: Rect, bordered: bool, zoomed: bool) -> Option<Rect> {
+    if bordered {
+        return (area.width >= 15 && area.height >= 2)
+            .then(|| Rect::new(area.right() - 10, area.y, 3, 1));
+    }
+    let pad = lone_pad(area.width);
+    let width = area.width.saturating_sub(2 * pad);
+    (area.height >= 2 && width >= if zoomed { 11 } else { 8 }).then(|| {
+        Rect::new(
+            area.right() - pad - if zoomed { 6 } else { 3 },
+            area.y,
+            3,
+            1,
+        )
+    })
 }
 
 /// Rect of the ✕ close button at the right of a pane's top-border title row.
@@ -1780,6 +1817,29 @@ mod retained_render_tests {
 #[cfg(test)]
 mod bar_projection_tests {
     use super::*;
+
+    #[test]
+    fn pane_restart_geometry_survives_passive_mobile_projection() {
+        let _env = crate::persist::test_env("pane-restart-projection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let desktop = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(desktop);
+        render_into(&mut RenderTarget::new(&mut buffer, desktop), &mut app);
+        let button = app.pane_restart_rect.expect("desktop restart");
+        let pane = app.layout().focus;
+        let size = app.panes[&pane].size();
+        app.pane_restart_confirm = Some(pane);
+        render_into(&mut RenderTarget::new(&mut buffer, desktop), &mut app);
+        let confirm = app.modal_commit_rect;
+        let mobile = Rect::new(0, 0, 40, 20);
+        let mut buffer = Buffer::empty(mobile);
+        render_projection(&mut RenderTarget::new(&mut buffer, mobile), &mut app);
+        assert_eq!(app.pane_restart_rect, Some(button));
+        assert_eq!(app.modal_commit_rect, confirm);
+        assert_eq!(app.panes[&pane].size(), size);
+        assert_eq!(app.pane_restart_confirm, Some(pane));
+    }
 
     #[test]
     fn secondary_viewport_preserves_active_bar_geometry_and_popup() {

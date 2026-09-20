@@ -18,6 +18,15 @@ mod split;
 #[cfg(unix)]
 pub(super) mod unix_actor;
 
+/// Preserve the child and pane identity if terminal processing fails. The
+/// poisoned engine must not be reused: report the failure on the app loop so
+/// the UI can replace a silently blank pane with an explicit error.
+fn run_guarded(id: PaneId, app_tx: mpsc::Sender<AppEvent>, run: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_err() {
+        let _ = app_tx.send(AppEvent::PtyThreadFailed(id));
+    }
+}
+
 pub(super) struct InputReceiver {
     receiver: mpsc::Receiver<QueuedInput>,
     #[cfg(unix)]
@@ -73,5 +82,24 @@ pub(super) fn start(
             data_pending,
             content_revision,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_panic_reports_failure_without_reporting_child_exit() {
+        let (tx, rx) = mpsc::channel();
+        let engine = Mutex::new(());
+        let id = PaneId::alloc();
+        run_guarded(id, tx, || {
+            let _guard = engine.lock().unwrap();
+            panic!("injected terminal failure");
+        });
+        assert!(engine.is_poisoned());
+        assert!(matches!(rx.try_recv(), Ok(AppEvent::PtyThreadFailed(pane)) if pane == id));
+        assert!(rx.try_recv().is_err());
     }
 }

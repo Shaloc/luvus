@@ -750,15 +750,15 @@ static HELP: &[Translation] = &[
         "탭을 만들고 순서를 바꾸고 이름을 바꾸고 닫기"
     ),
     tr!(
-        "Split, move, focus, run, inspect, and close panes",
-        "Dividir, mover, enfocar, ejecutar, inspeccionar y cerrar paneles",
-        "Dividir, mover, focar, executar, inspecionar e fechar painéis",
-        "Diviser, déplacer, cibler, exécuter, inspecter et fermer les volets",
-        "Bereiche teilen, verschieben, fokussieren, ausführen, prüfen und schließen",
-        "Bagi, pindah, fokus, jalankan, periksa, dan tutup panel",
-        "拆分、移动、聚焦、运行、检查和关闭窗格",
-        "ペインの分割、移動、フォーカス、実行、確認、終了",
-        "패널을 분할, 이동, 포커스, 실행, 검사, 닫기"
+        "Split, move, inspect, restart, and close panes",
+        "Dividir, mover, inspeccionar, reiniciar y cerrar paneles",
+        "Dividir, mover, inspecionar, reiniciar e fechar painéis",
+        "Diviser, déplacer, inspecter, redémarrer et fermer les volets",
+        "Bereiche teilen, verschieben, prüfen, neu starten und schließen",
+        "Bagi, pindah, periksa, mulai ulang, dan tutup panel",
+        "拆分、移动、检查、重启和关闭窗格",
+        "ペインの分割、移動、確認、再起動、終了",
+        "패널을 분할, 이동, 검사, 다시 시작, 닫기"
     ),
     tr!(
         "Start, fork, message, inspect, and resume coding agents",
@@ -1552,6 +1552,17 @@ static HELP: &[Translation] = &[
         "命名窗格以便引用（--pane <id>；--clear）",
         "参照できるようペインに名前を付ける（--pane <id>; --clear）",
         "패널을 참조할 수 있도록 이름 지정 (--pane <id>; --clear)"
+    ),
+    tr!(
+        "restart one pane, resuming its known agent session",
+        "reiniciar un panel y reanudar su sesión de agente conocida",
+        "reiniciar um painel e retomar sua sessão de agente conhecida",
+        "redémarrer un volet et reprendre sa session d’agent connue",
+        "einen Bereich neu starten und seine bekannte Agentensitzung fortsetzen",
+        "mulai ulang satu panel dan lanjutkan sesi agen yang diketahui",
+        "重启单个窗格，恢复已知的智能体会话",
+        "1つのペインを再起動し、特定済みのエージェントセッションを再開",
+        "패널 하나를 다시 시작하고 확인된 에이전트 세션 재개"
     ),
     tr!(
         "close a pane",

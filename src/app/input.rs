@@ -1033,6 +1033,17 @@ impl App {
                 }
                 true
             }
+            AppEvent::PtyThreadFailed(id) => {
+                crate::logging::event(
+                    crate::logging::EventKind::PtyThreadFailed,
+                    &[crate::logging::Field::PaneId(u64::from(id.0))],
+                );
+                if self.panes.contains_key(&id) {
+                    self.show_toast(format!("{} · {}", id.0, self.catalog.pane_output_failed));
+                    self.force_redraw = true;
+                }
+                true
+            }
             AppEvent::PtyData(id) => {
                 // The reader's coalescing flag is deliberately NOT cleared here
                 // — it re-arms on the frame/detect cadence (`rearm_pty_notify`),
@@ -1707,7 +1718,8 @@ impl App {
                 )
                 .find(|rect| hit(*rect));
         }
-        let modal_owns_mouse = self.file_prompt.is_some()
+        let modal_owns_mouse = self.pane_restart_confirm.is_some()
+            || self.file_prompt.is_some()
             || self.file_delete.is_some()
             || self.worktree_delete.is_some()
             || self.worktree_prompt.is_some()
@@ -1805,6 +1817,23 @@ impl App {
         self.hover = Some((m.column, m.row));
         if let MouseEventKind::Down(_) = m.kind {
             self.menu_scroll.press(m.column, m.row);
+        }
+        if self.pane_restart_confirm.is_some() {
+            if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let point = ratatui::layout::Position::new(m.column, m.row);
+                if self
+                    .modal_commit_rect
+                    .is_some_and(|rect| rect.contains(point))
+                {
+                    self.confirm_pane_restart();
+                } else if self
+                    .modal_cancel_rect
+                    .is_some_and(|rect| rect.contains(point))
+                {
+                    self.pane_restart_confirm = None;
+                }
+            }
+            return;
         }
         // The shortcut reference scrolls with the wheel; a click dismisses it.
         if self.help_open {
@@ -2966,6 +2995,10 @@ impl App {
             self.close_tab(*i);
             return;
         }
+        if self.pane_restart_rect.is_some_and(hit) {
+            self.pane_restart_confirm = Some(self.layout().focus);
+            return;
+        }
         // The focused pane's ✕ button closes the active pane.
         if self.pane_close_rect.is_some_and(hit) {
             self.close_pane(self.layout().focus);
@@ -4114,6 +4147,14 @@ impl App {
     fn handle_key(&mut self, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
             return false; // ignored — nothing changed
+        }
+        if self.pane_restart_confirm.is_some() {
+            match key.code {
+                KeyCode::Enter if key.kind != KeyEventKind::Repeat => self.confirm_pane_restart(),
+                KeyCode::Esc => self.pane_restart_confirm = None,
+                _ => {}
+            }
+            return true;
         }
         if self.bar.overflow.take().is_some() {
             return true;

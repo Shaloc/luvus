@@ -114,6 +114,7 @@ struct PaneSize {
 
 impl PaneSize {
     fn new(cols: u16, rows: u16, cell_pixels: Option<(u16, u16)>) -> Self {
+        let (cols, rows) = crate::terminal::vt::clamp_terminal_size(cols, rows);
         Self {
             cols,
             rows,
@@ -405,6 +406,54 @@ impl Pane {
             appearance,
             cell_pixels,
         )
+    }
+
+    /// Restart a shell or resume a known agent off the app loop. Use the same
+    /// shell-specific launch policy as restored sessions, with no saved VT grid.
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_resume_deferred(
+        id: PaneId,
+        cols: u16,
+        rows: u16,
+        cwd: PathBuf,
+        app_tx: Sender<AppEvent>,
+        shell: &str,
+        resume: Option<&str>,
+        history_budget_bytes: usize,
+        appearance: PaneAppearance,
+        cell_pixels: Option<(u16, u16)>,
+    ) -> Pane {
+        let argv = resume
+            .and_then(|resume| crate::platform::shell_run_then_interactive(shell, resume.trim()));
+        let direct = argv.as_ref().and_then(|argv| argv.split_first());
+        let cmd = if let Some((program, args)) = direct {
+            let mut cmd = CommandBuilder::new(program);
+            cmd.args(args);
+            cmd
+        } else {
+            CommandBuilder::new(shell)
+        };
+        let pane = Self::build_deferred(
+            id,
+            cols,
+            rows,
+            cwd,
+            &[],
+            app_tx,
+            None,
+            cmd,
+            basename(shell),
+            &[],
+            history_budget_bytes,
+            appearance,
+            cell_pixels,
+        );
+        if direct.is_none() {
+            if let Some(resume) = resume {
+                pane.send(resume.as_bytes());
+            }
+        }
+        pane
     }
 
     /// Deferred counterpart to [`Pane::spawn_shell_with`] for restoring a
@@ -1165,6 +1214,7 @@ impl Pane {
         if cols == 0 || rows == 0 {
             return false;
         }
+        let (cols, rows) = crate::terminal::vt::clamp_terminal_size(cols, rows);
         let updated = {
             let mut size = self.size.lock().unwrap_or_else(|p| p.into_inner());
             if (cols, rows) == (size.cols, size.rows) {
@@ -1202,7 +1252,7 @@ impl Pane {
             .cell_pixels
     }
 
-    #[cfg(test)]
+    /// Current negotiated PTY geometry, also retained across a pane restart.
     pub(crate) fn size(&self) -> (u16, u16) {
         let size = self.size.lock().unwrap_or_else(|p| p.into_inner());
         (size.cols, size.rows)
@@ -1484,6 +1534,93 @@ mod reap_tests {
             None,
         )
         .expect("spawn")
+    }
+
+    #[test]
+    fn narrow_panes_keep_pty_and_engine_alive_with_wide_output() {
+        for deferred in [false, true] {
+            let (tx, _rx) = mpsc::channel();
+            let cwd = std::env::current_dir().unwrap();
+            let argv = vec![
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "printf '中文\\n'; read line; printf '\\n%s\\n' \"$line\"; sleep 5".to_owned(),
+            ];
+            let mut pane = if deferred {
+                Pane::spawn_shell_with_deferred(
+                    PaneId::alloc(),
+                    1,
+                    4,
+                    cwd,
+                    &[],
+                    tx,
+                    None,
+                    "/bin/sh",
+                    &argv,
+                    64 * 1024,
+                    PaneAppearance::default(),
+                    None,
+                )
+                .unwrap()
+            } else {
+                Pane::spawn_command(
+                    PaneId::alloc(),
+                    1,
+                    4,
+                    cwd,
+                    tx,
+                    &argv,
+                    &[],
+                    64 * 1024,
+                    PaneAppearance::default(),
+                    None,
+                )
+                .unwrap()
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while pane.content_revision() == 0 {
+                assert!(
+                    !pane.engine.is_poisoned(),
+                    "narrow child output poisoned the grid"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no initial child output"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let actual = pane
+                .master
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get_size()
+                .unwrap();
+            assert_eq!((actual.cols, actual.rows), (2, 4));
+            assert!(
+                !pane.resize(1, 4),
+                "clamped geometry must not trigger repeated SIGWINCH"
+            );
+            pane.resize(40, 8);
+            pane.try_send(b"STILL_ALIVE\r").unwrap();
+            loop {
+                let text = pane
+                    .engine
+                    .lock()
+                    .expect("healthy engine")
+                    .detection_text(24);
+                if text.contains("STILL_ALIVE") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "child stopped after resize"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!pane.child_exited());
+        }
     }
 
     #[test]

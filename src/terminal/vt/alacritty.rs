@@ -172,9 +172,10 @@ impl AlacrittyEngine {
         initial_appearance: PaneAppearance,
     ) -> Self {
         let resp_tx = resp_tx.into();
+        let (cols, rows) = super::clamp_terminal_size(cols, rows);
         let dims = Dims {
-            cols: cols.max(1) as usize,
-            rows: rows.max(1) as usize,
+            cols: cols as usize,
+            rows: rows as usize,
         };
         let title: TitleSlot = Arc::new(Mutex::new(TitleState::default()));
         let clipboard: ClipboardSlot = Arc::new(Mutex::new(None));
@@ -469,9 +470,10 @@ impl VtEngine for AlacrittyEngine {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
+        let (cols, rows) = super::clamp_terminal_size(cols, rows);
         self.term.resize(Dims {
-            cols: cols.max(1) as usize,
-            rows: rows.max(1) as usize,
+            cols: cols as usize,
+            rows: rows as usize,
         });
         self.apply_history_budget();
     }
@@ -1382,6 +1384,22 @@ mod tests {
     fn feed_lines(e: &mut AlacrittyEngine, n: usize) {
         for i in 0..n {
             e.advance(format!("line{i}\r\n").as_bytes());
+        }
+    }
+
+    #[test]
+    fn one_column_pane_accepts_wide_output_before_and_after_resize() {
+        for initial_cols in [1, 80] {
+            let (tx, _rx) = channel();
+            let mut engine = AlacrittyEngine::new(initial_cols, 4, tx, 64 * 1024);
+            engine.resize(1, 4);
+            engine.advance("中文\r\nready".as_bytes());
+            engine.resize(40, 8);
+            engine.advance(b"\r\nSTILL_ALIVE");
+            assert!(engine
+                .visible_rows()
+                .iter()
+                .any(|row| row.contains("STILL_ALIVE")));
         }
     }
 

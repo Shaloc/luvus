@@ -700,3 +700,13 @@ Without `--wait`, the immediate `submitted:true`, `evidence:"queued"` response i
 unchanged and omits `observed_state`. Submission still means queue admission;
 state transitions do not confirm consumption of the prompt text. Do not resend
 automatically after a timeout or lost response because queued input may execute.
+
+### Recovering one terminal
+
+`luvus pane restart <id>` hangs up only that pane and replaces it in the same
+layout slot. It resumes a trusted supported native agent session or starts a
+shell; it does not replay arbitrary commands or scrollback. Ask the user before
+interrupting a running task. Use the returned new pane ID for subsequent calls.
+Other panes and the server remain alive. For remote panes, address the owning
+host/session; do not send a projected local pane ID. Module panes use their own
+reopen action. The desktop ↻ header button offers the same action with a prompt.

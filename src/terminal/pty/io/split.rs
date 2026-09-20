@@ -45,6 +45,10 @@ pub(super) fn start(
         .map_err(|error| io::Error::other(format!("clone PTY reader: {error:#}")))?;
     thread::Builder::new()
         .name(format!("luvus-pty-reader-{}", id.0))
-        .spawn(move || read_loop(id, reader, engine, app_tx, data_pending, content_revision))?;
+        .spawn(move || {
+            super::run_guarded(id, app_tx.clone(), || {
+                read_loop(id, reader, engine, app_tx, data_pending, content_revision);
+            });
+        })?;
     Ok(())
 }

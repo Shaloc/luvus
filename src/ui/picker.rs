@@ -7,6 +7,60 @@ use crate::i18n::Catalog;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::widgets::{Borders, Clear};
 
+/// The pane restart prompt shares the modal footer geometry with other prompts.
+pub(super) fn draw_pane_restart(
+    f: &mut RenderTarget,
+    area: Rect,
+    pane: PaneId,
+    cat: &Catalog,
+    t: &Theme,
+) -> (Option<Rect>, Option<Rect>) {
+    dim_backdrop(f, area, t);
+    let modal = centered_rect(
+        f.area(),
+        area.width.saturating_sub(4).min(70),
+        area.height.min(10),
+    );
+    f.render_widget(Clear, modal);
+    let block = Block::new()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(t.coral))
+        .style(Style::new().bg(t.surface0));
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+    f.render_widget(
+        Paragraph::new(format!("{} · {}", cat.pane_restart, pane.0))
+            .style(Style::new().fg(t.text).bold()),
+        Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
+    );
+    f.render_widget(
+        Paragraph::new(cat.pane_restart_warning)
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .style(Style::new().fg(t.text)),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(2),
+            inner.width,
+            inner.height.saturating_sub(3),
+        ),
+    );
+    if inner.height < 4 {
+        return (None, None);
+    }
+    let labels = [("⏎", cat.pane_restart), ("esc", cat.act_cancel)];
+    let (line, offsets) = hint_line_with_offsets(&labels, t);
+    let footer = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
+    f.render_widget(Paragraph::new(line), footer);
+    let rect = |index: usize| {
+        let x = offsets[index];
+        let (key, label) = labels[index];
+        let width = (display_width(key) + 1 + display_width(label)) as u16;
+        let width = width.min(footer.width.saturating_sub(x));
+        (width > 0).then(|| Rect::new(footer.x + x, footer.y, width, 1))
+    };
+    (rect(0), rect(1))
+}
+
 /// Draw the picker over a dimmed backdrop; returns the clickable row rects
 /// (row index → rect) the input layer uses for mouse selection.
 pub(super) fn draw_picker(
