@@ -21,6 +21,9 @@ use crate::ipc::protocol::{self, ClientMessage, FrameData, ServerMessage};
 use crate::layout::TileLayout;
 use crate::session::remote::{RemoteBinaryLocation, RemoteInput, RemoteSession};
 
+mod display;
+pub(super) use display::{PendingWorkspaceSwitch, SessionDisplay};
+
 const REMOTE_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const REMOTE_RETRY_MAX: Duration = Duration::from_secs(10);
 const REMOTE_RESPONSE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -206,6 +209,7 @@ pub struct RemoteSessionSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RemoteDisplay {
+    pub session_display: bool,
     pub location: RemoteBinaryLocation,
     pub server_generation: Option<String>,
     pub projection: bool,
@@ -234,6 +238,13 @@ pub enum RemoteViewState {
 }
 
 pub enum RemoteEffect {
+    Scoped {
+        connection: PaneId,
+        generation: u64,
+        workspace_id: String,
+        epoch: u64,
+        effect: protocol::WorkspaceEffect,
+    },
     Notify(String),
     Sound(crate::sound::SoundSignal),
     Clipboard(String),
@@ -274,7 +285,7 @@ pub struct RemoteView {
     pub error: Option<String>,
     pub frame: Option<FrameData>,
     pub generation: u64,
-    pub input: Option<RemoteInput>,
+    pub input: Option<Arc<RemoteInput>>,
     pub last_size: (u16, u16),
     pub projection: Box<RemoteProjection>,
     effect_leader: Arc<AtomicBool>,
@@ -282,7 +293,11 @@ pub struct RemoteView {
 
 impl Drop for RemoteView {
     fn drop(&mut self) {
-        if let Some(input) = &self.input {
+        if let Some(input) = self
+            .input
+            .as_ref()
+            .filter(|_| !self.projection.display.session_display)
+        {
             let _ = input.send(ClientMessage::Detach);
         }
     }
@@ -471,7 +486,9 @@ impl App {
                     .views
                     .get_mut(&self.workspaces[index].tabs[0].layout.focus)
                 {
-                    if view.projection.display.projection {
+                    if view.projection.display.projection
+                        && !view.projection.display.session_display
+                    {
                         // This epoch is queued AFTER the focus command. Its frame
                         // reflects the actual owner result, even if the target was
                         // closed or another client changed focus in the same tick.
@@ -711,6 +728,8 @@ impl App {
     }
 
     fn retain_remote_sessions(&mut self, keep: impl Fn(&str, &str) -> bool) {
+        self.remote_session_displays
+            .retain(|_, link| keep(&link.target.host, &link.target.session));
         self.remote_session_watchers
             .retain(|_, watcher| keep(&watcher.target.host, &watcher.target.session));
         let active_id = self
@@ -821,6 +840,14 @@ impl App {
 
     fn start_remote_watcher(&mut self, target: RemoteSession, retry: Option<Duration>) {
         let key = target.canonical_name();
+        if self.remote_session_displays.get(&key).is_some_and(|link| {
+            self.pending_workspace_switch
+                .as_ref()
+                .is_some_and(|p| p.connection == link.id)
+        }) {
+            self.cancel_workspace_switch();
+        }
+        self.remote_session_displays.remove(&key);
         self.remote_session_watchers.remove(&key);
         // Replacing the session scope also closes its display bridges. Fence
         // their queued frames even when this is a healthy, explicit refresh.
@@ -829,7 +856,9 @@ impl App {
                 if view.target.host == target.host && view.target.session == target.session {
                     view.projection.frame_deadline = None;
                     if let Some(input) = view.input.take() {
-                        let _ = input.send(ClientMessage::Detach);
+                        if !view.projection.display.session_display {
+                            let _ = input.send(ClientMessage::Detach);
+                        }
                     }
                     view.generation = view.generation.wrapping_add(1);
                     view.state = RemoteViewState::Connecting;
@@ -1050,7 +1079,9 @@ impl App {
                         view.scheduled = meta.scheduled;
                         if refresh_projections && view.state != RemoteViewState::Ready {
                             if let Some(input) = view.input.take() {
-                                let _ = input.send(ClientMessage::Detach);
+                                if !view.projection.display.session_display {
+                                    let _ = input.send(ClientMessage::Detach);
+                                }
                             }
                             view.generation = view.generation.wrapping_add(1);
                             view.state = RemoteViewState::Connecting;
@@ -1095,6 +1126,9 @@ impl App {
             self.add_remote_workspace(&target, meta, snapshot.display.clone());
         }
         for (pane, generation, remote, effect_leader) in reconnect {
+            if snapshot.display.session_display {
+                continue;
+            }
             spawn_projection(
                 pane,
                 generation,
@@ -1130,6 +1164,7 @@ impl App {
                 self.close_workspace_after_rehome(index);
             }
         }
+        self.ensure_session_display(&target, &snapshot.display);
         self.rebalance_remote_effect_leader(&target);
         self.finish_remote_workspace_picker();
         self.finish_remote_navigation();
@@ -1220,6 +1255,9 @@ impl App {
             pinned: false,
             remote: Some(remote.clone()),
         });
+        if display.session_display {
+            return;
+        }
         spawn_projection(
             pane,
             generation,
@@ -1280,6 +1318,34 @@ impl App {
     }
 
     pub(super) fn rebalance_remote_effect_leaders(&mut self) {
+        self.remote_session_displays.retain(|_, link| self.views.values().any(|view|
+            matches!(view, ViewKind::Remote(view) if view.target.host == link.target.host && view.target.session == link.target.session)));
+        for link in self.remote_session_displays.values_mut() {
+            if link
+                .selected
+                .is_some_and(|pane| !self.views.contains_key(&pane))
+            {
+                link.selected = None;
+                link.epoch = link.epoch.saturating_add(1);
+                if let Some(input) = &link.input {
+                    let _ = input.send(ClientMessage::ProjectionInterest {
+                        epoch: link.epoch,
+                        active: false,
+                        cols: 1,
+                        rows: 1,
+                    });
+                }
+            }
+        }
+        if self.pending_workspace_switch.as_ref().is_some_and(|p| {
+            !self.views.contains_key(&p.pane)
+                || !self
+                    .remote_session_displays
+                    .values()
+                    .any(|link| link.id == p.connection)
+        }) {
+            self.cancel_workspace_switch();
+        }
         let mut leaders = std::collections::HashMap::new();
         for (pane, view) in &self.views {
             let ViewKind::Remote(view) = view else {
@@ -1318,6 +1384,10 @@ impl App {
         generation: u64,
         input: RemoteInput,
     ) {
+        let input = Arc::new(input);
+        if self.session_display_ready(pane, generation, input.clone()) {
+            return;
+        }
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
@@ -1367,6 +1437,14 @@ impl App {
         let Some((frame, state, graphics)) = slot.take_graphics() else {
             return;
         };
+        let (pane, generation) = if self.views.contains_key(&pane) {
+            (pane, generation)
+        } else {
+            let Some(route) = self.session_frame_route(pane, generation, state.as_ref()) else {
+                return;
+            };
+            route
+        };
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
@@ -1403,6 +1481,9 @@ impl App {
         generation: u64,
         error: String,
     ) {
+        if self.session_display_closed(pane, generation, &error) {
+            return;
+        }
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
@@ -1452,6 +1533,15 @@ impl App {
 
     pub(crate) fn apply_remote_effect(&mut self, effect: RemoteEffect) {
         match effect {
+            RemoteEffect::Scoped {
+                connection,
+                generation,
+                workspace_id,
+                epoch,
+                effect,
+            } => {
+                self.apply_session_effect(connection, generation, &workspace_id, epoch, effect);
+            }
             RemoteEffect::Notify(message) => self.pending_notify.push(message),
             RemoteEffect::Sound(signal) => self.pending_sound = Some(signal),
             RemoteEffect::Clipboard(text) => self.pending_clipboard = Some(text),
@@ -1617,7 +1707,10 @@ impl App {
         self.active_remote_pane()
             .and_then(|pane| self.views.get(&pane))
             .and_then(|view| match view {
-                ViewKind::Remote(view) if view.state == RemoteViewState::Ready => {
+                ViewKind::Remote(view)
+                    if view.state == RemoteViewState::Ready
+                        && (!view.projection.display.session_display || view.projection.active) =>
+                {
                     view.input.as_ref()
                 }
                 _ => None,
@@ -1626,6 +1719,21 @@ impl App {
     }
 
     pub(crate) fn send_workspace_remote(&mut self, index: usize, message: ClientMessage) -> bool {
+        if self
+            .remote_workspace_view(index)
+            .is_some_and(|v| v.projection.display.session_display)
+            && self.prepare_workspace_switch(index)
+        {
+            if let Some(pending) = self.pending_workspace_switch.as_mut() {
+                if matches!(&message, ClientMessage::Command(text) if text.len() <= 16 * 1024)
+                    && pending.commands.len() < 16
+                {
+                    pending.commands.push(message);
+                    return true;
+                }
+            }
+            return false;
+        }
         if index == self.active_ws
             && self
                 .remote_workspace_view(index)
@@ -1845,31 +1953,33 @@ impl App {
     }
 
     pub(crate) fn resize_active_remote_projection(&mut self) {
+        if let Some(index) = self
+            .pending_workspace_switch
+            .as_ref()
+            .and_then(|p| self.pane_location(p.pane))
+            .map(|(i, _)| i)
+        {
+            self.prepare_workspace_switch(index);
+        }
         let active = self.active_remote_pane();
         if self.remote_display_pane != active {
             if let Some(previous) = self.remote_display_pane {
-                if let Some(ViewKind::Remote(view)) = self.views.get_mut(&previous) {
-                    if view.projection.display.projection && view.projection.active {
-                        view.projection.active = false;
-                        view.projection.frame_deadline = None;
-                        view.projection.epoch = view.projection.epoch.saturating_add(1);
-                        view.projection.frame_state = None;
-                        if let Some(input) = &view.input {
-                            let _ = input.send(ClientMessage::ProjectionInterest {
-                                epoch: view.projection.epoch,
-                                active: false,
-                                cols: view.last_size.0,
-                                rows: view.last_size.1,
-                            });
-                        }
-                    }
-                }
+                self.suspend_remote_display(previous);
             }
             self.remote_display_pane = active;
         }
         let Some(pane) = active else {
             return;
         };
+        if self
+            .remote_workspace_view(self.active_ws)
+            .is_some_and(|v| v.projection.display.session_display && !v.projection.active)
+        {
+            if self.pending_workspace_switch.is_none() {
+                self.prepare_workspace_switch(self.active_ws);
+            }
+            return;
+        }
         let rect = self.remote_workspace_rect(self.active_ws);
         let layout_cell_pixels = self.workspace_cell_pixels(self.active_ws);
         let cell_pixels = self.workspaces[self.active_ws]
@@ -1916,7 +2026,24 @@ impl App {
             if let Some(input) = &view.input {
                 if !view.projection.active || size != view.last_size {
                     view.projection.active = true;
-                    view.projection.epoch = view.projection.epoch.saturating_add(1);
+                    view.projection.epoch = if view.projection.display.session_display {
+                        let link = self
+                            .remote_session_displays
+                            .values_mut()
+                            .find(|link| link.selected == Some(pane))
+                            .expect("active session display");
+                        link.epoch = link.epoch.saturating_add(1);
+                        if let Some(pending) = self
+                            .pending_workspace_switch
+                            .as_mut()
+                            .filter(|p| p.connection == link.id)
+                        {
+                            pending.generation = 0;
+                        }
+                        link.epoch
+                    } else {
+                        view.projection.epoch.saturating_add(1)
+                    };
                     view.projection.frame_state = None;
                     view.state = RemoteViewState::Connecting;
                     view.last_size = size;
@@ -1929,6 +2056,15 @@ impl App {
                         rows: size.1,
                     });
                 }
+            }
+            if let Some(index) = self
+                .pending_workspace_switch
+                .as_ref()
+                .filter(|p| p.generation == 0)
+                .and_then(|p| self.pane_location(p.pane))
+                .map(|(i, _)| i)
+            {
+                self.prepare_workspace_switch(index);
             }
             return;
         }
@@ -2102,11 +2238,27 @@ pub(super) fn parse_remote_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let snapshot = RemoteSessionSnapshot {
         display: RemoteDisplay {
+            session_display: response
+                .get("result")
+                .and_then(|r| r.get("remote_display"))
+                .is_some_and(|d| {
+                    d.get("transport").and_then(Value::as_u64) == Some(13)
+                        && d.get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter().any(|c| {
+                                    c.as_str() == Some(protocol::SESSION_DISPLAY_CAPABILITY)
+                                })
+                            })
+                }),
             cell_pixels: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|display| {
-                    display.get("transport").and_then(Value::as_u64) == Some(12)
+                    display
+                        .get("transport")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|v| (12..=13).contains(&v))
                 }),
             graphics: response
                 .get("result")
@@ -2114,7 +2266,7 @@ pub(super) fn parse_remote_snapshot(
                 .is_some_and(|display| {
                     matches!(
                         display.get("transport").and_then(Value::as_u64),
-                        Some(11 | 12)
+                        Some(11..=13)
                     ) && display
                         .get("capabilities")
                         .and_then(Value::as_array)
@@ -2134,7 +2286,7 @@ pub(super) fn parse_remote_snapshot(
                 .is_some_and(|display| {
                     matches!(
                         display.get("transport").and_then(Value::as_u64),
-                        Some(10..=12)
+                        Some(10..=13)
                     ) && display
                         .get("capabilities")
                         .and_then(Value::as_array)
@@ -2356,8 +2508,10 @@ fn run_projection(
             &mut input,
             &if display.projection {
                 ClientMessage::HelloProjection {
-                    version: if display.cell_pixels {
+                    version: if display.session_display {
                         protocol::PROTOCOL_VERSION
+                    } else if display.cell_pixels {
+                        12
                     } else if display.graphics {
                         11
                     } else {
@@ -2425,6 +2579,44 @@ fn run_projection(
         let mut graphics = Vec::new();
         loop {
             match protocol::read_message::<_, ServerMessage>(&mut output) {
+                Ok(ServerMessage::WorkspaceEffect {
+                    workspace_id,
+                    epoch,
+                    effect,
+                }) => {
+                    let _ = app_tx.send(AppEvent::RemoteEffect {
+                        effect: RemoteEffect::Scoped {
+                            connection: pane,
+                            generation,
+                            workspace_id,
+                            epoch,
+                            effect,
+                        },
+                    });
+                }
+                Ok(ServerMessage::PreparedWorkspace {
+                    state,
+                    frame,
+                    graphics: update,
+                }) => {
+                    let graphics = crate::terminal::graphics::apply_updates(&[], update)
+                        .map_err(|e| e.to_string())?;
+                    let _ = app_tx.send(AppEvent::RemoteWorkspacePrepared {
+                        pane,
+                        generation,
+                        state,
+                        frame,
+                        graphics,
+                    });
+                }
+                Ok(ServerMessage::WorkspacePreparationFailed { epoch, error }) => {
+                    let _ = app_tx.send(AppEvent::RemoteWorkspacePreparationFailed {
+                        pane,
+                        generation,
+                        epoch,
+                        error,
+                    });
+                }
                 Ok(ServerMessage::GraphicFrame {
                     state,
                     text,
@@ -2944,7 +3136,7 @@ pub(crate) mod tests {
                 error: None,
                 frame: Some(frame("r")),
                 generation: 1,
-                input: Some(input.into()),
+                input: Some(Arc::new(input.into())),
                 projection: Box::default(),
                 last_size: (80, 24),
                 effect_leader: Arc::new(AtomicBool::new(true)),
@@ -5056,7 +5248,7 @@ pub(crate) mod tests {
                 error: None,
                 frame: Some(frame("s")),
                 generation: 2,
-                input: Some(input.into()),
+                input: Some(Arc::new(input.into())),
                 projection: Box::default(),
                 last_size: (80, 24),
                 effect_leader: second_leader.clone(),

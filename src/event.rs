@@ -15,6 +15,18 @@ use crate::terminal::theme_probe::TerminalColors;
 /// the server boundary lets the server select that client's geometry before it
 /// performs hit-testing or forwards bytes to a pane.
 pub enum ClientInput {
+    PrepareWorkspace {
+        workspace_id: String,
+        epoch: u64,
+        cols: u16,
+        rows: u16,
+    },
+    CommitWorkspace {
+        epoch: u64,
+    },
+    CancelWorkspace {
+        epoch: u64,
+    },
     CellPixels {
         cell_width: u16,
         cell_height: u16,
@@ -243,6 +255,19 @@ pub enum AppEvent {
     },
     RemoteEffect {
         effect: crate::app::remote::RemoteEffect,
+    },
+    RemoteWorkspacePrepared {
+        pane: PaneId,
+        generation: u64,
+        state: crate::ipc::protocol::ProjectionState,
+        frame: crate::ipc::protocol::FrameData,
+        graphics: Vec<crate::terminal::graphics::Graphic>,
+    },
+    RemoteWorkspacePreparationFailed {
+        pane: PaneId,
+        generation: u64,
+        epoch: u64,
+        error: String,
     },
     /// One structured Git status scan feeds FILES tint and DIFF (docs/88).
     DiffStatus {

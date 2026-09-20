@@ -190,7 +190,7 @@ def main():
     root = Path(tempfile.mkdtemp(prefix="installer-smoke-", dir=repo / "target"))
     for directory in ("bin", "downloads", "install", "tmp", "state"):
         (root / directory).mkdir()
-    payload = b'#!/bin/sh\n[ "$*" = "--version --remote-session-protocol" ] || exit 90\nprintf "luvus 1.0.99 remote-session=2 transport=9\\n"\n'
+    payload = b'#!/bin/sh\n[ "$*" = "--version --remote-session-protocol" ] || exit 90\nprintf "luvus 1.0.99 remote-session=2 transport=${FIXTURE_TRANSPORT:-13}\\n"\n'
     if len(sys.argv) > 1:
         binary = Path(sys.argv[1]).resolve()
         assert binary.is_relative_to(repo / "target"), "only test a checkout build"
@@ -260,6 +260,8 @@ esac
                                     FIXTURE_REDIRECT="https://github.com/other/luvus/releases/tag/fork-bad")
     assert installed.read_bytes() == payload
     if len(sys.argv) == 1:
+        for transport in ("9", "10", "11", "12", "13"):
+            run(FIXTURE_TRANSPORT=transport)
         run(FIXTURE_OS="Darwin", FIXTURE_ARCH="arm64")
         run(FIXTURE_OS="Darwin", FIXTURE_ARCH="aarch64")
     checksum = root / "downloads/luvus-x86_64-unknown-linux-musl.tar.gz.sha256"

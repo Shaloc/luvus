@@ -82,6 +82,14 @@ impl App {
     /// Explicit selection also reveals a workspace selected a second time.
     /// Restoration and passive projections still assign their index directly.
     pub(crate) fn focus_workspace(&mut self, workspace: usize) {
+        if self.prepare_workspace_switch(workspace) {
+            return;
+        }
+        self.cancel_workspace_switch();
+        self.focus_workspace_now(workspace);
+    }
+
+    pub(super) fn focus_workspace_now(&mut self, workspace: usize) {
         self.active_ws = workspace;
         if self.config.layout.workspace_display == WorkspaceDisplay::Tree
             && self

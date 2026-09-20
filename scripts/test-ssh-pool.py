@@ -82,15 +82,19 @@ try:
     result.check_returncode()
     commands = [json.loads(line)["args"] for line in (smoke / "ssh-pool-commands").read_text().splitlines()]
     paths = [args[args.index("-S") + 1] for args in commands]
-    counts = {path: paths[:16].count(path) for path in set(paths)}
-    assert len(paths) == 17 and len(counts) == 2 and sorted(counts.values()) == [8, 8], counts
+    shared_display = "use 1 display bridge(s)" in result.stdout
+    initial_channels = 1 if shared_display else 16
+    counts = {path: paths[:initial_channels].count(path) for path in set(paths)}
+    assert len(paths) == initial_channels + 1, paths
+    assert sorted(counts.values()) == ([1] if shared_display else [8, 8]), counts
     assert paths[-1] == paths[0], "retry should reuse the released channel slot"
-    # One public-key authentication per master, with 16 authenticated commands.
+    # One public-key authentication per master, including after channel retry.
     ssh_log = (root / "sshd.log").read_text()
     authentications = len(re.findall(r"Accepted publickey for", ssh_log))
-    assert authentications == 2, f"expected 2 SSH transports, got {authentications}"
+    expected_auth = 1 if shared_display else 2
+    assert authentications == expected_auth, f"expected {expected_auth} SSH transports, got {authentications}"
     assert "no more sessions" not in ssh_log.lower()
-    print("PASS: 16 display channels use 2 authenticated SSH connections, 8 channels each; MaxStartups=10 and MaxSessions=10", flush=True)
+    print(f"PASS: 16 workspaces use {initial_channels} display channels and {expected_auth} authenticated SSH connections; MaxStartups=10 and MaxSessions=10", flush=True)
 finally:
     if result is None or result.returncode:
         print("Isolated sshd diagnostics:\n" + (root / "sshd.log").read_text(), flush=True)

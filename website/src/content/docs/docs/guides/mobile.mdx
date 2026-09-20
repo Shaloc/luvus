@@ -92,3 +92,23 @@ desktop interface. A passive client render does not resize the shared PTY or
 replace the active client's mouse geometry.
 
 For host setup and SSH options, see [Remote Sessions](/docs/guides/remote/).
+
+## Managed remote views in this fork
+
+Managed remote workspaces use the same narrow-viewport renderer on their owner.
+The display forwards its content dimensions and translates touch/mouse coordinates
+into that owner viewport. It keeps the local navigation row for cross-machine
+controls while the remote MENU operates on the remote owner's workspaces.
+
+`layout.mobile_width` on the display controls its outer layout; the owner setting
+controls the remote content. If you override the default for a terminal reporting
+79 columns, configure the relevant owner as well.
+
+There is a distinction when a phone and desktop attach to the **same local
+presentation server** while it displays a managed remote workspace: they share
+that workspace's cached remote frame. Its dimensions follow the interactive
+display; a passive client can see a clipped frame rather than an independently
+rendered mobile/desktop remote layout. The local client geometry stays isolated,
+but independent remote rendering for both viewports is not implemented. Direct
+SSH clients attached to the actual owner use the per-client behavior described
+above. This is terminal-based mobile support, not a separate mobile or browser app.

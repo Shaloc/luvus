@@ -734,6 +734,25 @@ impl App {
                 self.apply_remote_projection_closed(pane, generation, error);
                 return true;
             }
+            AppEvent::RemoteWorkspacePrepared {
+                pane,
+                generation,
+                state,
+                frame,
+                graphics,
+            } => {
+                self.apply_prepared_workspace(pane, generation, state, frame, graphics);
+                return true;
+            }
+            AppEvent::RemoteWorkspacePreparationFailed {
+                pane,
+                generation,
+                epoch,
+                error,
+            } => {
+                self.workspace_preparation_failed(pane, generation, epoch, error);
+                return true;
+            }
             AppEvent::RemoteEffect { effect } => {
                 self.apply_remote_effect(effect);
                 return true;
@@ -1418,6 +1437,8 @@ impl App {
             | AppEvent::RemoteProjectionReady { .. }
             | AppEvent::RemoteFrameAvailable { .. }
             | AppEvent::RemoteProjectionClosed { .. }
+            | AppEvent::RemoteWorkspacePrepared { .. }
+            | AppEvent::RemoteWorkspacePreparationFailed { .. }
             | AppEvent::RemoteEffect { .. } => unreachable!(),
             AppEvent::NamedSessionsLoaded { .. }
             | AppEvent::NamedSessionPrepared { .. }

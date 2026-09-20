@@ -441,6 +441,8 @@ def main():
             api("config.patch", {"patch": {"remote_hosts": ["fake-dev"]}})
             run("session", "remote", "add", "fake-dev", "api", "--merge")
             wait_for(lambda: len(projected()) == 16)
+            shared_display = "session_display.v1" in api("session.snapshot", remote=True).get("remote_display", {}).get("capabilities", [])
+            expected_channels = 1 if shared_display else 16
             def admitted():
                 p = root / "ssh-admission.json"
                 import fcntl
@@ -448,28 +450,38 @@ def main():
                     fcntl.flock(lock, fcntl.LOCK_SH)
                     state = json.loads(p.read_text()) if p.exists() else {}
                 assert not state.get("rejected"), f"SSH Connection Failed: connection closed during 16-workspace attach: {state}"
-                return state if state.get("started", 0) >= 16 else None
-            # All sixteen handshakes deliberately queue; slower CI SSH/PAM
-            # startup must not share the one-operation ten-second allowance.
+                return state if state.get("started", 0) >= expected_channels else None
+            # Legacy owners queue sixteen handshakes; modern owners share one.
+            # Allow slower CI SSH/PAM startup for the entire admission batch.
             try:
                 state = wait_for(admitted, timeout=60)
             except Exception:
                 stats = root / "ssh-admission.json"
                 print("SSH admission diagnostics:", stats.read_text() if stats.exists() else "no authenticated display", flush=True)
                 raise
-            print("PASS: 16 remote workspaces connect without an SSH startup rejection", state, flush=True)
+            if shared_display:
+                # Every destination must become active only after its prepared frame.
+                for workspace in projected():
+                    api("workspace.focus", {"workspace": str(workspace["index"] - 1)})
+                    wait_for(lambda: any(w["id"] == workspace["id"] and w["active"] for w in projected()))
+                assert admitted()["started"] == 1, "switching workspaces opened extra display bridges"
+            print(f"PASS: 16 remote workspaces use {expected_channels} display bridge(s) without an SSH startup rejection", state, flush=True)
             if os.environ.get("LUVUS_TEST_SSH_POOL_CONFIG"):
                 channels = [json.loads(line) for line in (root / "ssh-pool-commands").read_text().splitlines()]
-                assert len(channels) == 16, channels
+                assert len(channels) == expected_channels, channels
                 os.kill(channels[0]["pid"], signal.SIGKILL)
                 def recovered():
                     state = admitted()
-                    return state is not None and state.get("started", 0) >= 17
+                    return state is not None and state.get("started", 0) >= expected_channels + 1
                 wait_for(recovered)
+                if shared_display:
+                    destination = projected()[0]
+                    api("workspace.focus", {"workspace": str(destination["index"] - 1)})
+                    wait_for(lambda: any(w["id"] == destination["id"] and w["active"] for w in projected()))
                 for healthy in channels[1:]:
                     os.kill(healthy["pid"], 0)
-                assert len((root / "ssh-pool-commands").read_text().splitlines()) == 17
-                print("PASS: one killed display channel reconnects; all 15 healthy SSH client processes survive", flush=True)
+                assert len((root / "ssh-pool-commands").read_text().splitlines()) == expected_channels + 1
+                print(f"PASS: one killed display channel reconnects; {expected_channels - 1} healthy SSH display processes survive", flush=True)
             return
         api("config.patch", {"patch": {"remote_hosts": ["fake-dev", "fake-old"]}})
         if upstream_only:

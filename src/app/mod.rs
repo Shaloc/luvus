@@ -2590,6 +2590,8 @@ pub struct App {
     /// there is no idle session discovery polling.
     remote_session_watchers: std::collections::HashMap<String, remote::RemoteWatcher>,
     remote_display_pane: Option<PaneId>,
+    remote_session_displays: std::collections::HashMap<String, remote::SessionDisplay>,
+    pending_workspace_switch: Option<remote::PendingWorkspaceSwitch>,
     /// Ordinary interactive display context, temporarily bound during scoped
     /// input when creating a workspace. Existing workspace spawns use its own
     /// cell_pixels so independent projections cannot overwrite one another.
@@ -3256,6 +3258,8 @@ impl App {
             focus_event_scope: false,
             remote_session_watchers: std::collections::HashMap::new(),
             remote_display_pane: None,
+            remote_session_displays: std::collections::HashMap::new(),
+            pending_workspace_switch: None,
             display_cell_pixels: None,
             remote_mouse_capture: None,
             pending_remote_navigation: None,
@@ -3963,6 +3967,8 @@ impl App {
             focus_event_scope: false,
             remote_session_watchers: std::collections::HashMap::new(),
             remote_display_pane: None,
+            remote_session_displays: std::collections::HashMap::new(),
+            pending_workspace_switch: None,
             display_cell_pixels: None,
             remote_mouse_capture: None,
             pending_remote_navigation: None,

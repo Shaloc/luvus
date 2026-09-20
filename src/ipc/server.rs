@@ -179,6 +179,7 @@ impl RenderRequest {
     }
 }
 
+#[derive(Clone)]
 struct ClientSender {
     messages: Sender<ServerMessage>,
     frame_pending: Arc<AtomicBool>,
@@ -215,6 +216,10 @@ impl ClientSender {
 }
 
 struct ClientState {
+    prepared_workspace: Option<Box<ClientState>>,
+    preparation_sent: bool,
+    preparation_epoch: u64,
+    candidate: bool,
     cell_pixels: Option<(u16, u16)>,
     graphics: Option<(u16, u16)>,
     last_graphics: Vec<crate::terminal::graphics::Graphic>,
@@ -264,6 +269,10 @@ impl ClientState {
     ) -> Self {
         let size = (cols.max(1), rows.max(1));
         Self {
+            prepared_workspace: None,
+            preparation_sent: false,
+            preparation_epoch: 0,
+            candidate: false,
             sender,
             graphics: None,
             cell_pixels: None,
@@ -293,6 +302,25 @@ impl ClientState {
     }
 
     fn send_control(&self, msg: ServerMessage) -> Result<(), ()> {
+        let msg = if self.preparation_epoch > 0 {
+            let effect = match msg {
+                ServerMessage::FocusWorkspace { workspace_id } => {
+                    protocol::WorkspaceEffect::Focus(workspace_id)
+                }
+                ServerMessage::SwitchSession { name } => protocol::WorkspaceEffect::Session(name),
+                ServerMessage::Detach => protocol::WorkspaceEffect::Detach,
+                ServerMessage::Clipboard(text) => protocol::WorkspaceEffect::Clipboard(text),
+                ServerMessage::OpenUrl(url) => protocol::WorkspaceEffect::OpenUrl(url),
+                other => return self.sender.send_control(other),
+            };
+            ServerMessage::WorkspaceEffect {
+                workspace_id: self.workspace_id.clone().unwrap_or_default(),
+                epoch: self.projection.as_ref().map_or(0, |p| p.epoch),
+                effect,
+            }
+        } else {
+            msg
+        };
         self.sender.send_control(msg)
     }
 }
@@ -673,9 +701,13 @@ pub fn run() -> Result<()> {
         // A forced redraw (resize / focus-regained / external damage) must render
         // even if nothing else changed this tick — and so must a client that is
         // waiting on its full-frame resync (see `needs_render`).
-        let any_behind = clients
-            .values()
-            .any(|client| client.surface_active() && client.behind);
+        let any_behind = clients.values().any(|client| {
+            (client.surface_active() && client.behind)
+                || client
+                    .prepared_workspace
+                    .as_ref()
+                    .is_some_and(|p| !p.preparation_sent)
+        });
         if app.force_redraw {
             render_request.record(RenderCause::ForcedRepair);
         }
@@ -832,6 +864,100 @@ fn apply(
             was_foreground || was_projection
         }
         AppEvent::ClientInput { id, input } => {
+            if let ClientInput::PrepareWorkspace {
+                workspace_id,
+                epoch,
+                cols,
+                rows,
+            } = &input
+            {
+                let Some(client) = clients.get_mut(&id) else {
+                    return false;
+                };
+                if client.projection.is_none()
+                    || *epoch <= client.preparation_epoch
+                    || client
+                        .projection
+                        .as_ref()
+                        .is_some_and(|p| *epoch <= p.epoch)
+                {
+                    return false;
+                }
+                client.preparation_epoch = *epoch;
+                client.prepared_workspace = None;
+                if !workspace_id.is_empty()
+                    && !app.workspaces.iter().any(|ws| ws.id == *workspace_id)
+                {
+                    let _ = client.send_control(ServerMessage::WorkspacePreparationFailed {
+                        epoch: *epoch,
+                        error: "remote workspace is no longer available".into(),
+                    });
+                    return false;
+                }
+                let mut candidate = ClientState::new(
+                    client.sender.clone(),
+                    *cols,
+                    *rows,
+                    client.terminal_colors.clone(),
+                    0,
+                    (!workspace_id.is_empty()).then(|| workspace_id.clone()),
+                );
+                candidate.projection = Some(ProjectionSubscription {
+                    active: true,
+                    epoch: *epoch,
+                    ..Default::default()
+                });
+                candidate.graphics = client.graphics;
+                candidate.cell_pixels = client.cell_pixels;
+                candidate.candidate = true;
+                client.prepared_workspace = Some(Box::new(candidate));
+                return true;
+            }
+            if let ClientInput::CancelWorkspace { epoch } = input {
+                if let Some(client) = clients.get_mut(&id) {
+                    if client.preparation_epoch == epoch {
+                        client.prepared_workspace = None;
+                    }
+                }
+                return false;
+            }
+            if let ClientInput::CommitWorkspace { epoch } = input {
+                let Some(client) = clients.get_mut(&id) else {
+                    return false;
+                };
+                if client.preparation_epoch != epoch
+                    || client.projection.as_ref().is_some_and(|p| epoch <= p.epoch)
+                    || !client
+                        .prepared_workspace
+                        .as_ref()
+                        .is_some_and(|p| p.preparation_sent)
+                {
+                    return false;
+                }
+                let candidate = client.prepared_workspace.take().unwrap();
+                if candidate
+                    .workspace_id
+                    .as_ref()
+                    .is_some_and(|id| !app.workspaces.iter().any(|ws| &ws.id == id))
+                {
+                    client.projection.as_mut().unwrap().active = false;
+                    let _ = client.send_control(ServerMessage::WorkspacePreparationFailed {
+                        epoch,
+                        error: "remote workspace closed before switch".into(),
+                    });
+                    return false;
+                }
+                client.workspace_id = candidate.workspace_id;
+                client.size = candidate.size;
+                client.projection = candidate.projection;
+                client.last_frame = None;
+                client.last_graphics.clear();
+                client.force_full = true;
+                client.retained_ready = false;
+                client.last_activity = *next_activity;
+                *next_activity = next_activity.saturating_add(1);
+                return true;
+            }
             if let ClientInput::ProjectionInterest {
                 epoch,
                 active,
@@ -999,7 +1125,10 @@ fn apply(
                     | ClientInput::Graphics { .. }
                     | ClientInput::Resize(..)
                     | ClientInput::ProjectionInterest { .. }
-                    | ClientInput::ProjectionPresented { .. } => unreachable!("handled above"),
+                    | ClientInput::ProjectionPresented { .. }
+                    | ClientInput::PrepareWorkspace { .. }
+                    | ClientInput::CommitWorkspace { .. }
+                    | ClientInput::CancelWorkspace { .. } => unreachable!("handled above"),
                 };
                 // These flags normally target whole-session foreground in the
                 // loop. Isolate only effects created by this scoped input so
@@ -1110,7 +1239,10 @@ fn apply(
                 | ClientInput::Graphics { .. }
                 | ClientInput::Resize(..)
                 | ClientInput::ProjectionInterest { .. }
-                | ClientInput::ProjectionPresented { .. } => unreachable!("handled above"),
+                | ClientInput::ProjectionPresented { .. }
+                | ClientInput::PrepareWorkspace { .. }
+                | ClientInput::CommitWorkspace { .. }
+                | ClientInput::CancelWorkspace { .. } => unreachable!("handled above"),
             };
             let changed = app.handle_event(event);
             bind_session_navigation_origin(app, id);
@@ -1377,6 +1509,17 @@ fn render_clients(
         .sort_unstable_by_key(|(id, owns_size)| (!owns_size, *foreground != Some(*id), *id));
     scratch.dead.clear();
     let mut presented = false;
+    for client in clients.values_mut() {
+        if let Some(candidate) = client
+            .prepared_workspace
+            .as_mut()
+            .filter(|candidate| !candidate.preparation_sent)
+        {
+            let outcome = render_client(app, candidate, false, false, true, false, &scratch.damage);
+            candidate.preparation_sent = outcome.enqueued;
+            presented |= outcome.enqueued;
+        }
+    }
     for (id, owns_size) in scratch.order.iter().copied() {
         let interactive = *foreground == Some(id);
         if let Some(client) = clients.get_mut(&id) {
@@ -1733,6 +1876,24 @@ fn render_client(
             graphics: updates,
         };
     }
+    if client.candidate {
+        let state = protocol::ProjectionState {
+            server_generation: app.backend_server_generation.clone(),
+            epoch: client.projection.as_ref().unwrap().epoch,
+            event_sequence: api::current_sequence(&app.events),
+            workspace_id: client.workspace_id.clone().unwrap_or_default(),
+            focused_pane: projected_pane.map(|pane| pane.0.to_string()),
+        };
+        message = ServerMessage::PreparedWorkspace {
+            state,
+            frame: client
+                .last_frame
+                .as_ref()
+                .expect("candidate is always full")
+                .clone(),
+            graphics: crate::terminal::graphics::updates(&graphics, &[]),
+        };
+    }
     match client.sender.try_send_frame(message) {
         Ok(()) => {
             client.last_graphics = graphics;
@@ -1866,7 +2027,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             }) => {
                 if !matches!(
                     version,
-                    protocol::PROJECTION_PROTOCOL_VERSION | 11 | protocol::PROTOCOL_VERSION
+                    protocol::PROJECTION_PROTOCOL_VERSION | 11 | 12 | protocol::PROTOCOL_VERSION
                 ) || workspace_id.len() > 128
                 {
                     let _ = protocol::write_message(
@@ -1923,7 +2084,9 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             let frame_stats = match &msg {
                 ServerMessage::Frame(_) => Some((true, 0usize)),
                 ServerMessage::FrameDiff(frame) => Some((false, frame.runs.len())),
-                ServerMessage::ProjectionFrame { .. } => Some((true, 0)),
+                ServerMessage::ProjectionFrame { .. } | ServerMessage::PreparedWorkspace { .. } => {
+                    Some((true, 0))
+                }
                 ServerMessage::ProjectionDiff { frame, .. } => Some((false, frame.runs.len())),
                 ServerMessage::GraphicFrame { text, .. } => Some(match text {
                     protocol::GraphicText::Full(_) => (true, 0),
@@ -2008,6 +2171,56 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                             cell_height,
                         },
                     });
+                }
+            }
+            Ok(ClientMessage::PrepareWorkspace {
+                workspace_id,
+                epoch,
+                cols,
+                rows,
+            }) if version >= 13 && managed_projection => {
+                if workspace_id.len() > 128
+                    || cols == 0
+                    || rows == 0
+                    || u32::from(cols) * u32::from(rows) > 1_000_000
+                {
+                    break;
+                }
+                if app_tx
+                    .send(AppEvent::ClientInput {
+                        id,
+                        input: ClientInput::PrepareWorkspace {
+                            workspace_id,
+                            epoch,
+                            cols,
+                            rows,
+                        },
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ClientMessage::CommitWorkspace { epoch }) if version >= 13 && managed_projection => {
+                if app_tx
+                    .send(AppEvent::ClientInput {
+                        id,
+                        input: ClientInput::CommitWorkspace { epoch },
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ClientMessage::CancelWorkspace { epoch }) if version >= 13 && managed_projection => {
+                if app_tx
+                    .send(AppEvent::ClientInput {
+                        id,
+                        input: ClientInput::CancelWorkspace { epoch },
+                    })
+                    .is_err()
+                {
+                    break;
                 }
             }
             Ok(ClientMessage::ProjectionInterest {
@@ -2158,6 +2371,9 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 | ClientMessage::HelloProjection { .. }
                 | ClientMessage::ProjectionInterest { .. }
                 | ClientMessage::ProjectionPresented { .. }
+                | ClientMessage::PrepareWorkspace { .. }
+                | ClientMessage::CommitWorkspace { .. }
+                | ClientMessage::CancelWorkspace { .. }
                 | ClientMessage::CellPixels { .. }
                 | ClientMessage::TerminalColors(_),
             ) => {}
@@ -3063,6 +3279,148 @@ mod tests {
                 Some((8, 24))
             );
             assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
+        }
+
+        #[test]
+        fn session_display_preparation_preserves_input_geometry_and_commits_one_client() {
+            let _env = crate::persist::test_env("session-display-owner");
+            let mut f = Fixture::new();
+            f.clients.get_mut(&2).unwrap().projection =
+                Some(super::super::ProjectionSubscription {
+                    active: true,
+                    epoch: 1,
+                    ..Default::default()
+                });
+            f.render();
+            let old_size = f.clients[&2].size;
+            let destination = f.foreground_workspace.clone();
+            let destination_size = f.app.panes[&f.foreground_pane].size();
+            f._client_receivers[1].try_iter().for_each(drop);
+            f.input(
+                2,
+                ClientInput::PrepareWorkspace {
+                    workspace_id: destination.clone(),
+                    epoch: 2,
+                    cols: 42,
+                    rows: 20,
+                },
+            );
+            assert_eq!(
+                f.clients[&2].workspace_id.as_deref(),
+                Some(f.workspace_id.as_str())
+            );
+            assert_eq!(f.clients[&2].size, old_size);
+            // Input remains scoped to the old committed workspace during preparation.
+            let old_tabs = f.app.workspaces[f.target_index()].tabs.len();
+            let new_tabs = f.app.ws().tabs.len();
+            f.input(2, ClientInput::Command("new_tab".into()));
+            assert_eq!(f.app.workspaces[f.target_index()].tabs.len(), old_tabs + 1);
+            assert_eq!(f.app.ws().tabs.len(), new_tabs);
+            f.render();
+            let prepared = f._client_receivers[1]
+                .try_iter()
+                .find_map(|m| match m {
+                    ServerMessage::PreparedWorkspace { state, frame, .. } => Some((state, frame)),
+                    _ => None,
+                })
+                .expect("complete candidate snapshot");
+            assert_eq!(prepared.0.workspace_id, destination);
+            assert_eq!((prepared.1.width, prepared.1.height), (42, 20));
+            assert_eq!(f.app.panes[&f.foreground_pane].size(), destination_size);
+            assert_eq!(f.app.ws().id, destination);
+            f.input(2, ClientInput::CommitWorkspace { epoch: 1 });
+            assert_eq!(
+                f.clients[&2].workspace_id.as_deref(),
+                Some(f.workspace_id.as_str())
+            );
+            f.input(2, ClientInput::CommitWorkspace { epoch: 2 });
+            assert_eq!(
+                f.clients[&2].workspace_id.as_deref(),
+                Some(destination.as_str())
+            );
+            assert_eq!(f.clients[&2].size, (42, 20));
+            assert!(
+                f.clients[&2].last_frame.is_none(),
+                "commit resets only active diff baseline"
+            );
+            assert_eq!(f.clients.len(), 2, "no extra client per workspace");
+            f.input(2, ClientInput::Command("new_tab".into()));
+            assert_eq!(f.app.ws().tabs.len(), new_tabs + 1);
+            assert_eq!(f.app.workspaces[f.target_index()].tabs.len(), old_tabs + 1);
+        }
+
+        #[test]
+        fn session_display_candidate_backpressure_cancel_and_closed_destination() {
+            let _env = crate::persist::test_env("session-display-cancel");
+            let mut f = Fixture::new();
+            f.clients.get_mut(&2).unwrap().projection =
+                Some(super::super::ProjectionSubscription {
+                    active: true,
+                    epoch: 1,
+                    ..Default::default()
+                });
+            f.render();
+            let destination = f.foreground_workspace.clone();
+            f.input(
+                2,
+                ClientInput::PrepareWorkspace {
+                    workspace_id: destination.clone(),
+                    epoch: 2,
+                    cols: 42,
+                    rows: 20,
+                },
+            );
+            // The writer is busy: candidates use the same one-frame pending gate.
+            render_clients(
+                &mut f.app,
+                &mut f.clients,
+                &mut f.foreground,
+                &mut f.interactive_size,
+                true,
+                false,
+                &mut RenderScratch::default(),
+            );
+            assert!(
+                !f.clients[&2]
+                    .prepared_workspace
+                    .as_ref()
+                    .unwrap()
+                    .preparation_sent
+            );
+            f.input(2, ClientInput::CommitWorkspace { epoch: 2 });
+            assert_eq!(
+                f.clients[&2].workspace_id.as_deref(),
+                Some(f.workspace_id.as_str())
+            );
+            f.input(2, ClientInput::CancelWorkspace { epoch: 2 });
+            assert!(f.clients[&2].prepared_workspace.is_none());
+            f.input(
+                2,
+                ClientInput::PrepareWorkspace {
+                    workspace_id: destination,
+                    epoch: 3,
+                    cols: 42,
+                    rows: 20,
+                },
+            );
+            f.input(2, ClientInput::CancelWorkspace { epoch: 2 });
+            assert!(f.clients[&2].prepared_workspace.is_some());
+            f.render();
+            f.app
+                .dispatch("workspace.close", &serde_json::json!({"workspace":"1"}))
+                .unwrap();
+            f.input(2, ClientInput::CommitWorkspace { epoch: 3 });
+            assert!(
+                !f.clients[&2].surface_active(),
+                "closed destination never redirects input to old workspace"
+            );
+            let old_tabs = f.app.workspaces[f.target_index()].tabs.len();
+            f.input(2, ClientInput::Command("new_tab".into()));
+            assert_eq!(f.app.workspaces[f.target_index()].tabs.len(), old_tabs);
+            assert!(f._client_receivers[1].try_iter().any(|m| matches!(
+                m,
+                ServerMessage::WorkspacePreparationFailed { epoch: 3, .. }
+            )));
         }
 
         struct Fixture {

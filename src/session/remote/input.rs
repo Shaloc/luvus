@@ -179,7 +179,8 @@ impl RemoteInput {
         let payload = match &message {
             ClientMessage::Paste(text) | ClientMessage::Command(text) => text.len(),
             ClientMessage::HelloWorkspace { workspace_id, .. }
-            | ClientMessage::HelloProjection { workspace_id, .. } => workspace_id.len(),
+            | ClientMessage::HelloProjection { workspace_id, .. }
+            | ClientMessage::PrepareWorkspace { workspace_id, .. } => workspace_id.len(),
             ClientMessage::ClipboardImage(image) => {
                 image.bytes.len().saturating_add(image.extension.len())
             }

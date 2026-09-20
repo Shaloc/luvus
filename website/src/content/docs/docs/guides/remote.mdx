@@ -364,7 +364,7 @@ local presentation row ID. Remote FILES views do not expose a stale local tree.
 ### Kitty graphics
 
 Stable fork releases include Kitty graphics from transport 11 onward. Current
-builds report `transport=12` with `luvus --version --remote-session-protocol`
+builds report `transport=13` with `luvus --version --remote-session-protocol`
 and separately negotiate physical cell dimensions for automatic split direction.
 Plain terminals can report cell dimensions without enabling Kitty graphics. Use Kitty 0.28 or newer on the display
 machine and matching graphics builds on remote owners. An older managed owner
@@ -791,28 +791,34 @@ luvus --remote alice@203.0.113.10 -p 2222 -i ~/.ssh/work_ed25519
 
 ### Ordinary SSH works but opening many remote workspaces fails
 
-Managed remote views keep independent workspace display channels. On Unix,
-Luvus pools those channels into private OpenSSH masters, with at most eight
-live display channels per master. Sixteen workspaces therefore use two display
-SSH connections, plus the separate control connection. This avoids putting all
-channels under one server `MaxSessions` limit (commonly ten). The pool's
-owner-only channel leases are shared by Luvus processes using the same home;
-idle masters exit after 30 seconds. Windows keeps independent SSH transports.
+With transport 13 (`session_display.v1`) on both ends, a local presentation server
+uses **one display bridge per remote host/session**, even when that session
+contains sixteen workspaces. The
+separate topology/control stream still discovers all workspaces and agent
+statuses. Switching workspaces reuses the bridge: Luvus prepares a full target
+frame and then commits its picture and input route together. Until that frame
+is ready, the current workspace remains usable. Cancelled, timed-out and stale
+preparations do not switch the display or replay typed input.
 
-Display handshakes are admitted one at a time per configured host across those
-processes, and the admission lease is released after the protocol handshake.
-This avoids a burst of workspace connections hitting `MaxStartups`, which
-limits unauthenticated SSH connections. Cancellation interrupts queued starts.
-A failed display reconnects independently; a failed topology connection still
-refreshes the session and fences old owner state. Healthy displays are not
-cancelled just because one workspace connection failed.
+The frame includes its workspace, connection generation, viewport and switch
+epoch. Graphics travel with the prepared frame; menu navigation and clipboard
+messages are fenced by the committed workspace and epoch as well. Display
+failures reconnect only that session's display bridge. Topology failures still
+refresh the owner generation and invalidate old state.
 
-Apply this fix on the display machine (for example the Mac running Luvus).
-Updating only the remote owner cannot change how the display starts SSH.
-No server SSH limits, authentication policy, or user SSH configuration are
-changed. If the host enforces a `MaxSessions` value below eight, its policy may
-prevent the configured pooling capacity; inspect SSH diagnostics for channel
-refusal rather than raising server limits automatically.
+Older owners retain independent workspace display channels. On Unix those
+channels share private OpenSSH masters, with at most eight live channels per
+master; sixteen legacy workspaces use two display SSH connections plus the
+separate control stream. The pool also serves multiple modern session bridges.
+Channel leases and handshake admission are shared by local Luvus processes
+using the same home. Handshakes start one at a time per configured host, and
+idle masters exit after 30 seconds. Windows uses independent SSH transports.
+
+Upgrade both the display machine and remote owner for the single-bridge and
+prepared-switch behavior. Updating only the display retains the older-owner
+fallback. No SSH limits, authentication policy, or user SSH configuration are
+changed. If a host enforces a `MaxSessions` value below the pool's eight-channel
+capacity, inspect channel-refusal diagnostics before changing its policy.
 
 ### Luvus is not found on the remote host
 

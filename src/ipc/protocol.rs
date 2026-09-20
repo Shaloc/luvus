@@ -17,7 +17,7 @@ pub fn local_cell_pixels() -> (u16, u16) {
     crate::platform::terminal_cell_pixels().unwrap_or((0, 0))
 }
 
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 pub const PROJECTION_PROTOCOL_VERSION: u32 = 10;
 pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 
@@ -26,7 +26,7 @@ pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 pub fn supports_version(version: u32) -> bool {
     matches!(
         version,
-        LEGACY_PROTOCOL_VERSION | PROJECTION_PROTOCOL_VERSION | 11 | PROTOCOL_VERSION
+        LEGACY_PROTOCOL_VERSION | PROJECTION_PROTOCOL_VERSION | 11 | 12 | PROTOCOL_VERSION
     )
 }
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -93,6 +93,20 @@ pub enum ClientMessage {
         cell_width: u16,
         cell_height: u16,
     },
+    /// Transport 13: prepare another workspace on the same display bridge.
+    /// Input continues to target the committed workspace until CommitWorkspace.
+    PrepareWorkspace {
+        workspace_id: String,
+        epoch: u64,
+        cols: u16,
+        rows: u16,
+    },
+    CommitWorkspace {
+        epoch: u64,
+    },
+    CancelWorkspace {
+        epoch: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -154,6 +168,31 @@ pub enum ServerMessage {
         text: GraphicText,
         graphics: Vec<crate::terminal::graphics::GraphicUpdate>,
     },
+    /// Independent full snapshot; never changes the active stream's diff base.
+    PreparedWorkspace {
+        state: ProjectionState,
+        frame: FrameData,
+        graphics: Vec<crate::terminal::graphics::GraphicUpdate>,
+    },
+    WorkspaceEffect {
+        workspace_id: String,
+        epoch: u64,
+        effect: WorkspaceEffect,
+    },
+    WorkspacePreparationFailed {
+        epoch: u64,
+        error: String,
+    },
+}
+
+/// Effects from a committed workspace carry the same switch identity as frames.
+#[derive(Serialize, Deserialize, Clone)]
+pub enum WorkspaceEffect {
+    Focus(String),
+    Session(String),
+    Detach,
+    Clipboard(String),
+    OpenUrl(String),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -174,10 +213,11 @@ pub struct ProjectionState {
 }
 
 pub const PROJECTION_CAPABILITY: &str = "projection.v1";
+pub const SESSION_DISPLAY_CAPABILITY: &str = "session_display.v1";
 
 pub fn remote_display_capabilities() -> serde_json::Value {
-    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, PROTOCOL_VERSION],
-        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1"]})
+    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, PROTOCOL_VERSION],
+        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY]})
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -607,7 +647,8 @@ mod tests {
         assert!(!supports_version(8));
         assert!(supports_version(11));
         assert!(supports_version(12));
-        assert!(!supports_version(13));
+        assert!(supports_version(13));
+        assert!(!supports_version(14));
     }
 
     #[test]
