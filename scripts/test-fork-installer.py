@@ -127,10 +127,15 @@ def host_admission_smoke(repo, root, binary, env):
     owner = [str(binary), "--session", "admission-ui"]
     subprocess.run([*owner, "server", "start"], env=env, cwd=root, check=True, capture_output=True, timeout=15)
     pid_file = root / "state/sessions/admission-ui/server.pid"
-    pid_before = pid_file.read_bytes()
     client = None
     master, slave = pty.openpty()
     try:
+        # Start returns when the client socket accepts connections, before all
+        # startup bookkeeping necessarily finishes (observed on macOS). A real
+        # app-loop API response fences PID publication without a fixed sleep.
+        subprocess.run([*owner, "pane", "list", "--json"], env=env, cwd=root,
+                       check=True, capture_output=True, timeout=15)
+        pid_before = pid_file.read_bytes()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         client = subprocess.Popen(owner, env=dict(env, TERM="xterm-256color"), cwd=root,
                                   stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
