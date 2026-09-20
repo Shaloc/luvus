@@ -339,6 +339,13 @@ def main():
             time.sleep(0.08)
         raise AssertionError("condition did not become true")
 
+    def select_hosts(hosts):
+        api("config.patch", {"patch": {"remote_hosts": hosts}})
+        # API acceptance updates live state first; persistence is asynchronous.
+        # The next standalone CLI reads its host admission list from disk.
+        wait_for(lambda: json.loads((root / "local-state/config.json").read_text())
+                 .get("remote_hosts", []) == hosts)
+
     def projected():
         return [w for w in api("session.snapshot")["workspaces"] if w.get("host") == "fake-dev"]
 
@@ -387,7 +394,7 @@ def main():
 
         # The same flags go through the existing SSH lifecycle command, and a
         # local batch with an enabled host must still leave remote owners alone.
-        api("config.patch", {"patch": {"remote_hosts": ["fake-dev"]}})
+        select_hosts(["fake-dev"])
         before = generations()
         assert run("--host", "fake-dev", "server", "restart", "-all", okay=False).returncode
         assert generations(remote=True) == remote_before
@@ -438,7 +445,7 @@ def main():
                 path = root / f"workspace-{i}"
                 path.mkdir()
                 api("workspace.new", {"path": str(path)}, remote=True)
-            api("config.patch", {"patch": {"remote_hosts": ["fake-dev"]}})
+            select_hosts(["fake-dev"])
             run("session", "remote", "add", "fake-dev", "api", "--merge")
             wait_for(lambda: len(projected()) == 16)
             shared_display = "session_display.v1" in api("session.snapshot", remote=True).get("remote_display", {}).get("capabilities", [])
@@ -483,7 +490,7 @@ def main():
                 assert len((root / "ssh-pool-commands").read_text().splitlines()) == expected_channels + 1
                 print(f"PASS: one killed display channel reconnects; {expected_channels - 1} healthy SSH display processes survive", flush=True)
             return
-        api("config.patch", {"patch": {"remote_hosts": ["fake-dev", "fake-old"]}})
+        select_hosts(["fake-dev", "fake-old"])
         if upstream_only:
             for remote in (False, True):
                 pane = api("pane.list", remote=remote)["panes"][0]["pane"]
@@ -1165,7 +1172,7 @@ def main():
             assert api("config.get", remote=True, session="api")["config"]["theme"] == "one-light"
             print("PASS: a rejecting first owner does not block later healthy owners on the same host", flush=True)
 
-            api("config.patch", {"patch": {"remote_hosts": []}})
+            select_hosts([])
             wait_for(lambda: not projected())
             run("--session", "api", "theme", "use", "one-dark")
             time.sleep(0.4)
@@ -1464,7 +1471,7 @@ def main():
                 if mode == "merge-tree":
                     run("--session", "api", "server", "stop", remote=True)
                     drain(master, 1)
-                    api("config.patch", {"patch": {"remote_hosts": []}})
+                    select_hosts([])
                     wait_for(lambda: not projected())
                     # Restart explicitly after deselection: pending retries or
                     # stale callbacks must not recreate any disabled projection.
@@ -2399,12 +2406,12 @@ def main():
         assert api("ping", remote=True)["session"] == "api"
         run("session", "merge", "api", "on")
         wait_for(projected)
-        api("config.patch", {"patch": {"remote_hosts": []}})
+        select_hosts([])
         wait_for(lambda: not projected())
         denied = run("--session", "remote-fake-dev-api", "pane", "list", okay=False)
         assert denied.returncode and "Settings > Remote" in denied.stderr
         assert api("ping", remote=True)["session"] == "api"
-        api("config.patch", {"patch": {"remote_hosts": ["fake-dev"]}})
+        select_hosts(["fake-dev"])
         wait_for(projected)
         run("session", "remote", "remove", "remote-fake-dev-api")
         # Removing a cached handle does not deselect its SSH host. Reopening
