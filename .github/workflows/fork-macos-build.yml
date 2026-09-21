@@ -83,6 +83,10 @@ jobs:
             file "$binary" | grep -E 'statically linked|static-pie linked'
           fi
           "$binary" --version --remote-session-protocol
+          "$binary" --version | tee "$RUNNER_TEMP/luvus-build-version.txt"
+          grep -Fx "commit=$GITHUB_SHA source=clean" "$RUNNER_TEMP/luvus-build-version.txt"
+          grep -Fx "build-id=github-$GITHUB_RUN_ID.$GITHUB_RUN_ATTEMPT" "$RUNNER_TEMP/luvus-build-version.txt"
+          grep -Fx "target=$TARGET profile=release" "$RUNNER_TEMP/luvus-build-version.txt"
           "$binary" help kitten
           "$binary" skill show > "$RUNNER_TEMP/luvus-skill.md"
           cmp skills/luvus/SKILL.md "$RUNNER_TEMP/luvus-skill.md"

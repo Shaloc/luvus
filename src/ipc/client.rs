@@ -261,7 +261,7 @@ where
     // `last_cursor` parks IME when this frame hid the PTY caret: CUP onto the
     // pane even after `?25l`, so composition does not follow chrome.
     let mut last_cursor = None;
-    let graphics_enabled = std::env::var("TERM").is_ok_and(|term| term.contains("kitty"));
+    let graphics_enabled = crate::terminal::is_kitty_display();
     send_cell_pixels(&mut writer)?;
     if graphics_enabled {
         send_graphics_size(&mut writer)?;

@@ -15,6 +15,7 @@ use crate::terminal::theme_probe::TerminalColors;
 /// the server boundary lets the server select that client's geometry before it
 /// performs hit-testing or forwards bytes to a pane.
 pub enum ClientInput {
+    ClipboardHelperOrigin(Option<u64>),
     PrepareWorkspace {
         workspace_id: String,
         epoch: u64,

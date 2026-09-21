@@ -499,6 +499,14 @@ impl App {
             protocol::WorkspaceEffect::Detach => RemoteEffect::Detach { pane, generation },
             protocol::WorkspaceEffect::Clipboard(text) => RemoteEffect::Clipboard(text),
             protocol::WorkspaceEffect::OpenUrl(url) => RemoteEffect::OpenUrl(url),
+            protocol::WorkspaceEffect::ClipboardHelper { origin, request } => {
+                RemoteEffect::ClipboardHelper {
+                    pane,
+                    generation,
+                    origin,
+                    request,
+                }
+            }
         });
     }
 

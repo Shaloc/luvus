@@ -167,9 +167,7 @@ pub fn read_image() -> Option<ClipboardImage> {
 /// denial; never query clipboard data on startup or relax Kitty permissions.
 #[cfg(not(windows))]
 fn read_kitty_image() -> Option<ClipboardImage> {
-    if !std::env::var("TERM").is_ok_and(|term| term.contains("kitty"))
-        && std::env::var_os("KITTY_WINDOW_ID").is_none()
-    {
+    if !super::is_kitty_display() {
         return None;
     }
     let mut command = Command::new(kitten::executable()?);

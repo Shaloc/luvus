@@ -68,6 +68,7 @@ pub struct SettingsUi {
     pub kitten_installing: bool,
     pub kitten_request: Option<crate::terminal::clipboard::kitten::Request>,
     pub kitten_client: Option<u64>,
+    pub kitten_relay_origin: Option<Option<u64>>,
     pub remote_hosts: Option<Result<Vec<String>, String>>,
     pub tab: SettingsTab,
     pub cursor: usize,
@@ -263,6 +264,7 @@ impl App {
             kitten_installing: false,
             kitten_request: None,
             kitten_client: None,
+            kitten_relay_origin: None,
             remote_hosts: None,
             tab: SettingsTab::General,
             cursor: 0,
@@ -286,6 +288,7 @@ impl App {
         settings.kitten_status = None;
         settings.kitten_installing = install;
         settings.kitten_client = None;
+        settings.kitten_relay_origin = None;
         settings.kitten_request = Some(crate::terminal::clipboard::kitten::Request {
             generation: settings.generation.clone(),
             install,
@@ -298,6 +301,9 @@ impl App {
         generation: &str,
         result: crate::terminal::clipboard::kitten::Outcome,
     ) -> bool {
+        if self.finish_remote_clipboard_helper(client, generation, &result) {
+            return true;
+        }
         let Some(settings) = self
             .settings
             .as_mut()

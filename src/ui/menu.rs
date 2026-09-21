@@ -624,6 +624,7 @@ fn ws_label(
 
 fn pane_label(it: PaneMenuItem, cat: &Catalog, extras: &[ModuleMenuAction]) -> String {
     match it {
+        PaneMenuItem::NewPane => cat.menu_new_pane.to_string(),
         PaneMenuItem::SplitVertical => cat.menu_split_vertical.to_string(),
         PaneMenuItem::SplitHorizontal => cat.menu_split_horizontal.to_string(),
         PaneMenuItem::ForkPane => cat.menu_fork_pane.to_string(),

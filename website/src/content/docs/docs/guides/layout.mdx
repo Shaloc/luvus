@@ -14,8 +14,9 @@ like, and luvus tiles them automatically.
 
 | Do this | Mouse | Key |
 |---|---|---|
-| Split side by side | right-click a pane → **Split** | `Ctrl+Space v` |
-| Split top / bottom | right-click a pane → **Split down** | `Ctrl+Space s` |
+| Create a pane with automatic direction | right-click a pane → **New Pane** | `Ctrl+Space +` |
+| Split side by side | right-click a pane → **Split Vertical** | `Ctrl+Space v` |
+| Split top / bottom | right-click a pane → **Split Horizontal** | `Ctrl+Space s` |
 | Focus a pane | click it | arrows or `hjkl` |
 | Move a pane to another tab | right-click → **Move to Tab** | n/a |
 | Zoom (fullscreen) a pane | n/a | `Ctrl+Space z` |
@@ -23,6 +24,12 @@ like, and luvus tiles them automatically.
 
 Each split pane shows a title bar with a **status dot** and its working
 directory. The focused pane's frame is brighter.
+
+**New Pane** splits the right-clicked pane along its longer physical side,
+using the terminal's cell dimensions to choose side by side or top / bottom.
+The new pane receives focus and follows the existing working-directory setting:
+the target pane's directory, or the workspace root when that option is enabled.
+This also works in remote workspaces.
 
 ### Resizing
 

@@ -1795,6 +1795,9 @@ mod tests {
     fn fixture_control(script: &str) -> ControlConnection {
         let mut child = Command::new("/bin/sh")
             .args(["-c", script])
+            // Parallel helper-discovery tests replace the process-wide PATH.
+            // Keep this deadline fixture's sleep available independently.
+            .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -2091,10 +2094,10 @@ mod tests {
 
     #[test]
     fn compatible_remote_release_does_not_require_identical_package_version() {
-        for transport in [9, crate::ipc::protocol::PROTOCOL_VERSION] {
+        for transport in [9, 13, crate::ipc::protocol::PROTOCOL_VERSION] {
             let output = VersionOutput {
                 status: exit_status(0),
-                stdout: format!("luvus 1.1.0 remote-session=2 transport={transport}\n")
+                stdout: format!("luvus 1.1.0 remote-session=2 transport={transport}\nbuild-id=fixture\ncommit=unknown source=unknown\n")
                     .into_bytes(),
                 stderr: Vec::new(),
             };

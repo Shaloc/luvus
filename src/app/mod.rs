@@ -1070,11 +1070,13 @@ pub struct AgentForkResult {
     pub tab: usize,
 }
 
-/// An action offered by the pane context menu. `SplitVertical` puts the new pane
+/// An action offered by the pane context menu. `NewPane` chooses the split axis
+/// from the target's physical dimensions. `SplitVertical` puts the new pane
 /// side by side (a vertical divider, like `v`); `SplitHorizontal` stacks it (a
 /// horizontal divider, like `s`). `Divider` is a non-interactive separator.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaneMenuItem {
+    NewPane,
     SplitVertical,
     SplitHorizontal,
     /// "Open Link" — open the URL that was under the right-click (docs/58). Only
@@ -1105,6 +1107,7 @@ impl PaneMenuItem {
     /// The built-in rows, in render order. Module actions are appended after a
     /// divider by [`App::pane_menu_items`].
     pub const ALL: &'static [PaneMenuItem] = &[
+        PaneMenuItem::NewPane,
         PaneMenuItem::SplitVertical,
         PaneMenuItem::SplitHorizontal,
         PaneMenuItem::ForkPane,
@@ -2644,6 +2647,7 @@ pub struct App {
     /// Text to copy to the client's system clipboard (via OSC 52) — set when a
     /// selection finishes, drained + broadcast by the loop.
     pub pending_clipboard: Option<String>,
+    pub(crate) remote_clipboard_helpers: HashMap<Option<u64>, remote::RemoteClipboardHelper>,
     /// A URL to open in the client's browser (docs/58) — set by a Ctrl+click on a
     /// link in a pane, drained + broadcast by the loop like `pending_clipboard`.
     pub pending_open_url: Option<String>,
@@ -3286,6 +3290,7 @@ impl App {
             copy_mode: None,
             mouse_grab: None,
             pending_clipboard: None,
+            remote_clipboard_helpers: HashMap::new(),
             pending_open_url: None,
             link_scan_at: None,
             hover_link: None,
@@ -3997,6 +4002,7 @@ impl App {
             copy_mode: None,
             mouse_grab: None,
             pending_clipboard: None,
+            remote_clipboard_helpers: HashMap::new(),
             pending_open_url: None,
             link_scan_at: None,
             hover_link: None,
@@ -7131,6 +7137,7 @@ impl App {
                     self.run_module_menu_action("pane", a, target);
                 }
             }
+            PaneMenuItem::NewPane => self.split_auto(),
             PaneMenuItem::SplitVertical => self.split(Axis::Col), // side by side
             PaneMenuItem::SplitHorizontal => self.split(Axis::Row), // stacked
             PaneMenuItem::ForkPane => {
@@ -13994,29 +14001,60 @@ fi
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
 
-        // Clicking "Split vertical" adds a pane and closes the menu.
+        // The first row creates a pane with automatic direction.
         let (item, rect) = app.pane_menu.as_ref().unwrap().items[0];
-        assert_eq!(item, PaneMenuItem::SplitVertical);
+        assert_eq!(item, PaneMenuItem::NewPane);
         let before = app.layout().len();
         app.pane_menu_click(rect.x + 1, rect.y);
         assert!(app.pane_menu.is_none(), "menu closed after a click");
+        assert_eq!(app.layout().len(), before + 1, "new pane added");
+
+        // Right-click the original pane while its sibling is focused. The
+        // automatic split must target that pane, using its current dimensions.
+        let sibling = app.layout().focus;
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let sibling_before = app.layout().pane_rect(app.last_pane_area, sibling);
+        let target_before = app.layout().pane_rect(app.last_pane_area, pane).unwrap();
+        app.open_pane_menu(pane, 6, 6);
+        app.pane_menu_action(PaneMenuItem::NewPane);
+        let new_pane = app.layout().focus;
+        assert_ne!(new_pane, pane);
+        assert_ne!(new_pane, sibling);
+        assert_eq!(app.layout().len(), before + 2);
+        assert_eq!(
+            app.layout().pane_rect(app.last_pane_area, sibling),
+            sibling_before,
+            "the previously focused sibling must keep its geometry"
+        );
+        let original = app.layout().pane_rect(app.last_pane_area, pane).unwrap();
+        let added = app
+            .layout()
+            .pane_rect(app.last_pane_area, new_pane)
+            .unwrap();
+        assert_eq!(original.x, added.x, "the narrow target should stack panes");
+        assert_eq!(original.width, target_before.width);
+        assert!(added.y > original.y);
+        app.open_pane_menu(new_pane, 6, 6);
+        app.pane_menu_action(PaneMenuItem::Close);
+
+        // Explicit vertical and horizontal splits remain available.
+        app.open_pane_menu(app.layout().focus, 6, 6);
+        app.pane_menu_action(PaneMenuItem::SplitVertical);
         assert_eq!(
             app.layout().len(),
-            before + 1,
+            before + 2,
             "split vertical added a pane"
         );
-
-        // Split horizontal and close, via the action path.
         app.open_pane_menu(app.layout().focus, 6, 6);
         app.pane_menu_action(PaneMenuItem::SplitHorizontal);
         assert_eq!(
             app.layout().len(),
-            before + 2,
+            before + 3,
             "split horizontal added a pane"
         );
         app.open_pane_menu(app.layout().focus, 6, 6);
         app.pane_menu_action(PaneMenuItem::Close);
-        assert_eq!(app.layout().len(), before + 1, "close removed a pane");
+        assert_eq!(app.layout().len(), before + 2, "close removed a pane");
 
         // A dashboard tab has no panes to act on — the menu never opens there.
         app.run_cmd(crate::app::keys::Cmd::OpenBoard);
@@ -16384,6 +16422,7 @@ fi
             kitten_installing: false,
             kitten_request: None,
             kitten_client: None,
+            kitten_relay_origin: None,
             remote_hosts: None,
             tab: SettingsTab::Layout,
             cursor: idx,

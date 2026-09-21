@@ -209,6 +209,7 @@ pub struct RemoteSessionSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RemoteDisplay {
+    pub clipboard_helper_relay: bool,
     pub session_display: bool,
     pub location: RemoteBinaryLocation,
     pub server_generation: Option<String>,
@@ -238,6 +239,12 @@ pub enum RemoteViewState {
 }
 
 pub enum RemoteEffect {
+    ClipboardHelper {
+        pane: PaneId,
+        generation: u64,
+        origin: Option<u64>,
+        request: crate::terminal::clipboard::kitten::Request,
+    },
     Scoped {
         connection: PaneId,
         generation: u64,
@@ -289,6 +296,17 @@ pub struct RemoteView {
     pub last_size: (u16, u16),
     pub projection: Box<RemoteProjection>,
     effect_leader: Arc<AtomicBool>,
+}
+
+/// One outstanding helper operation per display, using the existing helper
+/// worker and response message. The bridge and request identities fence replies.
+pub(crate) struct RemoteClipboardHelper {
+    pane: PaneId,
+    generation: u64,
+    input: Arc<RemoteInput>,
+    owner_generation: String,
+    relay_generation: String,
+    request: Option<crate::terminal::clipboard::kitten::Request>,
 }
 
 impl Drop for RemoteView {
@@ -1533,6 +1551,47 @@ impl App {
 
     pub(crate) fn apply_remote_effect(&mut self, effect: RemoteEffect) {
         match effect {
+            RemoteEffect::ClipboardHelper {
+                pane,
+                generation,
+                origin,
+                request,
+            } => {
+                let Some(ViewKind::Remote(view)) = self.views.get(&pane) else {
+                    return;
+                };
+                if view.generation != generation || self.active_remote_pane() != Some(pane) {
+                    return;
+                }
+                let Some(input) = view.input.clone() else {
+                    return;
+                };
+                // Bound queued work even if an owner sends arbitrary origin tokens.
+                if self.remote_clipboard_helpers.len() >= 64
+                    && !self.remote_clipboard_helpers.contains_key(&origin)
+                {
+                    let _ = input.send(ClientMessage::ClipboardHelperResult {
+                        generation: request.generation,
+                        result: Err("too many pending display helper requests".into()),
+                    });
+                    return;
+                }
+                let relay_generation = crate::ids::public_id("clipboard-relay");
+                self.remote_clipboard_helpers.insert(
+                    origin,
+                    RemoteClipboardHelper {
+                        pane,
+                        generation,
+                        input,
+                        owner_generation: request.generation.clone(),
+                        relay_generation: relay_generation.clone(),
+                        request: Some(crate::terminal::clipboard::kitten::Request {
+                            generation: relay_generation,
+                            install: request.install,
+                        }),
+                    },
+                );
+            }
             RemoteEffect::Scoped {
                 connection,
                 generation,
@@ -1590,6 +1649,53 @@ impl App {
                 }
             }
         }
+    }
+
+    pub(crate) fn forward_clipboard_helper_origin(&self, origin: Option<u64>) {
+        if let Some(view) = self.remote_workspace_view(self.active_ws) {
+            if view.projection.display.clipboard_helper_relay {
+                if let Some(input) = &view.input {
+                    let _ = input.send(ClientMessage::ClipboardHelperOrigin(origin));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn take_remote_clipboard_helper_requests(
+        &mut self,
+    ) -> Vec<(Option<u64>, crate::terminal::clipboard::kitten::Request)> {
+        self.remote_clipboard_helpers
+            .iter_mut()
+            .filter_map(|(client, relay)| relay.request.take().map(|request| (*client, request)))
+            .collect()
+    }
+
+    pub(crate) fn finish_remote_clipboard_helper(
+        &mut self,
+        client: Option<u64>,
+        generation: &str,
+        result: &crate::terminal::clipboard::kitten::Outcome,
+    ) -> bool {
+        let Some(relay) = self
+            .remote_clipboard_helpers
+            .get(&client)
+            .filter(|relay| relay.relay_generation == generation)
+        else {
+            return false;
+        };
+        let valid = self.views.get(&relay.pane).is_some_and(|view| {
+            matches!(view, ViewKind::Remote(view)
+                if view.generation == relay.generation
+                && view.input.as_ref().is_some_and(|input| Arc::ptr_eq(input, &relay.input)))
+        });
+        let relay = self.remote_clipboard_helpers.remove(&client).unwrap();
+        if valid {
+            let _ = relay.input.send(ClientMessage::ClipboardHelperResult {
+                generation: relay.owner_generation,
+                result: result.clone(),
+            });
+        }
+        true
     }
 
     fn remote_navigation_source(
@@ -2238,11 +2344,23 @@ pub(super) fn parse_remote_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let snapshot = RemoteSessionSnapshot {
         display: RemoteDisplay {
+            clipboard_helper_relay: response
+                .get("result")
+                .and_then(|r| r.get("remote_display"))
+                .is_some_and(|d| {
+                    d.get("transport").and_then(Value::as_u64) == Some(14)
+                        && d.get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter()
+                                    .any(|c| c.as_str() == Some("clipboard_helper_relay.v1"))
+                            })
+                }),
             session_display: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    d.get("transport").and_then(Value::as_u64) == Some(13)
+                    matches!(d.get("transport").and_then(Value::as_u64), Some(13..=14))
                         && d.get("capabilities")
                             .and_then(Value::as_array)
                             .is_some_and(|caps| {
@@ -2258,7 +2376,7 @@ pub(super) fn parse_remote_snapshot(
                     display
                         .get("transport")
                         .and_then(Value::as_u64)
-                        .is_some_and(|v| (12..=13).contains(&v))
+                        .is_some_and(|v| (12..=14).contains(&v))
                 }),
             graphics: response
                 .get("result")
@@ -2266,7 +2384,7 @@ pub(super) fn parse_remote_snapshot(
                 .is_some_and(|display| {
                     matches!(
                         display.get("transport").and_then(Value::as_u64),
-                        Some(11..=13)
+                        Some(11..=14)
                     ) && display
                         .get("capabilities")
                         .and_then(Value::as_array)
@@ -2286,7 +2404,7 @@ pub(super) fn parse_remote_snapshot(
                 .is_some_and(|display| {
                     matches!(
                         display.get("transport").and_then(Value::as_u64),
-                        Some(10..=13)
+                        Some(10..=14)
                     ) && display
                         .get("capabilities")
                         .and_then(Value::as_array)
@@ -2508,8 +2626,10 @@ fn run_projection(
             &mut input,
             &if display.projection {
                 ClientMessage::HelloProjection {
-                    version: if display.session_display {
-                        protocol::PROTOCOL_VERSION
+                    version: if display.clipboard_helper_relay {
+                        14
+                    } else if display.session_display {
+                        13
                     } else if display.cell_pixels {
                         12
                     } else if display.graphics {
@@ -2555,6 +2675,10 @@ fn run_projection(
             protocol::write_message(&mut input, &ClientMessage::TerminalColors(None))
                 .map_err(|error| error.to_string())?;
         }
+        if display.clipboard_helper_relay {
+            protocol::write_message(&mut input, &ClientMessage::ClipboardHelperOrigin(None))
+                .map_err(|error| error.to_string())?;
+        }
         drop(deadline);
         connection.authenticated();
 
@@ -2591,6 +2715,16 @@ fn run_projection(
                             workspace_id,
                             epoch,
                             effect,
+                        },
+                    });
+                }
+                Ok(ServerMessage::ForwardedClipboardHelper { origin, request }) => {
+                    let _ = app_tx.send(AppEvent::RemoteEffect {
+                        effect: RemoteEffect::ClipboardHelper {
+                            pane,
+                            generation,
+                            origin,
+                            request,
                         },
                     });
                 }
@@ -3671,6 +3805,109 @@ pub(crate) mod tests {
             assert!(outer
                 .dispatch("pane.restart", &json!({"pane":projection.0}))
                 .is_err());
+        }
+    }
+
+    #[test]
+    fn remote_clipboard_helper_routes_replies_and_rejects_retired_bridges() {
+        use crate::terminal::clipboard::kitten::{Request, Status};
+        let _env = crate::persist::test_env("remote-clipboard-helper");
+        let mut app = remote_ui_app();
+        let (pane, receiver, _) = add_remote_workspace(&mut app);
+        let request = |install| RemoteEffect::ClipboardHelper {
+            pane,
+            generation: 1,
+            origin: Some(7),
+            request: Request {
+                generation: "owner-settings".into(),
+                install,
+            },
+        };
+        app.apply_remote_effect(request(false));
+        let (origin, check) = app.take_remote_clipboard_helper_requests().pop().unwrap();
+        assert_eq!(origin, Some(7));
+        assert!(!check.install);
+        let installed = Ok(Status::Installed(
+            "kitten 0.49.0 created by Kovid Goyal".into(),
+        ));
+        assert!(!app.apply_clipboard_helper_result(Some(8), &check.generation, installed.clone()));
+        assert!(receiver.try_recv().is_err());
+        assert!(app.apply_clipboard_helper_result(Some(7), &check.generation, installed.clone()));
+        assert!(
+            matches!(receiver.try_recv().unwrap(), ClientMessage::ClipboardHelperResult { generation, result }
+            if generation == "owner-settings" && result == installed)
+        );
+
+        app.apply_remote_effect(request(true));
+        let (_, install) = app.take_remote_clipboard_helper_requests().pop().unwrap();
+        assert!(install.install);
+        assert!(!app.apply_clipboard_helper_result(Some(7), &check.generation, installed.clone()));
+        let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+            unreachable!()
+        };
+        let (replacement, replacement_rx) = mpsc::channel();
+        view.input = Some(Arc::new(replacement.into()));
+        assert!(app.apply_clipboard_helper_result(Some(7), &install.generation, installed));
+        assert!(receiver.try_recv().is_err());
+        assert!(replacement_rx.try_recv().is_err());
+        assert!(app.remote_clipboard_helpers.is_empty());
+    }
+
+    #[test]
+    fn remote_pane_menu_creates_a_pane_only_on_the_owner() {
+        use ratatui::crossterm::event::MouseButton;
+
+        let _env = crate::persist::test_env("remote-pane-menu-new");
+        for workspace_only in [false, true] {
+            let (tx, _rx) = mpsc::channel();
+            let mut owner = App::new(180, 48, tx).unwrap();
+            let old = owner.layout().focus;
+            let mut outer = remote_ui_app();
+            let (projection, receiver, _) = add_remote_workspace(&mut outer);
+            remote_ui_buffer(&mut outer, (180, 48));
+            let area = outer.pane_content_rects[0].1;
+            for open_menu in [true, false] {
+                let frame =
+                    remote_ui_owner_frame(&mut owner, (area.width, area.height), workspace_only);
+                let ViewKind::Remote(view) = outer.views.get_mut(&projection).unwrap() else {
+                    unreachable!()
+                };
+                view.frame = Some(frame);
+                let visible = remote_ui_buffer(&mut outer, (180, 48));
+                let (button, point) = if open_menu {
+                    let content = owner.pane_content_rects[0].1;
+                    (
+                        MouseButton::Right,
+                        (area.x + content.x + 2, area.y + content.y + 2),
+                    )
+                } else {
+                    (
+                        MouseButton::Left,
+                        remote_ui_visible_text(&visible, area, owner.catalog.menu_new_pane),
+                    )
+                };
+                for kind in [MouseEventKind::Down(button), MouseEventKind::Up(button)] {
+                    outer.handle_event(AppEvent::Mouse(MouseEvent {
+                        kind,
+                        column: point.0,
+                        row: point.1,
+                        modifiers: KeyModifiers::NONE,
+                    }));
+                    let ClientMessage::Mouse(mouse) = receiver.try_recv().expect("owner input")
+                    else {
+                        panic!("pane menu click did not reach owner");
+                    };
+                    owner.handle_event(AppEvent::Mouse(mouse));
+                }
+                assert_eq!(owner.pane_menu.is_some(), open_menu);
+            }
+            assert_eq!(owner.layout().len(), 2);
+            assert_ne!(owner.layout().focus, old);
+            assert!(owner.panes.contains_key(&old));
+            assert_eq!(outer.layout().len(), 1);
+            assert!(outer.views.contains_key(&projection));
+            assert!(outer.panes.is_empty(), "no local shadow pane was created");
+            assert!(receiver.try_recv().is_err());
         }
     }
 

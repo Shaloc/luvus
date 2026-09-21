@@ -84,7 +84,13 @@ fn main() -> Result<()> {
                     ipc::protocol::PROTOCOL_VERSION
                 );
             } else {
-                println!("luvus {}", env!("CARGO_PKG_VERSION"));
+                println!(
+                    "luvus {} remote-session=2 transport={}\nbuild-id={}\ncommit={} source={}\ntarget={} profile={}",
+                    env!("CARGO_PKG_VERSION"), ipc::protocol::PROTOCOL_VERSION,
+                    env!("LUVUS_BUILD_ID"), env!("LUVUS_BUILD_COMMIT"),
+                    env!("LUVUS_BUILD_SOURCE"), env!("LUVUS_BUILD_TARGET"),
+                    env!("LUVUS_BUILD_PROFILE"),
+                );
             }
             return Ok(());
         }
@@ -1773,16 +1779,20 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         if let Some(text) = app.pending_clipboard.take() {
             emit_clipboard(&text);
         }
+        let mut helper_requests = app.take_remote_clipboard_helper_requests();
         if let Some(request) = app
             .settings
             .as_mut()
             .and_then(|ui| ui.kitten_request.take())
         {
+            helper_requests.push((None, request));
+        }
+        for (client, request) in helper_requests {
             let sender = tx.clone();
             std::thread::spawn(move || {
                 let result = terminal::clipboard::kitten::perform(request.install);
                 let _ = sender.send(event::AppEvent::ClipboardHelperResult {
-                    client: None,
+                    client,
                     generation: request.generation,
                     result,
                 });

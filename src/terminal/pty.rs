@@ -1299,10 +1299,22 @@ fn apply_pane_env(
     // A persistent Luvus server may have been started through an SSH bridge.
     // Its panes own fresh local PTYs, so inheriting the bridge's connection
     // identity makes terminal applications misclassify those PTYs as SSH
-    // terminals long after the originating connection is gone. Keep
-    // SSH_AUTH_SOCK: forwarded agent access is still useful inside panes.
+    // terminals long after the originating connection is gone.
     for key in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"] {
         cmd.env_remove(key);
+    }
+    // Keep live agent forwarding, but don't pass a removed forwarding socket
+    // from the long-lived server to each new shell. Shell startup scripts can
+    // then select their own agent. Only clear a provably missing path: other
+    // metadata errors don't establish that the agent is unavailable. Windows
+    // agent endpoints aren't Unix filesystem sockets and retain their behavior.
+    #[cfg(unix)]
+    if cmd.get_env("SSH_AUTH_SOCK").is_some_and(|socket| {
+        matches!(std::fs::metadata(cwd.join(socket)), Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound)
+    }) {
+        cmd.env_remove("SSH_AUTH_SOCK");
+        cmd.env_remove("SSH_AGENT_PID");
     }
     cmd.env("TERM", "xterm-256color");
     cmd.env("LUVUS_ENV", "1");
@@ -2288,6 +2300,14 @@ mod tests {
     #[test]
     fn pane_env_drops_ssh_terminal_identity_but_keeps_agent_forwarding() {
         let mut command = CommandBuilder::new("shell");
+        #[cfg(unix)]
+        let _env = crate::persist::test_env("pane-agent-live");
+        #[cfg(unix)]
+        let agent_path = crate::persist::ensure_config_dir().join("agent.sock");
+        #[cfg(unix)]
+        let _agent = std::os::unix::net::UnixListener::bind(&agent_path).unwrap();
+        #[cfg(not(unix))]
+        let agent_path = PathBuf::from("forwarded-agent");
         let extra_env = [
             (
                 "SSH_CONNECTION".to_string(),
@@ -2295,7 +2315,11 @@ mod tests {
             ),
             ("SSH_CLIENT".to_string(), "client identity".to_string()),
             ("SSH_TTY".to_string(), "windows-pty".to_string()),
-            ("SSH_AUTH_SOCK".to_string(), "forwarded-agent".to_string()),
+            (
+                "SSH_AUTH_SOCK".to_string(),
+                agent_path.to_string_lossy().into_owned(),
+            ),
+            ("SSH_AGENT_PID".to_string(), "123".to_string()),
         ];
 
         apply_pane_env(
@@ -2310,9 +2334,47 @@ mod tests {
         }
         assert_eq!(
             command.get_env("SSH_AUTH_SOCK"),
-            Some(OsStr::new("forwarded-agent")),
+            Some(agent_path.as_os_str()),
             "SSH agent forwarding remains available"
         );
+        assert_eq!(command.get_env("SSH_AGENT_PID"), Some(OsStr::new("123")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_env_drops_missing_agent_socket_inherited_or_overridden() {
+        let _env = crate::persist::test_env("pane-agent-gone");
+        let dir = crate::persist::ensure_config_dir();
+        let agent_path = dir.join("agent.sock");
+        let agent = std::os::unix::net::UnixListener::bind(&agent_path).unwrap();
+        drop(agent);
+        std::fs::remove_file(&agent_path).unwrap();
+
+        for override_env in [false, true] {
+            for path in [agent_path.as_path(), std::path::Path::new("agent.sock")] {
+                let mut command = CommandBuilder::new("shell");
+                let env = vec![
+                    (
+                        "SSH_AUTH_SOCK".to_owned(),
+                        path.to_string_lossy().into_owned(),
+                    ),
+                    ("SSH_AGENT_PID".to_owned(), "123".to_owned()),
+                ];
+                if !override_env {
+                    for (key, value) in &env {
+                        command.env(key, value);
+                    }
+                }
+                apply_pane_env(
+                    &mut command,
+                    PaneId(1),
+                    &dir,
+                    if override_env { &env } else { &[] },
+                );
+                assert_eq!(command.get_env("SSH_AUTH_SOCK"), None);
+                assert_eq!(command.get_env("SSH_AGENT_PID"), None);
+            }
+        }
     }
 
     #[test]

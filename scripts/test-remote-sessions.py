@@ -256,7 +256,8 @@ def main():
     if network_reconnect_only:
         env["LUVUS_SMOKE_NETWORK_RECONNECT"] = "1"
     if graphics_only:
-        env["TERM"] = "xterm-kitty"
+        env["TERM"] = os.environ.get("LUVUS_TEST_KITTY_TERM", "xterm-kitty")
+        env["KITTY_WINDOW_ID"] = "1"
         if os.environ.get("LUVUS_TEST_PIXEL_BINDING"):
             binding = Path(os.environ["LUVUS_TEST_PIXEL_BINDING"]).resolve()
             assert binding.is_file() and binding.name == "pixel.node", binding
@@ -1635,15 +1636,15 @@ def main():
 
         if clipboard_only:
             clipboard_mode = os.environ.get("LUVUS_TEST_CLIPBOARD_MODE", "local")
-            assert clipboard_mode in ("local", "direct-remote", "merge"), clipboard_mode
-            if clipboard_mode == "merge":
+            assert clipboard_mode in ("local", "direct-remote", "merge", "owner-settings"), clipboard_mode
+            if clipboard_mode in ("merge", "owner-settings"):
                 run("session", "merge", "on")
                 wait_for(projected)
                 remote_workspace = next(w for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
                 api("workspace.focus", {"workspace": remote_workspace["workspace"]})
             process, master = start_client(["session", "attach", "remote-fake-dev-api"]
                                            if clipboard_mode == "direct-remote" else ["--session", "api"])
-            os.write(master, b"\x02=")
+            os.write(master, b"\x00=" if clipboard_mode == "owner-settings" else b"\x02=")
             screen = bytearray()
             def install_row():
                 screen.extend(drain(master, 0.1))

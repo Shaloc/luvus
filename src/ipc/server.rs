@@ -216,6 +216,8 @@ impl ClientSender {
 }
 
 struct ClientState {
+    /// None is an ordinary/legacy client; Some(None) is a monolithic relay.
+    clipboard_helper_origin: Option<Option<u64>>,
     prepared_workspace: Option<Box<ClientState>>,
     preparation_sent: bool,
     preparation_epoch: u64,
@@ -269,6 +271,7 @@ impl ClientState {
     ) -> Self {
         let size = (cols.max(1), rows.max(1));
         Self {
+            clipboard_helper_origin: None,
             prepared_workspace: None,
             preparation_sent: false,
             preparation_epoch: 0,
@@ -311,6 +314,9 @@ impl ClientState {
                 ServerMessage::Detach => protocol::WorkspaceEffect::Detach,
                 ServerMessage::Clipboard(text) => protocol::WorkspaceEffect::Clipboard(text),
                 ServerMessage::OpenUrl(url) => protocol::WorkspaceEffect::OpenUrl(url),
+                ServerMessage::ForwardedClipboardHelper { origin, request } => {
+                    protocol::WorkspaceEffect::ClipboardHelper { origin, request }
+                }
                 other => return self.sender.send_control(other),
             };
             ServerMessage::WorkspaceEffect {
@@ -667,6 +673,33 @@ pub fn run() -> Result<()> {
             broadcast(&mut clients, ServerMessage::Clipboard(text));
         }
         send_clipboard_helper_request(&mut app, &clients, foreground);
+        for (origin, request) in app.take_remote_clipboard_helper_requests() {
+            let sent = origin
+                .and_then(|id| clients.get(&id))
+                .is_some_and(|client| {
+                    let message = match client.clipboard_helper_origin {
+                        Some(origin) => ServerMessage::ForwardedClipboardHelper {
+                            origin,
+                            request: request.clone(),
+                        },
+                        None if client.workspace_id.is_none() => {
+                            ServerMessage::ClipboardHelper(request.clone())
+                        }
+                        None => return false,
+                    };
+                    client.send_control(message).is_ok()
+                });
+            if !sent {
+                app.finish_remote_clipboard_helper(
+                    origin,
+                    &request.generation,
+                    &Err(
+                        "requesting display disconnected or does not support helper forwarding"
+                            .into(),
+                    ),
+                );
+            }
+        }
         // An expired toast forces one render so it disappears (idle frames don't).
         if app.tick_toast(Instant::now()) {
             render_request.record(RenderCause::Metadata);
@@ -864,6 +897,12 @@ fn apply(
             was_foreground || was_projection
         }
         AppEvent::ClientInput { id, input } => {
+            if let ClientInput::ClipboardHelperOrigin(origin) = input {
+                if let Some(client) = clients.get_mut(&id) {
+                    client.clipboard_helper_origin = Some(origin);
+                }
+                return false;
+            }
             if let ClientInput::PrepareWorkspace {
                 workspace_id,
                 epoch,
@@ -1082,7 +1121,7 @@ fn apply(
             };
             client.last_activity = *next_activity;
             *next_activity = next_activity.saturating_add(1);
-            bind_session_navigation_origin(app, id);
+            bind_session_navigation_origin(app, id, client.clipboard_helper_origin);
 
             if let Some(workspace_id) = client.workspace_id.clone() {
                 let Some(workspace_index) = app
@@ -1114,6 +1153,7 @@ fn apply(
                     .get(app.active_ws)
                     .map(|workspace| workspace.id.clone());
                 app.active_ws = workspace_index;
+                app.forward_clipboard_helper_origin(Some(id));
                 let event = match input {
                     ClientInput::Key(key) => AppEvent::Key(key),
                     ClientInput::PrefixKey(key) => AppEvent::PrefixKey(key),
@@ -1121,7 +1161,8 @@ fn apply(
                     ClientInput::Paste(text) => AppEvent::Paste(text),
                     ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                     ClientInput::Command(command) => AppEvent::ClientCommand(command),
-                    ClientInput::CellPixels { .. }
+                    ClientInput::ClipboardHelperOrigin(_)
+                    | ClientInput::CellPixels { .. }
                     | ClientInput::Graphics { .. }
                     | ClientInput::Resize(..)
                     | ClientInput::ProjectionInterest { .. }
@@ -1143,7 +1184,7 @@ fn apply(
                 } else {
                     changed
                 };
-                bind_session_navigation_origin(app, id);
+                bind_session_navigation_origin(app, id, client.clipboard_helper_origin);
                 let requested_switch = app.pending_session_switch.take();
                 let requested_detach = std::mem::take(&mut app.detach_requested);
                 app.pending_session_switch = previous_switch;
@@ -1237,6 +1278,7 @@ fn apply(
                 ClientInput::Command(command) => AppEvent::ClientCommand(command),
                 ClientInput::CellPixels { .. }
                 | ClientInput::Graphics { .. }
+                | ClientInput::ClipboardHelperOrigin(_)
                 | ClientInput::Resize(..)
                 | ClientInput::ProjectionInterest { .. }
                 | ClientInput::ProjectionPresented { .. }
@@ -1244,8 +1286,12 @@ fn apply(
                 | ClientInput::CommitWorkspace { .. }
                 | ClientInput::CancelWorkspace { .. } => unreachable!("handled above"),
             };
+            let relay_origin = clients
+                .get(&id)
+                .and_then(|client| client.clipboard_helper_origin);
+            app.forward_clipboard_helper_origin(Some(id));
             let changed = app.handle_event(event);
-            bind_session_navigation_origin(app, id);
+            bind_session_navigation_origin(app, id, relay_origin);
             changed
         }
         // Redraw only if the event actually changed the UI — a plain keystroke
@@ -1254,13 +1300,14 @@ fn apply(
     }
 }
 
-fn bind_session_navigation_origin(app: &mut App, id: u64) {
+fn bind_session_navigation_origin(app: &mut App, id: u64, relay_origin: Option<Option<u64>>) {
     if let Some(settings) = app
         .settings
         .as_mut()
         .filter(|ui| ui.kitten_request.is_some() && ui.kitten_client.is_none())
     {
         settings.kitten_client = Some(id);
+        settings.kitten_relay_origin = relay_origin;
     }
     if let Some(menu) = app
         .named_session_menu
@@ -1280,13 +1327,21 @@ fn send_clipboard_helper_request(app: &mut App, clients: &Clients, foreground: O
     };
     let origin = settings.kitten_client.or(foreground);
     settings.kitten_client = origin;
+    let relay_origin = settings.kitten_relay_origin;
     let sent = origin
         .and_then(|id| clients.get(&id))
-        .filter(|client| client.workspace_id.is_none())
         .is_some_and(|client| {
-            client
-                .send_control(ServerMessage::ClipboardHelper(request.clone()))
-                .is_ok()
+            let message = match relay_origin {
+                Some(origin) => ServerMessage::ForwardedClipboardHelper {
+                    origin,
+                    request: request.clone(),
+                },
+                None if client.workspace_id.is_none() => {
+                    ServerMessage::ClipboardHelper(request.clone())
+                }
+                None => return false,
+            };
+            client.send_control(message).is_ok()
         });
     if !sent {
         app.apply_clipboard_helper_result(
@@ -1973,82 +2028,85 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
     let mut reader = BufReader::new(stream.clone());
     let mut writer = stream;
 
-    let (version, cols, rows, workspace_id, managed_projection) =
-        match protocol::read_message::<_, ClientMessage>(&mut reader) {
-            Ok(ClientMessage::Hello {
-                version,
-                cols,
-                rows,
-            }) => {
-                if !protocol::supports_version(version) {
-                    crate::logging::event(
-                        crate::logging::EventKind::ServerClientHandshakeRejected,
-                        &[
-                            crate::logging::Field::Reason(crate::logging::Reason::VersionMismatch),
-                            crate::logging::Field::ProtocolVersion(u64::from(version)),
-                        ],
-                    );
-                    let _ = protocol::write_version_mismatch(&mut writer, Some(version));
-                    return;
-                }
-                (version, cols, rows, None, false)
+    let (version, cols, rows, workspace_id, managed_projection) = match protocol::read_message::<
+        _,
+        ClientMessage,
+    >(&mut reader)
+    {
+        Ok(ClientMessage::Hello {
+            version,
+            cols,
+            rows,
+        }) => {
+            if !protocol::supports_version(version) {
+                crate::logging::event(
+                    crate::logging::EventKind::ServerClientHandshakeRejected,
+                    &[
+                        crate::logging::Field::Reason(crate::logging::Reason::VersionMismatch),
+                        crate::logging::Field::ProtocolVersion(u64::from(version)),
+                    ],
+                );
+                let _ = protocol::write_version_mismatch(&mut writer, Some(version));
+                return;
             }
-            Ok(ClientMessage::HelloWorkspace {
-                version,
-                cols,
-                rows,
-                workspace_id,
-            }) => {
-                if !protocol::supports_version(version) {
-                    let _ = protocol::write_message(
-                        &mut writer,
-                        &ServerMessage::Welcome {
-                            version: protocol::PROTOCOL_VERSION,
-                            error: Some("protocol version mismatch".into()),
-                        },
-                    );
-                    return;
-                }
-                if workspace_id.len() > 128 || workspace_id.is_empty() {
-                    let _ = protocol::write_message(
-                        &mut writer,
-                        &ServerMessage::Welcome {
-                            version: protocol::PROTOCOL_VERSION,
-                            error: Some("invalid workspace projection".into()),
-                        },
-                    );
-                    return;
-                }
-                (version, cols, rows, Some(workspace_id), false)
+            (version, cols, rows, None, false)
+        }
+        Ok(ClientMessage::HelloWorkspace {
+            version,
+            cols,
+            rows,
+            workspace_id,
+        }) => {
+            if !protocol::supports_version(version) {
+                let _ = protocol::write_message(
+                    &mut writer,
+                    &ServerMessage::Welcome {
+                        version: protocol::PROTOCOL_VERSION,
+                        error: Some("protocol version mismatch".into()),
+                    },
+                );
+                return;
             }
-            Ok(ClientMessage::HelloProjection {
-                version,
-                workspace_id,
-            }) => {
-                if !matches!(
-                    version,
-                    protocol::PROJECTION_PROTOCOL_VERSION | 11 | 12 | protocol::PROTOCOL_VERSION
-                ) || workspace_id.len() > 128
-                {
-                    let _ = protocol::write_message(
-                        &mut writer,
-                        &ServerMessage::Welcome {
-                            version: protocol::PROTOCOL_VERSION,
-                            error: Some("unsupported remote display".into()),
-                        },
-                    );
-                    return;
-                }
-                (
-                    version,
-                    80,
-                    24,
-                    (!workspace_id.is_empty()).then_some(workspace_id),
-                    true,
-                )
+            if workspace_id.len() > 128 || workspace_id.is_empty() {
+                let _ = protocol::write_message(
+                    &mut writer,
+                    &ServerMessage::Welcome {
+                        version: protocol::PROTOCOL_VERSION,
+                        error: Some("invalid workspace projection".into()),
+                    },
+                );
+                return;
             }
-            _ => return,
-        };
+            (version, cols, rows, Some(workspace_id), false)
+        }
+        Ok(ClientMessage::HelloProjection {
+            version,
+            workspace_id,
+        }) => {
+            if !matches!(
+                version,
+                protocol::PROJECTION_PROTOCOL_VERSION | 11 | 12 | 13 | protocol::PROTOCOL_VERSION
+            ) || workspace_id.len() > 128
+            {
+                let _ = protocol::write_message(
+                    &mut writer,
+                    &ServerMessage::Welcome {
+                        version: protocol::PROTOCOL_VERSION,
+                        error: Some("unsupported remote display".into()),
+                    },
+                );
+                return;
+            }
+            (
+                version,
+                80,
+                24,
+                (!workspace_id.is_empty()).then_some(workspace_id),
+                true,
+            )
+        }
+        _ => return,
+    };
 
     if protocol::write_message(
         &mut writer,
@@ -2140,6 +2198,14 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
 
     loop {
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::ClipboardHelperOrigin(origin))
+                if version >= 14 && managed_projection =>
+            {
+                let _ = app_tx.send(AppEvent::ClientInput {
+                    id,
+                    input: ClientInput::ClipboardHelperOrigin(origin),
+                });
+            }
             Ok(ClientMessage::CellPixels {
                 cell_width,
                 cell_height,
@@ -2366,7 +2432,8 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 break;
             }
             Ok(
-                ClientMessage::Hello { .. }
+                ClientMessage::ClipboardHelperOrigin(_)
+                | ClientMessage::Hello { .. }
                 | ClientMessage::HelloWorkspace { .. }
                 | ClientMessage::HelloProjection { .. }
                 | ClientMessage::ProjectionInterest { .. }
@@ -2717,7 +2784,7 @@ mod tests {
         let (second, second_rx) = display_client(100, 30, 2);
         let clients = HashMap::from([(1, first), (2, second)]);
         app.open_settings();
-        super::bind_session_navigation_origin(&mut app, 1);
+        super::bind_session_navigation_origin(&mut app, 1, None);
         super::send_clipboard_helper_request(&mut app, &clients, Some(2));
         assert!(
             matches!(first_rx.try_recv().unwrap(), ServerMessage::ClipboardHelper(request) if !request.install)
@@ -2728,7 +2795,7 @@ mod tests {
         );
 
         app.open_settings();
-        super::bind_session_navigation_origin(&mut app, 3);
+        super::bind_session_navigation_origin(&mut app, 3, None);
         super::send_clipboard_helper_request(&mut app, &clients, Some(2));
         assert!(
             second_rx.try_recv().is_err(),
@@ -2745,6 +2812,25 @@ mod tests {
     }
 
     #[test]
+    fn kitten_request_from_remote_workspace_reaches_its_display_bridge() {
+        let _env = crate::persist::test_env("server-kitten-projection");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let (bridge, bridge_rx) = projection_client(app.workspaces[0].id.clone(), 1);
+        let (other, other_rx) = display_client(100, 30, 2);
+        let clients = HashMap::from([(1, bridge), (2, other)]);
+        app.open_settings();
+        super::bind_session_navigation_origin(&mut app, 1, Some(Some(7)));
+        super::send_clipboard_helper_request(&mut app, &clients, Some(2));
+        assert!(
+            matches!(bridge_rx.try_recv(), Ok(ServerMessage::ForwardedClipboardHelper { origin: Some(7), request }) if !request.install),
+            "remote Settings must check kitten on its requesting display: {:?}",
+            app.settings.as_ref().unwrap().kitten_status
+        );
+        assert!(other_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn kitten_origin_survives_batched_input_and_changes_only_for_a_new_request() {
         use crate::terminal::clipboard::kitten::Status;
 
@@ -2758,8 +2844,8 @@ mod tests {
         // The event loop can drain input from both displays before it sends
         // the request. Later unrelated input cannot claim its origin.
         app.open_settings();
-        super::bind_session_navigation_origin(&mut app, 1);
-        super::bind_session_navigation_origin(&mut app, 2);
+        super::bind_session_navigation_origin(&mut app, 1, None);
+        super::bind_session_navigation_origin(&mut app, 2, None);
         super::send_clipboard_helper_request(&mut app, &clients, Some(2));
         let ServerMessage::ClipboardHelper(check) = first_rx
             .try_recv()
@@ -2780,8 +2866,8 @@ mod tests {
             .unwrap();
         app.settings.as_mut().unwrap().cursor = row;
         app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        super::bind_session_navigation_origin(&mut app, 2);
-        super::bind_session_navigation_origin(&mut app, 1);
+        super::bind_session_navigation_origin(&mut app, 2, None);
+        super::bind_session_navigation_origin(&mut app, 1, None);
         super::send_clipboard_helper_request(&mut app, &clients, Some(1));
         assert!(matches!(
             second_rx.try_recv().expect("installation belongs to its explicit requester"),

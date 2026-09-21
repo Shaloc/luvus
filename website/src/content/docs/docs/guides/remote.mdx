@@ -340,11 +340,22 @@ Luvus home, under `tools/kitten`, without replacing an existing PATH installatio
 changing PATH, or restarting a session. Luvus uses the private helper immediately.
 Linux and macOS x86-64/ARM64 installation targets are provided; other platforms
 report unsupported. The install runs on the display client even when the server
-is reached through SSH; in a managed remote workspace use the outer Settings,
-not the owner's projected Settings. This local-only command rejects `--host`.
+is reached through SSH. With matching builds supporting transport 14, the owner's
+projected Settings also forwards checks and explicit installs to the requesting
+display client. Reconnects and closed settings discard stale results. Older
+remote builds require the outer Settings. This local-only command rejects `--host`.
 Kitty may still ask you to authorize the clipboard read. Denied reads, missing
 helpers and non-image clipboards preserve the child application's Ctrl+V;
 an SSH-hosted child may then report its own X11 clipboard error.
+
+Use `luvus --version` (or `luvus -V`) on both machines when diagnosing a remote
+connection. It includes the remote-session and transport protocols, build ID,
+Git commit, source state, target platform and build profile. CI builds use the
+workflow run ID and attempt; local builds identify the commit and mark uncommitted
+changes as `dirty`. Source archives without Git metadata report `unknown` unless
+`LUVUS_BUILD_COMMIT` and `LUVUS_BUILD_ID` were supplied when building.
+The SSH compatibility probe, `luvus --version --remote-session-protocol`, retains
+its single-line format.
 
 Child OSC52 text-copy requests, including Neovim yank, are forwarded to the
 display client's clipboard from local and remote panes. They do not require
@@ -364,12 +375,14 @@ local presentation row ID. Remote FILES views do not expose a stale local tree.
 ### Kitty graphics
 
 Stable fork releases include Kitty graphics from transport 11 onward. Current
-builds report `transport=13` with `luvus --version --remote-session-protocol`
+builds report `transport=14` with `luvus --version --remote-session-protocol`
 and separately negotiate physical cell dimensions for automatic split direction.
 Plain terminals can report cell dimensions without enabling Kitty graphics. Use Kitty 0.28 or newer on the display
 machine and matching graphics builds on remote owners. An older managed owner
 can still display text, but cannot supply graphics. For an SSH-hosted display
-client, preserve `TERM=xterm-kitty`; changing TERM in the child pane alone does
+client, preserve either `TERM=xterm-kitty` or Kitty's `KITTY_WINDOW_ID`. Kitty
+with `TERM=xterm-256color` is supported when its window ID is present; graphics
+and clipboard use the same display detection. Changing TERM in the child pane alone does
 not enable graphics on the outer client.
 
 Luvus accepts direct-transfer (`t=d`) RGB, RGBA and PNG images, including zlib
@@ -901,6 +914,13 @@ not restart any existing server; restart is a separate, explicit operation.
 
 
 ### Session actions and automatic splits
+
+New tabs and panes preserve SSH agent forwarding while its socket exists. A
+persistent server can outlive the SSH connection that supplied that socket; on
+Unix, new pane shells omit a missing `SSH_AUTH_SOCK` and its `SSH_AGENT_PID` so
+shell startup can select its own agent instead of repeatedly reporting
+`Error connecting to agent: No such file or directory`. Luvus does not start an
+agent or substitute another identity. Existing pane environments are unchanged.
 
 The session selector displays cached local and remote rows immediately while it
 refreshes them in the background. Press **a** on a row for actions: start a stopped

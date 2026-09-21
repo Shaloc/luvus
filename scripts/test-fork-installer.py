@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import shlex
 import select
@@ -257,6 +258,23 @@ esac
     old_inode = installed.stat().st_ino
     assert "No servers were restarted" in run()
     assert installed.read_bytes() == payload and installed.stat().st_ino != old_inode
+    if len(sys.argv) > 1:
+        def version(*args):
+            return subprocess.run([str(installed), *args], env=env, cwd=root,
+                                  check=True, text=True, capture_output=True, timeout=5).stdout
+
+        before = sorted((root / "state").rglob("*"))
+        detailed = version("--version")
+        assert version("-V") == detailed
+        lines = detailed.splitlines()
+        assert len(lines) == 4, detailed
+        assert version("--version", "--remote-session-protocol") == lines[0] + "\n"
+        assert re.fullmatch(r"luvus \S+ remote-session=2 transport=14", lines[0]), detailed
+        assert re.fullmatch(r"build-id=[A-Za-z0-9._-]+", lines[1]), detailed
+        assert re.fullmatch(r"commit=(?:[A-Fa-f0-9]{40,64}|unknown) source=(?:clean|dirty|unknown)", lines[2]), detailed
+        assert re.fullmatch(r"target=\S+ profile=\S+", lines[3]), detailed
+        assert sorted((root / "state").rglob("*")) == before, "version query started or changed a server"
+        print("PASS: detailed build identity, -V alias, single-line SSH probe, no server side effects")
     assert any(p.read_bytes() == b"old binary" for p in (root / "install").glob(".luvus-update.*/luvus.previous"))
     assert "installed" in run(LUVUS_VERSION="fork-1.0.99-0123456").lower()
     assert installed.read_bytes() == payload
@@ -265,7 +283,7 @@ esac
                                     FIXTURE_REDIRECT="https://github.com/other/luvus/releases/tag/fork-bad")
     assert installed.read_bytes() == payload
     if len(sys.argv) == 1:
-        for transport in ("9", "10", "11", "12", "13"):
+        for transport in ("9", "10", "11", "12", "13", "14"):
             run(FIXTURE_TRANSPORT=transport)
         run(FIXTURE_OS="Darwin", FIXTURE_ARCH="arm64")
         run(FIXTURE_OS="Darwin", FIXTURE_ARCH="aarch64")
