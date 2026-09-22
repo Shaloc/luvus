@@ -120,26 +120,27 @@ pub fn resume_command(agent: &str, session_id: &str) -> Option<String> {
     Some((src.resume)(&q))
 }
 
-/// Strip the session-selection flags from a captured launch argv (docs/62) so
-/// replaying it cannot fight the fresh `--resume <id>` luvus injects or re-fork
-/// the pane. Every other flag is kept verbatim, so unknown future flags survive
-/// untouched. Value-taking selectors also swallow the following bareword value.
+/// Remove adapter-owned ephemeral routes before storing launch arguments.
+pub(crate) fn persistent_launch_flags(agent: &str, launch: &[String]) -> Vec<String> {
+    if agent == "codex" {
+        codex::launch::persistent_flags(launch)
+    } else {
+        launch.to_vec()
+    }
+}
+
+/// Strip stale session selectors and adapter-owned routes before replay.
 fn filter_launch_flags(agent: &str, launch: &[String]) -> Vec<String> {
+    if agent == "codex" {
+        return codex::launch::resume_flags(launch);
+    }
     const TAKES_VALUE: &[&str] = &["--resume", "-r", "--session", "--session-id", "--fork"];
     const STANDALONE: &[&str] = &["--continue", "--fork-session", "--print", "-p"];
 
     let mut i = 0;
     let is_letta = registry::find(agent).is_some_and(|descriptor| descriptor.id == letta::NAME);
-    // Codex and Muse select sessions with positional subcommands rather than
-    // flags. Drop them when they lead captured argv so a restored pane gets
-    // exactly one fresh session selector. A restored Codex fork must resume its
-    // new id, not fork the parent again.
-    if (agent == "codex"
-        && launch
-            .first()
-            .is_some_and(|s| matches!(s.as_str(), "resume" | "fork")))
-        || (agent == muse::NAME && launch.first().is_some_and(|s| s == "resume"))
-    {
+    // Muse selects sessions with a positional subcommand.
+    if agent == muse::NAME && launch.first().is_some_and(|s| s == "resume") {
         i = 1;
         if launch.get(1).is_some_and(|v| !v.starts_with('-')) {
             i = 2;
@@ -834,6 +835,28 @@ mod tests {
         // Nothing worth keeping.
         assert!(f("claude", &["--resume", "id"]).is_empty());
         assert!(f("claude", &[]).is_empty());
+    }
+
+    #[test]
+    fn codex_restore_discards_old_hook_routes_after_global_flags() {
+        let owned = r#"hooks.SessionStart=[{hooks=[{type="command",command="env LUVUS_CODEX_HOOK_CONTEXT=1 LUVUS_PANE_ID=50 /old/luvus-agent-hook.sh"}]}]"#;
+        for selector in ["resume", "fork"] {
+            let launch = [
+                "-c",
+                owned,
+                "--model",
+                "resume",
+                "-p",
+                "fork",
+                selector,
+                "old-session",
+                "-c",
+                "model_reasoning_effort=high",
+            ]
+            .map(str::to_owned);
+            assert_eq!(resume_command_with_flags("codex", "new-session", &launch).unwrap(),
+                "codex resume 'new-session' '--model' 'resume' '-p' 'fork' '-c' 'model_reasoning_effort=high'\r");
+        }
     }
 
     #[test]

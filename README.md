@@ -160,7 +160,9 @@ Keyboard → Keyboard Shortcuts → Input Sources** to free `Ctrl+Space`.
 | Devin | ✓ | exact-ID resume | No |
 | Gemini · Aider · Amp · Droid · Qwen · Kiro | ✓ | No | No |
 
-Live status needs no agent integration. See the
+Live status needs no agent integration. Codex's optional macOS/Linux integration
+uses a per-pane launcher; review its **Session flags** hooks in Codex's `/hooks`
+UI to enable exact session binding without bypassing hook trust. See the
 [documentation](https://luvus.dev/docs/) for setup, keybindings, modules, and
 the complete CLI and API reference.
 

@@ -10,6 +10,7 @@ Use --session-discovery-only for owner inventory and session deletion regression
 Use --remote-only-open-only for merge routing without implicit local owners.
 Use --agent-focus-only for Agents highlight and owner focus synchronization.
 Use --agent-seen-only for native Done acknowledgement after remote owner restart.
+Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
 Use --colors-only for child color queries and composed local/remote backgrounds (requires pyte).
 Use --reconnect-only for remote owner restart and automatic reconnection.
@@ -1632,6 +1633,32 @@ def main():
                 assert process.poll() is None
                 print("PASS: native Qoder state without navigation:", expected,
                       f"{time.monotonic() - started:.3f}s", flush=True)
+            for bound in (False, True):
+                if bound:
+                    api("pane.run", {"pane": pane, "command": "bash -c " + shlex.quote(command)}, remote=True)
+                    wait_for(lambda: any(a["pane"] == pane and a["agent"] == "qodercli"
+                                         for a in api("agent.list", remote=True)["agents"]))
+                    api("pane.report_session", {"pane": pane, "agent": "qodercli",
+                                                "session_id": "smoke-exit-bound"}, remote=True)
+                wait_for(lambda: any(a.get("owner_pane") == pane for a in api("agent.list")["agents"]))
+                api("agent.keys", {"target": pane, "keys": ["ctrl+c"]}, remote=True)
+                wait_for(lambda: not any(a["pane"] == pane for a in api("agent.list", remote=True)["agents"]))
+                def exit_synchronized():
+                    drain(master, 0.1)
+                    return not any(a.get("owner_pane") == pane for a in api("agent.list")["agents"])
+                wait_for(exit_synchronized)
+                assert process.poll() is None
+                print(f"PASS: Ctrl+C removes the remote agent row without navigation (session hook={bound})", flush=True)
+            command = "exec -a codex " + shlex.join([sys.executable, str(Path(__file__).resolve()), "--codex-fixture"])
+            api("pane.run", {"pane": pane, "command": "bash -c " + shlex.quote(command)}, remote=True)
+            wait_for(lambda: "CODEX_FIXTURE_READY" in api("pane.read", {"pane": pane}, remote=True)["text"])
+            for expected, text in (("working", "⠋ Thinking"), ("idle", "CODEX_IDLE_DECORATION")):
+                api("pane.run", {"pane": pane, "command": text}, remote=True)
+                for remote in (True, False):
+                    wait_for(lambda: any(a.get("pane" if remote else "owner_pane") == pane
+                                         and a["agent"] == "codex" and a["status"] == expected
+                                         for a in api("agent.list", remote=remote)["agents"]))
+                print(f"PASS: Codex {expected} matches on owner and display with composer decoration", flush=True)
             return
 
         if clipboard_only:
@@ -2468,11 +2495,16 @@ if __name__ == "__main__":
             destination.write_bytes(b"invalid download")
         else:
             shutil.copyfile(root / "official-kitten", destination)
-    elif "--qoder-fixture" in sys.argv:
+    elif "--qoder-fixture" in sys.argv or "--codex-fixture" in sys.argv:
         fixture_root()
-        print("QODER_FIXTURE_READY", flush=True)
+        codex = "--codex-fixture" in sys.argv
+        print("CODEX_FIXTURE_READY" if codex else "QODER_FIXTURE_READY", flush=True)
         for line in sys.stdin:
-            print("\033[2J\033[999;1H\033]0;Qoder CLI\007" + line.strip(), flush=True)
+            text = line.strip()
+            if codex and text == "CODEX_IDLE_DECORATION":
+                text = "done 8:33 PM\n\n  ⢀  ⠈    ⠂ ⠄    ⠄  ⠈\n› Ask Codex to do anything⡀  ⠈  ⠂\n  ⠠  ⠄   ⢀  ⠈\n  gpt-6-astra high"
+            title = "Codex" if codex else "Qoder CLI"
+            print("\033[2J\033[999;1H\033]0;" + title + "\007" + text, flush=True)
     elif Path(sys.argv[0]).name in ("xclip", "xsel", "wl-copy", "pbcopy"):
         root = fixture_root()
         if any(option in sys.argv[1:] for option in ("-o", "-out", "--output")):

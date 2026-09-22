@@ -422,9 +422,9 @@ luvus agent keys reviewer esc
 luvus wait agent-status <pane-id> --status done,blocked --timeout 600
 ```
 
-The neutral home workspace supports ordinary tabs and panes, and its displayed
-path follows the focused pane's live cwd. Use `workspace open <path>` when the
-user named a specific project.
+The neutral home workspace supports ordinary tabs and panes. Its sidebar path
+remains the stored home root while `terminal_cwd` follows the focused pane. Use
+`workspace open <path>` when the user named a specific project.
 
 `agent prompt` submits one complete prompt and can wait semantically. Prefer it
 to separate text and Enter operations. A timeout does not prove that an agent
@@ -473,6 +473,14 @@ discovery rather than inferring support from an agent name.
   and terminal state.
 - Supported agents can reopen their own conversation through native session
   discovery and resume commands.
+- Codex's optional integration reports identity, not an activity lease:
+  `authority: null` can be correct. On macOS/Linux it installs a private launcher
+  under `$LUVUS_HOME/integrations/bin/codex`; new panes prepend it to PATH.
+  The launcher carries the pane route in session hooks instead of relying on a
+  shared daemon's environment. Review the two Luvus **Session flags** hooks in
+  Codex's **Review hooks** or `/hooks` UI; route changes can require fresh trust.
+  The launcher neither grants trust nor adds `--dangerously-bypass-hook-trust`.
+  Installed verifies files and registration, not trust or successful execution.
 - Antigravity CLI is detected natively. Its optional
   `luvus integration install antigravity` hook reports only the exact
   conversation id needed for `agy --conversation <id>` restore; screen

@@ -3500,8 +3500,12 @@ impl App {
         App::new(cols, rows, app_tx)
     }
 
-    fn from_snapshot(snap: SessionSnapshot, app_tx: Sender<AppEvent>) -> Option<App> {
+    fn from_snapshot(mut snap: SessionSnapshot, app_tx: Sender<AppEvent>) -> Option<App> {
         let config = crate::config::load();
+        // Reject saved terminal content after opt-out and promptly scrub the
+        // old snapshot while preserving layout and native resume metadata.
+        let discarded_pane_screens =
+            !config.session.persist_pane_screen && snap.discard_pane_screens();
         let config_baseline = config.clone();
         let files_show_hidden = config.layout.files_show_hidden;
         let agents_active_only = config.agents_active_only;
@@ -3927,7 +3931,7 @@ impl App {
             zoomed: false,
             should_quit: false,
             server_mode: false,
-            session_dirty: false,
+            session_dirty: discarded_pane_screens,
             events: api::new_bus(),
             orch: crate::orch::OrchState::load(),
             automation: crate::automation::AutomationState::load(),
@@ -3993,7 +3997,7 @@ impl App {
             remote_merge_enabled: crate::session::remote::load_registry().merge_enabled(),
             remote_watcher_generation: 0,
             closed_remote_workspaces: std::collections::HashSet::new(),
-            persist_session_now: false,
+            persist_session_now: discarded_pane_screens,
             force_redraw: false,
             pending_notify: Vec::new(),
             pending_sound: None,
@@ -7784,6 +7788,9 @@ impl App {
         }
         if lifecycle_changed {
             self.session_dirty = true;
+            // Remote workspaces refresh agent rows from events, not local
+            // repaint requests. An idle agent can exit without a state change.
+            self.emit_event("agent.history_changed", serde_json::json!({}));
         }
         lifecycle_changed
     }
@@ -9322,6 +9329,97 @@ mod tests {
         assert_eq!(restored.layout().len(), 2);
         assert_eq!(restored.workspaces[0].name, "Luvus website");
         assert!(restored.workspaces[0].pinned);
+    }
+
+    #[test]
+    fn pane_screen_opt_out_ignores_and_schedules_scrubbing_of_existing_content() {
+        let _env = crate::persist::test_env("pane-screen-restore-opt-out");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.panes
+            .get(&pane)
+            .unwrap()
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[2J\x1b[HLUVUS-RESTORE-PRIVATE-MARKER");
+        let snapshot = persist::snapshot(&app);
+        assert!(snapshot.workspaces.iter().any(|workspace| workspace
+            .tabs
+            .iter()
+            .flat_map(|tab| &tab.panes)
+            .any(|(_, pane)| pane
+                .screen
+                .as_deref()
+                .is_some_and(|screen| screen.contains("LUVUS-RESTORE-PRIVATE-MARKER")))));
+        drop(app);
+
+        let mut config = crate::config::Config::default();
+        config.session.persist_pane_screen = false;
+        crate::config::save(&config);
+
+        let (restored_tx, _restored_rx) = std::sync::mpsc::channel();
+        let restored = App::from_snapshot(snapshot, restored_tx).expect("layout restores");
+        let pane = restored.layout().focus;
+        assert!(
+            !restored
+                .panes
+                .get(&pane)
+                .unwrap()
+                .engine
+                .lock()
+                .unwrap()
+                .detection_text(24)
+                .contains("LUVUS-RESTORE-PRIVATE-MARKER"),
+            "saved terminal content must not be replayed after opt-out"
+        );
+        assert!(restored.session_dirty);
+        assert!(
+            restored.persist_session_now,
+            "the old on-disk snapshot is scheduled for immediate scrubbing"
+        );
+    }
+
+    #[test]
+    fn pane_screen_opt_out_hot_patch_schedules_scrubbing_and_rejects_invalid_values() {
+        let _env = crate::persist::test_env("pane-screen-hot-opt-out");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.session_dirty = false;
+        app.persist_session_now = false;
+        for invalid in [
+            serde_json::json!("false"),
+            serde_json::json!(0),
+            serde_json::Value::Null,
+        ] {
+            assert!(app
+                .dispatch(
+                    "config.patch",
+                    &serde_json::json!({
+                        "patch": {"session": {"persist_pane_screen": invalid}}
+                    })
+                )
+                .is_err());
+            assert!(app.config.session.persist_pane_screen);
+            assert!(!app.persist_session_now);
+        }
+        app.dispatch(
+            "config.patch",
+            &serde_json::json!({
+                "patch": {"session": {"persist_pane_screen": false}}
+            }),
+        )
+        .unwrap();
+        assert!(!app.config.session.persist_pane_screen);
+        assert!(app.session_dirty);
+        assert!(app.persist_session_now);
+        assert!(persist::snapshot(&app)
+            .workspaces
+            .iter()
+            .flat_map(|workspace| &workspace.tabs)
+            .flat_map(|tab| &tab.panes)
+            .all(|(_, pane)| pane.screen.is_none()));
     }
 
     #[test]
@@ -11571,6 +11669,7 @@ fi
             "the first absence re-arms confirmation"
         );
         app.proc_scan_requested = false;
+        let before_exit = crate::ipc::api::current_sequence(&app.events);
         assert!(
             app.handle_event(AppEvent::ProcScanned(scan(&[&shell]))),
             "the confirmed exit dirties the sidebar through the event path"
@@ -11579,6 +11678,12 @@ fi
         assert!(st.agent_session.is_none());
         assert_eq!(st.agent, shell);
         assert!(app.session_dirty);
+        assert!(
+            crate::ipc::api::replayed_events_after(&app.events, before_exit)
+                .iter()
+                .any(|event| event["event"] == "agent.history_changed"),
+            "confirmed exit must invalidate remote agent projections even when state stays idle"
+        );
 
         let pane = persist::snapshot(&app)
             .workspaces
@@ -12523,6 +12628,7 @@ fi
         app.last_proc_at = now;
         app.last_sessions_at = now;
         app.session_dirty = false;
+        let before_appearance = crate::ipc::api::current_sequence(&app.events);
 
         assert!(
             app.detect_tick(now),
@@ -12530,8 +12636,28 @@ fi
         );
         assert_eq!(app.status.get(&focus).unwrap().agent, "aider");
         assert!(
+            crate::ipc::api::replayed_events_after(&app.events, before_appearance)
+                .iter()
+                .any(|event| event["event"] == "agent.history_changed"),
+            "an idle identity change must also refresh remote agent rows"
+        );
+        assert!(
             !app.session_dirty,
             "a non-resumable identity repaint does not create persistence work"
+        );
+
+        // With no native session binding, disappearance is detected here too.
+        let before_exit = crate::ipc::api::current_sequence(&app.events);
+        let shell = app.panes[&focus].command.clone();
+        app.proc_commands.insert(focus, vec![shell.clone()]);
+        app.status.get_mut(&focus).unwrap().force_detect = true;
+        assert!(app.detect_tick(now + Duration::from_millis(200)));
+        assert_eq!(app.status[&focus].agent, shell);
+        assert!(
+            crate::ipc::api::replayed_events_after(&app.events, before_exit)
+                .iter()
+                .any(|event| event["event"] == "agent.history_changed"),
+            "an idle exit without a session hook must also refresh remote agent rows"
         );
     }
 
@@ -12892,6 +13018,8 @@ fi
     fn pane_content_edge_starts_selection_instead_of_sidebar_resize() {
         let _env = crate::persist::test_env("sidebar-edge-selection");
         use crate::event::AppEvent;
+        use crate::terminal::appearance::PaneAppearance;
+        use crate::terminal::vt::{create_engine, VtEngineKind};
         use ratatui::backend::TestBackend;
         use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::Terminal;
@@ -12899,6 +13027,18 @@ fi
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
         let pane = app.layout().focus;
+        // Exercise real rendering and mouse routing on a deterministic grid.
+        // The spawned shell can redraw its prompt (CR + EL) on the first
+        // resize, erasing text injected into its live PTY engine.
+        let (response_tx, _response_rx) = std::sync::mpsc::channel();
+        app.panes.get_mut(&pane).unwrap().engine = create_engine(
+            VtEngineKind::default(),
+            120,
+            40,
+            response_tx,
+            app.config.scrollback_bytes(),
+            PaneAppearance::default(),
+        );
         app.panes
             .get(&pane)
             .expect("focused pane exists")
@@ -12915,6 +13055,10 @@ fi
             .find(|(id, _)| *id == pane)
             .map(|(_, rect)| *rect)
             .expect("focused pane has a content rect");
+        let displayed: String = (content.x..content.x + 4)
+            .map(|x| term.backend().buffer()[(x, content.y)].symbol())
+            .collect();
+        assert_eq!(displayed, "edge", "select the actual rendered text");
         assert!(
             content.x > seam.x,
             "the first content column is on the pane side of the rule"
@@ -12942,6 +13086,7 @@ fi
             MouseEventKind::Drag(MouseButton::Left),
             content.x + 3,
         ));
+        assert_eq!(app.selection_text().as_deref(), Some("edge"));
         app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), content.x + 3));
         assert_eq!(app.pending_clipboard.as_deref(), Some("edge"));
     }

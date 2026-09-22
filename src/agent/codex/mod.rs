@@ -4,6 +4,7 @@ use super::types::{
 };
 
 mod integration;
+pub(super) mod launch;
 pub(in crate::agent) mod sessions;
 #[cfg(test)]
 pub(super) use sessions::{latest as codex_latest, list as codex_list, recent as codex_recent};

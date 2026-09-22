@@ -1339,18 +1339,27 @@ fn apply_pane_env(
     }
 }
 
-/// Put the server's own executable directory first without dropping the
-/// user's existing command search path. A debug server therefore gives its
+/// Prepend optional integration launchers and the server's executable directory
+/// without dropping the user's existing command search path. A debug server gives its
 /// panes the debug CLI, while an installed server gives them that exact
 /// release CLI. `split_paths`/`join_paths` keep this portable across Unix and
 /// Windows and avoid shell-specific quoting.
 fn path_with_server_binary(exe: &Path, inherited: Option<OsString>) -> Option<OsString> {
     let binary_dir = exe.parent()?;
     let mut entries = vec![binary_dir.to_path_buf()];
+    #[cfg(unix)]
+    entries.insert(0, crate::integration::launcher_dir());
     if let Some(inherited) = inherited {
-        entries.extend(
-            std::env::split_paths(&inherited).filter(|entry| entry.as_path() != binary_dir),
-        );
+        entries.extend(std::env::split_paths(&inherited).filter(|entry| {
+            if entry.as_path() == binary_dir {
+                return false;
+            }
+            #[cfg(unix)]
+            if *entry == crate::integration::launcher_dir() {
+                return false;
+            }
+            true
+        }));
     }
     std::env::join_paths(entries).ok()
 }
@@ -2379,6 +2388,7 @@ mod tests {
 
     #[test]
     fn pane_path_pins_the_owning_server_binary_portably() {
+        let _env = crate::persist::test_env("integration-launcher-path");
         let binary_dir = std::env::temp_dir().join("luvus exact binary");
         let exe = binary_dir.join(if cfg!(windows) { "luvus.exe" } else { "luvus" });
         let other = std::env::temp_dir().join("other tools");
@@ -2386,7 +2396,9 @@ mod tests {
 
         let path = path_with_server_binary(&exe, Some(inherited)).expect("portable PATH");
         let entries = std::env::split_paths(&path).collect::<Vec<PathBuf>>();
-        assert_eq!(entries.first(), Some(&binary_dir));
+        #[cfg(unix)]
+        assert_eq!(entries.first(), Some(&crate::integration::launcher_dir()));
+        assert_eq!(entries[usize::from(cfg!(unix))], binary_dir);
         assert_eq!(
             entries.iter().filter(|entry| *entry == &binary_dir).count(),
             1
@@ -2394,9 +2406,10 @@ mod tests {
         assert!(entries.contains(&other), "the user's PATH is preserved");
 
         let only = path_with_server_binary(&exe, None).expect("PATH without an inherited value");
-        assert_eq!(
-            std::env::split_paths(&only).collect::<Vec<_>>(),
-            [binary_dir]
-        );
+        #[cfg(unix)]
+        let expected = vec![crate::integration::launcher_dir(), binary_dir];
+        #[cfg(not(unix))]
+        let expected = vec![binary_dir];
+        assert_eq!(std::env::split_paths(&only).collect::<Vec<_>>(), expected);
     }
 }

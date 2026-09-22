@@ -499,10 +499,10 @@ luvus workspace unpin <workspace-index>
 
 Closing the final project does not stop the client or leave it without a shell.
 Luvus immediately creates a neutral workspace and terminal at the user's home
-directory. Its displayed path follows the focused pane's live cwd. An empty
-`workspace list` is therefore an exceptional restore or spawn failure, not proof
-that the server is offline. Use `workspace open <path>` when the user named a
-specific project.
+directory. Its sidebar path remains the stored home root while `terminal_cwd`
+follows the focused pane. An empty `workspace list` is therefore an exceptional
+restore or spawn failure, not proof that the server is offline. Use
+`workspace open <path>` when the user named a specific project.
 
 From a managed pane, use `LUVUS_PANE_ID` as the caller or split anchor. From an
 external terminal, select an explicit pane returned by live state.
@@ -661,6 +661,14 @@ surface:
   optional native session-resume hooks and must not be used merely to make an
   agent appear in the sidebar. Install or remove an integration only when the
   user explicitly requests that lifecycle integration.
+- Codex's optional integration reports identity, not an activity lease:
+  `authority: null` can be correct. On macOS/Linux it installs a private launcher
+  under `$LUVUS_HOME/integrations/bin/codex`; new panes prepend it to PATH.
+  The launcher carries the pane route in session hooks instead of relying on a
+  shared daemon's environment. Review the two Luvus **Session flags** hooks in
+  Codex's **Review hooks** or `/hooks` UI; route changes can require fresh trust.
+  The launcher neither grants trust nor adds `--dangerously-bypass-hook-trust`.
+  Installed verifies files and registration, not trust or successful execution.
 - For Antigravity CLI, `luvus integration install antigravity` adds exact
   conversation identity for restore. It is session-only; native screen
   detection remains authoritative for agent state.

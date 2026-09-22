@@ -45,6 +45,11 @@ proves nothing. A CLI printing its whole welcome screen at launch is idle, your
 keystrokes echoing while you compose a prompt are idle, a scrolling log is
 idle. That way you never get a false state or a false completion chime.
 
+Codex's idle composer can contain decorative braille dots. Rows made entirely
+of those dots and whitespace do not count as screen spinners; spinners with
+activity text and interrupt hints still indicate work. Remote agent rows also
+refresh when an agent appears or exits without changing its activity state.
+
 The **All / Active** toggle in the header switches between the full resumable
 history and live agents only. A new configuration starts with **All**, then
 luvus remembers whichever view you select across restarts.
@@ -211,6 +216,43 @@ rollout in a shared folder, because that could fork another pane's active
 conversation. Install or refresh the Codex hook with
 `luvus integration install codex`; its SessionStart and prompt hooks bind new
 and resumed Codex panes to their exact rollout.
+
+The Codex integration writes `hooks.json` and `luvus-agent-hook.sh` under
+`$CODEX_HOME`, or `~/.codex` when it is unset. These hooks report session identity,
+not an activity-state lease: `agent explain` can show `authority: null` while
+the integration is installed and a session is bound. Codex activity still uses
+native screen detection. Installed verifies the expected hook registration,
+script contents and executable permissions, plus the Unix launcher. It does not
+prove that Codex enabled, trusted, or executed a hook.
+
+On macOS and Linux, the integration also installs a private `codex` launcher at
+`$LUVUS_HOME/integrations/bin/codex` (normally `~/.luvus/integrations/bin/codex`,
+or `~/.luvus-dev/integrations/bin/codex` for debug builds). New panes prepend
+that directory to PATH. The launcher passes the current pane's route as
+session-scoped hook configuration, so a shared Codex app-server can report to
+the right pane even when its daemon environment is missing or stale. The
+registered global hook does nothing without this explicit routing context.
+
+After upgrading, run `luvus integration install codex` and open a new pane.
+Check `command -v codex`: shell startup files, aliases, or an absolute binary
+path can bypass the private launcher. You can invoke the launcher by its full
+path if needed. Both the launcher and hook require Python 3. Administrative
+commands pass through unchanged. Explicit Codex `--remote` connections do not
+receive a local pane route.
+
+Launch Codex normally, then choose **Review hooks** at its **Hooks need review**
+prompt, or open `/hooks`. Review the `SessionStart` and `UserPromptSubmit` entries
+whose source is **Session flags** and whose command invokes the Luvus hook with
+`LUVUS_CODEX_HOOK_CONTEXT=1`. Trust those individual definitions with Codex's
+review UI. Approval applies to the exact hook hash, so a changed pane, socket,
+binary path, or hook definition can require fresh review. Submit a prompt after
+approval if the initial session-start hook was skipped.
+
+The launcher does not grant trust, edit Codex's trust records, or add a bypass
+flag. If you explicitly use `codex --dangerously-bypass-hook-trust`, Codex skips
+trust checks for all enabled hooks in that invocation, not only Luvus's hooks.
+That flag remains optional; the native review flow works for the launcher's
+startup configuration. See the [Codex hooks documentation](https://learn.chatgpt.com/docs/hooks).
 
 Kilo Code also requires an exact session ID for resume or fork. Luvus detects
 the `kilo` and `kilocode` executables natively, but it does not scan Kilo's

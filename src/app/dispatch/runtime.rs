@@ -838,7 +838,7 @@ impl App {
         });
         // State and visible identity transitions both change the sidebar. Session
         // persistence remains limited to resumable agents via `agent_appeared`.
-        if presentation_metadata_changed {
+        if presentation_metadata_changed || visible_identity_changed {
             self.emit_event("agent.history_changed", json!({}));
         }
         let changed =

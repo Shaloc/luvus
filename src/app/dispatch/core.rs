@@ -285,7 +285,13 @@ impl App {
         }
         let workspace_display_changed =
             self.config.layout.workspace_display != next.layout.workspace_display;
+        let discard_pane_screens =
+            self.config.session.persist_pane_screen && !next.session.persist_pane_screen;
         self.config = next;
+        if discard_pane_screens {
+            self.session_dirty = true;
+            self.persist_session_now = true;
+        }
         if workspace_display_changed {
             self.reset_workspace_sidebar_view();
         }

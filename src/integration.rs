@@ -108,6 +108,14 @@ pub(crate) fn home() -> PathBuf {
     crate::platform::home_dir().unwrap_or_default()
 }
 
+/// Optional integration launchers, searched only by panes owned by this Luvus home.
+#[cfg(unix)]
+pub(crate) fn launcher_dir() -> PathBuf {
+    crate::persist::config_dir()
+        .join("integrations")
+        .join("bin")
+}
+
 static ATOMIC_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Serialize JSON into a same-directory temporary file, sync it, and atomically
@@ -135,11 +143,14 @@ pub(crate) fn write_bytes_atomic(path: &Path, output: &[u8]) -> Result<()> {
                 ".{file_name}.luvus-{}-{sequence}.tmp",
                 std::process::id()
             ));
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
             {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            match options.open(&temporary) {
                 Ok(file) => Some(Ok((temporary, file))),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
                 Err(error) => Some(Err(error)),
@@ -149,6 +160,13 @@ pub(crate) fn write_bytes_atomic(path: &Path, output: &[u8]) -> Result<()> {
         .ok_or_else(|| anyhow!("could not reserve a temporary configuration file"))?;
 
     let result = (|| -> Result<()> {
+        // A private user config must remain private across atomic replacement.
+        // Set the destination's permissions before writing any of its contents.
+        match fs::metadata(path) {
+            Ok(metadata) => file.set_permissions(metadata.permissions())?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
         file.write_all(output)?;
         file.flush()?;
         file.sync_all()?;
@@ -358,6 +376,31 @@ pub(crate) fn set_executable(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn atomic_integration_write_preserves_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory =
+            std::env::temp_dir().join(format!("luvus-private-write-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("hooks.json");
+        fs::write(&path, "{}").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        super::write_json_atomic(&path, &serde_json::json!({"private": "kept"})).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(fs::read_to_string(&path).unwrap().contains("kept"));
+        let fresh = directory.join("new.json");
+        super::write_json_atomic(&fresh, &serde_json::json!({})).unwrap();
+        assert_eq!(
+            fs::metadata(fresh).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     use super::*;
 
     fn kimi_entry_is_luvus(table: &toml_edit::Table) -> bool {
@@ -666,12 +709,20 @@ mod tests {
 
     #[test]
     fn codex_hook_installs_start_and_prompt_session_reporting() {
-        let _env = crate::persist::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _env = crate::persist::test_env("codex-integration");
         let tmp = std::env::temp_dir().join(format!("luvus-codex-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         std::env::set_var("CODEX_HOME", &tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let unrelated = json!({"hooks": [{"type": "command", "command": "echo user-hook"}]});
+        write_json_atomic(
+            &tmp.join("hooks.json"),
+            &json!({"description": "user-owned", "hooks": {
+                "SessionStart": [unrelated.clone()],
+                "UserPromptSubmit": [unrelated.clone()]
+            }}),
+        )
+        .unwrap();
 
         install("codex").unwrap();
         install("codex").unwrap(); // idempotent
@@ -704,11 +755,64 @@ mod tests {
         );
         assert!(is_installed("codex"));
 
+        // A working pre-upgrade registration used a bare, shell-safe path.
+        if tmp
+            .to_string_lossy()
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
+        {
+            let mut legacy = hooks.clone();
+            for event in ["SessionStart", "UserPromptSubmit"] {
+                for group in legacy["hooks"][event].as_array_mut().unwrap() {
+                    if group_mentions_luvus(group) {
+                        group["hooks"][0]["command"] =
+                            json!(tmp.join("luvus-agent-hook.sh").to_string_lossy());
+                    }
+                }
+            }
+            write_json_atomic(&tmp.join("hooks.json"), &legacy).unwrap();
+            assert!(is_installed("codex"), "valid old registrations still work");
+            install("codex").unwrap();
+        }
+        fs::write(tmp.join("luvus-agent-hook.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(
+            !is_installed("codex"),
+            "an unrelated replacement script is not the installed integration"
+        );
+        install("codex").unwrap();
+        fs::remove_file(tmp.join("luvus-agent-hook.sh")).unwrap();
+        assert!(
+            !is_installed("codex"),
+            "registration alone is not installation"
+        );
+        install("codex").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                tmp.join("luvus-agent-hook.sh"),
+                fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            assert!(
+                !is_installed("codex"),
+                "a non-executable script is not installed"
+            );
+            install("codex").unwrap();
+            fs::remove_file(launcher_dir().join("codex")).unwrap();
+            assert!(!is_installed("codex"), "the launcher is required");
+            install("codex").unwrap();
+        }
+
         uninstall("codex").unwrap();
+        #[cfg(unix)]
+        assert!(!launcher_dir().join("codex").exists());
         assert!(!is_installed("codex"));
         let after: Value =
             serde_json::from_str(&fs::read_to_string(tmp.join("hooks.json")).unwrap()).unwrap();
+        assert_eq!(after["description"], "user-owned");
         for event in ["SessionStart", "UserPromptSubmit"] {
+            assert_eq!(after["hooks"][event], json!([unrelated.clone()]));
             assert!(
                 after["hooks"][event]
                     .as_array()

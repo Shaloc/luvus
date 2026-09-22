@@ -289,10 +289,24 @@ impl Manifests {
                 continue;
             }
             let text = regions.get(r.region);
-            if r.conds.iter().all(|c| c.holds(text))
-                && best
-                    .as_ref()
-                    .is_none_or(|matched| r.priority >= matched.priority)
+            if r.conds.iter().all(|c| {
+                // Codex decorates its idle composer with scattered braille
+                // dots. Only its screen spinner needs to distinguish those
+                // all-braille rows from a spinner followed by activity text.
+                // Keep title spinners and other agents' rules unchanged.
+                if matches!(c, Cond::Spinner) && agent == "codex" && r.region == Region::Screen {
+                    text.lines().any(|line| {
+                        c.holds(line)
+                            && line.chars().any(|ch| {
+                                !ch.is_whitespace() && !('\u{2800}'..='\u{28ff}').contains(&ch)
+                            })
+                    })
+                } else {
+                    c.holds(text)
+                }
+            }) && best
+                .as_ref()
+                .is_none_or(|matched| r.priority >= matched.priority)
             {
                 best = Some(RuleMatch {
                     state: r.state,
@@ -1260,7 +1274,7 @@ impl Manifests {
             };
             let first_low = first.to_lowercase();
             if self.match_binary(binary_name(&first_low)).as_deref() == Some(agent) {
-                return Some(rest.iter().map(|s| s.to_string()).collect());
+                return Some(crate::agent::persistent_launch_flags(agent, rest));
             }
             // Interpreter form: the agent token is the script slot, and nothing
             // before it is a launch flag.
@@ -1268,7 +1282,10 @@ impl Manifests {
                 if let Some(i) = interpreter_script_slot(rest) {
                     let t_low = rest[i].to_lowercase();
                     if self.match_interpreter_script(&t_low).as_deref() == Some(agent) {
-                        return Some(rest[(i + 1)..].iter().map(|s| s.to_string()).collect());
+                        return Some(crate::agent::persistent_launch_flags(
+                            agent,
+                            &rest[(i + 1)..],
+                        ));
                     }
                 }
             }
@@ -2054,6 +2071,20 @@ Would you like to proceed?
     }
 
     #[test]
+    fn codex_launch_capture_omits_pane_bound_hook_routes() {
+        let m = Manifests::builtin();
+        let command = r#"codex -c hooks.SessionStart=[{hooks=[{type="command",command="env LUVUS_CODEX_HOOK_CONTEXT=1 LUVUS_PANE_ID=50 /old/luvus-agent-hook.sh"}]}] resume old-session --model gpt-6"#;
+        assert_eq!(
+            m.launch_args_for(&[command.into()], "codex"),
+            Some(
+                ["resume", "old-session", "--model", "gpt-6"]
+                    .map(str::to_owned)
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
     fn launch_args_extracted_after_the_agent_token() {
         let m = Manifests::builtin();
         // Direct binary at an absolute path; original case is preserved.
@@ -2428,6 +2459,64 @@ Would you like to proceed?
         assert_eq!(
             prompt_evidence(Some("Codex"), bottom, "codex", &manifests),
             PromptEvidence::Unknown
+        );
+    }
+
+    #[test]
+    fn codex_idle_composer_braille_decoration_is_not_a_working_spinner() {
+        let manifests = Manifests::builtin();
+        let screen = "done 8:33 PM\n\n\
+                         ⢀  ⠈                             ⠂ ⠄           ⠄      ⠈      ⠄⠈   ⠠\n\
+            › Ask Codex to do anything⡀  ⠈       ⠂  ⠁                    ⠈             ⠂         ⠐     ⢀\n\
+                  ⠠                   ⠄         ⠠          ⢀      ⠄⠂                   ⠈\n\
+              gpt-6-astra high · ~/project";
+        let detect = |screen| {
+            classify(
+                Some("Codex"),
+                screen,
+                true,
+                false,
+                "zsh",
+                "codex",
+                &["codex".into()],
+                &manifests,
+            )
+        };
+        assert_eq!(detect(screen).state, State::Idle);
+        assert_eq!(detect("⠋ Thinking").state, State::Working);
+        assert_eq!(
+            detect("• Working (2s · esc to interrupt)").state,
+            State::Working
+        );
+        assert_eq!(
+            classify(
+                Some("⠋"),
+                screen,
+                false,
+                false,
+                "zsh",
+                "codex",
+                &["codex".into()],
+                &manifests
+            )
+            .state,
+            State::Working,
+            "a real title spinner remains working"
+        );
+        assert_eq!(
+            classify(
+                None,
+                "⠋",
+                false,
+                false,
+                "zsh",
+                "claude",
+                &["claude".into()],
+                &manifests
+            )
+            .state,
+            State::Working,
+            "other agents retain standalone screen spinners"
         );
     }
 
