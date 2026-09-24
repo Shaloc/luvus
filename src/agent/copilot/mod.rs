@@ -13,6 +13,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &[],
     launch_command: "copilot",
     task_prompt_args: &["--interactive"],
+    prompt_settle: std::time::Duration::ZERO,
     automation: Some(AutomationOperations {
         read_only: Some(AutomationLaunch {
             args: &[

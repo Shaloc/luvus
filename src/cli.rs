@@ -69,6 +69,7 @@ pub fn is_cli(args: &[String]) -> bool {
                 | "api"
                 | "logs"
                 | "uhp"
+                | "web"
                 | "socket"
                 | "module"
                 | "theme"
@@ -130,6 +131,7 @@ Commands:
   search       Search across pane scrollback
   events       Stream live status changes
   uhp          Discover and use Universal Harness Protocol 1.0
+  web          Serve the optional browser client
   attach       Open the TUI focused on one pane
   doctor       Check optional external tools
   kitten       Manage Kitty clipboard helper
@@ -151,7 +153,6 @@ Options:
   --remote <host> [ssh args]             Attach through SSH
   --version, -V                          Print the version
   --help, -h                             Show this help
-
 Help:
   luvus help all                         Complete CLI reference
   luvus help <topic> [command]           Focus on one area or command
@@ -385,6 +386,10 @@ universal harness protocol:
   uhp access [--control] [--ttl <seconds> | --no-expiry]   expose scoped UHP through a private provider endpoint
   uhp proxy                 forward one JSON request from stdin to the selected server
 
+web access:
+  web [--control|--read-only] [--port <port>] [--max-devices <1-8>] [--public-url <origin>] [--origin <origin>] [--no-open]
+                             serve the optional loopback browser client (read-only by default)
+
 sessions:
   session list [--json]      list local and discovered remote sessions
   session attach <name>      start or attach the named session
@@ -401,6 +406,8 @@ sessions:
 remote:
   host add <ssh-alias> [--install [--yes]] [--json]
                              enable and connect; --install allows fork installation
+  host update <ssh-alias> [--json]
+                             update from the latest fork release; keep servers running
   --host <ssh-alias> [--session <name>] <command>
                              run server-backed CLI controls against the selected
                              session on a literal Host from ~/.ssh/config
@@ -708,7 +715,7 @@ fn normalize_help_topic(topic: &str) -> Option<&str> {
         "workspace" | "tab" | "pane" | "agent" | "files" | "git" | "mission" | "worktree"
         | "task" | "lease" | "automation" | "module" | "theme" | "bar" | "ui" | "session"
         | "host" | "server" | "integration" | "diff" | "skill" | "wait" | "search" | "events"
-        | "uhp" | "ping" | "doctor" | "kitten" | "update" | "attach" => Some(topic),
+        | "web" | "uhp" | "ping" | "doctor" | "kitten" | "update" | "attach" => Some(topic),
         "node" => Some("pane"),
         "remote" | "--remote" => Some("remote"),
         _ => None,
@@ -895,15 +902,19 @@ fn write_topic_help_english(
         ),
         "uhp" => (
             "luvus uhp <capabilities|schema|snapshot|events|access|proxy>",
-            detailed_section("universal harness protocol:\n", "\nsessions:\n"),
+            detailed_section("universal harness protocol:\n", "\nweb access:\n"),
+        ),
+        "web" => (
+            "luvus [--session <name>] web [options]",
+            detailed_section("web access:\n", "\nsessions:\n"),
         ),
         "remote" => (
             "luvus [--session <name>] --remote <host> [ssh args]",
             detailed_section("remote:\n", "\nserver:\n"),
         ),
         "host" => (
-            "luvus host add <ssh-alias> [--install [--yes]] [--json]",
-            "  host add <ssh-alias> [--install [--yes]] [--json]\n                             enable and connect; --install allows fork installation\n",
+            "luvus host <add|update> <ssh-alias> [options]",
+            "  host add <ssh-alias> [--install [--yes]] [--json]\n                             enable and connect; --install allows fork installation\n  host update <ssh-alias> [--json]\n                             update from the latest fork release; keep servers running\n",
         ),
         "server" => (
             "luvus [--session <name>] server <command>",
@@ -1030,7 +1041,45 @@ fn parse_host_add(args: &[String]) -> Result<(&str, bool, bool, bool)> {
     Ok((host, install, json, yes))
 }
 
+fn parse_host_update(args: &[String]) -> Result<(&str, bool)> {
+    const USAGE: &str = "usage: luvus host update <ssh-alias> [--json]";
+    let host = args.get(1).ok_or_else(|| anyhow!(USAGE))?;
+    if args.first().map(String::as_str) != Some("update")
+        || !(args.len() == 2 || (args.len() == 3 && args[2] == "--json"))
+    {
+        return Err(anyhow!(USAGE));
+    }
+    crate::session::remote::validate_host_alias(host).map_err(anyhow::Error::msg)?;
+    Ok((host, args.len() == 3))
+}
+
 fn host_cmd(args: &[String], context: crate::i18n::cli::Context) -> Result<i32> {
+    if args.first().map(String::as_str) == Some("update") {
+        let (host, json_output) = parse_host_update(args)?;
+        if crate::session::remote::process_target().is_some() {
+            return session_error(
+                "invalid_request",
+                "host update selects its SSH host explicitly; omit --host",
+                json_output,
+            );
+        }
+        return match crate::session::remote::bootstrap::update_host(host) {
+            Ok(status) => {
+                if json_output {
+                    let mut value = serde_json::to_value(&status)?;
+                    value["type"] = json!("host_updated");
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    println!("{}\n{}", context.render("Updated fork binary on `{host}`; running servers need an explicit restart.", &[("host", host)]), status.version);
+                    if status.path_shadowed {
+                        println!("{}", context.text("PATH selects another Luvus binary; put ~/.local/bin first before restarting."));
+                    }
+                }
+                Ok(0)
+            }
+            Err(error) => session_error("host_update_failed", &error, json_output),
+        };
+    }
     let (host, install, json_output, yes) = parse_host_add(args)?;
     if crate::session::remote::process_target().is_some() {
         return session_error(
@@ -4676,6 +4725,32 @@ mod tests {
     }
 
     #[test]
+    fn host_update_is_explicit_and_rejects_install_flags_and_extra_targets() {
+        assert!(is_cli(&argv("luvus host update dev --json")));
+        assert_eq!(
+            parse_host_update(&argv("update dev")).unwrap(),
+            ("dev", false)
+        );
+        assert_eq!(
+            parse_host_update(&argv("update dev --json")).unwrap(),
+            ("dev", true)
+        );
+        for args in [
+            "update",
+            "update --json",
+            "update user@host",
+            "update dev;true",
+            "update dev other",
+            "update dev --install",
+            "update dev --yes",
+            "update dev --json --json",
+        ] {
+            assert!(parse_host_update(&argv(args)).is_err(), "{args}");
+        }
+        assert!(rendered_topic_help("host", Some("update")).contains("host update <ssh-alias>"));
+    }
+
+    #[test]
     fn kitten_cli_help_and_invalid_flags_are_local_and_non_mutating() {
         let _env = crate::persist::test_env("cli-kitten");
         assert!(is_cli(&argv("luvus kitten status")));
@@ -4806,6 +4881,7 @@ mod tests {
                             | "automation"
                             | "integration"
                             | "host"
+                            | "web"
                     )
                 ) && !trimmed.contains("  ");
                 if trimmed.is_empty()

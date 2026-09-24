@@ -133,6 +133,62 @@ macro_rules! tr {
 /// suffix, so canonical syntax at the start of a row is never rewritten.
 static HELP: &[Translation] = &[
     tr!(
+        "update from the latest fork release; keep servers running",
+        "actualizar desde la última versión del fork; mantener servidores activos",
+        "atualizar pela última versão do fork; manter servidores ativos",
+        "mettre à jour depuis le dernier fork ; garder les serveurs actifs",
+        "aus neuestem Fork-Release aktualisieren; Server weiterlaufen lassen",
+        "perbarui dari rilis fork terbaru; server tetap berjalan",
+        "更新到最新 fork release；保持 server 运行",
+        "最新のフォークリリースへ更新；サーバーは稼働を継続",
+        "최신 fork 릴리스로 업데이트; 서버 실행 유지"
+    ),
+    tr!(
+        "Updated fork binary on `{host}`; running servers need an explicit restart.",
+        "Binario del fork actualizado en `{host}`; reinicie los servidores explícitamente.",
+        "Binário do fork atualizado em `{host}`; reinicie os servidores explicitamente.",
+        "Binaire du fork mis à jour sur `{host}` ; redémarrez explicitement les serveurs.",
+        "Fork-Binärdatei auf `{host}` aktualisiert; laufende Server explizit neu starten.",
+        "Biner fork di `{host}` diperbarui; mulai ulang server secara eksplisit.",
+        "已更新 `{host}` 的 fork 二进制；运行中的 server 需手动重启。",
+        "`{host}` のフォークを更新しました。稼働中のサーバーは手動で再起動してください。",
+        "`{host}`의 fork 바이너리를 업데이트했습니다. 실행 중인 서버는 직접 재시작하세요."
+    ),
+    tr!(
+        "PATH selects another Luvus binary; put ~/.local/bin first before restarting.",
+        "PATH selecciona otro Luvus; coloque ~/.local/bin primero antes de reiniciar.",
+        "PATH seleciona outro Luvus; coloque ~/.local/bin primeiro antes de reiniciar.",
+        "PATH sélectionne un autre Luvus ; placez ~/.local/bin en premier avant de redémarrer.",
+        "PATH wählt ein anderes Luvus; ~/.local/bin vor dem Neustart an erste Stelle setzen.",
+        "PATH memilih Luvus lain; tempatkan ~/.local/bin pertama sebelum mulai ulang.",
+        "PATH 指向其他 Luvus；重启前请将 ~/.local/bin 放到 PATH 最前面。",
+        "PATH が別の Luvus を選択しています。再起動前に ~/.local/bin を先頭にしてください。",
+        "PATH가 다른 Luvus를 선택합니다. 재시작 전에 ~/.local/bin을 맨 앞에 두세요."
+    ),
+    tr!(
+        "Updating fork binary on `{host}`…",
+        "Actualizando el fork en `{host}`…",
+        "Atualizando o fork em `{host}`…",
+        "Mise à jour du fork sur `{host}`…",
+        "Fork auf `{host}` wird aktualisiert…",
+        "Memperbarui fork di `{host}`…",
+        "正在更新 `{host}` 的 fork 二进制…",
+        "`{host}` のフォークを更新中…",
+        "`{host}`의 fork 업데이트 중…"
+    ),
+    tr!(
+        "Remote update failed: {error}",
+        "Error de actualización remota: {error}",
+        "Falha na atualização remota: {error}",
+        "Échec de la mise à jour distante : {error}",
+        "Remote-Aktualisierung fehlgeschlagen: {error}",
+        "Pembaruan remote gagal: {error}",
+        "远端更新失败：{error}",
+        "リモート更新に失敗しました：{error}",
+        "원격 업데이트 실패: {error}"
+    ),
+
+    tr!(
         "Enable and connect SSH hosts",
         "Habilitar y conectar hosts SSH",
         "Habilitar e conectar hosts SSH",
@@ -208,6 +264,39 @@ static HELP: &[Translation] = &[
         "全局开关：自动合并同名会话",
         "同名セッションの全体統合を切り替え",
         "같은 이름 세션의 전역 병합 전환"
+    ),
+    tr!(
+        "Serve the optional browser client",
+        "Servir el cliente web opcional",
+        "Servir o cliente web opcional",
+        "Servir le client web facultatif",
+        "Den optionalen Webclient bereitstellen",
+        "Sajikan klien web opsional",
+        "提供可选的 Web 客户端",
+        "オプションの Web クライアントを提供",
+        "선택적 웹 클라이언트 제공"
+    ),
+    tr!(
+        "web access:",
+        "acceso web:",
+        "acesso web:",
+        "accès web :",
+        "Webzugriff:",
+        "akses web:",
+        "Web 访问：",
+        "Web アクセス:",
+        "웹 접근:"
+    ),
+    tr!(
+        "serve the optional loopback browser client (read-only by default)",
+        "servir el cliente web opcional en loopback (solo lectura por defecto)",
+        "servir o cliente web opcional em loopback (somente leitura por padrão)",
+        "servir le client web facultatif en boucle locale (lecture seule par défaut)",
+        "den optionalen Loopback-Webclient bereitstellen (standardmäßig schreibgeschützt)",
+        "sajikan klien web loopback opsional (bawaan hanya-baca)",
+        "提供可选的回环 Web 客户端（默认只读）",
+        "オプションのループバック Web クライアントを提供（既定は読み取り専用）",
+        "선택적 루프백 웹 클라이언트 제공(기본값은 읽기 전용)"
     ),
     tr!(
         "expose scoped UHP through a private provider endpoint",

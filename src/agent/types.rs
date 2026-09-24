@@ -80,6 +80,9 @@ pub(crate) struct AgentDescriptor {
     pub launch_command: &'static str,
     /// Static arguments required before an ORCH task briefing.
     pub task_prompt_args: &'static [&'static str],
+    /// Minimum paste-to-Enter delay for an interactive prompt. Zero preserves
+    /// the caller's default; adapters may account for a native paste guard.
+    pub prompt_settle: std::time::Duration,
     /// Reviewed one-shot commands for scheduled ORCH work. Interactive task
     /// starts continue to use `task_prompt_args` above.
     pub automation: Option<AutomationOperations>,

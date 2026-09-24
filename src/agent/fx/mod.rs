@@ -14,6 +14,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     // FX reserves positional text for subcommands. `ask` is its documented
     // one-request entrypoint; keep permission approval attached to the PTY.
     task_prompt_args: &["ask", "--prompt-permissions"],
+    prompt_settle: std::time::Duration::ZERO,
     automation: Some(AutomationOperations {
         read_only: None,
         workspace: Some(AutomationLaunch {

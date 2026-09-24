@@ -47,7 +47,12 @@ def ssh_helper():
         return subprocess.call(parsed, env=env)
     # A stale PATH binary remains stale after installation; standard fallback
     # must discover the compatible user-local binary without any PATH edits.
-    if command == ["luvus", "--version", "--remote-session-protocol"]:
+    if command[:2] == ["luvus", "--version"]:
+        if os.environ.get("FIXTURE_SHADOW_PATH") == "1":
+            print("luvus 1.0.99 remote-session=2 transport=14")
+            return 0
+        if os.environ.get("FIXTURE_COMPATIBLE_PATH") == "1" and installed.exists():
+            return subprocess.call([str(installed), *command[1:]], env=env)
         print("luvus 1.0.99")
         return 0
     assert len(command) == 1 and command[0].startswith("for luvus_bin in "), command
@@ -60,7 +65,7 @@ def ssh_helper():
         argv = ["--session", "default", "remote-session-list"]
     else:
         assert "--version" in command[0]
-        argv = ["--version", "--remote-session-protocol"]
+        argv = ["--version"] + (["--remote-session-protocol"] if "--remote-session-protocol" in command[0] else [])
     return subprocess.call([str(installed), *argv], env=env)
 
 
@@ -181,6 +186,19 @@ def host_admission_smoke(repo, root, binary, env):
         assert pid_file.read_bytes() == pid_before and client.poll() is None
         assert not list((root / "remote-state").rglob("server.pid"))
         print("PASS: real Settings selection prompts, default Enter cancels, affirmative consent installs; existing UI owner survives")
+        drain(1)
+        inode = installed.stat().st_ino
+        os.write(master, b"u")
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline and installed.stat().st_ino == inode:
+            drain(0.2)
+        assert installed.stat().st_ino != inode, "Settings u did not update a compatible installation"
+        screen = drain(2)
+        assert b"Updated fork binary" in screen, screen
+        assert len((root / "installs").read_text().splitlines()) == 4
+        assert pid_file.read_bytes() == pid_before and client.poll() is None
+        assert not list((root / "remote-state").rglob("server.pid"))
+        print("PASS: Settings u updates compatible fork binary without restarting either owner")
     finally:
         if client is not None:
             client.terminate()
@@ -189,6 +207,33 @@ def host_admission_smoke(repo, root, binary, env):
         if slave is not None:
             os.close(slave)
         subprocess.run([*owner, "server", "stop"], env=env, cwd=root, check=True, capture_output=True, timeout=15)
+
+    env["FIXTURE_COMPATIBLE_PATH"] = "1"
+    inode = installed.stat().st_ino
+    status = json.loads(run("host", "update", "fixture", "--json").stdout)
+    assert status["type"] == "host_updated" and status["host"] == "fixture"
+    assert status["release_source"] == "https://github.com/Shaloc/luvus/releases/latest"
+    assert not status["servers_restarted"] and not status["path_shadowed"]
+    assert "build-id=" in status["version"] and installed.stat().st_ino != inode
+    assert installed.read_bytes() == binary.read_bytes()
+    env["FIXTURE_SHADOW_PATH"] = "1"
+    status = json.loads(run("host", "update", "fixture", "--json").stdout)
+    assert status["path_shadowed"], status
+    env.pop("FIXTURE_SHADOW_PATH")
+    requests = (root / "requests").read_text()
+    calls = (root / "ssh-calls").read_text()
+    run("host", "update", "unknown", "--json", ok=False)
+    assert (root / "ssh-calls").read_text() == calls
+    for checksum in (root / "downloads").glob("*.sha256"):
+        checksum.write_text("0" * 64 + "\n")
+    inode = installed.stat().st_ino
+    run("host", "update", "fixture", "--json", ok=False)
+    assert installed.stat().st_ino == inode and installed.read_bytes() == binary.read_bytes()
+    # Restore fixture checksums for the remaining installer rejection tests.
+    for archive in (root / "downloads").glob("*.tar.gz"):
+        archive.with_suffix(".gz.sha256").write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "\n")
+    assert "RizRiyz" not in requests and "luvus.dev" not in requests
+    print("PASS: host update reinstalls compatible fork, verifies identity, reports PATH shadowing, rejects unknown host and bad checksum, preserves servers")
 
 
 def main():
@@ -269,7 +314,7 @@ esac
         lines = detailed.splitlines()
         assert len(lines) == 4, detailed
         assert version("--version", "--remote-session-protocol") == lines[0] + "\n"
-        assert re.fullmatch(r"luvus \S+ remote-session=2 transport=14", lines[0]), detailed
+        assert re.fullmatch(r"luvus \S+ remote-session=2 transport=15", lines[0]), detailed
         assert re.fullmatch(r"build-id=[A-Za-z0-9._-]+", lines[1]), detailed
         assert re.fullmatch(r"commit=(?:[A-Fa-f0-9]{40,64}|unknown) source=(?:clean|dirty|unknown)", lines[2]), detailed
         assert re.fullmatch(r"target=\S+ profile=\S+", lines[3]), detailed
@@ -283,7 +328,7 @@ esac
                                     FIXTURE_REDIRECT="https://github.com/other/luvus/releases/tag/fork-bad")
     assert installed.read_bytes() == payload
     if len(sys.argv) == 1:
-        for transport in ("9", "10", "11", "12", "13", "14"):
+        for transport in ("9", "10", "11", "12", "13", "14", "15"):
             run(FIXTURE_TRANSPORT=transport)
         run(FIXTURE_OS="Darwin", FIXTURE_ARCH="arm64")
         run(FIXTURE_OS="Darwin", FIXTURE_ARCH="aarch64")

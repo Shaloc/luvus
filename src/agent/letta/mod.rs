@@ -18,6 +18,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     // argument after `-p`. Scheduled automation remains disabled until each
     // Luvus access level has a reviewed, non-interactive permission mapping.
     task_prompt_args: &["-p"],
+    prompt_settle: std::time::Duration::ZERO,
     automation: None,
     identity: IdentityDescriptor {
         // `letta` is trusted as deliberate process/title evidence but not from

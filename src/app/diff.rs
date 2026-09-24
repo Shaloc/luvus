@@ -1543,7 +1543,8 @@ impl App {
             .panes
             .get(&target)
             .ok_or_else(|| "target pane closed before delivery".to_string())?;
-        pane.try_submit_text_with_settle(&message, super::AGENT_MESSAGE_SETTLE)?;
+        let settle = self.agent_prompt_settle(target, super::AGENT_MESSAGE_SETTLE);
+        pane.try_submit_text_with_settle(&message, settle)?;
         let delivered_at = crate::diff::notes::now_ms();
         for selected_note in &selected {
             if let Some(index) = self

@@ -5,6 +5,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &[],
     launch_command: "kiro-cli",
     task_prompt_args: &[],
+    prompt_settle: std::time::Duration::ZERO,
     automation: Some(AutomationOperations {
         read_only: Some(AutomationLaunch {
             args: &["chat", "--no-interactive", "--trust-tools=read,grep"],

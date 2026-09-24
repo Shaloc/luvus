@@ -40,9 +40,8 @@ pub fn option_modifier_pressed() -> bool {
     false
 }
 
-/// Read and normalize a local Windows clipboard image after an explicit paste
-/// gesture. Other platforms preserve their existing terminal and agent-native
-/// clipboard behavior and never probe the clipboard here.
+/// Read and normalize a local clipboard image after an explicit paste gesture.
+/// Clipboard ownership stays with the display client, including remote attach.
 #[cfg(windows)]
 pub fn clipboard_image() -> Option<Vec<u8>> {
     windows::clipboard_image()

@@ -5,6 +5,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &[],
     launch_command: "amp",
     task_prompt_args: &["--execute"],
+    prompt_settle: std::time::Duration::ZERO,
     // Execute mode is one-shot, but Amp does not expose a reviewed per-run
     // permission profile that maps cleanly to Luvus automation access levels.
     automation: None,

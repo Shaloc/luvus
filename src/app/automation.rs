@@ -1172,11 +1172,12 @@ impl App {
             }),
         );
 
+        let settle = self.agent_prompt_settle(pane_id, Duration::from_millis(30));
         let delivery = self
             .panes
             .get(&pane_id)
             .ok_or_else(|| "target pane closed before prompt delivery".to_string())
-            .and_then(|pane| pane.try_submit_text(&run.task.prompt));
+            .and_then(|pane| pane.try_submit_text_with_settle(&run.task.prompt, settle));
         match delivery {
             Ok(()) => self.finish_active_agent_run(run, RunStatus::Delivered, None, now, false),
             Err(message) => {

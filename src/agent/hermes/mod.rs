@@ -24,6 +24,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &["hermes-agent"],
     launch_command: "hermes",
     task_prompt_args: &["--oneshot"],
+    prompt_settle: std::time::Duration::ZERO,
     automation: Some(AutomationOperations {
         read_only: None,
         workspace: None,

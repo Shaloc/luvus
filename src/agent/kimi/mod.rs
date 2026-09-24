@@ -13,6 +13,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &[],
     launch_command: "kimi",
     task_prompt_args: &["--prompt"],
+    prompt_settle: std::time::Duration::ZERO,
     automation: Some(AutomationOperations {
         read_only: None,
         workspace: Some(AutomationLaunch {

@@ -662,6 +662,14 @@ impl App {
                 self.apply_settings_remote_hosts_loaded(generation, result);
                 return true;
             }
+            AppEvent::SettingsRemoteUpdateFinished {
+                generation,
+                host,
+                result,
+            } => {
+                self.finish_settings_remote_update(generation, host, result);
+                return true;
+            }
             AppEvent::RemoteInstallNeeded { generation, host } => {
                 self.offer_remote_install(generation, host);
                 return true;
@@ -1271,6 +1279,26 @@ impl App {
                 self.mission_last_cost = Some((total, now));
                 self.active_is_mission()
             }
+            AppEvent::FileFilterResults {
+                instance,
+                generation,
+                rows,
+                partial,
+            } => {
+                if let Some(filter) = self
+                    .file_tree
+                    .filter
+                    .as_mut()
+                    .filter(|f| f.instance == instance && f.generation == generation)
+                {
+                    filter.rows = rows;
+                    filter.partial = partial;
+                    filter.loading = false;
+                    true
+                } else {
+                    false
+                }
+            }
             AppEvent::DirRead { path, entries } => {
                 self.file_tree.apply_dir(path.clone(), entries);
                 self.finish_pending_files_api(&path);
@@ -1441,6 +1469,7 @@ impl App {
             | AppEvent::RemoteRegistryLoaded { .. }
             | AppEvent::RemoteMergeChanged { .. }
             | AppEvent::SettingsRemoteHostsLoaded { .. }
+            | AppEvent::SettingsRemoteUpdateFinished { .. }
             | AppEvent::RemoteInstallNeeded { .. }
             | AppEvent::ClipboardImageReady { .. }
             | AppEvent::ClipboardHelperResult { .. }
@@ -1506,7 +1535,9 @@ impl App {
         // Search can rank a large catalog, so append the whole paste and launch
         // one recomputation instead of replaying one query per character.
         if self.search.is_some() {
-            self.search_paste(s);
+            if self.file_menu.is_none() {
+                self.search_paste(s);
+            }
             return true;
         }
         // The picker owns both text sub-modes and direct path navigation.
@@ -1549,6 +1580,16 @@ impl App {
         } else if self.pane_rename.is_some() {
             Self::handle_pane_rename_key
         } else {
+            if self.files_focused && self.files_mode == crate::diff::FilesMode::Files {
+                if let Some(filter) = self.file_tree.filter.as_mut() {
+                    if self.file_menu.is_none() {
+                        filter.append(s);
+                        self.file_tree.cursor = 0;
+                        self.file_tree.scroll = 0;
+                    }
+                    return true;
+                }
+            }
             return false;
         };
         for c in s.chars().filter(|c| !c.is_control()) {
@@ -2066,9 +2107,12 @@ impl App {
         // The global-search overlay (docs/63) owns the mouse while open: a click
         // on a result jumps to it, a click outside dismisses, the wheel moves the
         // result cursor.
-        if self.search.is_some() {
+        if self.search.is_some() && self.file_menu.is_none() {
             match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => self.search_click(m.column, m.row),
+                MouseEventKind::Down(MouseButton::Right) => {
+                    self.search_context_click(m.column, m.row)
+                }
                 MouseEventKind::ScrollUp => self.search_move(-1),
                 MouseEventKind::ScrollDown => self.search_move(1),
                 _ => {}
@@ -2543,7 +2587,9 @@ impl App {
                     self.press_diff_source(pane, row, side);
                     return;
                 }
-                if m.modifiers.contains(KeyModifiers::CONTROL) {
+                if m.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+                {
                     // A link under the cursor claims the press, but only
                     // provisionally: `Ctrl`+drag is the RESIZE-5 divider grab, so
                     // which gesture this was is decided by whether it moves (see
@@ -2723,7 +2769,9 @@ impl App {
                 // gesture's own affordance and what keeps this off the hot path:
                 // ordinary mouse motion never scans a grid and never takes the
                 // engine lock (the PTY reader holds that during output bursts).
-                if m.modifiers.contains(KeyModifiers::CONTROL) {
+                if m.modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+                {
                     // Guarded on the cell *this* resolved for, not on `hover`:
                     // pointing at a link and only then pressing `Ctrl` is the
                     // natural gesture, and it never moves the mouse.
@@ -4388,6 +4436,14 @@ impl App {
         }
         if let Some(changed) = self.handle_active_remote_key(key) {
             return changed;
+        }
+        // Editing a FILES query has the same precedence as other text inputs.
+        if self.files_focused
+            && self.files_mode == crate::diff::FilesMode::Files
+            && self.file_tree.filter.is_some()
+            && !self.prefix.matches(&key)
+        {
+            return self.handle_file_tree_key(key);
         }
         // Explicit direct shortcuts are the only normal-mode keys Luvus takes
         // before pane/dashboard dispatch. The configured prefix retains
@@ -7030,6 +7086,14 @@ mod link_click_tests {
     }
 
     #[test]
+    fn super_click_on_a_file_path_uses_the_same_native_preview() {
+        let _env = crate::persist::test_env("link-file-super");
+        let (app, id, tabs) = click_cargo_toml(KeyModifiers::SUPER);
+        assert_eq!(app.ws().tabs.len(), tabs, "no new tab");
+        assert!(app.preview_views.contains(&id), "it is the preview pane");
+    }
+
+    #[test]
     fn osc8_file_target_overrides_a_domain_shaped_label() {
         let _env = crate::persist::test_env("link-osc8-file");
         let path = std::env::current_dir().unwrap().join("Cargo.toml");
@@ -7044,6 +7108,27 @@ mod link_click_tests {
             other => panic!("OSC 8 file target must win over its label, got {other:?}"),
         }
         assert!(app.pending_open_url.is_none());
+    }
+
+    #[test]
+    fn osc8_file_target_overrides_server_prefixed_mjs_label() {
+        let _env = crate::persist::test_env("link-osc8-mjs");
+        let path = std::env::current_dir().unwrap().join("Cargo.toml");
+        let uri = format!("file://{}", path.display());
+        let (app, _term, at) = fixture_showing_osc8(
+            "server/scripts/reconcile-communication-deliveries.mjs",
+            &uri,
+            8,
+        );
+
+        assert!(
+            app.rendered_hyperlinks.iter().any(|link| link.uri == uri),
+            "the thin-client projection retains the authoritative OSC 8 target"
+        );
+        assert!(matches!(
+            app.link_at_screen(at.0, at.1).map(|hover| hover.target),
+            Some(LinkTarget::File { path: target, line: None }) if target == path
+        ));
     }
 
     #[test]

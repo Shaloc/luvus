@@ -17,7 +17,7 @@ pub fn local_cell_pixels() -> (u16, u16) {
     crate::platform::terminal_cell_pixels().unwrap_or((0, 0))
 }
 
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 15;
 pub const PROJECTION_PROTOCOL_VERSION: u32 = 10;
 pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 
@@ -26,7 +26,13 @@ pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 pub fn supports_version(version: u32) -> bool {
     matches!(
         version,
-        LEGACY_PROTOCOL_VERSION | PROJECTION_PROTOCOL_VERSION | 11 | 12 | 13 | PROTOCOL_VERSION
+        LEGACY_PROTOCOL_VERSION
+            | PROJECTION_PROTOCOL_VERSION
+            | 11
+            | 12
+            | 13
+            | 14
+            | PROTOCOL_VERSION
     )
 }
 pub(crate) const MAX_FRAME: usize = 64 * 1024 * 1024;
@@ -190,6 +196,100 @@ pub enum ServerMessage {
         origin: Option<u64>,
         request: crate::terminal::clipboard::kitten::Request,
     },
+    /// Transport 15: links accompany the exact full frame, including graphics
+    /// and workspace preparation identity. Older message layouts stay frozen.
+    LinkedFrame {
+        state: Option<ProjectionState>,
+        frame: FrameData,
+        graphics: Option<Vec<crate::terminal::graphics::GraphicUpdate>>,
+        prepared: bool,
+        hyperlinks: Vec<FrameHyperlink>,
+    },
+}
+
+/// Only a peer that negotiated transport 15 receives the appended variant.
+pub(crate) fn encode_hyperlinks(message: ServerMessage, version: u32) -> ServerMessage {
+    if version < 15 {
+        return message;
+    }
+    let (state, mut frame, graphics, prepared) = match message {
+        ServerMessage::Frame(frame) if !frame.hyperlinks.is_empty() => (None, frame, None, false),
+        ServerMessage::ProjectionFrame { state, frame } if !frame.hyperlinks.is_empty() => {
+            (Some(state), frame, None, false)
+        }
+        ServerMessage::GraphicFrame {
+            state,
+            text: GraphicText::Full(frame),
+            graphics,
+        } if !frame.hyperlinks.is_empty() => (state, frame, Some(graphics), false),
+        ServerMessage::PreparedWorkspace {
+            state,
+            frame,
+            graphics,
+        } if !frame.hyperlinks.is_empty() => (Some(state), frame, Some(graphics), true),
+        other => return other,
+    };
+    let hyperlinks = std::mem::take(&mut frame.hyperlinks);
+    ServerMessage::LinkedFrame {
+        state,
+        frame,
+        graphics,
+        prepared,
+        hyperlinks,
+    }
+}
+
+/// Restore links into the private render projection before existing owner and
+/// display routing. This cannot weaken workspace generation/epoch checks.
+pub(crate) fn decode_hyperlinks(message: ServerMessage) -> io::Result<ServerMessage> {
+    let ServerMessage::LinkedFrame {
+        state,
+        mut frame,
+        graphics,
+        prepared,
+        hyperlinks,
+    } = message
+    else {
+        return Ok(message);
+    };
+    if hyperlinks.len() > frame.cells.len()
+        || hyperlinks.iter().any(|link| {
+            link.start >= link.end
+                || link.end as usize > frame.cells.len()
+                || frame.width == 0
+                || link.start / u32::from(frame.width) != (link.end - 1) / u32::from(frame.width)
+                || !super::client::valid_host_hyperlink(&link.uri)
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid frame hyperlinks",
+        ));
+    }
+    frame.hyperlinks = hyperlinks;
+    if prepared {
+        let (Some(state), Some(graphics)) = (state, graphics) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid prepared linked frame",
+            ));
+        };
+        Ok(ServerMessage::PreparedWorkspace {
+            state,
+            frame,
+            graphics,
+        })
+    } else if let Some(graphics) = graphics {
+        Ok(ServerMessage::GraphicFrame {
+            state,
+            text: GraphicText::Full(frame),
+            graphics,
+        })
+    } else if let Some(state) = state {
+        Ok(ServerMessage::ProjectionFrame { state, frame })
+    } else {
+        Ok(ServerMessage::Frame(frame))
+    }
 }
 
 /// Effects from a committed workspace carry the same switch identity as frames.
@@ -227,8 +327,8 @@ pub const PROJECTION_CAPABILITY: &str = "projection.v1";
 pub const SESSION_DISPLAY_CAPABILITY: &str = "session_display.v1";
 
 pub fn remote_display_capabilities() -> serde_json::Value {
-    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, PROTOCOL_VERSION],
-        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1"]})
+    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, 14, PROTOCOL_VERSION],
+        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1", "hyperlinks.v1"]})
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -237,6 +337,10 @@ pub struct FrameData {
     pub height: u16,
     /// Row-major, `width * height` cells.
     pub cells: Vec<CellData>,
+    /// Sparse validated OSC 8 runs. Empty for the overwhelming majority of
+    /// frames, so ordinary terminal traffic carries no per-cell link metadata.
+    #[serde(skip)]
+    pub hyperlinks: Vec<FrameHyperlink>,
     pub cursor: Option<(u16, u16)>,
     /// When `cursor` is Some, whether the host caret should be shown. Hidden
     /// in-view PTY still parks IME (Pi `?25l` after CUP to its input marker).
@@ -269,6 +373,13 @@ pub struct DiffRun {
     pub bg: u32,
     pub mods: u16,
     pub symbols: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+pub struct FrameHyperlink {
+    pub start: u32,
+    pub end: u32,
+    pub uri: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
@@ -420,9 +531,58 @@ pub fn frame_from_buffer(
         width: area.width,
         height: area.height,
         cells,
+        hyperlinks: Vec::new(),
         cursor,
         cursor_visible: cursor.is_some() && cursor_visible,
     }
+}
+
+/// Project sparse screen-coordinate link spans onto an already materialized
+/// frame. The text and styling remain in `frame.cells`; links carry only their
+/// bounds and target, keeping the wire bounded by span count.
+pub fn frame_hyperlinks(
+    frame: &FrameData,
+    links: &[crate::app::RenderedHyperlink],
+) -> Vec<FrameHyperlink> {
+    let width = u32::from(frame.width);
+    let height = u32::from(frame.height);
+    let mut runs = Vec::<FrameHyperlink>::new();
+    for link in links {
+        let y = u32::from(link.y);
+        if y >= height {
+            continue;
+        }
+        let start_x = u32::from(link.start).min(width);
+        let end_x = u32::from(link.end).min(width);
+        if start_x < end_x {
+            runs.push(FrameHyperlink {
+                start: y * width + start_x,
+                end: y * width + end_x,
+                uri: link.uri.clone(),
+            });
+        }
+    }
+    runs
+}
+
+pub fn diff_intersects_hyperlinks(runs: &[DiffRun], hyperlinks: &[FrameHyperlink]) -> bool {
+    let mut link_index = 0;
+    for run in runs {
+        let run_end = run.start.saturating_add(run.symbols.len() as u32);
+        while hyperlinks
+            .get(link_index)
+            .is_some_and(|link| link.end <= run.start)
+        {
+            link_index += 1;
+        }
+        if hyperlinks
+            .get(link_index)
+            .is_some_and(|link| link.start < run_end)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// Diff the live ratatui `buf` against `prev` (the last sent frame) **in place**:
@@ -580,6 +740,183 @@ fn sq(x: i32) -> i32 {
 mod tests {
     use super::*;
 
+    fn linked_fixture() -> FrameData {
+        let mut frame = frame_from_buffer(
+            &Buffer::empty(ratatui::layout::Rect::new(0, 0, 4, 2)),
+            Some((1, 0)),
+            true,
+        );
+        frame.hyperlinks.push(FrameHyperlink {
+            start: 0,
+            end: 4,
+            uri: "https://example.com/owner".into(),
+        });
+        frame
+    }
+
+    #[test]
+    fn hyperlinks_keep_transport_9_through_14_frame_bytes_frozen() {
+        #[derive(Serialize)]
+        struct LegacyFrame<'a> {
+            width: u16,
+            height: u16,
+            cells: &'a [CellData],
+            cursor: Option<(u16, u16)>,
+            cursor_visible: bool,
+        }
+        #[derive(Serialize)]
+        enum LegacyMessage<'a> {
+            Welcome { version: u32, error: Option<String> },
+            Frame(LegacyFrame<'a>),
+        }
+        let frame = linked_fixture();
+        let mut expected = Vec::new();
+        write_message(
+            &mut expected,
+            &LegacyMessage::Frame(LegacyFrame {
+                width: frame.width,
+                height: frame.height,
+                cells: &frame.cells,
+                cursor: frame.cursor,
+                cursor_visible: frame.cursor_visible,
+            }),
+        )
+        .unwrap();
+        // Exercise the frozen Welcome discriminant too.
+        let mut welcome = Vec::new();
+        write_message(
+            &mut welcome,
+            &LegacyMessage::Welcome {
+                version: 14,
+                error: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_message::<_, ServerMessage>(&mut welcome.as_slice()).unwrap(),
+            ServerMessage::Welcome {
+                version: 14,
+                error: None
+            }
+        ));
+        for version in 9..=14 {
+            assert!(supports_version(version));
+            let mut bytes = Vec::new();
+            write_message(
+                &mut bytes,
+                &encode_hyperlinks(ServerMessage::Frame(frame.clone()), version),
+            )
+            .unwrap();
+            assert_eq!(bytes, expected, "legacy transport {version}");
+        }
+    }
+
+    #[test]
+    fn linked_frames_preserve_owner_identity_graphics_and_preparation() {
+        let frame = linked_fixture();
+        let state = ProjectionState {
+            server_generation: "boot".into(),
+            epoch: 7,
+            event_sequence: 42,
+            workspace_id: "owner-workspace".into(),
+            focused_pane: Some("88".into()),
+        };
+        let graphics = vec![crate::terminal::graphics::GraphicUpdate {
+            key: "owner-image".into(),
+            image: None,
+            crop: [1, 2, 3, 4],
+            size: [5, 6],
+        }];
+        for prepared in [false, true] {
+            let original = if prepared {
+                ServerMessage::PreparedWorkspace {
+                    state: state.clone(),
+                    frame: frame.clone(),
+                    graphics: graphics.clone(),
+                }
+            } else {
+                ServerMessage::GraphicFrame {
+                    state: Some(state.clone()),
+                    text: GraphicText::Full(frame.clone()),
+                    graphics: graphics.clone(),
+                }
+            };
+            let encoded = encode_hyperlinks(original, 15);
+            assert!(matches!(encoded, ServerMessage::LinkedFrame { .. }));
+            let mut bytes = Vec::new();
+            write_message(&mut bytes, &encoded).unwrap();
+            let message = decode_hyperlinks(read_message(&mut bytes.as_slice()).unwrap()).unwrap();
+            let (received_state, received_frame) = match message {
+                ServerMessage::PreparedWorkspace {
+                    state,
+                    frame,
+                    graphics,
+                } if prepared => {
+                    assert_eq!(graphics.len(), 1);
+                    assert_eq!(graphics[0].key, "owner-image");
+                    assert_eq!(graphics[0].crop, [1, 2, 3, 4]);
+                    assert_eq!(graphics[0].size, [5, 6]);
+                    (state, frame)
+                }
+                ServerMessage::GraphicFrame {
+                    state: Some(state),
+                    text: GraphicText::Full(frame),
+                    graphics,
+                } if !prepared => {
+                    assert_eq!(graphics.len(), 1);
+                    assert_eq!(graphics[0].key, "owner-image");
+                    assert_eq!(graphics[0].crop, [1, 2, 3, 4]);
+                    assert_eq!(graphics[0].size, [5, 6]);
+                    (state, frame)
+                }
+                _ => panic!("frame routing changed"),
+            };
+            assert_eq!(received_state.server_generation, "boot");
+            assert_eq!(received_state.epoch, 7);
+            assert_eq!(received_state.workspace_id, "owner-workspace");
+            assert_eq!(received_state.focused_pane.as_deref(), Some("88"));
+            assert_eq!(received_frame.hyperlinks, frame.hyperlinks);
+        }
+    }
+
+    #[test]
+    fn linked_frames_accept_file_uris_from_either_owner_platform() {
+        for uri in [
+            "file:///home/user/My%20File.rs",
+            "file://localhost/home/user/main.rs",
+            "file:///C:/Users/user/main.rs",
+        ] {
+            let mut frame = linked_fixture();
+            frame.hyperlinks[0].uri = uri.into();
+            let received = decode_hyperlinks(encode_hyperlinks(ServerMessage::Frame(frame), 15))
+                .expect("wire validation must not resolve paths on the display OS");
+            let ServerMessage::Frame(received) = received else {
+                panic!("frame routing changed");
+            };
+            assert_eq!(received.hyperlinks[0].uri, uri);
+        }
+    }
+
+    #[test]
+    fn linked_frames_reject_out_of_bounds_and_terminal_escape_targets() {
+        for (end, uri) in [
+            (9, "https://example.com"),
+            (5, "https://example.com"),
+            (4, "https://example.com/\x1b[2J"),
+            (4, "file://server/share/main.rs"),
+            (4, "file:////server/share/main.rs"),
+            (4, "file:///bad%GG"),
+            (4, "file:///bad%00name"),
+            (4, "file:///path.rs?query"),
+            (4, "file:///path.rs#fragment"),
+        ] {
+            let mut frame = linked_fixture();
+            frame.hyperlinks[0].end = end;
+            frame.hyperlinks[0].uri = uri.into();
+            assert!(decode_hyperlinks(encode_hyperlinks(ServerMessage::Frame(frame), 15)).is_err());
+        }
+    }
+
     #[test]
     fn first_handshake_decodes_both_released_welcome_shapes() {
         for peer in [9, 12, V0141_PROTOCOL_VERSION] {
@@ -660,7 +997,8 @@ mod tests {
         assert!(supports_version(12));
         assert!(supports_version(13));
         assert!(supports_version(14));
-        assert!(!supports_version(15));
+        assert!(supports_version(15));
+        assert!(!supports_version(16));
     }
 
     #[test]
@@ -711,6 +1049,7 @@ mod tests {
                     mods: 0,
                 },
             ],
+            hyperlinks: Vec::new(),
             cursor: Some((1, 0)),
             cursor_visible: true,
         });
@@ -888,6 +1227,7 @@ mod tests {
             width: 3,
             height: 1,
             cells: vec![cell("a"), cell("b"), cell("c")],
+            hyperlinks: Vec::new(),
             cursor: Some((0, 0)),
             cursor_visible: true,
         };
@@ -916,6 +1256,69 @@ mod tests {
     }
 
     #[test]
+    fn hyperlink_projection_preserves_mjs_target_and_can_be_removed() {
+        let label = "server/scripts/reconcile.mjs";
+        let cells = label
+            .chars()
+            .map(|character| CellData {
+                symbol: character.to_string(),
+                fg: 7,
+                bg: 0,
+                mods: 0,
+            })
+            .collect::<Vec<_>>();
+        let frame = FrameData {
+            width: cells.len() as u16,
+            height: 1,
+            cells,
+            hyperlinks: Vec::new(),
+            cursor: None,
+            cursor_visible: false,
+        };
+        let links = [crate::app::RenderedHyperlink {
+            pane: crate::ids::PaneId(7),
+            y: 0,
+            start: 0,
+            end: frame.width,
+            uri: "file:///repo/server/scripts/reconcile.mjs".into(),
+        }];
+
+        let projected = frame_hyperlinks(&frame, &links);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].uri, links[0].uri);
+        assert_eq!(projected[0].start, 0);
+        assert_eq!(projected[0].end, label.len() as u32);
+
+        assert!(frame_hyperlinks(&frame, &[]).is_empty());
+    }
+
+    #[test]
+    fn hyperlink_intersection_detects_only_changed_link_cells() {
+        let hyperlink = FrameHyperlink {
+            start: 4,
+            end: 8,
+            uri: "file:///repo/server/task.mjs".into(),
+        };
+        let run = |start, symbols: &[&str]| DiffRun {
+            start,
+            fg: 7,
+            bg: 0,
+            mods: 0,
+            symbols: symbols.iter().map(|symbol| (*symbol).into()).collect(),
+        };
+
+        assert!(!diff_intersects_hyperlinks(
+            &[run(0, &["a", "b", "c", "d"])],
+            std::slice::from_ref(&hyperlink)
+        ));
+        assert!(diff_intersects_hyperlinks(
+            &[run(7, &["x"])],
+            std::slice::from_ref(&hyperlink)
+        ));
+        assert!(!diff_intersects_hyperlinks(&[run(8, &["x"])], &[hyperlink]));
+    }
+
+    #[test]
     fn diff_coalesces_adjacent_same_style_into_one_run() {
         let c = |s: &str, fg: u32| CellData {
             symbol: s.into(),
@@ -927,6 +1330,7 @@ mod tests {
             width: 5,
             height: 1,
             cells: vec![c(" ", 0), c(" ", 0), c(" ", 0), c(" ", 0), c(" ", 0)],
+            hyperlinks: Vec::new(),
             cursor: None,
             cursor_visible: false,
         };
@@ -960,6 +1364,7 @@ mod tests {
             width: 2,
             height: 2,
             cells: vec![cell("a", 1), cell("b", 2), cell("c", 3), cell("d", 4)],
+            hyperlinks: Vec::new(),
             cursor: Some((0, 0)),
             cursor_visible: true,
         };
@@ -1033,6 +1438,7 @@ mod size_probe {
             width: w,
             height: h,
             cells,
+            hyperlinks: Vec::new(),
             cursor: Some((0, 0)),
             cursor_visible: true,
         }

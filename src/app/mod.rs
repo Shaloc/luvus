@@ -58,6 +58,8 @@ pub(crate) mod workspace_sidebar;
 
 pub use search::{GlobalSearch, SearchFlash};
 
+#[cfg(test)]
+pub(crate) use keys::build_direct_keymap;
 pub use keys::{key_reference_rows, presets, Cmd, PrefixSpec};
 pub use modules::ModuleMenuAction;
 pub use picker::{FolderPicker, PickerHit, Row};
@@ -1989,6 +1991,17 @@ pub struct HoverLink {
     pub target: LinkTarget,
 }
 
+/// One validated OSC 8 span projected into a client's screen coordinates.
+/// Kept sparse so ordinary terminal cells and frames pay no per-cell metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenderedHyperlink {
+    pub pane: PaneId,
+    pub y: u16,
+    pub start: u16,
+    pub end: u16,
+    pub uri: String,
+}
+
 /// A `Ctrl`+press that landed on a link, held until its release.
 ///
 /// The same gesture dragged is the RESIZE-5 divider grab, so the two are told
@@ -2308,6 +2321,10 @@ pub struct App {
     /// Harness-assigned display labels are separate from addressable agent
     /// aliases and from child-controlled OSC titles.
     pub(crate) backend_labels: HashMap<PaneId, String>,
+    /// Last terminal content revision announced to backend observers. PTY
+    /// readers coalesce wakeups, so the re-arm boundary may need to publish a
+    /// newer trailing revision without duplicating the first wake's event.
+    pub(crate) backend_published_revisions: HashMap<PaneId, u64>,
     /// Bounded, event-driven protocol waits keyed by pane. These observe the
     /// PTY's monotonic content revision and never poll from a socket worker.
     pub(crate) backend_revision_waits:
@@ -2696,6 +2713,12 @@ pub struct App {
     /// authoritative answer to "which agent is this?", since an agent is a
     /// process, not a word on screen. Empty for a pane we could not scan.
     pub(crate) proc_commands: HashMap<PaneId, Vec<String>>,
+    /// A failed scan leaves the cache intact for lifecycle recovery, but its
+    /// commands are no longer fresh enough to override live screen identity.
+    pub(crate) proc_scan_unavailable: bool,
+    /// Last server-tick client presence; failed scans only wake visible clients
+    /// for screen reclassification, never a detached idle server.
+    runtime_clients_attached: bool,
     /// One process scan at a time, same guard as the session scan.
     proc_scan_inflight: bool,
     /// A one-shot process scan explicitly requested by an API or by the first
@@ -2907,6 +2930,9 @@ pub struct App {
     /// Each pane's **content** rect (inside the border/title) — maps a mouse
     /// position to a grid cell for text selection.
     pub pane_content_rects: Vec<(PaneId, Rect)>,
+    /// Sparse OSC 8 spans from the last interactive render. Secondary clients
+    /// receive their own projection without replacing this geometry.
+    pub(crate) rendered_hyperlinks: Vec<RenderedHyperlink>,
     /// When `Some`, keyboard **scroll mode** is active on this pane: plain keys
     /// scroll its scrollback (see `handle_scroll_mode_key`) instead of reaching
     /// the agent. Entered by wheel-up or `Shift+↑`; left by `q`/typing. A
@@ -3130,6 +3156,7 @@ impl App {
             backend_server_generation,
             backend_terminal_index,
             backend_labels: HashMap::new(),
+            backend_published_revisions: HashMap::new(),
             backend_revision_waits: HashMap::new(),
             last_backend_wait_scan: Instant::now(),
             status,
@@ -3307,6 +3334,8 @@ impl App {
             agent_title_sessions: HashMap::new(),
             sessions_scan_inflight: false,
             proc_commands: HashMap::new(),
+            proc_scan_unavailable: false,
+            runtime_clients_attached: false,
             proc_scan_inflight: false,
             proc_scan_requested: false,
             proc_scan_demand_inflight: false,
@@ -3415,6 +3444,7 @@ impl App {
             cell_height_px: 0,
             pane_rects: Vec::new(),
             pane_content_rects: Vec::new(),
+            rendered_hyperlinks: Vec::new(),
             scroll_pane: None,
             resize_drag: None,
             hover_divider: None,
@@ -3859,6 +3889,7 @@ impl App {
             backend_server_generation,
             backend_terminal_index,
             backend_labels: HashMap::new(),
+            backend_published_revisions: HashMap::new(),
             backend_revision_waits: HashMap::new(),
             last_backend_wait_scan: Instant::now(),
             status,
@@ -4023,6 +4054,8 @@ impl App {
             agent_title_sessions: HashMap::new(),
             sessions_scan_inflight: false,
             proc_commands: HashMap::new(),
+            proc_scan_unavailable: false,
+            runtime_clients_attached: false,
             proc_scan_inflight: false,
             proc_scan_requested: false,
             proc_scan_demand_inflight: false,
@@ -4131,6 +4164,7 @@ impl App {
             cell_height_px: 0,
             pane_rects: Vec::new(),
             pane_content_rects: Vec::new(),
+            rendered_hyperlinks: Vec::new(),
             scroll_pane: None,
             resize_drag: None,
             hover_divider: None,
@@ -4955,16 +4989,18 @@ impl App {
     /// uses this to keep focused rendering responsive without repeatedly
     /// diffing an unchanged UI for background-only bursts.
     pub fn rearm_pty_notify_by_visibility(
-        &self,
+        &mut self,
         is_visible: impl Fn(PaneId) -> bool,
     ) -> (bool, bool, bool) {
         let mut visible = false;
         let mut background = false;
         let mut title_changed = false;
+        let mut changed = Vec::new();
         for (id, pane) in &self.panes {
             if !pane.take_data_pending() {
                 continue;
             }
+            changed.push(*id);
             if is_visible(*id) {
                 visible = true;
             } else {
@@ -4972,16 +5008,57 @@ impl App {
                 title_changed |= self.hidden_title_changed(*id);
             }
         }
+        // A reader can append more bytes while its wake flag is already set.
+        // Publish at the re-arm boundary so backend observers receive that
+        // final revision even when no later command produces another wake.
+        for id in changed {
+            self.backend_output_changed(id);
+        }
         (visible, background, title_changed)
     }
 
     pub(crate) fn hidden_title_changed(&self, id: PaneId) -> bool {
-        self.config.layout.agent_title
-            && self.is_agent_pane(id)
-            && self
+        let changed = self.agent_session_title_changed(id);
+        self.config.layout.agent_title && changed
+    }
+
+    /// Emit a snapshot refresh only when an agent's OSC title generation moves.
+    pub(crate) fn agent_session_title_changed(&self, id: PaneId) -> bool {
+        if !self.is_agent_pane(id)
+            || !self
                 .panes
                 .get(&id)
                 .is_some_and(|pane| pane.take_title_change())
+        {
+            return false;
+        }
+        crate::ipc::api::publish_event(
+            &self.events,
+            "agent.title_changed",
+            json!({"pane": id.0.to_string(), "title": self.web_agent_session_title(id)}),
+        );
+        true
+    }
+
+    pub(crate) fn web_agent_session_title(&self, id: PaneId) -> Option<String> {
+        self.is_agent_pane(id)
+            .then(|| self.pane_title(id))
+            .flatten()
+            .and_then(|title| {
+                let title = title
+                    .chars()
+                    .take(160)
+                    .map(|character| {
+                        if character.is_whitespace() || character.is_control() {
+                            ' '
+                        } else {
+                            character
+                        }
+                    })
+                    .collect::<String>();
+                let title = title.trim();
+                (!title.is_empty()).then(|| title.to_string())
+            })
     }
 
     /// Whether any PTY reader is currently coalescing an output notification.
@@ -7681,6 +7758,12 @@ impl App {
         let demand_inflight = std::mem::take(&mut self.proc_scan_demand_inflight);
         let demanded_panes = std::mem::take(&mut self.proc_scan_demand_panes_inflight);
         let Some(by_pid) = found else {
+            self.proc_scan_unavailable = true;
+            if self.runtime_clients_attached {
+                for status in self.status.values_mut() {
+                    status.force_detect = true;
+                }
+            }
             if demand_inflight && self.proc_scan_failure_retries > 0 {
                 self.proc_scan_failure_retries -= 1;
                 self.proc_scan_requested = true;
@@ -7717,6 +7800,7 @@ impl App {
             }
             return false;
         };
+        let was_unavailable = std::mem::replace(&mut self.proc_scan_unavailable, false);
         let mut next: HashMap<PaneId, Vec<String>> = HashMap::new();
         for (id, pane) in self.panes.iter() {
             let pid = pane.child_pid.load(std::sync::atomic::Ordering::SeqCst);
@@ -7781,7 +7865,7 @@ impl App {
         }
         let processes_changed = self.proc_commands != next;
         self.proc_commands = next;
-        if processes_changed {
+        if processes_changed || was_unavailable {
             for status in self.status.values_mut() {
                 status.force_detect = true;
             }
@@ -7860,6 +7944,7 @@ impl App {
             || session_count != agent_session_title_count(&self.agent_title_sessions);
         if changed {
             self.emit_event("agent.history_changed", json!({}));
+            self.emit_event("agent.title_changed", json!({}));
         }
         changed
     }
@@ -8454,6 +8539,7 @@ impl App {
         self.emit_backend_terminal_event(id, "terminal.closed", serde_json::json!({}));
         self.backend_terminal_index.retain(|_, pane| *pane != id);
         self.backend_labels.remove(&id);
+        self.backend_published_revisions.remove(&id);
         self.agent_title_panes.remove(&id);
         self.cancel_backend_revision_waits(id);
         let reported = self
@@ -12066,6 +12152,26 @@ fi
         let old: persist::PaneSnap =
             serde_json::from_str(r#"{"cwd":"/tmp/x","command":"sh"}"#).unwrap();
         assert_eq!(old.agent_launch, None);
+    }
+
+    #[test]
+    fn failed_process_scan_keeps_cache_but_releases_stale_detection_evidence() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.proc_commands.insert(pane, vec!["zsh".into()]);
+        app.runtime_clients_attached = true;
+        app.status.get_mut(&pane).unwrap().force_detect = false;
+        assert_eq!(app.running_for_detection(pane), &["zsh"]);
+
+        assert!(!app.apply_proc_scan(None));
+        assert_eq!(app.proc_commands.get(&pane).unwrap(), &["zsh"]);
+        assert!(app.running_for_detection(pane).is_empty());
+        assert!(app.status.get(&pane).unwrap().force_detect);
+
+        assert!(!app.apply_proc_scan(Some(HashMap::new())));
+        app.proc_commands.insert(pane, vec!["zsh".into()]);
+        assert_eq!(app.running_for_detection(pane), &["zsh"]);
     }
 
     /// A Devin pane restores from the exact binding Luvus persisted (it has no
@@ -16560,6 +16666,7 @@ fi
             .position(|r| matches!(r, LayoutRow::Dock(k) if *k == DockKind::Workspaces))
             .unwrap();
         app.settings = Some(SettingsUi {
+            remote_update_host: None,
             remote_install_prompts: Default::default(),
             remote_install_confirm: false,
             generation: crate::ids::public_id("settings"),

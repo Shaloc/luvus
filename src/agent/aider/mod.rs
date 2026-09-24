@@ -5,6 +5,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &[],
     launch_command: "aider",
     task_prompt_args: &["--message"],
+    prompt_settle: std::time::Duration::ZERO,
     automation: Some(AutomationOperations {
         read_only: Some(AutomationLaunch {
             args: &["--dry-run", "--message"],

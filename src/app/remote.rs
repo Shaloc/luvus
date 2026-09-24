@@ -209,6 +209,7 @@ pub struct RemoteSessionSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RemoteDisplay {
+    pub hyperlinks: bool,
     pub clipboard_helper_relay: bool,
     pub session_display: bool,
     pub location: RemoteBinaryLocation,
@@ -2344,11 +2345,22 @@ pub(super) fn parse_remote_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let snapshot = RemoteSessionSnapshot {
         display: RemoteDisplay {
+            hyperlinks: response
+                .get("result")
+                .and_then(|r| r.get("remote_display"))
+                .is_some_and(|d| {
+                    d.get("transport").and_then(Value::as_u64) == Some(15)
+                        && d.get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter().any(|c| c.as_str() == Some("hyperlinks.v1"))
+                            })
+                }),
             clipboard_helper_relay: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    d.get("transport").and_then(Value::as_u64) == Some(14)
+                    matches!(d.get("transport").and_then(Value::as_u64), Some(14..=15))
                         && d.get("capabilities")
                             .and_then(Value::as_array)
                             .is_some_and(|caps| {
@@ -2360,7 +2372,7 @@ pub(super) fn parse_remote_snapshot(
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    matches!(d.get("transport").and_then(Value::as_u64), Some(13..=14))
+                    matches!(d.get("transport").and_then(Value::as_u64), Some(13..=15))
                         && d.get("capabilities")
                             .and_then(Value::as_array)
                             .is_some_and(|caps| {
@@ -2376,7 +2388,7 @@ pub(super) fn parse_remote_snapshot(
                     display
                         .get("transport")
                         .and_then(Value::as_u64)
-                        .is_some_and(|v| (12..=14).contains(&v))
+                        .is_some_and(|v| (12..=15).contains(&v))
                 }),
             graphics: response
                 .get("result")
@@ -2384,7 +2396,7 @@ pub(super) fn parse_remote_snapshot(
                 .is_some_and(|display| {
                     matches!(
                         display.get("transport").and_then(Value::as_u64),
-                        Some(11..=14)
+                        Some(11..=15)
                     ) && display
                         .get("capabilities")
                         .and_then(Value::as_array)
@@ -2404,7 +2416,7 @@ pub(super) fn parse_remote_snapshot(
                 .is_some_and(|display| {
                     matches!(
                         display.get("transport").and_then(Value::as_u64),
-                        Some(10..=14)
+                        Some(10..=15)
                     ) && display
                         .get("capabilities")
                         .and_then(Value::as_array)
@@ -2497,6 +2509,7 @@ fn watch_remote_session(
                 name,
                 "workspace.created"
                     | "agent.history_changed"
+                    | "agent.title_changed"
                     | "agent.pin_changed"
                     | "automation.created"
                     | "automation.updated"
@@ -2626,7 +2639,9 @@ fn run_projection(
             &mut input,
             &if display.projection {
                 ClientMessage::HelloProjection {
-                    version: if display.clipboard_helper_relay {
+                    version: if display.hyperlinks {
+                        15
+                    } else if display.clipboard_helper_relay {
                         14
                     } else if display.session_display {
                         13
@@ -2702,7 +2717,9 @@ fn run_projection(
         let mut frame = None;
         let mut graphics = Vec::new();
         loop {
-            match protocol::read_message::<_, ServerMessage>(&mut output) {
+            match protocol::read_message::<_, ServerMessage>(&mut output)
+                .and_then(protocol::decode_hyperlinks)
+            {
                 Ok(ServerMessage::WorkspaceEffect {
                     workspace_id,
                     epoch,
@@ -2936,6 +2953,7 @@ pub(crate) mod tests {
 
     fn frame(symbol: &str) -> FrameData {
         FrameData {
+            hyperlinks: Vec::new(),
             width: 1,
             height: 1,
             cells: vec![protocol::CellData {
@@ -3175,6 +3193,25 @@ pub(crate) mod tests {
             app.remote_workspace_view(app.active_ws).unwrap().state,
             RemoteViewState::Connecting
         );
+    }
+
+    #[test]
+    fn remote_link_capability_keeps_older_projection_features() {
+        for version in 9..=15 {
+            let mut capabilities = protocol::remote_display_capabilities();
+            capabilities["transport"] = json!(version);
+            let response = json!({"result":{"workspaces":[], "event_sequence":0,
+                "server_generation":"boot", "remote_display":capabilities}});
+            let display = parse_remote_snapshot(&response, RemoteBinaryLocation::Path)
+                .unwrap()
+                .display;
+            assert_eq!(display.hyperlinks, version == 15);
+            assert_eq!(display.projection, version >= 10);
+            assert_eq!(display.graphics, version >= 11);
+            assert_eq!(display.cell_pixels, version >= 12);
+            assert_eq!(display.session_display, version >= 13);
+            assert_eq!(display.clipboard_helper_relay, version >= 14);
+        }
     }
 
     #[test]

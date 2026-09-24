@@ -94,7 +94,7 @@ Luvus release number.
 | git | `git.status` · `git.branches` · `git.log` · `git.open` |
 | mission control | `mission.snapshot` · `mission.refresh` · `mission.open` |
 | diff | `diff.refresh` · `diff.list` · `diff.open` · `diff.get` · `diff.navigate` · `diff.note.add` · `diff.note.apply` · `diff.note.list` · `diff.note.edit` · `diff.note.resolve` · `diff.note.reopen` · `diff.note.remove` · `diff.note.send` |
-| terminal | `terminal.backend.inventory` · `terminal.backend.snapshot` · `terminal.backend.validate` · `terminal.backend.processes` · `terminal.backend.capture` · `terminal.backend.observe` · `terminal.backend.control` · `terminal.backend.type_literal` · `terminal.backend.submit_text` · `terminal.backend.send_key` · `terminal.backend.set_title` · `terminal.backend.notify` · `terminal.backend.create` · `terminal.backend.close` · `terminal.backend.wait_change` · `terminal.backend.wait_output` · `terminal.backend.events.subscribe` |
+| terminal | `terminal.backend.inventory` · `terminal.backend.snapshot` · `terminal.backend.validate` · `terminal.backend.processes` · `terminal.backend.capture` · `terminal.backend.observe` · `terminal.backend.control` · `terminal.backend.type_literal` · `terminal.backend.paste_text` · `terminal.backend.submit_text` · `terminal.backend.send_key` · `terminal.backend.set_title` · `terminal.backend.notify` · `terminal.backend.create` · `terminal.backend.close` · `terminal.backend.wait_change` · `terminal.backend.wait_output` · `terminal.backend.events.subscribe` |
 | worktrees | `worktree.list` · `worktree.create` · `worktree.open` · `worktree.remove` |
 | orchestration | `task.add` · `task.list` · `task.get` · `task.claim` · `task.next` · `task.start` · `task.heartbeat` · `task.update` · `task.done` · `task.retry` · `task.merge` · `task.release` · `lease.acquire` · `lease.list` · `lease.release` |
 | agent automation | `automation.create` · `automation.list` · `automation.get` · `automation.update` · `automation.enable` · `automation.disable` · `automation.rebind` · `automation.delete` · `automation.run` · `automation.history` · `automation.preview` · `automation.health` |
@@ -521,6 +521,15 @@ Every snapshot terminal row includes `pane_id`, nullable `agent_name`, and nulla
 `title`. The title is the cached terminal or module-provided presentation title;
 it is also projected to remote agent rows. Module title changes emit the existing
 `agent.history_changed` event.
+
+It also includes nullable `agent_session_title`: the bounded, single-line title
+used by the AGENTS sidebar for a live agent pane (OSC title first, then a
+module-provided pane or session title). It is `null` when no title is available
+or the pane is not an agent. Native `kind:"view"` rows omit it.
+OSC and module title changes emit `agent.title_changed`. OSC events carry
+`pane` and nullable `title` so clients can update that row directly; module
+title events have no per-pane payload and require a snapshot refresh. Neither
+requires polling terminal output.
 `agent_name` is the operator alias set by `agent.name` or `pane.rename`; a terminal-backend title
 does not mask it. This differs from the presentation name in `agent.get` and
 `agent.list`, which prefer a backend title. Clearing an alias returns JSON
@@ -571,6 +580,12 @@ safely bound a stream read (currently Windows named pipes).
 the pane, queues the launch as one submitted shell action, reserves the unique
 name, and waits for manifest-driven detection without composing separate UHP
 requests.
+
+QoderCLI uses an adapter-owned 500ms paste-to-Enter delay so its paste guard
+receives one submit key after the pasted text. The prompt remains one atomic
+queue action; this does not acknowledge task acceptance. Read back with
+`agent read <target> --source visible` to confirm a task-specific response before
+claiming receipt. Do not blindly resend the text or add another Enter.
 
 `agent.prompt` takes `target`, `text`, optional `wait` (default `false`),
 optional `until`, and optional `timeout_s`. `until` and `timeout_s` require

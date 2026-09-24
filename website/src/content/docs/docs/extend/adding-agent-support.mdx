@@ -79,6 +79,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &["my-agent"],
     launch_command: "myagent-cli",
     task_prompt_args: &[],
+    prompt_settle: std::time::Duration::ZERO,
     automation: None,
     identity: IdentityDescriptor {
         distinct: &["myagent-cli"],
@@ -98,7 +99,9 @@ normalize accepted user input to that canonical ID; they do not create another
 agent. `launch_command` is the exact executable used to start a fresh
 interactive worker from ORCH. Put required static arguments before an ORCH task
 briefing in `task_prompt_args`. Keep shell syntax and user data out of both
-fields.
+fields. `prompt_settle` is a minimum paste-to-Enter delay for native interactive
+paste guards; leave it zero unless the agent requires a longer delay. The shared
+PTY queue owns the single paste-and-submit action.
 
 ### Identity evidence
 

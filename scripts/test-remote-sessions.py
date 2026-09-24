@@ -1898,6 +1898,19 @@ def main():
 
             row("prefix help and fixed tab digits execute on owner despite different prefixes", prefix_help)
 
+            def hyperlinks():
+                uri = f"https://example.com/luvus-{mode}"
+                drain(master)
+                cli("pane", "run", str(temp_pane),
+                    "printf '\\033]8;;" + uri + "\\007OWNER_LINK\\033]8;;\\007\\n'")
+                output = bytearray()
+                def linked():
+                    output.extend(drain(master, 0.1))
+                    return b"\x1b]8;;" + uri.encode() in output
+                wait_for(linked)
+
+            row("OSC8 hyperlink survives owner projection and display transport", hyperlinks)
+
             def clipboard():
                 payload = f"OSC52 {mode} indentation\n  second line 中文".encode()
                 encoded = base64.b64encode(payload)

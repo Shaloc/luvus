@@ -15,6 +15,10 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &["qoderclicn", "qoder", "qodercn"],
     launch_command: "qodercli",
     task_prompt_args: &["--prompt-interactive"],
+    // QoderCLI 1.1.61 treats Enter within 40ms of a paste as a newline.
+    // The guard starts when Qoder processes the paste, not when we write it.
+    // 150ms still left consecutive live prompts in the editor; allow 500ms.
+    prompt_settle: std::time::Duration::from_millis(500),
     // Interactive prompts are supported; scheduled access policies have not
     // been reviewed for Qoder's one-shot entrypoint.
     automation: None,

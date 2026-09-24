@@ -192,7 +192,8 @@ impl App {
                     "target pane closed before input was queued".to_string(),
                 )
             })?;
-            pane.try_submit_text_with_settle(text, AGENT_MESSAGE_SETTLE)
+            let settle = self.agent_prompt_settle(id, AGENT_MESSAGE_SETTLE);
+            pane.try_submit_text_with_settle(text, settle)
                 .map_err(|message| ("send_failed".to_string(), message))?;
             let (agent, status) = self
                 .status

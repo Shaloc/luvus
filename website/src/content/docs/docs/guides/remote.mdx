@@ -25,6 +25,7 @@ port, configure SSH forwarding, or require another daemon.
 | Open the full remote Luvus interface from a computer with Luvus installed | `luvus --remote devbox` |
 | Open a specific named session | `luvus --session api --remote devbox` |
 | Connect from a phone that only has an SSH app | SSH to the host, then run `luvus` there |
+| Connect from a phone or computer browser | [Luvus Web](/docs/guides/web/) behind a trusted private TLS provider |
 | Send one JSON automation request | Pipe the request through `ssh devbox luvus uhp proxy` |
 | Build an independent remote or mobile client | Use [`luvus uhp access`](/docs/uhp/remote-access/) with a secure transport provider |
 
@@ -68,7 +69,7 @@ existing remote sessions; it does not create a session. `--install` permits
 an installation offer only if the compatible fork binary is missing. Alternatively,
 enable **Settings → Remote → Offer Luvus installation when selecting a host** before
 selecting a host (or running `host add`). This policy defaults to **off**;
-changing it alone never starts installation. Before any install/update, the UI
+changing it alone never starts installation. Before automatic installation offers, the UI
 asks whether to proceed for that specific host, with **Cancel** selected by
 default. The CLI asks `[y/N]`; non-interactive execution requires explicit
 `--install --yes`. The saved policy never bypasses confirmation. A failed host remains selected
@@ -87,7 +88,35 @@ verification. Once installation has started it is bounded but disconnecting
 does not roll it back. **No server is started, stopped, or restarted** by host
 installation; an older running server may still need a user-triggered restart.
 Ordinary discovery, config reload, and background reconnect never install.
-`host add` is a local setup command, not a `--host`-routable UHP method.
+### Updating an enabled host
+
+```sh
+luvus host update devbox
+luvus host update devbox --json
+```
+
+Unlike `host add --install`, this explicitly updates even an already compatible
+installation. Select an enabled host row in **Settings → Remote** and press `u`
+for the same operation. It uses the embedded installer and the latest stable
+release from **Shaloc/luvus**, checks the archive SHA-256 and downloaded binary,
+backs up the previous binary, then atomically replaces `~/.local/bin/luvus`.
+Inherited `LUVUS_VERSION` and `LUVUS_INSTALL_DIR` cannot redirect this operation.
+An unknown or disabled SSH alias is rejected before running SSH.
+
+The CLI returns `host_updated` with `version`, `release_source`, `path_shadowed`,
+and `servers_restarted: false`. `version` includes build identity, because fork
+releases can share the same package version. If PATH still selects a different
+binary, put `~/.local/bin` first before restarting. Existing servers and PTYs
+continue using their current executable; when ready, explicitly restart the
+chosen owner session to activate the new binary:
+
+```sh
+luvus --host devbox --session work server restart
+```
+
+Restart ends that session's live PTYs. Updating alone does not restart or stop
+any owner and does not change selected hosts. Both `host add` and `host update`
+are local setup commands, not `--host`-routable UHP methods.
 
 ```sh
 luvus session remote add devbox api
@@ -370,12 +399,21 @@ owner's pane. `agent list` includes `host`, `owner_session`, and `owner_pane` fo
 remote rows. Follow up with those owner selectors and `--host`, not the qualified
 local presentation row ID. Remote FILES views do not expose a stale local tree.
 
+### Hyperlinks across remote displays
+
+Transport 15 carries OSC 8 links with the same workspace generation and epoch as
+text and graphics. Managed owners using transports 9–14 retain their existing
+wire layouts and text rendering. HTTP(S) links can open on the display host;
+remote `file://` links stay on the owner through Ctrl+click, so a local terminal
+cannot accidentally open a same-named file on the display machine. Links covered
+by menus are excluded from the projected frame.
+
 <a id="kitty-graphics-preview"></a>
 
 ### Kitty graphics
 
 Stable fork releases include Kitty graphics from transport 11 onward. Current
-builds report `transport=14` with `luvus --version --remote-session-protocol`
+builds report `transport=15` with `luvus --version --remote-session-protocol`
 and separately negotiate physical cell dimensions for automatic split direction.
 Plain terminals can report cell dimensions without enabling Kitty graphics. Use Kitty 0.28 or newer on the display
 machine and matching graphics builds on remote owners. An older managed owner
@@ -705,16 +743,17 @@ With `luvus --remote`, the local attached client owns effects that should happen
 where you are sitting:
 
 - copied text goes to the local clipboard
-- on Windows, an explicit image paste reads the local clipboard and stages the
-  private PNG on the remote Luvus server before pasting that remote path into
-  the focused pane
+- an explicit image paste reads the local Windows, macOS, Wayland, or X11
+  clipboard and stages the private image on the remote Luvus server before
+  pasting that remote path into the focused pane
 - notifications and sounds play locally
 - detected links open in the local browser
 - each attached client uses its own terminal size and mobile or desktop layout
 
 Image bytes travel inside the existing encrypted SSH connection. Luvus does not
 open another port or write the image to the local machine's Luvus server. If no
-supported image is present, the original paste key continues unchanged.
+supported image is present, the original paste key continues unchanged. Linux
+display clients use `wl-paste` or `xclip`; the remote host does not.
 
 With the raw `luvus --remote` transport, the global finder searches that remote
 Luvus home. In managed remote and merge mode, the local finder also queries the

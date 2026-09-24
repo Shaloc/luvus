@@ -7,6 +7,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &["cursor-agent"],
     launch_command: "cursor-agent",
     task_prompt_args: &[],
+    prompt_settle: std::time::Duration::ZERO,
     automation: Some(AutomationOperations {
         read_only: Some(AutomationLaunch {
             args: &["--mode", "plan", "--trust", "--print"],

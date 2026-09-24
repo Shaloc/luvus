@@ -6,7 +6,7 @@ use std::path::Path;
 use std::thread;
 
 use anyhow::{anyhow, Result};
-use ratatui::backend::Backend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::Cell;
 #[cfg(not(windows))]
 use ratatui::crossterm::event::read as read_event;
@@ -295,7 +295,25 @@ where
                 );
                 continue;
             }
-            Ok(ClientEvent::Server(epoch, message)) if epoch == generation => message,
+            Ok(ClientEvent::Server(epoch, message)) if epoch == generation => {
+                message.map(|mut message| {
+                    if !local {
+                        match &mut message {
+                            ServerMessage::Frame(frame)
+                            | ServerMessage::GraphicFrame {
+                                text: protocol::GraphicText::Full(frame),
+                                ..
+                            } => {
+                                frame
+                                    .hyperlinks
+                                    .retain(|link| crate::platform::is_openable_url(&link.uri));
+                            }
+                            _ => {}
+                        }
+                    }
+                    message
+                })
+            }
             Ok(_) => continue,
             Err(_) => break ClientExit::Done,
         };
@@ -312,15 +330,15 @@ where
                     }
                     graphics.apply(update, &mut std::io::stdout())?;
                     std::io::stdout().flush()?;
-                    let (mut cells, cursor, visible, _full) = match text {
+                    let (mut cells, cursor, visible, _full) = match &text {
                         protocol::GraphicText::Full(frame) => (
-                            frame_cells(&frame, true),
+                            frame_cells(frame, true),
                             frame.cursor,
                             frame.cursor_visible,
                             true,
                         ),
                         protocol::GraphicText::Diff(diff) => (
-                            diff_cells(&diff, true),
+                            diff_cells(diff, true),
                             diff.cursor,
                             diff.cursor_visible,
                             false,
@@ -330,6 +348,16 @@ where
                     let _metadata_colors =
                         crate::terminal::graphics::MetadataColors::prepare(&mut cells);
                     paint(terminal, &cells, cursor, visible, false, &mut last_cursor)?;
+                    if let protocol::GraphicText::Full(frame) = &text {
+                        paint_hyperlink_runs(
+                            terminal,
+                            frame,
+                            cursor,
+                            visible,
+                            &mut last_cursor,
+                            truecolor,
+                        )?;
+                    }
                     Ok(())
                 })();
                 sync_end();
@@ -350,7 +378,18 @@ where
                     frame.cursor_visible,
                     true,
                     &mut last_cursor,
-                );
+                )
+                .and_then(|()| {
+                    paint_hyperlink_runs(
+                        terminal,
+                        &frame,
+                        frame.cursor,
+                        frame.cursor_visible,
+                        &mut last_cursor,
+                        truecolor,
+                    )?;
+                    Ok(())
+                });
                 sync_end();
                 if r.is_err() {
                     crate::logging::event(
@@ -511,7 +550,7 @@ fn spawn_frame_reader<R: Read + Send + 'static>(
     tx: std::sync::mpsc::SyncSender<ClientEvent>,
 ) {
     thread::spawn(move || loop {
-        let message = protocol::read_message(&mut reader);
+        let message = protocol::read_message(&mut reader).and_then(protocol::decode_hyperlinks);
         let terminal = matches!(
             &message,
             Err(_)
@@ -851,10 +890,113 @@ fn diff_cells(diff: &FrameDiff, truecolor: bool) -> Vec<(u16, u16, Cell)> {
     cells
 }
 
+pub(crate) fn valid_host_hyperlink(uri: &str) -> bool {
+    uri.len() <= 4_096
+        && !uri.is_empty()
+        && !uri.chars().any(char::is_control)
+        && (crate::links::valid_file_uri(uri) || crate::platform::is_openable_url(uri))
+}
+
+fn write_osc8<W: Write>(writer: &mut W, uri: Option<&str>) -> std::io::Result<()> {
+    writer.write_all(b"\x1b]8;;")?;
+    if let Some(uri) = uri.filter(|uri| valid_host_hyperlink(uri)) {
+        writer.write_all(uri.as_bytes())?;
+    }
+    writer.write_all(b"\x1b\\")
+}
+
+/// Overlay sparse OSC 8 runs after the ordinary Ratatui blit. The server sends
+/// a full frame whenever this projection changes, so clearing that frame also
+/// clears links which disappeared without changing their visible label.
+pub(super) fn paint_hyperlink_runs<W>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    frame: &FrameData,
+    cursor: Option<(u16, u16)>,
+    cursor_visible: bool,
+    last_cursor: &mut Option<(u16, u16)>,
+    truecolor: bool,
+) -> std::io::Result<()>
+where
+    W: Write,
+{
+    if frame.width == 0 {
+        return Ok(());
+    }
+    let size = terminal.size()?;
+    let backend = terminal.backend_mut();
+    let mut wrote = false;
+    for run in &frame.hyperlinks {
+        write_osc8(backend, Some(&run.uri))?;
+        let cells = (run.start..run.end)
+            .filter_map(|index| {
+                let cell = frame.cells.get(index as usize)?;
+                if cell.symbol.is_empty() {
+                    return None;
+                }
+                let x = (index % u32::from(frame.width)) as u16;
+                let y = (index / u32::from(frame.width)) as u16;
+                (x < size.width && y < size.height).then(|| {
+                    (
+                        x,
+                        y,
+                        make_cell(&cell.symbol, cell.fg, cell.bg, cell.mods, truecolor),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let draw_result = backend.draw(cells.iter().map(|(x, y, cell)| (*x, *y, cell)));
+        let close_result = write_osc8(backend, None);
+        draw_result?;
+        close_result?;
+        wrote = true;
+    }
+    if !wrote {
+        return Ok(());
+    }
+    restore_host_cursor(
+        backend,
+        size.width,
+        size.height,
+        cursor,
+        cursor_visible,
+        last_cursor,
+    )?;
+    Backend::flush(backend)
+}
+
 /// Visible in-bounds pane cell. Does not remap a compact/mobile row-0/1 caret
 /// onto the status line, and does not invent a prompt row.
 fn ime_position(cursor: Option<(u16, u16)>, tw: u16, th: u16) -> Option<(u16, u16)> {
     cursor.filter(|(x, y)| *x < tw && *y < th)
+}
+
+fn restore_host_cursor<B: Backend>(
+    backend: &mut B,
+    width: u16,
+    height: u16,
+    cursor: Option<(u16, u16)>,
+    cursor_visible: bool,
+    last_cursor: &mut Option<(u16, u16)>,
+) -> std::result::Result<(), B::Error> {
+    match ime_position(cursor, width, height) {
+        Some((x, y)) => {
+            *last_cursor = Some((x, y));
+            backend.set_cursor_position(Position::new(x, y))?;
+            if cursor_visible {
+                backend.show_cursor()
+            } else {
+                backend.hide_cursor()
+            }
+        }
+        None => {
+            if let Some((x, y)) = *last_cursor {
+                if x < width && y < height {
+                    backend.set_cursor_position(Position::new(x, y))?;
+                }
+            }
+            backend.hide_cursor()
+        }
+    }
 }
 
 /// Write `cells` straight to the terminal via the backend (no full re-blit / no
@@ -890,25 +1032,7 @@ where
             .filter(|(x, y, _)| *x < tw && *y < th)
             .map(|(x, y, c)| (*x, *y, c)),
     )?;
-    match ime_position(cursor, tw, th) {
-        Some((x, y)) => {
-            *last_cursor = Some((x, y));
-            backend.set_cursor_position(Position::new(x, y))?;
-            if cursor_visible {
-                backend.show_cursor()?;
-            } else {
-                backend.hide_cursor()?;
-            }
-        }
-        None => {
-            if let Some((x, y)) = *last_cursor {
-                if x < tw && y < th {
-                    backend.set_cursor_position(Position::new(x, y))?;
-                }
-            }
-            backend.hide_cursor()?;
-        }
-    }
+    restore_host_cursor(backend, tw, th, cursor, cursor_visible, last_cursor)?;
     backend.flush()?;
     Ok(())
 }
@@ -989,6 +1113,7 @@ mod tests {
             width: 4,
             height: 1,
             cells: vec![c("\u{1F534}"), c(""), c("A"), c("B")],
+            hyperlinks: Vec::new(),
             cursor: None,
             cursor_visible: false,
         };
@@ -1589,6 +1714,7 @@ mod render_tests {
             width: 3,
             height: 1,
             cells: vec![cell("a"), cell("b"), cell("c")],
+            hyperlinks: Vec::new(),
             cursor: None,
             cursor_visible: false,
         };
@@ -1596,6 +1722,7 @@ mod render_tests {
             width: 3,
             height: 1,
             cells: vec![cell("a"), cell("X"), cell("c")],
+            hyperlinks: Vec::new(),
             cursor: Some((1, 0)),
             cursor_visible: true,
         };
@@ -1638,7 +1765,7 @@ mod render_tests {
 
 #[cfg(test)]
 mod paint_tests {
-    use super::paint;
+    use super::{paint, write_osc8};
     use crate::ipc::protocol::{self, FrameData, FrameDiff};
     use ratatui::backend::{Backend, TestBackend};
     use ratatui::layout::Position;
@@ -1654,6 +1781,24 @@ mod paint_tests {
     }
 
     #[test]
+    fn osc8_writer_preserves_valid_mjs_file_targets_and_closes_invalid_ones() {
+        let mut output = Vec::new();
+        write_osc8(
+            &mut output,
+            Some("file:///repo/server/scripts/reconcile.mjs"),
+        )
+        .unwrap();
+        assert_eq!(
+            output,
+            b"\x1b]8;;file:///repo/server/scripts/reconcile.mjs\x1b\\"
+        );
+
+        output.clear();
+        write_osc8(&mut output, Some("command://run\x07bad")).unwrap();
+        assert_eq!(output, b"\x1b]8;;\x1b\\");
+    }
+
+    #[test]
     fn pty_visible_cursor_is_restored_after_spinner_like_diff() {
         let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
         let mut cells = vec![cell(" "); 64];
@@ -1661,6 +1806,7 @@ mod paint_tests {
             width: 8,
             height: 8,
             cells: cells.clone(),
+            hyperlinks: Vec::new(),
             cursor: Some((1, 4)),
             cursor_visible: true,
         };
@@ -1686,6 +1832,7 @@ mod paint_tests {
             width: 8,
             height: 8,
             cells,
+            hyperlinks: Vec::new(),
             cursor: Some((1, 4)),
             cursor_visible: true,
         };
@@ -1721,6 +1868,7 @@ mod paint_tests {
             width: 8,
             height: 8,
             cells: cells.clone(),
+            hyperlinks: Vec::new(),
             cursor: Some((1, 4)),
             cursor_visible: true,
         };
@@ -1745,6 +1893,7 @@ mod paint_tests {
             width: 8,
             height: 8,
             cells,
+            hyperlinks: Vec::new(),
             cursor: Some((1, 4)),
             cursor_visible: false,
         };
@@ -1781,6 +1930,7 @@ mod paint_tests {
             width: 8,
             height: 8,
             cells,
+            hyperlinks: Vec::new(),
             cursor: Some((1, 4)),
             cursor_visible: true,
         };
@@ -1812,6 +1962,7 @@ mod paint_tests {
             width: 8,
             height: 8,
             cells,
+            hyperlinks: Vec::new(),
             cursor: Some((3, 5)),
             cursor_visible: false,
         };

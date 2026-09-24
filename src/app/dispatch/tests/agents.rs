@@ -12,6 +12,73 @@ fn mark_codex_prompt_ready(app: &mut App, pane: PaneId) {
 }
 
 #[test]
+fn qoder_prompt_and_legacy_send_queue_one_submit_after_the_paste_guard() {
+    let _env = crate::persist::test_env("qoder-prompt-paste-guard");
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(80, 24, tx).unwrap();
+    let pane = app.layout().focus;
+    mark_codex_prompt_ready(&mut app, pane);
+    let (input, received) = std::sync::mpsc::channel();
+    app.panes
+        .get_mut(&pane)
+        .unwrap()
+        .replace_input_sender_for_test(input);
+    app.panes[&pane]
+        .engine
+        .lock()
+        .unwrap()
+        .advance(b"\x1b[?2004h");
+    let text = "Check $PATH and 'quotes'.\n保留缩进：\n  second line\n\nFinal line";
+
+    app.status.get_mut(&pane).unwrap().agent = "qodercli".into();
+    for legacy in [false, true] {
+        let params = json!({"target":pane.0.to_string(), "text":text});
+        if legacy {
+            app.api_agent_send("agent.send", &params).unwrap();
+        } else {
+            let (reply, response) = std::sync::mpsc::channel();
+            app.start_agent_prompt(
+                "qoder".into(),
+                params,
+                reply,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let response: Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+            assert_eq!(response["result"]["evidence"], "queued", "{response}");
+            assert_eq!(response["result"]["submitted"], true);
+        }
+        let crate::terminal::pty::InputAction::Submit { paste, settle } =
+            received.try_recv().unwrap()
+        else {
+            panic!("paste and Enter must share one queue admission")
+        };
+        assert_eq!(paste, format!("\x1b[200~{text}\x1b[201~").as_bytes());
+        assert_eq!(settle, Duration::from_millis(500));
+        assert!(
+            received.try_recv().is_err(),
+            "must not queue a second Enter"
+        );
+    }
+
+    // Menus remain blocked: increasing the delay must not weaken admission.
+    let generation = app.panes[&pane].engine.lock().unwrap().output_generation();
+    let status = app.status.get_mut(&pane).unwrap();
+    status.last_detect_generation = Some(generation);
+    status.force_detect = false;
+    status.prompt_evidence = detect::PromptEvidence::Blocked;
+    let (reply, response) = std::sync::mpsc::channel();
+    app.start_agent_prompt(
+        "blocked".into(),
+        json!({"target":pane.0.to_string(), "text":text}),
+        reply,
+        Arc::new(AtomicBool::new(false)),
+    );
+    let response: Value = serde_json::from_str(&response.recv().unwrap()).unwrap();
+    assert_eq!(response["error"]["code"], "agent_not_ready");
+    assert!(received.try_recv().is_err());
+}
+
+#[test]
 fn reported_usage_rejects_malformed_and_out_of_range_values() {
     let valid = json!({
         "model":"provider/model",
@@ -1337,6 +1404,36 @@ fn snapshot_alias_excludes_native_views_and_handles_no_workspace() {
         app.dispatch("session.snapshot", &json!({})).unwrap()["workspaces"],
         json!([])
     );
+}
+
+#[test]
+fn runtime_snapshot_projects_agent_session_title_without_using_the_alias() {
+    let (tx, _rx) = std::sync::mpsc::channel();
+    let mut app = App::new(80, 24, tx).unwrap();
+    let pane = app.layout().focus;
+    {
+        let status = app.status.get_mut(&pane).unwrap();
+        status.agent = "pi".into();
+        status.agent_session = Some(crate::app::AgentSession {
+            agent: "pi".into(),
+            session_id: "live-1".into(),
+        });
+    }
+    app.agent_names.insert("web".into(), pane);
+    assert!(app.set_agent_row_title_for_session(
+        "pi".into(),
+        "live-1".into(),
+        Some("Build the web dashboard".into()),
+    ));
+
+    let snapshot = app.dispatch("session.snapshot", &json!({})).unwrap();
+    let row = &snapshot["workspaces"][0]["tabs"][0]["panes"][0];
+    assert_eq!(row["agent_name"], "web");
+    assert_eq!(row["agent_session_title"], "Build the web dashboard");
+
+    assert!(app.set_agent_row_title_for_session("pi".into(), "live-1".into(), None));
+    let snapshot = app.dispatch("session.snapshot", &json!({})).unwrap();
+    assert!(snapshot["workspaces"][0]["tabs"][0]["panes"][0]["agent_session_title"].is_null());
 }
 
 #[test]

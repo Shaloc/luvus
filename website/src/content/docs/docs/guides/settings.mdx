@@ -70,5 +70,18 @@ cycle tabs, and every prefix command is remappable, including the vim aliases.
 The **Prefix** row captures a safe function key or `Ctrl`/`Alt` chord and asks
 you to press it again before saving. The **Preset** row provides **luvus
 (default)**, **no-Ctrl (F12)**, and **tmux** bundles. Press the configured prefix
-and then `?` to show the current map. See
-[Keybindings](/docs/reference/keybindings/) for the full list.
+and then `?` to show the current map. The Keyboard Shortcuts panel clearly
+separates **Prefix commands** from opt-in **Direct shortcuts**. Direct shortcuts
+are read from `direct_keybindings`; their labels are normalized for display,
+and the panel lists only the effective winner when multiple commands configure
+the same chord. See [Keybindings](/docs/reference/keybindings/) for the full
+list and direct-shortcut configuration format.
+
+## Remote binary updates
+
+In **Remote**, highlight an enabled SSH host and press `u` to update its Luvus
+binary from the latest **Shaloc/luvus** release. A rotating arrow marks the
+background operation. The existing installer verifies the checksum and binary,
+keeps a backup, and leaves running servers and PTYs intact. Restart the owner
+explicitly when ready to activate the update. The same action is available as
+`luvus host update <ssh-alias> [--json]`; see [Remote](/docs/guides/remote/).

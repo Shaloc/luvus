@@ -5,6 +5,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     aliases: &[],
     launch_command: "droid",
     task_prompt_args: &[],
+    prompt_settle: std::time::Duration::ZERO,
     automation: Some(AutomationOperations {
         read_only: Some(AutomationLaunch { args: &["exec"] }),
         workspace: Some(AutomationLaunch {

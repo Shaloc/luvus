@@ -38,6 +38,8 @@ remain active with this setting off.
 
 - **Persistent workspaces:** Open, rename, pin, and switch projects. A background
   server keeps tabs, panes, layouts, terminal state, and named sessions alive.
+  Disable saved pane screens when terminal content should not be written to the
+  session snapshot.
 - **Complete pane and tab control:** Split, resize, zoom, move, name, focus, run,
   inspect, close, reorder, and swap with the mouse, TUI, or CLI.
 - **Agent awareness:** Detect supported agents automatically and show blocked,
@@ -47,18 +49,24 @@ remain active with this setting off.
   keys to agents. Fork Claude, Grok, Codex, Pi, and OMP sessions with their
   context intact.
 - **Files and code:** Browse a Git-aware file tree, inspect files and changes,
-  reveal paths, and open files in a pane, tab, preview, or external editor.
+  fuzzy-find files, create or rename them from the FILES dock, reveal paths,
+  and open files in a pane, tab, preview, or external editor.
 - **Git and GitHub:** View status, branches, commits, contributors, pull
   requests, issues, and repository activity without leaving Luvus.
 - **Worktrees and orchestration:** Create worktrees, coordinate dependent tasks,
   keep task queues and path leases scoped to their projects, assign agents,
   schedule timezone-aware recurring work, run quality gates, and merge completed
-  work.
+  work. Modules can provide worktree creation and removal.
+- **Luvus Web:** An optional, read-only-by-default browser client for live
+  workspaces, terminals, and agent session titles. Pair multiple devices by
+  link or QR code and switch named sessions; control is opt-in. The loopback
+  bridge needs a trusted TLS tunnel for phone access, and stopping it leaves
+  the TUI, server, and panes running.
 - **Remote and multi-client use:** Register SSH-config hosts, target remote
   panes and worktrees with `--host`, merge same-name local and remote
   workspaces with hostname tags, or use the raw SSH attach escape hatch.
 - **Terminal tools:** Configure per-pane Scrollback Memory, search across pane
-  history, use copy mode, click detected links, and run full-screen terminal apps.
+  history, use copy mode, follow terminal hyperlinks and paste clipboard images, and run full-screen terminal apps.
 - **Kitty graphics:** Display direct-transfer images in local and managed
   remote panes, including terminal-browser's inline pixel output and tele-style
   scrolling Unicode image placeholders. Image updates
@@ -71,7 +79,7 @@ remain active with this setting off.
   single versioned UHP 1.0 method registry, with owner-only local IPC,
   snapshots, event streams, exact input, and semantic waits.
 - **Custom interface:** Move and resize two sidebars, remap keys and the prefix,
-  use presets, select from 8 languages, and install composable local or
+  use presets and a help view of effective shortcuts, select from 8 languages, and install composable local or
   community themes.
 - **Fork releases:** Download macOS Apple Silicon and Linux x86_64 binaries, and
   inspect the environment with `luvus doctor`.
@@ -144,6 +152,7 @@ Keyboard → Keyboard Shortcuts → Input Sources** to free `Ctrl+Space`.
 | Claude Code | ✓ | ✓ | ✓ |
 | GitHub Copilot CLI | ✓ | ✓ | ✓ |
 | Codex | ✓ | ✓ | ✓ |
+| Arc Studio CLI | ✓ | No | No |
 | Antigravity CLI | ✓ | ✓ | session only |
 | Letta Code | ✓ | ✓ with integration | session only |
 | opencode | ✓ | ✓ | ✓ |
@@ -176,3 +185,8 @@ Report vulnerabilities through [SECURITY.md](SECURITY.md).
 ## License
 
 [Apache License 2.0](LICENSE).
+
+Remote fork binaries can be updated explicitly with `luvus host update <ssh-alias>`
+or `u` on an enabled host in Settings → Remote. This uses the latest Shaloc/luvus
+release and leaves running servers intact; activate the update with a separate
+owner restart when ready.

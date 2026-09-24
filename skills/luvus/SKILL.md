@@ -398,6 +398,12 @@ luvus agent send reviewer "Review the diff. When done, run: luvus agent send lea
 After a no-wait handoff, end the turn. The report-back message starts a fresh
 turn. An external terminal has no caller pane, so do not invent one.
 
+QoderCLI uses an adapter-owned 500ms paste-to-Enter delay so its paste guard
+receives one submit key after the pasted text. The prompt remains one atomic
+queue action; this does not acknowledge task acceptance. Read back with
+`agent read <target> --source visible` to confirm a task-specific response before
+claiming receipt. Do not blindly resend the text or add another Enter.
+
 With `--wait`, `agent prompt` (also `agent send`) requires a new `working` or
 `blocked` transition before the requested `--until` state can complete the wait.
 An unchanged status, title flicker, or quiet output alone cannot complete it.
@@ -728,3 +734,25 @@ interrupting a running task. Use the returned new pane ID for subsequent calls.
 Other panes and the server remain alive. For remote panes, address the owning
 host/session; do not send a projected local pane ID. Module panes use their own
 reopen action. The desktop ↻ header button offers the same action with a prompt.
+
+### Web and remote display compatibility
+
+`luvus web` starts the native browser bridge; use `luvus web --help` for bind,
+pairing, and control options. Web access uses the existing UHP authority and
+terminal identity checks. Treat a queued prompt as delivery, not completion.
+Managed SSH owners retain their own workspace, terminal, input revision, and
+clipboard staging. Transport 15 adds OSC 8 hyperlinks while transports 9–14
+keep their existing wire layouts. Remote web URLs can open on the display host;
+remote file links stay owner-routed through Ctrl+click. Arc Studio is detection-only
+and is not an ORCH task worker.
+
+### Update a remote fork binary
+
+Use `luvus host update <ssh-alias> --json` only for an explicitly requested update
+of an enabled SSH host. It always runs the embedded Shaloc/luvus latest-release
+installer, including when the old build is protocol-compatible. Check the
+returned `version`, `release_source`, and `path_shadowed`. `servers_restarted`
+is false: restarting an owner is a separate explicit lifecycle action that ends
+its live PTYs. Do not substitute upstream `luvus update` or infer restart
+authority from binary-update authorization. Settings → Remote offers the same
+action with `u` on an enabled host row.

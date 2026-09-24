@@ -37,6 +37,7 @@ mod theme;
 mod uhp;
 mod ui;
 mod update;
+mod web;
 mod worktree;
 
 use std::io::{self, Write};
@@ -199,6 +200,7 @@ fn main() -> Result<()> {
     }
     match args.get(1).map(String::as_str) {
         Some("server") => return server_cmd(&args),
+        Some("web") => std::process::exit(web::run_cli(&args[2..])?),
         Some("client") => {
             ensure_interactive_launch_allowed()?;
             return ipc::client::run(&persist::client_socket_path());

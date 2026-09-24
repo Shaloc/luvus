@@ -26,6 +26,17 @@ use crate::ui;
 const DEFAULT_SIZE: (u16, u16) = (120, 32);
 /// Minimum time between rendered frames — the fps cap during activity (60fps).
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const IDLE_PTY_REARM_INTERVAL: Duration = Duration::from_millis(100);
+
+fn pty_rearm_interval(history_maintenance: bool, terminal_streams: usize) -> Duration {
+    if history_maintenance {
+        Duration::from_millis(1)
+    } else if terminal_streams > 0 {
+        FRAME_INTERVAL
+    } else {
+        IDLE_PTY_REARM_INTERVAL
+    }
+}
 const SESSION_SAVE_DEBOUNCE: Duration = Duration::from_secs(2);
 
 fn frame_wait(elapsed_since_attempt: Duration) -> Duration {
@@ -233,6 +244,7 @@ struct ClientState {
     behind: bool,
     force_full: bool,
     retained_pane_content: Vec<(crate::ids::PaneId, Rect)>,
+    retained_hyperlinks: Vec<crate::app::RenderedHyperlink>,
     retained_ready: bool,
     // Attach or actual input priority; a passive resize must not claim a PTY.
     last_activity: u64,
@@ -287,6 +299,7 @@ impl ClientState {
             behind: false,
             force_full: true,
             retained_pane_content: Vec::new(),
+            retained_hyperlinks: Vec::new(),
             retained_ready: false,
             last_activity,
             workspace_id,
@@ -489,20 +502,18 @@ pub fn run() -> Result<()> {
     let mut render_request = RenderRequest::default();
     // Fallback re-arm cadence for PTY wake coalescing when frames aren't being
     // rendered (no client attached / nothing dirty): readers may announce new
-    // output ~10x/s. While rendering, the render path re-arms at the frame rate.
+    // output ~10x/s. Rendering and active terminal streams re-arm at the frame
+    // rate so their final coalesced revision is not delayed.
     let mut last_rearm = Instant::now();
-    const REARM_INTERVAL: Duration = Duration::from_millis(100);
-
     loop {
         // Pending + clients attached → wait only until the cap frees up.
         // Otherwise sleep until the next real deadline, or block on the
         // channel when nothing is due (PTY/API/client/signal wake the loop).
         let now = Instant::now();
-        let rearm_interval = if app.has_history_maintenance() {
-            Duration::from_millis(1)
-        } else {
-            REARM_INTERVAL
-        };
+        let rearm_interval = pty_rearm_interval(
+            app.has_history_maintenance(),
+            crate::ipc::api::active_terminal_streams(),
+        );
         let persist_due = !app.session_save_inflight
             && ((app.persist_session_now && !immediate_save_attempted)
                 || (app.session_dirty && last_save.elapsed() >= SESSION_SAVE_DEBOUNCE));
@@ -719,7 +730,7 @@ pub fn run() -> Result<()> {
         if last_rearm.elapsed() >= rearm_interval {
             last_rearm = Instant::now();
             let (visible, background, title_changed) =
-                rearm_pty_notify_by_visibility(&app, &clients);
+                rearm_pty_notify_by_visibility(&mut app, &clients);
             if title_changed {
                 render_request.record(RenderCause::Metadata);
             }
@@ -768,7 +779,7 @@ pub fn run() -> Result<()> {
             // set during this frame = more output already waiting → stay dirty
             // so the burst keeps rendering at the frame cap, tail included.
             let (visible, background, title_changed) =
-                rearm_pty_notify_by_visibility(&app, &clients);
+                rearm_pty_notify_by_visibility(&mut app, &clients);
             if title_changed {
                 render_request.record(RenderCause::Metadata);
             }
@@ -1459,8 +1470,9 @@ fn pane_visible_to_any_client(app: &App, clients: &Clients, pane: crate::ids::Pa
             })
 }
 
-fn rearm_pty_notify_by_visibility(app: &App, clients: &Clients) -> (bool, bool, bool) {
-    app.rearm_pty_notify_by_visibility(|pane| pane_visible_to_any_client(app, clients, pane))
+fn rearm_pty_notify_by_visibility(app: &mut App, clients: &Clients) -> (bool, bool, bool) {
+    let visible = visible_terminal_panes(app, clients);
+    app.rearm_pty_notify_by_visibility(|pane| visible.contains(&pane))
 }
 
 fn record_event_render_request(
@@ -1743,6 +1755,7 @@ fn render_client(
         client.last_frame = None;
         client.force_full = true;
         client.retained_ready = false;
+        client.retained_hyperlinks.clear();
     }
 
     let may_patch = partial_pass
@@ -1753,9 +1766,15 @@ fn render_client(
         && client.last_frame.is_some();
     let patched = if may_patch {
         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
-        ui::patch_terminal_damage(&mut target, app, &client.retained_pane_content, damage)
-            .map(|()| (target.cursor(), target.cursor_visible()))
-            .ok()
+        ui::patch_terminal_damage(
+            &mut target,
+            app,
+            &client.retained_pane_content,
+            damage,
+            &mut client.retained_hyperlinks,
+        )
+        .map(|()| (target.cursor(), target.cursor_visible()))
+        .ok()
     } else {
         None
     };
@@ -1796,11 +1815,12 @@ fn render_client(
         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
         target.graphics_enabled = client.graphics.is_some();
         if let Some(workspace_id) = client.workspace_id.as_deref() {
-            if owns_size {
-                ui::render_workspace_owner_projection(&mut target, app, workspace_id);
+            let projection = if owns_size {
+                ui::render_workspace_owner_projection(&mut target, app, workspace_id)
             } else {
-                ui::render_workspace_projection(&mut target, app, workspace_id);
-            }
+                ui::render_workspace_projection(&mut target, app, workspace_id)
+            };
+            client.retained_hyperlinks = projection.hyperlinks;
             client.retained_ready = false;
         } else if interactive {
             if owns_size {
@@ -1812,9 +1832,14 @@ fn render_client(
             client
                 .retained_pane_content
                 .clone_from(&app.pane_content_rects);
+            client
+                .retained_hyperlinks
+                .clone_from(&app.rendered_hyperlinks);
             client.retained_ready = owns_size;
         } else {
-            client.retained_pane_content = ui::render_projection(&mut target, app);
+            let projection = ui::render_projection(&mut target, app);
+            client.retained_pane_content = projection.pane_content;
+            client.retained_hyperlinks = projection.hyperlinks;
             client.retained_ready = true;
         }
         let cursor = (target.cursor(), target.cursor_visible());
@@ -1843,7 +1868,7 @@ fn render_client(
     });
     // Image content and text cells have independent damage. Stable graphic
     // slots let a new image replace its pixels without repainting its cells.
-    let full = state_changed
+    let mut full = state_changed
         || force_all
         || client.force_full
         || client.behind
@@ -1852,11 +1877,9 @@ fn render_client(
                 || previous.height != client.render_buf.area.height
         });
     let message = if full {
-        client.last_frame = Some(protocol::frame_from_buffer(
-            &client.render_buf,
-            cursor,
-            cursor_visible,
-        ));
+        let mut frame = protocol::frame_from_buffer(&client.render_buf, cursor, cursor_visible);
+        frame.hyperlinks = protocol::frame_hyperlinks(&frame, &client.retained_hyperlinks);
+        client.last_frame = Some(frame);
         Some(ServerMessage::Frame(
             client.last_frame.as_ref().expect("frame stored").clone(),
         ))
@@ -1864,9 +1887,16 @@ fn render_client(
         let previous = client.last_frame.as_mut().expect("frame baseline exists");
         let cursor_moved = previous.cursor != cursor || previous.cursor_visible != cursor_visible;
         let runs = protocol::diff_buffer(previous, &client.render_buf);
+        let current_hyperlinks = protocol::frame_hyperlinks(previous, &client.retained_hyperlinks);
+        let hyperlinks_changed = previous.hyperlinks != current_hyperlinks;
+        let linked_cells_changed = protocol::diff_intersects_hyperlinks(&runs, &current_hyperlinks);
+        previous.hyperlinks = current_hyperlinks;
         previous.cursor = cursor;
         previous.cursor_visible = cursor_visible;
-        if runs.is_empty() && !cursor_moved && graphics == client.last_graphics {
+        if hyperlinks_changed || linked_cells_changed {
+            full = true;
+            Some(ServerMessage::Frame(previous.clone()))
+        } else if runs.is_empty() && !cursor_moved && graphics == client.last_graphics {
             None
         } else {
             Some(ServerMessage::FrameDiff(protocol::FrameDiff {
@@ -2139,8 +2169,9 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
     let writer_frame_pending = frame_pending.clone();
     thread::spawn(move || {
         for msg in message_rx {
+            let msg = protocol::encode_hyperlinks(msg, version);
             let frame_stats = match &msg {
-                ServerMessage::Frame(_) => Some((true, 0usize)),
+                ServerMessage::LinkedFrame { .. } | ServerMessage::Frame(_) => Some((true, 0usize)),
                 ServerMessage::FrameDiff(frame) => Some((false, frame.runs.len())),
                 ServerMessage::ProjectionFrame { .. } | ServerMessage::PreparedWorkspace { .. } => {
                     Some((true, 0))
@@ -2645,9 +2676,10 @@ mod shutdown {
 mod tests {
     use super::ServerMessage;
     use super::{
-        apply, broadcast, frame_cadence_ready, frame_wait, record_event_render_request,
-        render_clients, visible_terminal_panes, ClientSender, ClientState, EventRenderSource,
-        FrameSendError, RenderCause, RenderRequest, RenderScratch, FRAME_INTERVAL,
+        apply, broadcast, frame_cadence_ready, frame_wait, pty_rearm_interval,
+        record_event_render_request, render_clients, visible_terminal_panes, ClientSender,
+        ClientState, EventRenderSource, FrameSendError, RenderCause, RenderRequest, RenderScratch,
+        FRAME_INTERVAL,
     };
     use crate::app::App;
     use crate::event::{AppEvent, ClientInput};
@@ -4651,13 +4683,14 @@ mod tests {
         // Output may arrive while the reader's notification is already set.
         engine.lock().unwrap().advance(b"\x1b]2;finished\x07");
         app.panes[&hidden].mark_data_pending_for_test();
+        let visible = visible_terminal_panes(&app, &HashMap::new());
         assert!(
-            app.rearm_pty_notify_by_visibility(|pane| app.pane_is_visible(pane))
+            app.rearm_pty_notify_by_visibility(|id| visible.contains(&id))
                 .2
         );
         app.panes[&hidden].mark_data_pending_for_test();
         assert!(
-            !app.rearm_pty_notify_by_visibility(|pane| app.pane_is_visible(pane))
+            !app.rearm_pty_notify_by_visibility(|id| visible.contains(&id))
                 .2
         );
     }
@@ -4811,7 +4844,7 @@ mod tests {
         ));
         assert!(matches!(rx.recv().unwrap(), ServerMessage::FrameDiff(_)));
         assert!(
-            !super::rearm_pty_notify_by_visibility(&app, &clients).0,
+            !super::rearm_pty_notify_by_visibility(&mut app, &clients).0,
             "the notification for output just rendered must not schedule a duplicate tail frame"
         );
         assert!(
@@ -4827,7 +4860,7 @@ mod tests {
         engine.lock().expect("engine lock").advance(b" more");
         app.panes[&focus].mark_data_pending_for_test();
         assert!(
-            super::rearm_pty_notify_by_visibility(&app, &clients).0,
+            super::rearm_pty_notify_by_visibility(&mut app, &clients).0,
             "fresh output after a frame still requests its trailing render"
         );
         assert!(!render_clients(
@@ -4899,6 +4932,13 @@ mod tests {
             FRAME_INTERVAL - Duration::from_millis(1)
         ));
         assert!(frame_cadence_ready(FRAME_INTERVAL));
+    }
+
+    #[test]
+    fn terminal_streams_rearm_at_frame_cadence_without_changing_idle_cost() {
+        assert_eq!(pty_rearm_interval(false, 0), Duration::from_millis(100));
+        assert_eq!(pty_rearm_interval(false, 1), FRAME_INTERVAL);
+        assert_eq!(pty_rearm_interval(true, 0), Duration::from_millis(1));
     }
 
     /// A tab switch requests a frame at the same time a finished selection sends

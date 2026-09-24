@@ -2,7 +2,7 @@
 //! No clipboard is read on the remote host; image bytes use the same private
 //! client transport as text input, then a path local to the owning PTY is pasted.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -11,6 +11,9 @@ use serde::{Deserialize, Serialize};
 
 pub mod kitten;
 pub(crate) mod png;
+
+pub(crate) const MAX_WEB_PNG_BYTES: usize = 160 * 1024;
+pub(crate) const MAX_WEB_PNG_BASE64_BYTES: usize = MAX_WEB_PNG_BYTES.div_ceil(3) * 4;
 
 pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -215,6 +218,93 @@ pub fn stage(image: &ClipboardImage) -> Result<PathBuf, String> {
         return Err(error.to_string());
     }
     Ok(path)
+}
+
+/// Decode one strict standard-base64 PNG carried by a bounded semantic web
+/// control frame. Whitespace, URL-safe symbols, misplaced padding, and excess
+/// decoded bytes fail before the staging path is touched.
+pub(crate) fn stage_web_png(encoded: &str) -> io::Result<PathBuf> {
+    if encoded.is_empty()
+        || encoded.len() > MAX_WEB_PNG_BASE64_BYTES
+        || !encoded.len().is_multiple_of(4)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid browser image encoding",
+        ));
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 4 * 3);
+    let (chunks, remainder) = encoded.as_bytes().as_chunks::<4>();
+    debug_assert!(remainder.is_empty());
+    for (index, chunk) in chunks.iter().enumerate() {
+        let last = (index + 1) * 4 == encoded.len();
+        let a = base64_value(chunk[0]).ok_or_else(invalid_web_image)?;
+        let b = base64_value(chunk[1]).ok_or_else(invalid_web_image)?;
+        let c = if chunk[2] == b'=' {
+            if !last || chunk[3] != b'=' || b & 0x0f != 0 {
+                return Err(invalid_web_image());
+            }
+            None
+        } else {
+            Some(base64_value(chunk[2]).ok_or_else(invalid_web_image)?)
+        };
+        let d = if c.is_none() {
+            None
+        } else if chunk[3] == b'=' {
+            if !last || c.unwrap_or_default() & 0x03 != 0 {
+                return Err(invalid_web_image());
+            }
+            None
+        } else {
+            Some(base64_value(chunk[3]).ok_or_else(invalid_web_image)?)
+        };
+        decoded.push((a << 2) | (b >> 4));
+        if let Some(c) = c {
+            decoded.push((b << 4) | (c >> 2));
+            if let Some(d) = d {
+                decoded.push((c << 6) | d);
+            }
+        }
+        if decoded.len() > MAX_WEB_PNG_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "browser image exceeds upload limit",
+            ));
+        }
+    }
+    stage(&ClipboardImage {
+        extension: "png".into(),
+        bytes: decoded,
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn invalid_web_image() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "invalid browser image encoding")
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Remove only an image staged by this session after failed delivery.
+pub(crate) fn discard_staged_png(path: &std::path::Path) {
+    let dir = crate::session::active_dir().join("clipboard");
+    if path.parent() == Some(dir.as_path())
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| name.starts_with("image_") && name.ends_with(".png"))
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn deserialize_image_bytes<'de, D: serde::Deserializer<'de>>(

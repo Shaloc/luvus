@@ -403,7 +403,9 @@ fn draw_content(
                 t,
             ));
             f.render_widget(
-                Paragraph::new(cat.settings.remote_hosts_hint).style(Style::new().fg(t.overlay1)),
+                Paragraph::new(cat.settings.remote_hosts_hint)
+                    .style(Style::new().fg(t.overlay1))
+                    .wrap(ratatui::widgets::Wrap { trim: true }),
                 Rect::new(
                     area.x,
                     area.y + 2,
@@ -440,7 +442,11 @@ fn draw_content(
                         cursor,
                         host,
                         Line::from(Span::styled(
-                            if !selected {
+                            if app.settings.as_ref().is_some_and(|ui| {
+                                ui.remote_update_host.as_deref() == Some(host.as_str())
+                            }) {
+                                "[↻]".to_string()
+                            } else if !selected {
                                 "[ ]".to_string()
                             } else {
                                 match app

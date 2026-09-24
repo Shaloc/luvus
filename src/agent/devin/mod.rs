@@ -20,6 +20,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     launch_command: "devin",
     // Devin reads every positional argument after `--` as the initial prompt.
     task_prompt_args: &["--"],
+    prompt_settle: std::time::Duration::ZERO,
     // Devin does expose the pieces an unattended profile needs (`-p` print mode
     // and `--permission-mode`), but its trust gate also has to be resolved:
     // print mode fails in an untrusted directory because it cannot show the

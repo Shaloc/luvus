@@ -61,6 +61,7 @@ impl SettingsTab {
 
 /// Transient state of the open Settings modal.
 pub struct SettingsUi {
+    pub remote_update_host: Option<String>,
     pub remote_install_prompts: std::collections::VecDeque<String>,
     pub remote_install_confirm: bool,
     pub generation: String,
@@ -257,6 +258,7 @@ impl App {
     /// preselects the active palette, via `settings_set_tab`.
     pub fn open_settings(&mut self) {
         self.settings = Some(SettingsUi {
+            remote_update_host: None,
             remote_install_prompts: Default::default(),
             remote_install_confirm: false,
             generation: crate::ids::public_id("settings"),
@@ -445,6 +447,9 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Char('u') if tab == SettingsTab::Remote && key.modifiers.is_empty() => {
+                self.update_settings_remote_host(cursor)
+            }
             KeyCode::Esc => self.close_settings(),
             KeyCode::Tab => self.settings_set_tab(SettingsTab::from_index(tab.index() + 1)),
             KeyCode::BackTab => self.settings_set_tab(SettingsTab::from_index(
@@ -644,6 +649,68 @@ impl App {
         {
             ui.remote_hosts = Some(result);
         }
+    }
+
+    fn update_settings_remote_host(&mut self, cursor: usize) {
+        let Some(ui) = self.settings.as_mut() else {
+            return;
+        };
+        if ui.remote_update_host.is_some() {
+            return;
+        }
+        let Some(host) = cursor
+            .checked_sub(2)
+            .and_then(|index| ui.remote_hosts.as_ref()?.as_ref().ok()?.get(index))
+            .cloned()
+            .filter(|host| self.config.remote_hosts.contains(host))
+        else {
+            return;
+        };
+        ui.remote_update_host = Some(host.clone());
+        let generation = ui.generation.clone();
+        let tx = self.app_tx.clone();
+        let context = crate::i18n::cli::Context::for_language(
+            crate::i18n::cli::Language::from_code(&self.config.language),
+        );
+        self.show_toast(context.render("Updating fork binary on `{host}`…", &[("host", &host)]));
+        std::thread::spawn(move || {
+            let result = crate::session::remote::bootstrap::update_host(&host);
+            let _ = tx.send(AppEvent::SettingsRemoteUpdateFinished {
+                generation,
+                host,
+                result,
+            });
+        });
+    }
+
+    pub(super) fn finish_settings_remote_update(
+        &mut self,
+        generation: String,
+        host: String,
+        result: Result<crate::session::remote::bootstrap::HostUpdate, String>,
+    ) {
+        let Some(ui) = self.settings.as_mut().filter(|ui| {
+            ui.generation == generation && ui.remote_update_host.as_deref() == Some(host.as_str())
+        }) else {
+            return;
+        };
+        ui.remote_update_host = None;
+        let context = crate::i18n::cli::Context::for_language(
+            crate::i18n::cli::Language::from_code(&self.config.language),
+        );
+        let message = match result {
+            Ok(status) if status.path_shadowed => context
+                .text(
+                    "PATH selects another Luvus binary; put ~/.local/bin first before restarting.",
+                )
+                .into(),
+            Ok(_) => context.render(
+                "Updated fork binary on `{host}`; running servers need an explicit restart.",
+                &[("host", &host)],
+            ),
+            Err(error) => context.render("Remote update failed: {error}", &[("error", &error)]),
+        };
+        self.show_toast(message);
     }
 
     fn toggle_settings_remote_host(&mut self, cursor: usize) {
@@ -1817,6 +1884,47 @@ mod tests {
             assert!(!app.settings.as_ref().unwrap().remote_install_confirm);
             app.confirm_remote_install(false);
         }
+    }
+
+    #[test]
+    fn remote_update_requires_a_selected_host_and_fences_completion_by_dialog() {
+        let _env = crate::persist::test_env("settings-remote-update");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.open_settings();
+        let ui = app.settings.as_mut().unwrap();
+        ui.tab = SettingsTab::Remote;
+        ui.cursor = 2;
+        ui.remote_hosts = Some(Ok(vec!["disabled".into()]));
+        app.handle_settings_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(app.settings.as_ref().unwrap().remote_update_host.is_none());
+        let ui = app.settings.as_mut().unwrap();
+        ui.remote_update_host = Some("owner".into());
+        let generation = ui.generation.clone();
+        app.finish_settings_remote_update(
+            "closed-dialog".into(),
+            "owner".into(),
+            Err("stale".into()),
+        );
+        assert_eq!(
+            app.settings.as_ref().unwrap().remote_update_host.as_deref(),
+            Some("owner")
+        );
+        app.finish_settings_remote_update(
+            generation.clone(),
+            "other".into(),
+            Err("wrong host".into()),
+        );
+        assert_eq!(
+            app.settings.as_ref().unwrap().remote_update_host.as_deref(),
+            Some("owner")
+        );
+        app.finish_settings_remote_update(
+            generation,
+            "owner".into(),
+            Err("fixture failure".into()),
+        );
+        assert!(app.settings.as_ref().unwrap().remote_update_host.is_none());
     }
 
     #[test]

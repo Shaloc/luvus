@@ -153,6 +153,13 @@ pub enum AppEvent {
     /// thread — the scan walks agent session stores and must never block the
     /// event loop).
     SessionsScanned(Vec<crate::agent::SessionInfo>),
+    /// Bounded FILES fuzzy results, fenced by filter instance and query generation.
+    FileFilterResults {
+        instance: u64,
+        generation: u64,
+        rows: Vec<crate::files::VisibleRow>,
+        partial: bool,
+    },
     /// A FILES-dock directory read finished (docs/38): its sorted entries, run
     /// on a worker thread so the tree never blocks a frame on `read_dir`.
     DirRead {
@@ -198,6 +205,11 @@ pub enum AppEvent {
     SettingsRemoteHostsLoaded {
         generation: String,
         result: Result<Vec<String>, String>,
+    },
+    SettingsRemoteUpdateFinished {
+        generation: String,
+        host: String,
+        result: Result<crate::session::remote::bootstrap::HostUpdate, String>,
     },
     RemoteInstallNeeded {
         generation: String,

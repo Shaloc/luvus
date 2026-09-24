@@ -214,6 +214,7 @@ impl App {
             self.agent_title_panes = panes;
             self.agent_title_sessions = sessions;
             self.emit_event("agent.history_changed", json!({}));
+            self.emit_event("agent.title_changed", json!({}));
         }
         Ok(changed)
     }

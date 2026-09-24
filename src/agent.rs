@@ -18,6 +18,7 @@ use std::time::SystemTime;
 pub(crate) mod aider;
 pub(crate) mod amp;
 pub(crate) mod antigravity;
+pub(crate) mod arc_studio;
 pub(crate) mod claude;
 pub(crate) mod codex;
 pub(crate) mod copilot;
@@ -51,6 +52,12 @@ pub struct SessionInfo {
     pub session_id: String,
     pub cwd: PathBuf,
     pub updated: SystemTime,
+}
+
+/// Preserve the caller's default unless the native adapter needs more time
+/// between paste and Enter. Manifest-only agents retain the default.
+pub(crate) fn prompt_settle(agent: &str, default: std::time::Duration) -> std::time::Duration {
+    registry::find(agent).map_or(default, |descriptor| default.max(descriptor.prompt_settle))
 }
 
 /// Resolve an agent name (normalizing known aliases) to its native session

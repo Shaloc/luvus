@@ -15,6 +15,33 @@ use std::path::PathBuf;
 /// control characters, query strings, fragments, and relative paths are
 /// rejected so terminal output cannot hand an arbitrary URI to the OS.
 pub fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    let decoded = decode_file_uri_path(uri)?;
+    #[cfg(windows)]
+    let decoded = {
+        let bytes = decoded.as_bytes();
+        if bytes.len() >= 4
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && bytes[2] == b':'
+            && bytes[3] == b'/'
+        {
+            decoded[1..].to_string()
+        } else {
+            decoded
+        }
+    };
+
+    let path = PathBuf::from(decoded);
+    path.is_absolute().then_some(path)
+}
+
+/// Validate an owner's file URI without applying the display machine's path
+/// semantics. A Linux owner can send links to a Windows display and vice versa.
+pub(crate) fn valid_file_uri(uri: &str) -> bool {
+    decode_file_uri_path(uri).is_some()
+}
+
+fn decode_file_uri_path(uri: &str) -> Option<String> {
     if uri
         .chars()
         .any(|character| character.is_control() || character.is_whitespace())
@@ -40,23 +67,7 @@ pub fn file_uri_path(uri: &str) -> Option<PathBuf> {
         return None;
     }
 
-    #[cfg(windows)]
-    let decoded = {
-        let bytes = decoded.as_bytes();
-        if bytes.len() >= 4
-            && bytes[0] == b'/'
-            && bytes[1].is_ascii_alphabetic()
-            && bytes[2] == b':'
-            && bytes[3] == b'/'
-        {
-            decoded[1..].to_string()
-        } else {
-            decoded
-        }
-    };
-
-    let path = PathBuf::from(decoded);
-    path.is_absolute().then_some(path)
+    Some(decoded)
 }
 
 fn percent_decode_uri_path(encoded: &str) -> Option<String> {

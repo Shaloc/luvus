@@ -471,6 +471,13 @@ impl App {
         );
     }
 
+    /// Select input timing from the destination agent, never the focused pane.
+    pub(crate) fn agent_prompt_settle(&self, id: PaneId, default: Duration) -> Duration {
+        self.status.get(&id).map_or(default, |status| {
+            crate::agent::prompt_settle(&status.agent, default)
+        })
+    }
+
     /// Return current raw readiness evidence for prompt admission. Normal
     /// detection already caches this result. If terminal output arrived after
     /// that pass, inspect only the same bounded live rows once, on this request,
@@ -636,7 +643,8 @@ impl App {
             return;
         };
         let baseline_revision = target.content_revision();
-        if let Err(message) = target.try_submit_text(text) {
+        let settle = self.agent_prompt_settle(pane, Duration::from_millis(30));
+        if let Err(message) = target.try_submit_text_with_settle(text, settle) {
             fail("send_failed", message);
             return;
         }

@@ -273,6 +273,10 @@ universal harness protocol:
   uhp access [--control] [--ttl <seconds> | --no-expiry]   expose scoped UHP through a private provider endpoint
   uhp proxy                 forward one JSON request from stdin to the selected server
 
+web access:
+  web [--control|--read-only] [--port <port>] [--max-devices <1-8>] [--public-url <origin>] [--origin <origin>] [--no-open]
+                             serve the optional loopback browser client (read-only by default)
+
 sessions:
   session list [--json]      list local and discovered remote sessions
   session attach <name>      start or attach the named session
@@ -289,6 +293,8 @@ sessions:
 remote:
   host add <ssh-alias> [--install [--yes]] [--json]
                              enable and connect; --install allows fork installation
+  host update <ssh-alias> [--json]
+                             update from the latest fork release; keep servers running
   --host <ssh-alias> [--session <name>] <command>
                              run server-backed CLI controls against the selected
                              session on a literal Host from ~/.ssh/config
@@ -346,9 +352,26 @@ root instead. `--no-focus` preserves the caller's current view.
 
 `luvus uhp capabilities` on the owner endpoint reports supported methods. The same RPC through paired `luvus uhp access` adds `access.mode`, `access.allowed_methods`, and gateway connection/request limits; use that effective set for permission-aware clients.
 
+`luvus web` is an explicit foreground client bridge, not part of ordinary TUI
+or server startup. It starts or reuses the selected session without restarting
+it, binds loopback, and serves the embedded browser application with read-only
+authority by default. Add `--control` for bounded terminal and workspace input.
+Stopping the command revokes only its temporary web authority; the Luvus
+server, PTYs, and other clients remain attached.
+
+See the [Luvus Web guide](/docs/guides/web/) for first-time pairing, phone
+access through a private TLS provider, multiple devices, terminal input, file
+uploads, session switching, and troubleshooting.
+
 `luvus uhp snapshot` includes nullable `agent_name` operator aliases on terminal rows alongside `pane_id`. Native view rows omit the field. Refresh snapshots after naming: `agent.name` emits no event and does not advance `event_sequence`, while `pane.rename` updates the same map, emits `pane.renamed`, and advances the sequence, including when clearing a name. The event sequence is not an alias ETag because `agent.name` is silent.
 
 ## Prompt wait observation
+
+QoderCLI uses an adapter-owned 500ms paste-to-Enter delay so its paste guard
+receives one submit key after the pasted text. The prompt remains one atomic
+queue action; this does not acknowledge task acceptance. Read back with
+`agent read <target> --source visible` to confirm a task-specific response before
+claiming receipt. Do not blindly resend the text or add another Enter.
 
 With `--wait`, `agent prompt` (also `agent send`) requires a new `working` or
 `blocked` transition before the requested `--until` state can complete the wait.

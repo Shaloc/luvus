@@ -32,19 +32,7 @@ pub(crate) fn connect_host(
             // admission before installation starts. Once admitted, an install
             // is a bounded operation; disconnect does not roll it back.
             require_enabled_host(host)?;
-            let output = run_ssh_command_with_timeout(
-                install_command(host),
-                host,
-                64 * 1024,
-                Duration::from_secs(180),
-            )?;
-            if !output.status.success() {
-                return Err(format!(
-                    "Luvus installation failed on `{host}`: {}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
+            install_fork_release(host)?;
             verify_remote_version(host)?;
         }
     }
@@ -52,6 +40,66 @@ pub(crate) fn connect_host(
         host: host.into(),
         sessions: list_host_sessions(host)?,
         error: None,
+    })
+}
+
+fn install_fork_release(host: &str) -> Result<(), String> {
+    require_enabled_host(host)?;
+    let output = run_ssh_command_with_timeout(
+        install_command(host),
+        host,
+        64 * 1024,
+        Duration::from_secs(180),
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "Luvus installation failed on `{host}`: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct HostUpdate {
+    pub host: String,
+    pub version: String,
+    pub release_source: &'static str,
+    pub path_shadowed: bool,
+    pub servers_restarted: bool,
+}
+
+/// An explicit update always runs the embedded fork installer, even if the
+/// existing binary already speaks a compatible transport. Installation itself
+/// checks the release checksum and binary before its same-filesystem rename.
+pub(crate) fn update_host(host: &str) -> Result<HostUpdate, String> {
+    install_fork_release(host)?;
+    let installed = run_version_command(
+        command_on_host(host, &["--version"], RemoteBinaryLocation::StandardFallback),
+        host,
+    )?;
+    verified_version_output(host, &installed)?
+        .ok_or_else(|| "updated binary did not report a compatible version".to_string())?;
+    let version = String::from_utf8_lossy(&installed.stdout)
+        .trim()
+        .to_string();
+    let effective_location = verify_remote_version(host)?;
+    let path_shadowed = if effective_location == RemoteBinaryLocation::Path {
+        let effective = run_version_command(
+            command_on_host(host, &["--version"], effective_location),
+            host,
+        )?;
+        !effective.status.success() || String::from_utf8_lossy(&effective.stdout).trim() != version
+    } else {
+        false
+    };
+    Ok(HostUpdate {
+        host: host.into(),
+        version,
+        release_source: "https://github.com/Shaloc/luvus/releases/latest",
+        path_shadowed,
+        servers_restarted: false,
     })
 }
 

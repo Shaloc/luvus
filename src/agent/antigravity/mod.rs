@@ -13,6 +13,7 @@ pub(super) const DESCRIPTOR: AgentDescriptor = AgentDescriptor {
     // in legacy editor builds. Current CLI releases use print mode for a
     // bounded non-interactive ORCH task.
     task_prompt_args: &["-p"],
+    prompt_settle: std::time::Duration::ZERO,
     // Current Antigravity releases expose editor chat modes but no reviewed,
     // terminal-headless permission contract. Keep scheduled execution disabled
     // instead of launching an interactive window that can wait forever.
