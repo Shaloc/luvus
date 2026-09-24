@@ -10,8 +10,8 @@ use crate::app::SidebarListFocus;
 fn attention(s: State) -> u8 {
     match s {
         State::Blocked => 4,
-        State::Done => 3,
-        State::Working => 2,
+        State::Working => 3,
+        State::Done => 2,
         State::Idle => 1,
         State::Unknown => 0,
     }
@@ -1434,8 +1434,69 @@ mod tests {
 
     use crate::app::App;
     use crate::event::AppEvent;
+    use crate::ui::theme::State;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
+
+    fn workspace_rollup_cases() -> [(State, State, State); 5] {
+        use crate::ui::theme::State::*;
+        [
+            (Working, Done, Working),
+            (Done, Working, Working),
+            (Working, Blocked, Blocked),
+            (Idle, Done, Done),
+            (Idle, Idle, Idle),
+        ]
+    }
+
+    #[test]
+    fn workspace_rollup_prioritizes_running_agents_across_local_tabs() {
+        let _env = crate::persist::test_env("workspace-rollup-local");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let first = app.layout().focus;
+        app.run_cmd(crate::app::Cmd::NewTab);
+        let second = app.layout().focus;
+        assert_ne!(first, second);
+        assert_eq!(app.workspaces[app.active_ws].tabs.len(), 2);
+        for (first_state, second_state, expected) in workspace_rollup_cases() {
+            app.status.get_mut(&first).unwrap().state = first_state;
+            app.status.get_mut(&second).unwrap().state = second_state;
+            assert_eq!(super::rollup(&app, app.active_ws), expected);
+        }
+    }
+
+    #[test]
+    fn workspace_rollup_prioritizes_running_agents_in_remote_projection() {
+        use crate::app::remote::tests::{add_remote_workspace, remote_ui_app};
+        use crate::app::remote::RemoteAgentMeta;
+        let _env = crate::persist::test_env("workspace-rollup-remote");
+        let mut app = remote_ui_app();
+        let (pane, _receiver, _) = add_remote_workspace(&mut app);
+        for (first_state, second_state, expected) in workspace_rollup_cases() {
+            let Some(crate::app::ViewKind::Remote(view)) = app.views.get_mut(&pane) else {
+                panic!("remote fixture");
+            };
+            view.agents = [first_state, second_state]
+                .into_iter()
+                .enumerate()
+                .map(|(index, state)| RemoteAgentMeta {
+                    title: None,
+                    pane: (index + 1).to_string(),
+                    agent: "codex".into(),
+                    state,
+                    tab: index + 1,
+                    focused: index == 1,
+                    name: None,
+                    session: None,
+                    terminal_id: None,
+                    cwd: "/srv/api".into(),
+                    pinned: false,
+                })
+                .collect();
+            assert_eq!(super::rollup(&app, app.active_ws), expected);
+        }
+    }
 
     #[test]
     fn sidebar_scrollbar_is_thin_and_proportional() {
