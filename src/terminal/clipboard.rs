@@ -220,6 +220,14 @@ pub fn stage(image: &ClipboardImage) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+#[cfg(test)]
+pub(crate) fn stage_png(bytes: &[u8]) -> Result<PathBuf, String> {
+    stage(&ClipboardImage {
+        extension: "png".into(),
+        bytes: bytes.to_vec(),
+    })
+}
+
 /// Decode one strict standard-base64 PNG carried by a bounded semantic web
 /// control frame. Whitespace, URL-safe symbols, misplaced padding, and excess
 /// decoded bytes fail before the staging path is touched.

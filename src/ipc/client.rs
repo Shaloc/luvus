@@ -273,6 +273,13 @@ where
         }
         let message = match event {
             Ok(ClientEvent::Clipboard(epoch)) if epoch == generation => continue,
+            Ok(ClientEvent::ClipboardSucceeded(epoch, receipt)) if epoch == generation => {
+                let _ = protocol::write_message(
+                    &mut writer,
+                    &ClientMessage::ClipboardSucceeded { receipt },
+                );
+                continue;
+            }
             Ok(ClientEvent::Input(message)) => {
                 if matches!(message, ClientMessage::Resize { .. }) {
                     let _ = send_cell_pixels(&mut writer);
@@ -356,6 +363,7 @@ where
                             visible,
                             &mut last_cursor,
                             truecolor,
+                            local && host_terminal_shares_local_filesystem(),
                         )?;
                     }
                     Ok(())
@@ -387,6 +395,7 @@ where
                         frame.cursor_visible,
                         &mut last_cursor,
                         truecolor,
+                        local && host_terminal_shares_local_filesystem(),
                     )?;
                     Ok(())
                 });
@@ -424,6 +433,12 @@ where
             }
             Ok(ServerMessage::Notify(msg)) => crate::emit_notification(&msg),
             Ok(ServerMessage::Sound(signal)) => crate::emit_sound(signal),
+            Ok(ServerMessage::ClipboardTracked { text, receipt }) => {
+                let sender = tx.clone();
+                crate::emit_clipboard_tracked_to(&text, clipboard.0.clone(), move || {
+                    let _ = sender.send(ClientEvent::ClipboardSucceeded(generation, receipt));
+                });
+            }
             Ok(ServerMessage::Clipboard(text)) => {
                 crate::emit_clipboard_to(&text, clipboard.0.clone());
             }
@@ -534,6 +549,7 @@ impl Drop for ClipboardCompletion {
 }
 
 enum ClientEvent {
+    ClipboardSucceeded(u64, u64),
     Clipboard(u64),
     Input(ClientMessage),
     Helper(
@@ -897,6 +913,41 @@ pub(crate) fn valid_host_hyperlink(uri: &str) -> bool {
         && (crate::links::valid_file_uri(uri) || crate::platform::is_openable_url(uri))
 }
 
+/// Whether file URIs from a server on this machine also name files on the
+/// machine that owns the outer terminal. A local socket proves where the client
+/// process runs, not where its terminal emulator runs, so only direct terminal
+/// ownership evidence opts in. SSH and tmux remain unknown and fail closed.
+pub(super) fn host_terminal_shares_local_filesystem() -> bool {
+    host_terminal_shares_local_filesystem_with(|key| std::env::var_os(key))
+}
+
+fn host_terminal_shares_local_filesystem_with(
+    mut read_env: impl FnMut(&str) -> Option<std::ffi::OsString>,
+) -> bool {
+    let has_value =
+        |value: Option<std::ffi::OsString>| value.is_some_and(|value| !value.is_empty());
+    if ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "TMUX"]
+        .into_iter()
+        .any(|key| has_value(read_env(key)))
+    {
+        return false;
+    }
+
+    // These variables are created by the terminal emulator for a direct local
+    // child. Generic TERM/COLORTERM values are deliberately insufficient: SSH
+    // transports them too, and their absence must remain unknown rather than
+    // silently opting into a host-handled file URI.
+    [
+        "TERM_PROGRAM",
+        "WT_SESSION",
+        "KITTY_WINDOW_ID",
+        "VTE_VERSION",
+        "KONSOLE_VERSION",
+    ]
+    .into_iter()
+    .any(|key| has_value(read_env(key)))
+}
+
 fn write_osc8<W: Write>(writer: &mut W, uri: Option<&str>) -> std::io::Result<()> {
     writer.write_all(b"\x1b]8;;")?;
     if let Some(uri) = uri.filter(|uri| valid_host_hyperlink(uri)) {
@@ -915,6 +966,7 @@ pub(super) fn paint_hyperlink_runs<W>(
     cursor_visible: bool,
     last_cursor: &mut Option<(u16, u16)>,
     truecolor: bool,
+    allow_local_files: bool,
 ) -> std::io::Result<()>
 where
     W: Write,
@@ -926,6 +978,9 @@ where
     let backend = terminal.backend_mut();
     let mut wrote = false;
     for run in &frame.hyperlinks {
+        if !allow_local_files && crate::links::valid_file_uri(&run.uri) {
+            continue;
+        }
         write_osc8(backend, Some(&run.uri))?;
         let cells = (run.start..run.end)
             .filter_map(|index| {
@@ -1114,6 +1169,7 @@ mod tests {
             height: 1,
             cells: vec![c("\u{1F534}"), c(""), c("A"), c("B")],
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: None,
             cursor_visible: false,
         };
@@ -1715,6 +1771,7 @@ mod render_tests {
             height: 1,
             cells: vec![cell("a"), cell("b"), cell("c")],
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: None,
             cursor_visible: false,
         };
@@ -1723,6 +1780,7 @@ mod render_tests {
             height: 1,
             cells: vec![cell("a"), cell("X"), cell("c")],
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((1, 0)),
             cursor_visible: true,
         };
@@ -1765,7 +1823,7 @@ mod render_tests {
 
 #[cfg(test)]
 mod paint_tests {
-    use super::{paint, write_osc8};
+    use super::{host_terminal_shares_local_filesystem_with, paint, write_osc8};
     use crate::ipc::protocol::{self, FrameData, FrameDiff};
     use ratatui::backend::{Backend, TestBackend};
     use ratatui::layout::Position;
@@ -1799,6 +1857,31 @@ mod paint_tests {
     }
 
     #[test]
+    fn file_link_locality_requires_direct_terminal_evidence() {
+        assert!(
+            !host_terminal_shares_local_filesystem_with(|_| None),
+            "missing evidence must fail closed"
+        );
+        assert!(host_terminal_shares_local_filesystem_with(|key| {
+            (key == "TERM_PROGRAM").then(|| std::ffi::OsString::from("ghostty"))
+        }));
+        assert!(!host_terminal_shares_local_filesystem_with(|key| {
+            match key {
+                "TERM_PROGRAM" => Some(std::ffi::OsString::from("ghostty")),
+                "SSH_TTY" => Some(std::ffi::OsString::from("/dev/pts/4")),
+                _ => None,
+            }
+        }));
+        assert!(!host_terminal_shares_local_filesystem_with(|key| {
+            match key {
+                "TERM_PROGRAM" => Some(std::ffi::OsString::from("ghostty")),
+                "TMUX" => Some(std::ffi::OsString::from("/private/tmux/default,1,0")),
+                _ => None,
+            }
+        }));
+    }
+
+    #[test]
     fn pty_visible_cursor_is_restored_after_spinner_like_diff() {
         let mut term = Terminal::new(TestBackend::new(8, 8)).unwrap();
         let mut cells = vec![cell(" "); 64];
@@ -1807,6 +1890,7 @@ mod paint_tests {
             height: 8,
             cells: cells.clone(),
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((1, 4)),
             cursor_visible: true,
         };
@@ -1833,6 +1917,7 @@ mod paint_tests {
             height: 8,
             cells,
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((1, 4)),
             cursor_visible: true,
         };
@@ -1869,6 +1954,7 @@ mod paint_tests {
             height: 8,
             cells: cells.clone(),
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((1, 4)),
             cursor_visible: true,
         };
@@ -1894,6 +1980,7 @@ mod paint_tests {
             height: 8,
             cells,
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((1, 4)),
             cursor_visible: false,
         };
@@ -1931,6 +2018,7 @@ mod paint_tests {
             height: 8,
             cells,
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((1, 4)),
             cursor_visible: true,
         };
@@ -1963,6 +2051,7 @@ mod paint_tests {
             height: 8,
             cells,
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((3, 5)),
             cursor_visible: false,
         };

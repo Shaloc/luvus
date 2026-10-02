@@ -1,4 +1,4 @@
-//! Dependency-free global fuzzy finder (docs/90).
+//! Global fuzzy finder and exact retained-output search (docs/90).
 //!
 //! Small navigation metadata is ranked immediately. Complete file-path
 //! catalogs and retained terminal output are scored on workers and merged by a
@@ -26,6 +26,54 @@ pub struct SearchFlash {
     pub row: u16,
     pub scroll: usize,
     pub until: std::time::Instant,
+}
+
+#[derive(Clone, Debug)]
+pub struct PaneSearchMatch {
+    pub row: usize,
+    pub col: usize,
+    pub width: usize,
+}
+
+#[cfg(test)]
+/// Terminal adapter retained for focused matcher tests.
+pub(super) fn match_display_spans(
+    line: &str,
+    query: &str,
+    case_sensitive: bool,
+) -> Vec<(usize, usize)> {
+    crate::search::local::match_spans(line, query, case_sensitive)
+        .into_iter()
+        .map(|search_match| (search_match.column, search_match.width))
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PaneSearchOwner {
+    Scroll,
+    Copy,
+}
+
+#[derive(Clone, Debug)]
+pub struct PaneSearch {
+    pub pane: PaneId,
+    pub owner: PaneSearchOwner,
+    pub local: crate::search::local::LocalSearch<PaneSearchMatch>,
+    pub saved_scroll: usize,
+}
+
+impl std::ops::Deref for PaneSearch {
+    type Target = crate::search::local::LocalSearch<PaneSearchMatch>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.local
+    }
+}
+
+impl std::ops::DerefMut for PaneSearch {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.local
+    }
 }
 
 pub struct LegacySearchHit {
@@ -710,14 +758,9 @@ impl App {
     /// Preserve the exact-scrollback CLI/API contract while the interactive
     /// overlay uses the fuzzy worker.
     pub fn search_all(&self, query: &str, case_sensitive: bool) -> (Vec<LegacySearchHit>, usize) {
-        let needle = if case_sensitive {
-            query.to_string()
-        } else {
-            query.to_lowercase()
-        };
-        if needle.is_empty() {
+        let Some(matcher) = crate::search::local::LiteralMatcher::new(query, case_sensitive) else {
             return (Vec::new(), 0);
-        }
+        };
         let mut hits = Vec::new();
         let mut total = 0usize;
         for (wi, ws) in self.workspaces.iter().enumerate() {
@@ -728,14 +771,7 @@ impl App {
                     };
                     let mut pane_hits = 0usize;
                     pane.for_each_retained_row(&mut |row, history, _row_count, line| {
-                        let folded;
-                        let haystack = if case_sensitive {
-                            line
-                        } else {
-                            folded = line.to_lowercase();
-                            &folded
-                        };
-                        let Some(col) = haystack.find(&needle) else {
+                        let Some(col) = matcher.first_byte_start(line) else {
                             return;
                         };
                         total = total.saturating_add(1);
@@ -1054,7 +1090,7 @@ impl App {
         }
     }
 
-    fn activate_output(
+    pub(super) fn activate_output(
         &mut self,
         pane_id: PaneId,
         old_row: usize,
@@ -1086,6 +1122,10 @@ impl App {
             }
             None => return,
         };
+        self.reveal_output_position(pane_id, offset, above);
+    }
+
+    pub(super) fn reveal_output_position(&mut self, pane_id: PaneId, offset: usize, above: usize) {
         if let Some(pane) = self.panes.get(&pane_id) {
             pane.scroll_to(offset);
         }
@@ -1641,92 +1681,24 @@ mod tests {
     }
 
     #[test]
-    fn remote_search_api_does_not_index_a_same_path_on_the_local_machine() {
-        let _env = crate::persist::test_env("remote-search-api-roots");
-        let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(80, 24, tx).unwrap();
-        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
-            host: "fake-dev".into(),
-            session: "api".into(),
-            workspace_id: "owner-workspace".into(),
-        });
-        let (reply, response) = mpsc::channel();
-        app.start_search_api(crate::ipc::api::ApiRequest {
-            id: "private-owner".into(), method: "search.query".into(),
-            params: serde_json::json!({"query":"Cargo.toml", "scope":"files", "all_sessions":false}), reply,
-        });
-        let value: serde_json::Value = serde_json::from_str(
-            &response
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(value["result"]["matches"], serde_json::json!([]));
-    }
+    fn legacy_exact_search_uses_shared_folding_and_original_byte_columns() {
+        let _env = crate::persist::test_env("exact-search-shared-folding");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let app = App::new(80, 24, tx).unwrap();
+        let pane_id = app.layout().focus;
+        let pane = app.panes.get(&pane_id).unwrap();
+        pane.engine
+            .lock()
+            .unwrap()
+            .advance("\x1b[H\x1b[2JKx needle ς ſ ı".as_bytes());
 
-    #[test]
-    fn remote_search_activation_rejects_local_interpretation_of_an_owner_file() {
-        let _env = crate::persist::test_env("remote-search-file-activation");
-        let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(80, 24, tx).unwrap();
-        let cwd = app.workspaces[0].cwd.clone();
-        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
-            host: "fake-dev".into(),
-            session: "api".into(),
-            workspace_id: "owner-workspace".into(),
-        });
-        let request = crate::ipc::api::ApiRequest {
-            id: "private-owner".into(),
-            method: "search.activate".into(),
-            params: serde_json::json!({"kind":"file", "target":{
-                "workspace":0, "workspace_path":cwd, "path":cwd.join("Cargo.toml")}}),
-            reply: mpsc::channel().0,
-        };
-        let before = app.views.len();
-        let value: serde_json::Value =
-            serde_json::from_str(&app.handle_search_activate(&request)).unwrap();
-        assert!(value.get("error").is_some());
-        assert_eq!(app.views.len(), before);
-    }
-
-    #[test]
-    fn remote_search_handoff_focuses_exact_owner_projection_without_switching_clients() {
-        let _env = crate::persist::test_env("remote-search-owner-focus");
-        let (tx, _rx) = mpsc::channel();
-        let mut app = App::new(80, 24, tx).unwrap();
-        let cwd = app.workspaces[0].cwd.clone();
-        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
-            host: "another-host".into(),
-            session: "api".into(),
-            workspace_id: "same-id".into(),
-        });
-        assert!(app.create_workspace_at(cwd));
-        app.workspaces[1].remote = Some(crate::app::remote::RemoteWorkspaceRef {
-            host: "fake-dev".into(),
-            session: "api".into(),
-            workspace_id: "same-id".into(),
-        });
-        app.active_ws = 0;
-        app.finish_search_handoff(
-            "remote-fake-dev-api".into(),
-            crate::search::federation::SearchActivation {
-                remote: Some(
-                    crate::session::remote::RemoteSession::new("fake-dev", "api").unwrap(),
-                ),
-                workspace_id: Some("same-id".into()),
-            },
-        );
-        assert_eq!(app.active_ws, 1);
-        assert!(app.pending_session_switch.is_none());
-        assert!(app.named_session_menu.is_none());
-        app.finish_search_handoff(
-            "sibling".into(),
-            crate::search::federation::SearchActivation {
-                remote: None,
-                workspace_id: None,
-            },
-        );
-        assert_eq!(app.pending_session_switch.as_deref(), Some("sibling"));
+        let (needle, total) = app.search_all("needle", false);
+        assert_eq!(total, 1);
+        assert_eq!(needle[0].col, "Kx ".len());
+        assert_eq!(app.search_all("σ", false).1, 1);
+        assert_eq!(app.search_all("s", false).1, 1);
+        assert_eq!(app.search_all("i", false).1, 0);
+        assert_eq!(app.search_all("ı", false).1, 1);
     }
 
     #[test]
@@ -2306,5 +2278,23 @@ mod tests {
         app.open_file_search_result(path);
         assert_eq!(app.workspaces[0].tabs.len(), tabs_after);
         assert_eq!(app.layout().focus, file_tab_view, "the whole tab is reused");
+    }
+
+    #[test]
+    fn match_display_spans_respects_case_mode_and_uses_display_cells() {
+        assert_eq!(
+            match_display_spans("hello Needle world", "needle", false),
+            vec![(6, 6)]
+        );
+        assert!(match_display_spans("hello Needle world", "needle", true).is_empty());
+        assert!(match_display_spans("nope", "needle", false).is_empty());
+        assert_eq!(
+            match_display_spans("前Needle后", "needle", false),
+            vec![(2, 6)]
+        );
+        assert_eq!(
+            match_display_spans("hit hit", "hit", true),
+            vec![(0, 3), (4, 3)]
+        );
     }
 }

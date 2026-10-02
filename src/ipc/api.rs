@@ -159,6 +159,8 @@ impl Drop for RequestMetrics {
 struct ConnectionPermit;
 
 impl ConnectionPermit {
+    // Keep fetch_update for Rust 1.88; newer Rust renamed it to try_update.
+    #[allow(deprecated)]
     fn acquire() -> Option<Self> {
         ACTIVE_CONNECTIONS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
@@ -172,6 +174,8 @@ impl ConnectionPermit {
 struct TerminalStreamPermit;
 
 impl TerminalStreamPermit {
+    // Keep fetch_update for Rust 1.88; newer Rust renamed it to try_update.
+    #[allow(deprecated)]
     fn acquire() -> Option<Self> {
         ACTIVE_TERMINAL_STREAMS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {

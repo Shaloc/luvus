@@ -115,6 +115,8 @@ boundaries are:
   remote workspaces, display pooling, SSH recovery, and host setup. Preserve
   transport 9–14 encodings; negotiated transport 15 adds linked full frames
   without changing legacy frames, graphics, or workspace identity checks.
+  Transport 16 adds clipboard receipts and origin-scoped Commander frames and
+  copies; shared display channels must retain their source and owner fences.
 - `src/ipc/api.rs` and `src/ipc/transport.rs`: bounded local API handling plus
   Unix-socket and Windows-named-pipe transport.
 - `src/ui/`: Ratatui rendering, panes, sidebars, docks, tab bar, settings,
@@ -461,10 +463,11 @@ production session. Preserve coverage without turning ordinary CI tests into
 unbounded input bursts or timing benchmarks.
 
 The CI matrix currently covers formatting and Clippy on Ubuntu and Windows,
-locked tests on Ubuntu and macOS, targeted Windows
-protocol/ConPTY boundaries, UHP fixtures and live conformance, web
-client/bridge checks, patched terminal crates, packageability, RustSec audit,
-and Nix flake evaluation/build.
+locked tests on Ubuntu and macOS, targeted Windows protocol/ConPTY boundaries,
+UHP fixtures and live conformance, web client/bridge checks, patched terminal
+crates, packageability, RustSec audit, and Nix flake evaluation/build. FreeBSD
+amd64 is focused-tested, built, and packaged by the release workflow rather
+than pull-request CI.
 
 ## Repository and contribution conventions
 

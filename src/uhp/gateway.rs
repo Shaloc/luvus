@@ -161,6 +161,8 @@ impl Drop for Gateway {
     }
 }
 
+// Keep fetch_update for Rust 1.88; newer Rust renamed it to try_update.
+#[allow(deprecated)]
 fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     let mut workers = Vec::new();
     while !shared.cancelled.load(Ordering::Acquire) {

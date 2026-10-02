@@ -196,13 +196,14 @@ impl RemoteInput {
             _ => 0,
         };
         let bytes = payload.saturating_add(256);
-        if self
+        // Keep fetch_update for Rust 1.88; newer Rust renamed it to try_update.
+        #[allow(deprecated)]
+        let reserved = self
             .budget
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes).filter(|total| *total <= MAX_BYTES)
-            })
-            .is_err()
-        {
+            });
+        if reserved.is_err() {
             return Err(self.queue_failed());
         }
         let queued = Queued {

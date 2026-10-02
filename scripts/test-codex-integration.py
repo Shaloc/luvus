@@ -2,6 +2,7 @@
 """Isolated real Codex + Luvus hook routing and selective native hook trust.
 
 Requires Python 3.11+, Codex with app-server/hooks, and cargo build.
+Use --launcher-only for the installed launcher's PTY/environment regression.
 All servers/files are below target/. No model service or trust bypass is used.
 """
 from contextlib import contextmanager
@@ -9,6 +10,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import pty
 import selectors
 import shlex
 import shutil
@@ -17,6 +19,42 @@ import sys
 import tempfile
 import time
 import tomllib
+
+
+def clipboard_launcher(launcher, caller):
+    """Exercise the installed launcher with a real PTY and an inspecting child."""
+    env = dict(caller, LUVUS_TEST_CODEX_ENV="1")
+    for key in ("SSH_TTY", "SSH_CONNECTION", "SSH_CLIENT"):
+        env.pop(key, None)
+    master, slave = pty.openpty()
+    try:
+        def inspect(args, selected_env=env, terminal=slave):
+            return json.loads(subprocess.check_output(
+                [str(launcher), *args], stdin=terminal, env=selected_env,
+                text=True, timeout=5))
+
+        tty = os.ttyname(slave)
+        for args in ([], ["resume", "fixture"], ["fork", "fixture"]):
+            result = inspect(args)
+            assert result["SSH_TTY"] == tty, result
+            assert result["SSH_CONNECTION"] is None and result["SSH_CLIENT"] is None
+        for args in (["exec", "fixture"], ["--version"], ["app-server"],
+                     ["resume", "--remote=unix://fixture"]):
+            assert inspect(args)["SSH_TTY"] is None, args
+        assert inspect([], terminal=subprocess.DEVNULL)["SSH_TTY"] is None
+        outside = dict(env, LUVUS_ENV="0")
+        assert inspect([], outside)["SSH_TTY"] is None
+        incomplete = dict(env)
+        incomplete.pop("LUVUS_PANE_ID")
+        assert inspect([], incomplete)["SSH_TTY"] is None
+        existing = dict(env, SSH_TTY="/dev/pts/existing", SSH_CONNECTION="existing")
+        result = inspect([], existing)
+        assert result["SSH_TTY"] == existing["SSH_TTY"]
+        assert result["SSH_CONNECTION"] == existing["SSH_CONNECTION"]
+    finally:
+        os.close(slave)
+        os.close(master)
+    print("PASS: installed launcher enables terminal clipboard forwarding only for pane TUIs", flush=True)
 
 
 @contextmanager
@@ -136,13 +174,21 @@ def main():
         fake_dir = root / "fake tools"
         fake_dir.mkdir()
         fake = fake_dir / "codex"
-        fake.write_text("#!/usr/bin/env python3\nimport json,sys\nprint(json.dumps(sys.argv[1:]))\n")
+        fake.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                        "print(json.dumps({k:os.environ.get(k) for k in "
+                        "['SSH_TTY','SSH_CONNECTION','SSH_CLIENT']} if "
+                        "os.environ.get('LUVUS_TEST_CODEX_ENV') else sys.argv[1:]))\n")
         fake.chmod(0o755)
         routes = []
         for pane in (first, second):
             caller = dict(env, LUVUS_ENV="1", LUVUS_PANE_ID=pane,
                           LUVUS_SOCKET_PATH=info["socket_path"], LUVUS_BIN_PATH=str(luvus),
                           PATH=os.pathsep.join([str(launcher.parent), str(fake_dir), env["PATH"]]))
+            if pane == first:
+                clipboard_launcher(launcher, caller)
+                if "--launcher-only" in sys.argv[1:]:
+                    passed = True
+                    return
             args = json.loads(subprocess.check_output([str(launcher), "resume", "fixture-session"], env=caller, text=True, timeout=5))
             assert args[-2:] == ["resume", "fixture-session"]
             assert "--dangerously-bypass-hook-trust" not in args

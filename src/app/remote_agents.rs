@@ -642,7 +642,7 @@ impl App {
     /// A native history entry always resumes locally, even when the outer
     /// workspace focus is currently on a remote projection with the same path.
     pub(crate) fn resume_workspace_target(&self, cwd: &std::path::Path) -> Option<usize> {
-        if self.config.layout.resume_in_new_workspace
+        let target = if self.config.layout.resume_in_new_workspace
             || self
                 .workspaces
                 .get(self.active_ws)
@@ -653,7 +653,8 @@ impl App {
             })
         } else {
             (!self.workspaces.is_empty()).then_some(self.active_ws)
-        }
+        };
+        target.filter(|&index| !self.workspace_delete_pending(index))
     }
     /// Same lightweight scheduled rows for the native and remote AGENTS dock.
     /// No disk reads or new automation state: the existing ledger is authoritative.

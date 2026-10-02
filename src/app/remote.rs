@@ -209,6 +209,7 @@ pub struct RemoteSessionSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RemoteDisplay {
+    pub scoped_frames: bool,
     pub hyperlinks: bool,
     pub clipboard_helper_relay: bool,
     pub session_display: bool,
@@ -256,6 +257,12 @@ pub enum RemoteEffect {
     Notify(String),
     Sound(crate::sound::SoundSignal),
     Clipboard(String),
+    ScopedClipboard {
+        pane: PaneId,
+        generation: u64,
+        origin: Option<u64>,
+        text: String,
+    },
     OpenUrl(String),
     Workspace {
         pane: PaneId,
@@ -323,6 +330,23 @@ impl Drop for RemoteView {
 }
 
 impl RemoteView {
+    pub(crate) fn display_frame(
+        &self,
+        origin: Option<u64>,
+    ) -> Option<(&FrameData, &[crate::terminal::graphics::Graphic])> {
+        let frame = self.frame.as_ref()?;
+        match frame.scoped.as_ref().filter(|view| view.origin == origin) {
+            Some(view) => Some((&view.frame, &view.graphics)),
+            None => Some((frame, &self.graphics)),
+        }
+    }
+
+    pub(super) fn relays_input_origin(&self) -> bool {
+        self.projection.display.clipboard_helper_relay
+    }
+    pub(super) fn projection_epoch(&self) -> u64 {
+        self.projection.epoch
+    }
     pub(crate) fn focused_pane_metadata(&self) -> Option<&crate::bar::FocusedPaneMetadata> {
         if self.state != RemoteViewState::Ready {
             return None;
@@ -501,6 +525,7 @@ impl App {
                 ClientMessage::Command(format!("remote_agent_focus {pane}")),
             );
             if sent {
+                self.release_remote_key_presses(self.workspaces[index].tabs[0].layout.focus);
                 if let Some(ViewKind::Remote(view)) = self
                     .views
                     .get_mut(&self.workspaces[index].tabs[0].layout.focus)
@@ -1605,6 +1630,16 @@ impl App {
             RemoteEffect::Notify(message) => self.pending_notify.push(message),
             RemoteEffect::Sound(signal) => self.pending_sound = Some(signal),
             RemoteEffect::Clipboard(text) => self.pending_clipboard = Some(text),
+            RemoteEffect::ScopedClipboard {
+                pane,
+                generation,
+                origin,
+                text,
+            } => {
+                if self.remote_navigation_source(pane, generation).is_some() {
+                    self.pending_client_clipboard = Some((origin, text));
+                }
+            }
             RemoteEffect::OpenUrl(url) => self.pending_open_url = Some(url),
             RemoteEffect::Workspace {
                 pane,
@@ -1810,7 +1845,30 @@ impl App {
             .map(|tab| tab.layout.focus)
     }
 
+    /// An outer display can detach while its pooled SSH channel stays alive.
+    /// Retire only that opaque source, once per retained channel.
+    pub(crate) fn notify_remote_client_detach(&self, origin: u64) {
+        let mut sent = std::collections::HashSet::new();
+        for view in self.views.values() {
+            let ViewKind::Remote(view) = view else {
+                continue;
+            };
+            if !view.projection.display.scoped_frames {
+                continue;
+            }
+            let Some(input) = view.input.as_ref() else {
+                continue;
+            };
+            if sent.insert(Arc::as_ptr(input)) {
+                let _ = input.send(ClientMessage::InputSourceClosed { origin });
+            }
+        }
+    }
+
     pub(crate) fn send_active_remote(&self, message: ClientMessage) -> bool {
+        if matches!(&message, ClientMessage::Command(_)) {
+            self.forward_clipboard_helper_origin(self.input_key_origin.or(self.input_client_id));
+        }
         self.active_remote_pane()
             .and_then(|pane| self.views.get(&pane))
             .and_then(|view| match view {
@@ -1928,6 +1986,42 @@ impl App {
         }
     }
 
+    fn forward_active_remote_key(
+        &mut self,
+        key: ratatui::crossterm::event::KeyEvent,
+        prefixed: bool,
+    ) {
+        use ratatui::crossterm::event::KeyEventKind;
+        if self.replaying_ui_repeat {
+            return;
+        }
+        let Some(pane) = self.active_remote_pane() else {
+            return;
+        };
+        let Some(ViewKind::Remote(view)) = self.views.get(&pane) else {
+            return;
+        };
+        let remote = Some((view.generation, view.projection.epoch));
+        let origin = self.input_key_origin.or(self.input_client_id);
+        self.forward_clipboard_helper_origin(origin);
+        let sent = self.send_active_remote(if prefixed {
+            ClientMessage::PrefixKey(key)
+        } else {
+            ClientMessage::Key(key)
+        });
+        if sent && key.kind == KeyEventKind::Press {
+            self.forwarded_key_presses.insert(
+                super::input::key_identity(self.input_client_id, self.input_key_origin, key),
+                super::ForwardedKeyPress {
+                    pane,
+                    press: key,
+                    remote,
+                    remote_origin: origin,
+                },
+            );
+        }
+    }
+
     pub(crate) fn handle_active_remote_key(
         &mut self,
         key: ratatui::crossterm::event::KeyEvent,
@@ -1948,6 +2042,9 @@ impl App {
                 return Some(true);
             }
             if let Some(command) = super::keys::direct_command(&self.direct_keymap, &key) {
+                if key.kind != ratatui::crossterm::event::KeyEventKind::Press {
+                    return Some(false);
+                }
                 if outer_command(command) {
                     self.run_cmd(command);
                 } else {
@@ -1956,7 +2053,7 @@ impl App {
                 }
                 return Some(true);
             }
-            let _ = self.send_active_remote(ClientMessage::Key(key));
+            self.forward_active_remote_key(key, false);
             return Some(false);
         }
 
@@ -1975,7 +2072,7 @@ impl App {
             } else {
                 // Fixed keys (?, digits, scrollback) and custom bindings all
                 // belong to the owner; do not duplicate its prefix dispatch.
-                let _ = self.send_active_remote(ClientMessage::PrefixKey(key));
+                self.forward_active_remote_key(key, true);
             }
             return Some(true);
         }
@@ -2093,10 +2190,11 @@ impl App {
             .graphics_enabled
             .then_some(layout_cell_pixels)
             .flatten();
+        let size = (rect.width.max(1), rect.height.max(1));
+        if self.views.get(&pane).is_some_and(|view| matches!(view, ViewKind::Remote(view) if view.projection.display.projection && (!view.projection.active || size != view.last_size))) { self.release_remote_key_presses(pane); }
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
-        let size = (rect.width.max(1), rect.height.max(1));
         if view.projection.display.cell_pixels
             && view.projection.layout_cell_pixels != layout_cell_pixels
         {
@@ -2310,6 +2408,7 @@ pub(super) fn parse_remote_snapshot(
                     .get("worktree")
                     .filter(|value| !value.is_null())
                     .map(|value| crate::git::WorktreeMembership {
+                        directory_identity: None,
                         common_dir: PathBuf::from(
                             value
                                 .get("common_dir")
@@ -2345,11 +2444,22 @@ pub(super) fn parse_remote_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let snapshot = RemoteSessionSnapshot {
         display: RemoteDisplay {
+            scoped_frames: response
+                .get("result")
+                .and_then(|r| r.get("remote_display"))
+                .is_some_and(|d| {
+                    d.get("transport").and_then(Value::as_u64) == Some(16)
+                        && d.get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter().any(|c| c.as_str() == Some("scoped_frames.v1"))
+                            })
+                }),
             hyperlinks: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    d.get("transport").and_then(Value::as_u64) == Some(15)
+                    matches!(d.get("transport").and_then(Value::as_u64), Some(15..=16))
                         && d.get("capabilities")
                             .and_then(Value::as_array)
                             .is_some_and(|caps| {
@@ -2360,7 +2470,7 @@ pub(super) fn parse_remote_snapshot(
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    matches!(d.get("transport").and_then(Value::as_u64), Some(14..=15))
+                    matches!(d.get("transport").and_then(Value::as_u64), Some(14..=16))
                         && d.get("capabilities")
                             .and_then(Value::as_array)
                             .is_some_and(|caps| {
@@ -2372,7 +2482,7 @@ pub(super) fn parse_remote_snapshot(
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    matches!(d.get("transport").and_then(Value::as_u64), Some(13..=15))
+                    matches!(d.get("transport").and_then(Value::as_u64), Some(13..=16))
                         && d.get("capabilities")
                             .and_then(Value::as_array)
                             .is_some_and(|caps| {
@@ -2388,7 +2498,7 @@ pub(super) fn parse_remote_snapshot(
                     display
                         .get("transport")
                         .and_then(Value::as_u64)
-                        .is_some_and(|v| (12..=15).contains(&v))
+                        .is_some_and(|v| (12..=16).contains(&v))
                 }),
             graphics: response
                 .get("result")
@@ -2396,7 +2506,7 @@ pub(super) fn parse_remote_snapshot(
                 .is_some_and(|display| {
                     matches!(
                         display.get("transport").and_then(Value::as_u64),
-                        Some(11..=15)
+                        Some(11..=16)
                     ) && display
                         .get("capabilities")
                         .and_then(Value::as_array)
@@ -2416,7 +2526,7 @@ pub(super) fn parse_remote_snapshot(
                 .is_some_and(|display| {
                     matches!(
                         display.get("transport").and_then(Value::as_u64),
-                        Some(10..=15)
+                        Some(10..=16)
                     ) && display
                         .get("capabilities")
                         .and_then(Value::as_array)
@@ -2639,7 +2749,9 @@ fn run_projection(
             &mut input,
             &if display.projection {
                 ClientMessage::HelloProjection {
-                    version: if display.hyperlinks {
+                    version: if display.scoped_frames {
+                        16
+                    } else if display.hyperlinks {
                         15
                     } else if display.clipboard_helper_relay {
                         14
@@ -2804,7 +2916,19 @@ fn run_projection(
                         return Err("unexpected remote projection codec".into());
                     }
                     frame = Some(next.clone());
-                    slot.publish_with_state(pane, generation, next, Some(state), app_tx);
+                    if next.scoped.is_some() {
+                        graphics.clear();
+                        slot.publish_graphics(
+                            pane,
+                            generation,
+                            next,
+                            Some(state),
+                            Vec::new(),
+                            app_tx,
+                        );
+                    } else {
+                        slot.publish_with_state(pane, generation, next, Some(state), app_tx);
+                    }
                 }
                 Ok(ServerMessage::ProjectionDiff { state, frame: diff }) => {
                     if !display.projection {
@@ -2821,7 +2945,12 @@ fn run_projection(
                 }
                 Ok(ServerMessage::Frame(next)) => {
                     frame = Some(next.clone());
-                    slot.publish(pane, generation, next, app_tx);
+                    if next.scoped.is_some() {
+                        graphics.clear();
+                        slot.publish_graphics(pane, generation, next, None, Vec::new(), app_tx);
+                    } else {
+                        slot.publish(pane, generation, next, app_tx);
+                    }
                 }
                 Ok(ServerMessage::FrameDiff(diff)) => {
                     let Some(current) = frame.as_mut() else {
@@ -2852,6 +2981,16 @@ fn run_projection(
                             effect: RemoteEffect::Clipboard(text),
                         });
                     }
+                }
+                Ok(ServerMessage::ScopedClipboard { origin, text }) => {
+                    let _ = app_tx.send(AppEvent::RemoteEffect {
+                        effect: RemoteEffect::ScopedClipboard {
+                            pane,
+                            generation,
+                            origin,
+                            text,
+                        },
+                    });
                 }
                 Ok(ServerMessage::OpenUrl(url)) => {
                     if effect_leader.load(Ordering::Acquire) {
@@ -2954,6 +3093,7 @@ pub(crate) mod tests {
     fn frame(symbol: &str) -> FrameData {
         FrameData {
             hyperlinks: Vec::new(),
+            scoped: None,
             width: 1,
             height: 1,
             cells: vec![protocol::CellData {
@@ -3197,7 +3337,7 @@ pub(crate) mod tests {
 
     #[test]
     fn remote_link_capability_keeps_older_projection_features() {
-        for version in 9..=15 {
+        for version in 9..=16 {
             let mut capabilities = protocol::remote_display_capabilities();
             capabilities["transport"] = json!(version);
             let response = json!({"result":{"workspaces":[], "event_sequence":0,
@@ -3205,7 +3345,8 @@ pub(crate) mod tests {
             let display = parse_remote_snapshot(&response, RemoteBinaryLocation::Path)
                 .unwrap()
                 .display;
-            assert_eq!(display.hyperlinks, version == 15);
+            assert_eq!(display.scoped_frames, version >= 16);
+            assert_eq!(display.hyperlinks, version >= 15);
             assert_eq!(display.projection, version >= 10);
             assert_eq!(display.graphics, version >= 11);
             assert_eq!(display.cell_pixels, version >= 12);
@@ -3329,6 +3470,91 @@ pub(crate) mod tests {
         });
         app.active_ws = app.workspaces.len() - 1;
         (pane, receiver, remote_path)
+    }
+
+    #[test]
+    fn remote_key_origins_survive_detach_and_overlay_repeat_is_blocked() {
+        use ratatui::crossterm::event::KeyEventKind;
+        let _env = crate::persist::test_env("remote-key-origin-release");
+        let mut app = remote_ui_app();
+        let (pane, rx, _) = add_remote_workspace(&mut app);
+        let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+            unreachable!()
+        };
+        view.projection.display.clipboard_helper_relay = true;
+        let event = |kind| {
+            AppEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                kind,
+            ))
+        };
+        app.handle_client_event(11, event(KeyEventKind::Press));
+        app.handle_client_event(12, event(KeyEventKind::Press));
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            messages[0],
+            ClientMessage::ClipboardHelperOrigin(Some(11))
+        ));
+        assert!(matches!(
+            messages[2],
+            ClientMessage::ClipboardHelperOrigin(Some(12))
+        ));
+        app.release_client_key_presses(11);
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ClientMessage::ClipboardHelperOrigin(Some(11))
+        ));
+        assert!(
+            matches!(rx.try_recv().unwrap(), ClientMessage::Key(key) if key.kind == KeyEventKind::Release)
+        );
+        app.help_open = true;
+        app.handle_client_event(12, event(KeyEventKind::Repeat));
+        assert!(rx.try_recv().is_err(), "outer overlay owns repeats");
+        app.handle_client_event(12, event(KeyEventKind::Release));
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ClientMessage::ClipboardHelperOrigin(Some(12))
+        ));
+        assert!(
+            matches!(rx.try_recv().unwrap(), ClientMessage::Key(key) if key.kind == KeyEventKind::Release)
+        );
+    }
+
+    #[test]
+    fn remote_direct_shortcut_is_press_only_and_local_commander_does_not_capture_paste() {
+        use ratatui::crossterm::event::KeyEventKind;
+        let _env = crate::persist::test_env("remote-shortcut-commander");
+        let mut app = remote_ui_app();
+        app.open_commander();
+        let (_, rx, _) = add_remote_workspace(&mut app);
+        app.direct_keymap = super::super::keys::build_direct_keymap(
+            &std::collections::HashMap::from([("new_tab".into(), "alt+n".into())]),
+        );
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            app.handle_event(AppEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Char('n'),
+                KeyModifiers::ALT,
+                kind,
+            )));
+        }
+        let messages = rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| matches!(m, ClientMessage::Command(c) if c == "new_tab"))
+                .count(),
+            1
+        );
+        app.handle_event(AppEvent::Paste("owner paste".into()));
+        assert!(
+            matches!(rx.try_recv().unwrap(), ClientMessage::Paste(text) if text == "owner paste")
+        );
     }
 
     /// Restore only a native dashboard: these UI tests own no PTY, shell,
@@ -3781,6 +4007,209 @@ pub(crate) mod tests {
             }
         }
         panic!("visible owner UI text {text:?} was not rendered in {rect:?}");
+    }
+
+    #[test]
+    fn remote_scoped_commander_is_visible_only_to_its_outer_client() {
+        let _env = crate::persist::test_env("remote-scoped-commander-render");
+        let mut owner = remote_ui_app();
+        let mut outer = remote_ui_app();
+        let (pane, _receiver, _) = add_remote_workspace(&mut outer);
+        remote_ui_buffer(&mut outer, (160, 42));
+        let content = outer.pane_content_rects[0].1;
+        let owner_size = (content.width, content.height);
+        owner.with_input_source(Some(5), Some(77), |app| {
+            app.open_commander();
+            app.handle_event(AppEvent::Paste("private remote draft".into()));
+        });
+        let private_frame = owner.with_input_source(Some(5), Some(77), |app| {
+            remote_ui_owner_frame(app, owner_size, true)
+        });
+        let private_text: String = private_frame
+            .cells
+            .iter()
+            .map(|cell| cell.symbol.as_str())
+            .collect();
+        assert!(private_text.contains("private remote draft"));
+        assert!(private_frame.cursor.is_some());
+
+        let owner_id = owner.workspaces[0].id.clone();
+        let area = Rect::new(0, 0, owner_size.0, owner_size.1);
+        let mut public = ratatui::buffer::Buffer::empty(area);
+        let mut target = crate::ui::RenderTarget::new(&mut public, area);
+        owner.with_input_source(Some(5), None, |app| {
+            crate::ui::render_workspace_projection(&mut target, app, &owner_id)
+        });
+        let cursor = target.cursor();
+        let cursor_visible = target.cursor_visible();
+        let frame = protocol::frame_from_buffer(&public, cursor, cursor_visible);
+        let mut bytes = Vec::new();
+        protocol::write_message(
+            &mut bytes,
+            &ServerMessage::ScopedFrame {
+                state: Some(protocol::ProjectionState {
+                    server_generation: "boot".into(),
+                    epoch: 7,
+                    event_sequence: 42,
+                    workspace_id: "workspace_remote".into(),
+                    focused_pane: None,
+                }),
+                origin: Some(77),
+                frame: Box::new(frame),
+                hyperlinks: Vec::new(),
+                graphics: Vec::new(),
+                private_frame: Box::new(private_frame),
+                private_hyperlinks: Vec::new(),
+                private_graphics: Vec::new(),
+            },
+        )
+        .unwrap();
+        let ServerMessage::ProjectionFrame { state, frame } =
+            protocol::decode_hyperlinks(protocol::read_message(&mut bytes.as_slice()).unwrap())
+                .unwrap()
+        else {
+            panic!("ordinary remote terminal lost the non-graphics codec");
+        };
+        let ViewKind::Remote(view) = outer.views.get_mut(&pane).unwrap() else {
+            unreachable!()
+        };
+        view.projection.display.projection = true;
+        view.projection.display.scoped_frames = true;
+        view.projection.display.server_generation = Some("boot".into());
+        view.projection.active = true;
+        view.projection.epoch = 7;
+        view.last_size = owner_size;
+        let slot = Arc::new(RemoteFrameSlot::new());
+        let (tx, _events) = mpsc::channel();
+        slot.publish_with_state(pane, 1, frame, Some(state), &tx);
+        outer.apply_remote_frame(pane, 1, &slot);
+
+        let active =
+            outer.with_input_source(Some(77), None, |app| remote_ui_buffer(app, (160, 42)));
+        remote_ui_visible_text(&active, content, "private remote draft");
+        let area = Rect::new(0, 0, 160, 42);
+        let mut passive = ratatui::buffer::Buffer::empty(area);
+        let mut target = crate::ui::RenderTarget::new(&mut passive, area);
+        outer.with_input_source(Some(88), None, |app| {
+            crate::ui::render_projection(&mut target, app)
+        });
+        assert!(
+            target.cursor().is_none(),
+            "other client received a private caret"
+        );
+        let passive_text: String = passive.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(!passive_text.contains("private remote draft"));
+        assert!(
+            owner.commander.is_some(),
+            "passive rendering closed the owner's draft"
+        );
+        assert!(outer.commander.is_none());
+    }
+
+    #[test]
+    fn remote_scoped_render_keeps_links_cursor_and_images_with_the_exact_origin() {
+        let _env = crate::persist::test_env("remote-scoped-resources-render");
+        let mut outer = remote_ui_app();
+        let (pane, _receiver, _) = add_remote_workspace(&mut outer);
+        remote_ui_buffer(&mut outer, (160, 42));
+        let content = outer.pane_content_rects[0].1;
+        let owner_area = Rect::new(0, 0, content.width, content.height);
+        let mut public = ratatui::buffer::Buffer::empty(owner_area);
+        public.set_string(0, 0, "PUBLIC", ratatui::style::Style::default());
+        public[(0, 1)].set_symbol(&crate::terminal::graphics::MARKER.to_string());
+        public[(0, 1)].set_fg(crate::terminal::graphics::slot_color(1));
+        let public_frame = protocol::frame_from_buffer(&public, None, false);
+        let mut private = public.clone();
+        private.set_string(0, 0, "PRIVATE", ratatui::style::Style::default());
+        let private_frame = protocol::frame_from_buffer(&private, Some((2, 2)), true);
+        let graphic = |key: &str, payload: &str| crate::terminal::graphics::GraphicUpdate {
+            key: key.into(),
+            image: Some(Arc::new(alacritty_terminal::term::graphics::Image {
+                sequence: 1,
+                width: 1,
+                height: 1,
+                format: 24,
+                compressed: false,
+                data: payload.into(),
+            })),
+            crop: [0, 0, 1, 1],
+            size: [1, 1],
+        };
+        let message = ServerMessage::ScopedFrame {
+            state: None,
+            origin: Some(77),
+            frame: Box::new(public_frame.clone()),
+            hyperlinks: vec![protocol::FrameHyperlink {
+                start: 0,
+                end: 6,
+                uri: "https://example.com/public".into(),
+            }],
+            graphics: vec![graphic("public-image", "/wAA")],
+            private_frame: Box::new(private_frame),
+            private_hyperlinks: vec![protocol::FrameHyperlink {
+                start: 0,
+                end: 7,
+                uri: "https://example.com/private".into(),
+            }],
+            private_graphics: vec![graphic("private-image", "AAD/")],
+        };
+        let ServerMessage::GraphicFrame {
+            text: protocol::GraphicText::Full(frame),
+            graphics,
+            ..
+        } = protocol::decode_hyperlinks(message).unwrap()
+        else {
+            unreachable!()
+        };
+        let graphics = crate::terminal::graphics::apply_updates(&[], graphics).unwrap();
+        let slot = Arc::new(RemoteFrameSlot::new());
+        let (tx, _events) = mpsc::channel();
+        slot.publish_graphics(pane, 1, frame, None, graphics.clone(), &tx);
+        outer.apply_remote_frame(pane, 1, &slot);
+        for (client, origin, is_private) in [
+            (Some(77), None, true),
+            (Some(5), Some(77), true),
+            (Some(88), None, false),
+            (Some(77), Some(88), false),
+        ] {
+            let area = Rect::new(0, 0, 160, 42);
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
+            target.graphics_enabled = true;
+            outer.with_input_source(client, origin, |app| {
+                crate::ui::render_into(&mut target, app)
+            });
+            let layer = if is_private { "private" } else { "public" };
+            assert_eq!(target.graphics.len(), 1);
+            assert_eq!(target.graphics[0].key, format!("{layer}-image"));
+            assert_eq!(
+                target.cursor(),
+                is_private.then_some((content.x + 2, content.y + 2))
+            );
+            assert_eq!(outer.rendered_hyperlinks.len(), 1);
+            assert_eq!(
+                outer.rendered_hyperlinks[0].uri,
+                format!("https://example.com/{layer}")
+            );
+            assert_eq!(outer.rendered_hyperlinks[0].pane, pane);
+            remote_ui_visible_text(
+                &buffer,
+                content,
+                if is_private { "PRIVATE" } else { "PUBLIC" },
+            );
+        }
+        let ViewKind::Remote(view) = outer.views.get_mut(&pane).unwrap() else {
+            unreachable!()
+        };
+        view.frame = Some(public_frame);
+        view.graphics = graphics;
+        let public =
+            outer.with_input_source(Some(77), None, |app| remote_ui_buffer(app, (160, 42)));
+        remote_ui_visible_text(&public, content, "PUBLIC");
+        assert!(
+            outer.last_cursor.is_none(),
+            "closed private surface retained its caret"
+        );
     }
 
     #[test]

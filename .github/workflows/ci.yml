@@ -44,6 +44,10 @@ jobs:
       # RUSTFLAGS, which would also fail on harmless dependency warnings.
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
+      - name: Validate detached server lifecycle
+        run: |
+          cargo build --locked
+          python3 tests/server_detach_pty.py --luvus target/debug/luvus
       - name: Validate web client and bridge
         run: |
           cargo build --locked
@@ -95,6 +99,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked
+      - name: Validate detached server lifecycle
+        run: |
+          cargo build --locked
+          python3 tests/server_detach_pty.py --luvus target/debug/luvus
       - name: Validate terminal backend contract
         run: |
           python3 examples/uhp/terminal/consumer.py --fixtures
@@ -150,7 +158,8 @@ jobs:
           python3 scripts/check-binary-size.py \
             --target x86_64-apple-darwin \
             --binary target/x86_64-apple-darwin/release/luvus \
-            --archive target/luvus-x86_64-size.tar.gz
+            --archive target/luvus-x86_64-size.tar.gz \
+            --baseline "${{ github.repository == 'Shaloc/luvus' && '.github/fork-binary-size-baseline.json' || '.github/binary-size-baseline.json' }}"
 
   binary-size-windows:
     name: windows binary size
@@ -175,7 +184,8 @@ jobs:
           python3 scripts/check-binary-size.py \
             --target x86_64-pc-windows-msvc \
             --binary target/x86_64-pc-windows-msvc/release/luvus.exe \
-            --archive "${{ steps.package.outputs.zip }}"
+            --archive "${{ steps.package.outputs.zip }}" \
+            --baseline "${{ github.repository == 'Shaloc/luvus' && '.github/fork-binary-size-baseline.json' || '.github/binary-size-baseline.json' }}"
 
   windows:
     name: windows protocol · ConPTY

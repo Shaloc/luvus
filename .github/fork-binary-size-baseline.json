@@ -18,6 +18,30 @@
     "aarch64-apple-darwin": {
       "executable_bytes": 13375376,
       "archive_bytes": 5731548
+    },
+    "x86_64-apple-darwin": {
+      "executable_bytes": 15441272,
+      "archive_bytes": 6519508,
+      "source": {
+        "repository": "Shaloc/luvus",
+        "commit": "b1ee9637974f6af0e67e2f6933551420c2a43956",
+        "workflow_run": 36975154551,
+        "job": 110737261303,
+        "rustc": "1.99.0",
+        "measurement": "macOS CI release executable and binary-only tar.gz. This newly imported target previously used the upstream baseline, which excludes fork remote ownership, pooled display, clipboard and Web behavior. Establish its first measured fork baseline; retain the 5% warning and 10% block thresholds."
+      }
+    },
+    "x86_64-pc-windows-msvc": {
+      "executable_bytes": 19468288,
+      "archive_bytes": 6709160,
+      "source": {
+        "repository": "Shaloc/luvus",
+        "commit": "b1ee9637974f6af0e67e2f6933551420c2a43956",
+        "workflow_run": 36975154551,
+        "job": 110737261483,
+        "archive_sha256": "df442d32fcd815351bcf9b285bc7305cbe30b8860717247555e73ff135cd5744",
+        "measurement": "Windows CI release executable and binary-only ZIP produced by upload-rust-binary-action. This newly imported target previously used the upstream baseline, which excludes fork remote ownership, pooled display, clipboard and Web behavior. Establish its first measured fork baseline; retain the 5% warning and 10% block thresholds."
+      }
     }
   }
 }

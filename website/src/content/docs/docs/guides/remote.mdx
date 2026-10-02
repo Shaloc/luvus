@@ -391,6 +391,11 @@ display client's clipboard from local and remote panes. They do not require
 the image helper. Clipboard reads (`OSC 52 ... ?`) and primary-selection writes
 are not forwarded.
 
+Transport 16 also keeps Commander drafts and selection copies private to the
+display that opened them, including clients sharing one SSH channel. Update
+both the display and owner to use remote Commander; managed transports 9–15
+keep terminal input and rendering but cannot open this private surface.
+
 In merge mode, the workspace **+** first asks for Local machine or an enabled
 SSH host. Worktree, rename, delete-worktree, TaskBoard and Mission Control
 actions run on the selected workspace's owner. The Agents dock combines native
@@ -413,7 +418,7 @@ by menus are excluded from the projected frame.
 ### Kitty graphics
 
 Stable fork releases include Kitty graphics from transport 11 onward. Current
-builds report `transport=15` with `luvus --version --remote-session-protocol`
+builds report `transport=16` with `luvus --version --remote-session-protocol`
 and separately negotiate physical cell dimensions for automatic split direction.
 Plain terminals can report cell dimensions without enabling Kitty graphics. Use Kitty 0.28 or newer on the display
 machine and matching graphics builds on remote owners. An older managed owner

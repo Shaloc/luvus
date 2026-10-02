@@ -227,8 +227,13 @@ impl ClientSender {
 }
 
 struct ClientState {
+    version: u32,
+    clipboard_receipt: Option<u64>,
     /// None is an ordinary/legacy client; Some(None) is a monolithic relay.
     clipboard_helper_origin: Option<Option<u64>>,
+    /// Held key phases retain their route without changing the displayed draft.
+    render_origin: Option<u64>,
+    private_frame_active: bool,
     prepared_workspace: Option<Box<ClientState>>,
     preparation_sent: bool,
     preparation_epoch: u64,
@@ -283,7 +288,11 @@ impl ClientState {
     ) -> Self {
         let size = (cols.max(1), rows.max(1));
         Self {
+            version: crate::ipc::protocol::PROTOCOL_VERSION,
+            clipboard_receipt: None,
             clipboard_helper_origin: None,
+            render_origin: None,
+            private_frame_active: false,
             prepared_workspace: None,
             preparation_sent: false,
             preparation_epoch: 0,
@@ -326,6 +335,9 @@ impl ClientState {
                 ServerMessage::SwitchSession { name } => protocol::WorkspaceEffect::Session(name),
                 ServerMessage::Detach => protocol::WorkspaceEffect::Detach,
                 ServerMessage::Clipboard(text) => protocol::WorkspaceEffect::Clipboard(text),
+                ServerMessage::ScopedClipboard { origin, text } => {
+                    protocol::WorkspaceEffect::ScopedClipboard { origin, text }
+                }
                 ServerMessage::OpenUrl(url) => protocol::WorkspaceEffect::OpenUrl(url),
                 ServerMessage::ForwardedClipboardHelper { origin, request } => {
                     protocol::WorkspaceEffect::ClipboardHelper { origin, request }
@@ -676,13 +688,15 @@ pub fn run() -> Result<()> {
         if let Some(signal) = app.pending_sound.take() {
             broadcast(&mut clients, ServerMessage::Sound(signal));
         }
+        app.release_absent_client_key_presses(|id| clients.contains_key(&id));
         // A finished mouse selection copies to the client's clipboard (OSC 52).
         if let Some(url) = app.pending_open_url.take() {
             broadcast(&mut clients, ServerMessage::OpenUrl(url));
         }
         if let Some(text) = app.pending_clipboard.take() {
-            broadcast(&mut clients, ServerMessage::Clipboard(text));
+            dispatch_clipboard(&mut clients, foreground, &mut next_activity, text);
         }
+        dispatch_private_clipboard(&mut app, &clients);
         send_clipboard_helper_request(&mut app, &clients, foreground);
         for (origin, request) in app.take_remote_clipboard_helper_requests() {
             let sent = origin
@@ -844,6 +858,7 @@ fn apply(
         }
         AppEvent::ClientConnected {
             id,
+            version,
             messages,
             frame_pending,
             cols,
@@ -858,7 +873,7 @@ fn apply(
                     crate::logging::Field::ClientId(id),
                     crate::logging::Field::Cols(u64::from(cols)),
                     crate::logging::Field::Rows(u64::from(rows)),
-                    crate::logging::Field::ProtocolVersion(u64::from(protocol::PROTOCOL_VERSION)),
+                    crate::logging::Field::ProtocolVersion(u64::from(version)),
                 ],
             );
             let activity = *next_activity;
@@ -877,12 +892,14 @@ fn apply(
                     workspace_id.clone(),
                 ),
             );
+            clients.get_mut(&id).expect("connected client").version = version;
             if managed_projection {
                 if let Some(client) = clients.get_mut(&id) {
                     client.projection = Some(ProjectionSubscription::default());
                 }
             }
             if workspace_id.is_none() && !managed_projection {
+                app.close_commander();
                 *foreground = Some(id);
                 apply_foreground_theme(app, clients, *foreground);
             }
@@ -890,6 +907,9 @@ fn apply(
             true
         }
         AppEvent::ClientDetach { id } => {
+            app.release_client_key_presses(id);
+            app.notify_remote_client_detach(id);
+            app.close_client_commander(id);
             crate::logging::event(
                 crate::logging::EventKind::ServerClientDetach,
                 &[
@@ -902,12 +922,51 @@ fn apply(
                 .remove(&id)
                 .is_some_and(|client| client.workspace_id.is_some());
             if was_foreground {
+                app.close_commander();
                 *foreground = latest_client(clients);
                 apply_foreground_theme(app, clients, *foreground);
             }
             was_foreground || was_projection
         }
+        AppEvent::ClientClipboardSucceeded { id, receipt } => {
+            if *foreground != Some(id) {
+                return false;
+            }
+            let Some(client) = clients.get_mut(&id) else {
+                return false;
+            };
+            if !client.surface_active()
+                || client.workspace_id.is_some()
+                || client.projection.is_some()
+                || client.clipboard_receipt != Some(receipt)
+            {
+                return false;
+            }
+            client.clipboard_receipt = None;
+            app.show_toast(app.catalog.copied);
+            true
+        }
         AppEvent::ClientInput { id, input } => {
+            if let ClientInput::InputSourceClosed { origin } = input {
+                let Some(client) = clients.get_mut(&id) else {
+                    return false;
+                };
+                if client.version < 16
+                    || (client.workspace_id.is_none() && client.projection.is_none())
+                {
+                    return false;
+                }
+                if app
+                    .commander
+                    .as_ref()
+                    .is_some_and(|draft| draft.input_source == (Some(id), Some(origin)))
+                {
+                    app.close_commander();
+                    client.force_full = true;
+                    return true;
+                }
+                return false;
+            }
             if let ClientInput::ClipboardHelperOrigin(origin) = input {
                 if let Some(client) = clients.get_mut(&id) {
                     client.clipboard_helper_origin = Some(origin);
@@ -997,6 +1056,8 @@ fn apply(
                     });
                     return false;
                 }
+                app.release_client_key_presses(id);
+                app.close_client_commander(id);
                 client.workspace_id = candidate.workspace_id;
                 client.size = candidate.size;
                 client.projection = candidate.projection;
@@ -1023,6 +1084,10 @@ fn apply(
                 };
                 if epoch <= projection.epoch {
                     return false;
+                }
+                if !active {
+                    app.release_client_key_presses(id);
+                    app.close_client_commander(id);
                 }
                 projection.epoch = epoch;
                 projection.active = active;
@@ -1120,7 +1185,9 @@ fn apply(
                         let area = Rect::new(0, 0, client.size.0, client.size.1);
                         client.render_buf = Buffer::empty(area);
                         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
-                        ui::render_workspace_owner_projection(&mut target, app, workspace_id);
+                        app.with_input_source(Some(id), client.render_origin, |app| {
+                            ui::render_workspace_owner_projection(&mut target, app, workspace_id);
+                        });
                         *interactive_size = (0, 0);
                     }
                 }
@@ -1130,8 +1197,13 @@ fn apply(
             let Some(client) = clients.get_mut(&id) else {
                 return false;
             };
-            client.last_activity = *next_activity;
-            *next_activity = next_activity.saturating_add(1);
+            let key_phase_promotes = !matches!(&input, ClientInput::Key(key) | ClientInput::PrefixKey(key) if key.kind != ratatui::crossterm::event::KeyEventKind::Press);
+            if key_phase_promotes {
+                app.close_commander_from_other_source(id, client.clipboard_helper_origin.flatten());
+                client.render_origin = client.clipboard_helper_origin.flatten();
+                client.last_activity = *next_activity;
+                *next_activity = next_activity.saturating_add(1);
+            }
             bind_session_navigation_origin(app, id, client.clipboard_helper_origin);
 
             if let Some(workspace_id) = client.workspace_id.clone() {
@@ -1145,10 +1217,14 @@ fn apply(
                 // Actual scoped input has just promoted this display to the
                 // workspace geometry owner. A pane created by that input must
                 // inherit its pixels before the next frame, not the old viewer's.
-                app.workspaces[workspace_index].cell_pixels = client.layout_cell_pixels();
-                app.workspaces[workspace_index].graphics_enabled = client.graphics.is_some();
+                if key_phase_promotes {
+                    app.workspaces[workspace_index].cell_pixels = client.layout_cell_pixels();
+                    app.workspaces[workspace_index].graphics_enabled = client.graphics.is_some();
+                }
                 let previous_cell_pixels = app.display_cell_pixels;
-                app.display_cell_pixels = client.layout_cell_pixels();
+                if key_phase_promotes {
+                    app.display_cell_pixels = client.layout_cell_pixels();
+                }
                 // Rebuild exactly this projection's hit geometry and PTY sizes
                 // before applying its input. The ordinary foreground viewport
                 // is forced to rebuild its own geometry on its next input.
@@ -1156,15 +1232,24 @@ fn apply(
                 if client.render_buf.area != area {
                     client.render_buf = Buffer::empty(area);
                 }
-                client.render_buf.reset();
-                let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
-                ui::render_workspace_interactive(&mut target, app, workspace_index);
+                if key_phase_promotes {
+                    client.render_buf.reset();
+                    let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
+                    app.with_input_source(
+                        Some(id),
+                        client.clipboard_helper_origin.flatten(),
+                        |app| {
+                            ui::render_workspace_interactive(&mut target, app, workspace_index);
+                        },
+                    );
+                }
                 let previous = app
                     .workspaces
                     .get(app.active_ws)
                     .map(|workspace| workspace.id.clone());
                 app.active_ws = workspace_index;
-                app.forward_clipboard_helper_origin(Some(id));
+                let relay_origin = client.clipboard_helper_origin;
+                app.forward_clipboard_helper_origin(relay_origin.unwrap_or(Some(id)));
                 let event = match input {
                     ClientInput::Key(key) => AppEvent::Key(key),
                     ClientInput::PrefixKey(key) => AppEvent::PrefixKey(key),
@@ -1172,7 +1257,8 @@ fn apply(
                     ClientInput::Paste(text) => AppEvent::Paste(text),
                     ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                     ClientInput::Command(command) => AppEvent::ClientCommand(command),
-                    ClientInput::ClipboardHelperOrigin(_)
+                    ClientInput::InputSourceClosed { .. }
+                    | ClientInput::ClipboardHelperOrigin(_)
                     | ClientInput::CellPixels { .. }
                     | ClientInput::Graphics { .. }
                     | ClientInput::Resize(..)
@@ -1187,7 +1273,21 @@ fn apply(
                 // another client's earlier request cannot be consumed here.
                 let previous_switch = app.pending_session_switch.take();
                 let previous_detach = std::mem::take(&mut app.detach_requested);
-                let changed = app.with_preserved_workspace_sidebar(|app| app.handle_event(event));
+                let changed = app.with_preserved_workspace_sidebar(|app| {
+                    app.handle_client_event_with_surface(
+                        id,
+                        relay_origin.flatten(),
+                        client.version >= 16,
+                        event,
+                    )
+                });
+                if let Some(text) = app
+                    .commander
+                    .as_mut()
+                    .and_then(|commander| commander.pending_clipboard.take())
+                {
+                    send_private_clipboard(client, text);
+                }
                 // Legacy viewers have no presentation acknowledgement. Actual
                 // scoped input is still evidence of viewing; a passive render is not.
                 let changed = if client.projection.is_none() && !app.workspaces.is_empty() {
@@ -1210,7 +1310,7 @@ fn apply(
                 // from the input, not on the next keystroke or frame. The
                 // action may also have removed/reordered workspaces: resolve
                 // the stable owner id again before touching any geometry.
-                if changed {
+                if changed && key_phase_promotes {
                     if let Some(workspace_index) = app
                         .workspaces
                         .iter()
@@ -1218,7 +1318,13 @@ fn apply(
                     {
                         client.render_buf.reset();
                         let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
-                        ui::render_workspace_interactive(&mut target, app, workspace_index);
+                        app.with_input_source(
+                            Some(id),
+                            client.clipboard_helper_origin.flatten(),
+                            |app| {
+                                ui::render_workspace_interactive(&mut target, app, workspace_index);
+                            },
+                        );
                     }
                 }
                 if let Some(previous) = previous {
@@ -1253,21 +1359,31 @@ fn apply(
             // geometry and PTY dimensions synchronously.
             // A capability update can precede this input without an intervening
             // render even when the foreground and character size are unchanged.
-            app.display_cell_pixels = client.layout_cell_pixels();
-            if let Some(workspace) = app.workspaces.get_mut(app.active_ws) {
+            if key_phase_promotes {
+                app.display_cell_pixels = client.layout_cell_pixels();
+            }
+            if let Some(workspace) = app
+                .workspaces
+                .get_mut(app.active_ws)
+                .filter(|_| key_phase_promotes)
+            {
                 workspace.cell_pixels = client.layout_cell_pixels();
                 workspace.graphics_enabled = client.graphics.is_some();
             }
-            let promoted = *foreground != Some(id);
+            let promoted = key_phase_promotes && *foreground != Some(id);
             if promoted {
+                app.close_commander();
                 *foreground = Some(id);
                 apply_foreground_theme(app, clients, *foreground);
             }
             let target_size = clients.get(&id).map(|client| client.size);
-            if promoted || target_size.is_some_and(|size| size != *interactive_size) {
+            if key_phase_promotes
+                && (promoted || target_size.is_some_and(|size| size != *interactive_size))
+            {
                 let no_damage = HashMap::new();
                 let disconnected = clients.get_mut(&id).is_some_and(|client| {
-                    render_client(app, client, true, true, false, false, &no_damage).disconnected
+                    render_client(app, client, true, true, false, false, &no_damage, Some(id))
+                        .disconnected
                 });
                 if disconnected {
                     clients.remove(&id);
@@ -1287,7 +1403,8 @@ fn apply(
                 ClientInput::Paste(text) => AppEvent::Paste(text),
                 ClientInput::ClipboardImage(image) => AppEvent::ClipboardImage(image),
                 ClientInput::Command(command) => AppEvent::ClientCommand(command),
-                ClientInput::CellPixels { .. }
+                ClientInput::InputSourceClosed { .. }
+                | ClientInput::CellPixels { .. }
                 | ClientInput::Graphics { .. }
                 | ClientInput::ClipboardHelperOrigin(_)
                 | ClientInput::Resize(..)
@@ -1300,8 +1417,25 @@ fn apply(
             let relay_origin = clients
                 .get(&id)
                 .and_then(|client| client.clipboard_helper_origin);
-            app.forward_clipboard_helper_origin(Some(id));
-            let changed = app.handle_event(event);
+            app.forward_clipboard_helper_origin(relay_origin.unwrap_or(Some(id)));
+            let private_surfaces = clients
+                .get(&id)
+                .is_none_or(|client| client.projection.is_none() || client.version >= 16);
+            let changed = app.handle_client_event_with_surface(
+                id,
+                relay_origin.flatten(),
+                private_surfaces,
+                event,
+            );
+            if let Some(text) = app
+                .commander
+                .as_mut()
+                .and_then(|commander| commander.pending_clipboard.take())
+            {
+                if let Some(client) = clients.get(&id) {
+                    send_private_clipboard(client, text);
+                }
+            }
             bind_session_navigation_origin(app, id, relay_origin);
             changed
         }
@@ -1373,6 +1507,7 @@ fn finish_client_navigation(
     id: u64,
     message: ServerMessage,
 ) {
+    app.release_client_key_presses(id);
     if let Some(client) = clients.remove(&id) {
         let _ = client.send_control(message);
     }
@@ -1381,6 +1516,66 @@ fn finish_client_navigation(
         apply_foreground_theme(app, clients, *foreground);
     }
     app.has_attached_client = !clients.is_empty();
+}
+
+fn send_private_clipboard(client: &ClientState, text: String) {
+    if !client.surface_active() {
+        return;
+    }
+    let managed = client.workspace_id.is_some()
+        || client.projection.is_some()
+        || client.clipboard_helper_origin.is_some();
+    let message = if managed {
+        // A legacy pooled viewer cannot identify one outer display. Never turn
+        // private composer text into its ordinary broadcast clipboard effect.
+        if client.version < 16 {
+            return;
+        }
+        ServerMessage::ScopedClipboard {
+            origin: client.clipboard_helper_origin.flatten(),
+            text,
+        }
+    } else {
+        ServerMessage::Clipboard(text)
+    };
+    let _ = client.send_control(message);
+}
+
+fn dispatch_private_clipboard(app: &mut App, clients: &Clients) {
+    if let Some((Some(origin), text)) = app.pending_client_clipboard.take() {
+        if let Some(client) = clients.get(&origin) {
+            send_private_clipboard(client, text);
+        }
+    }
+}
+
+fn dispatch_clipboard(
+    clients: &mut Clients,
+    foreground: Option<u64>,
+    next_receipt: &mut u64,
+    text: String,
+) {
+    clients.retain(|id, client| {
+        if !client.surface_active() {
+            return true;
+        }
+        let message = if foreground == Some(*id)
+            && client.version >= 16
+            && client.workspace_id.is_none()
+            && client.projection.is_none()
+        {
+            let receipt = *next_receipt;
+            *next_receipt = next_receipt.saturating_add(1);
+            client.clipboard_receipt = Some(receipt);
+            ServerMessage::ClipboardTracked {
+                text: text.clone(),
+                receipt,
+            }
+        } else {
+            ServerMessage::Clipboard(text.clone())
+        };
+        client.send_control(message).is_ok()
+    });
 }
 
 fn broadcast(clients: &mut Clients, msg: ServerMessage) {
@@ -1582,7 +1777,16 @@ fn render_clients(
             .as_mut()
             .filter(|candidate| !candidate.preparation_sent)
         {
-            let outcome = render_client(app, candidate, false, false, true, false, &scratch.damage);
+            let outcome = render_client(
+                app,
+                candidate,
+                false,
+                false,
+                true,
+                false,
+                &scratch.damage,
+                None,
+            );
             candidate.preparation_sent = outcome.enqueued;
             presented |= outcome.enqueued;
         }
@@ -1598,6 +1802,7 @@ fn render_clients(
                 force_all,
                 partial_pass,
                 &scratch.damage,
+                Some(id),
             );
             presented |= outcome.enqueued;
             if outcome.disconnected {
@@ -1736,6 +1941,7 @@ fn acknowledge_visible_terminal_generations(
 
 /// Render and enqueue one client's next frame. Returns true when its writer is
 /// disconnected and the caller should remove it.
+#[allow(clippy::too_many_arguments)] // The source fences client-owned draft rendering.
 fn render_client(
     app: &mut App,
     client: &mut ClientState,
@@ -1744,268 +1950,325 @@ fn render_client(
     force_all: bool,
     partial_pass: bool,
     damage: &HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
+    client_id: Option<u64>,
 ) -> RenderClientOutcome {
-    if !client.surface_active() {
-        return RenderClientOutcome::default();
-    }
-    CLIENT_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
-    let area = Rect::new(0, 0, client.size.0, client.size.1);
-    if client.render_buf.area != area {
-        client.render_buf = Buffer::empty(area);
-        client.last_frame = None;
-        client.force_full = true;
-        client.retained_ready = false;
-        client.retained_hyperlinks.clear();
-    }
-
-    let may_patch = partial_pass
-        && client.last_graphics.is_empty()
-        && client.retained_ready
-        && !client.force_full
-        && !client.behind
-        && client.last_frame.is_some();
-    let patched = if may_patch {
-        let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
-        ui::patch_terminal_damage(
-            &mut target,
-            app,
-            &client.retained_pane_content,
-            damage,
-            &mut client.retained_hyperlinks,
-        )
-        .map(|()| (target.cursor(), target.cursor_visible()))
-        .ok()
-    } else {
-        None
-    };
-
-    let mut graphics = Vec::new();
-    if owns_size {
-        if client.workspace_id.is_none() {
-            app.display_cell_pixels = client.layout_cell_pixels();
+    let origin = client.render_origin;
+    app.with_input_source(client_id, origin, |app| {
+        if !client.surface_active() {
+            return RenderClientOutcome::default();
         }
-        {
-            let workspace_index = match client.workspace_id.as_deref() {
-                Some(id) => app.workspaces.iter().position(|ws| ws.id == id),
-                None => Some(app.active_ws),
-            };
-            if let Some(workspace) = workspace_index.and_then(|index| app.workspaces.get_mut(index))
+        CLIENT_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
+        let area = Rect::new(0, 0, client.size.0, client.size.1);
+        if client.render_buf.area != area {
+            client.render_buf = Buffer::empty(area);
+            client.last_frame = None;
+            client.force_full = true;
+            client.retained_ready = false;
+            client.retained_hyperlinks.clear();
+        }
+
+        let may_patch = partial_pass
+            && client.last_graphics.is_empty()
+            && client.retained_ready
+            && !client.force_full
+            && !client.behind
+            && client.last_frame.is_some();
+        let patched = if may_patch {
+            let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
+            ui::patch_terminal_damage(
+                &mut target,
+                app,
+                &client.retained_pane_content,
+                damage,
+                &mut client.retained_hyperlinks,
+            )
+            .map(|()| (target.cursor(), target.cursor_visible()))
+            .ok()
+        } else {
+            None
+        };
+
+        let mut graphics = Vec::new();
+        if owns_size {
+            if client.workspace_id.is_none() {
+                app.display_cell_pixels = client.layout_cell_pixels();
+            }
             {
-                workspace.cell_pixels = client.layout_cell_pixels();
-                workspace.graphics_enabled = client.graphics.is_some();
-                if let Some(tab) = workspace.tabs.get(workspace.active_tab) {
-                    for (id, pane) in &app.panes {
-                        if tab.layout.contains(*id) {
-                            pane.set_cell_pixels(client.layout_cell_pixels());
+                let workspace_index = match client.workspace_id.as_deref() {
+                    Some(id) => app.workspaces.iter().position(|ws| ws.id == id),
+                    None => Some(app.active_ws),
+                };
+                if let Some(workspace) =
+                    workspace_index.and_then(|index| app.workspaces.get_mut(index))
+                {
+                    workspace.cell_pixels = client.layout_cell_pixels();
+                    workspace.graphics_enabled = client.graphics.is_some();
+                    if let Some(tab) = workspace.tabs.get(workspace.active_tab) {
+                        for (id, pane) in &app.panes {
+                            if tab.layout.contains(*id) {
+                                pane.set_cell_pixels(client.layout_cell_pixels());
+                            }
                         }
                     }
                 }
             }
         }
-    }
-    let (cursor, cursor_visible) = if let Some(cursor) = patched {
-        PARTIAL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
-        cursor
-    } else {
-        if partial_pass {
-            RETAINED_RENDER_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-        }
-        FULL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
-        client.render_buf.reset();
-        let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
-        target.graphics_enabled = client.graphics.is_some();
-        if let Some(workspace_id) = client.workspace_id.as_deref() {
-            let projection = if owns_size {
-                ui::render_workspace_owner_projection(&mut target, app, workspace_id)
-            } else {
-                ui::render_workspace_projection(&mut target, app, workspace_id)
-            };
-            client.retained_hyperlinks = projection.hyperlinks;
-            client.retained_ready = false;
-        } else if interactive {
-            if owns_size {
-                ui::render_into(&mut target, app);
-                app.resize_active_remote_projection();
-            } else {
-                ui::render_into_without_pane_resize(&mut target, app);
-            }
-            client
-                .retained_pane_content
-                .clone_from(&app.pane_content_rects);
-            client
-                .retained_hyperlinks
-                .clone_from(&app.rendered_hyperlinks);
-            client.retained_ready = owns_size;
+        let (cursor, cursor_visible) = if let Some(cursor) = patched {
+            PARTIAL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
+            cursor
         } else {
-            let projection = ui::render_projection(&mut target, app);
-            client.retained_pane_content = projection.pane_content;
-            client.retained_hyperlinks = projection.hyperlinks;
-            client.retained_ready = true;
-        }
-        let cursor = (target.cursor(), target.cursor_visible());
-        graphics = std::mem::take(&mut target.graphics);
-        cursor
-    };
-
-    let projected_pane = client.projection.as_ref().and_then(|_| {
-        client
-            .workspace_id
-            .as_ref()
-            .and_then(|id| app.workspaces.iter().find(|workspace| &workspace.id == id))
-            .or_else(|| {
-                if client.workspace_id.is_none() {
-                    app.workspaces.get(app.active_ws)
+            if partial_pass {
+                RETAINED_RENDER_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            }
+            FULL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
+            client.render_buf.reset();
+            let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
+            target.graphics_enabled = client.graphics.is_some();
+            if let Some(workspace_id) = client.workspace_id.as_deref() {
+                let projection = if owns_size {
+                    ui::render_workspace_owner_projection(&mut target, app, workspace_id)
                 } else {
-                    None
+                    ui::render_workspace_projection(&mut target, app, workspace_id)
+                };
+                client.retained_hyperlinks = projection.hyperlinks;
+                client.retained_ready = false;
+            } else if interactive {
+                if owns_size {
+                    ui::render_into(&mut target, app);
+                    app.resize_active_remote_projection();
+                } else {
+                    ui::render_into_without_pane_resize(&mut target, app);
                 }
-            })
-            .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
-            .map(|tab| tab.layout.focus)
-    });
-    let observation = projected_pane.and_then(|pane| app.agent_observation(pane));
-    let state_changed = client.projection.as_ref().is_some_and(|projection| {
-        projection.last_focus != projected_pane || projection.last_observation != observation
-    });
-    // Image content and text cells have independent damage. Stable graphic
-    // slots let a new image replace its pixels without repainting its cells.
-    let mut full = state_changed
-        || force_all
-        || client.force_full
-        || client.behind
-        || client.last_frame.as_ref().is_none_or(|previous| {
-            previous.width != client.render_buf.area.width
-                || previous.height != client.render_buf.area.height
-        });
-    let message = if full {
-        let mut frame = protocol::frame_from_buffer(&client.render_buf, cursor, cursor_visible);
-        frame.hyperlinks = protocol::frame_hyperlinks(&frame, &client.retained_hyperlinks);
-        client.last_frame = Some(frame);
-        Some(ServerMessage::Frame(
-            client.last_frame.as_ref().expect("frame stored").clone(),
-        ))
-    } else {
-        let previous = client.last_frame.as_mut().expect("frame baseline exists");
-        let cursor_moved = previous.cursor != cursor || previous.cursor_visible != cursor_visible;
-        let runs = protocol::diff_buffer(previous, &client.render_buf);
-        let current_hyperlinks = protocol::frame_hyperlinks(previous, &client.retained_hyperlinks);
-        let hyperlinks_changed = previous.hyperlinks != current_hyperlinks;
-        let linked_cells_changed = protocol::diff_intersects_hyperlinks(&runs, &current_hyperlinks);
-        previous.hyperlinks = current_hyperlinks;
-        previous.cursor = cursor;
-        previous.cursor_visible = cursor_visible;
-        if hyperlinks_changed || linked_cells_changed {
-            full = true;
-            Some(ServerMessage::Frame(previous.clone()))
-        } else if runs.is_empty() && !cursor_moved && graphics == client.last_graphics {
-            None
-        } else {
-            Some(ServerMessage::FrameDiff(protocol::FrameDiff {
-                width: previous.width,
-                height: previous.height,
-                runs,
-                cursor,
-                cursor_visible,
-            }))
-        }
-    };
+                client
+                    .retained_pane_content
+                    .clone_from(&app.pane_content_rects);
+                client
+                    .retained_hyperlinks
+                    .clone_from(&app.rendered_hyperlinks);
+                client.retained_ready = owns_size;
+            } else {
+                let projection = ui::render_projection(&mut target, app);
+                client.retained_pane_content = projection.pane_content;
+                client.retained_hyperlinks = projection.hyperlinks;
+                client.retained_ready = true;
+            }
+            let cursor = (target.cursor(), target.cursor_visible());
+            graphics = std::mem::take(&mut target.graphics);
+            cursor
+        };
 
-    let Some(mut message) = message else {
-        // The same cells already have a successfully submitted baseline. A
-        // status-only owner token must not need a visual change to be seen.
-        if interactive && owns_size && client.workspace_id.is_none() {
-            app.acknowledge_presented_remote_projection();
-        }
-        UNCHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
-        return RenderClientOutcome::default();
-    };
-    if let Some(projection) = client.projection.as_mut() {
-        let pane = projected_pane;
-        projection.last_focus = pane;
-        projection.last_observation = observation;
-        let sequence = api::current_sequence(&app.events);
-        let state = protocol::ProjectionState {
-            server_generation: app.backend_server_generation.clone(),
-            epoch: projection.epoch,
-            event_sequence: sequence,
-            workspace_id: client.workspace_id.clone().unwrap_or_default(),
-            focused_pane: pane.map(|pane| pane.0.to_string()),
-        };
-        projection.seen_frame =
-            pane.and_then(|pane| app.agent_observation(pane).map(|at| (sequence, pane, at)));
-        message = match message {
-            ServerMessage::Frame(frame) => ServerMessage::ProjectionFrame { state, frame },
-            ServerMessage::FrameDiff(frame) => ServerMessage::ProjectionDiff { state, frame },
-            _ => unreachable!("rendered frame"),
-        };
-    }
-    CHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
-    if client.graphics.is_some() && (!graphics.is_empty() || !client.last_graphics.is_empty()) {
-        let (state, text) = match message {
-            ServerMessage::Frame(frame) => (None, protocol::GraphicText::Full(frame)),
-            ServerMessage::FrameDiff(frame) => (None, protocol::GraphicText::Diff(frame)),
-            ServerMessage::ProjectionFrame { state, frame } => {
-                (Some(state), protocol::GraphicText::Full(frame))
-            }
-            ServerMessage::ProjectionDiff { state, frame } => {
-                (Some(state), protocol::GraphicText::Diff(frame))
-            }
-            _ => unreachable!("rendered frame"),
-        };
-        let updates = crate::terminal::graphics::updates(
-            &graphics,
-            if full { &[] } else { &client.last_graphics },
-        );
-        message = ServerMessage::GraphicFrame {
-            state,
-            text,
-            graphics: updates,
-        };
-    }
-    if client.candidate {
-        let state = protocol::ProjectionState {
-            server_generation: app.backend_server_generation.clone(),
-            epoch: client.projection.as_ref().unwrap().epoch,
-            event_sequence: api::current_sequence(&app.events),
-            workspace_id: client.workspace_id.clone().unwrap_or_default(),
-            focused_pane: projected_pane.map(|pane| pane.0.to_string()),
-        };
-        message = ServerMessage::PreparedWorkspace {
-            state,
-            frame: client
-                .last_frame
+        let projected_pane = client.projection.as_ref().and_then(|_| {
+            client
+                .workspace_id
                 .as_ref()
-                .expect("candidate is always full")
-                .clone(),
-            graphics: crate::terminal::graphics::updates(&graphics, &[]),
+                .and_then(|id| app.workspaces.iter().find(|workspace| &workspace.id == id))
+                .or_else(|| {
+                    if client.workspace_id.is_none() {
+                        app.workspaces.get(app.active_ws)
+                    } else {
+                        None
+                    }
+                })
+                .and_then(|workspace| workspace.tabs.get(workspace.active_tab))
+                .map(|tab| tab.layout.focus)
+        });
+        let observation = projected_pane.and_then(|pane| app.agent_observation(pane));
+        let state_changed = client.projection.as_ref().is_some_and(|projection| {
+            projection.last_focus != projected_pane || projection.last_observation != observation
+        });
+        let scoped_private = client.version >= 16
+            && !client.candidate
+            && owns_size
+            && (client.workspace_id.is_some() || client.projection.is_some())
+            && app.commander_visible_in_view();
+        // Image content and text cells have independent damage. Stable graphic
+        // slots let a new image replace its pixels without repainting its cells.
+        let mut full = state_changed
+            || scoped_private
+            || client.private_frame_active != scoped_private
+            || force_all
+            || client.force_full
+            || client.behind
+            || client.last_frame.as_ref().is_none_or(|previous| {
+                previous.width != client.render_buf.area.width
+                    || previous.height != client.render_buf.area.height
+            });
+        let message = if full {
+            let mut frame = protocol::frame_from_buffer(&client.render_buf, cursor, cursor_visible);
+            frame.hyperlinks = protocol::frame_hyperlinks(&frame, &client.retained_hyperlinks);
+            client.last_frame = Some(frame);
+            Some(ServerMessage::Frame(
+                client.last_frame.as_ref().expect("frame stored").clone(),
+            ))
+        } else {
+            let previous = client.last_frame.as_mut().expect("frame baseline exists");
+            let cursor_moved =
+                previous.cursor != cursor || previous.cursor_visible != cursor_visible;
+            let runs = protocol::diff_buffer(previous, &client.render_buf);
+            let current_hyperlinks =
+                protocol::frame_hyperlinks(previous, &client.retained_hyperlinks);
+            let hyperlinks_changed = previous.hyperlinks != current_hyperlinks;
+            let linked_cells_changed =
+                protocol::diff_intersects_hyperlinks(&runs, &current_hyperlinks);
+            previous.hyperlinks = current_hyperlinks;
+            previous.cursor = cursor;
+            previous.cursor_visible = cursor_visible;
+            if hyperlinks_changed || linked_cells_changed {
+                full = true;
+                Some(ServerMessage::Frame(previous.clone()))
+            } else if runs.is_empty() && !cursor_moved && graphics == client.last_graphics {
+                None
+            } else {
+                Some(ServerMessage::FrameDiff(protocol::FrameDiff {
+                    width: previous.width,
+                    height: previous.height,
+                    runs,
+                    cursor,
+                    cursor_visible,
+                }))
+            }
         };
-    }
-    match client.sender.try_send_frame(message) {
-        Ok(()) => {
-            client.last_graphics = graphics;
-            // Rendering before an enqueue that fails under backpressure is not
-            // viewing. Only the interactive display's submitted frame may ack.
+
+        let Some(mut message) = message else {
+            // The same cells already have a successfully submitted baseline. A
+            // status-only owner token must not need a visual change to be seen.
             if interactive && owns_size && client.workspace_id.is_none() {
                 app.acknowledge_presented_remote_projection();
             }
-            FRAMES_ENQUEUED.fetch_add(1, Ordering::Relaxed);
-            client.behind = false;
-            client.force_full = false;
-            RenderClientOutcome {
-                enqueued: true,
-                disconnected: false,
+            UNCHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
+            return RenderClientOutcome::default();
+        };
+        if let Some(projection) = client.projection.as_mut() {
+            let pane = projected_pane;
+            projection.last_focus = pane;
+            projection.last_observation = observation;
+            let sequence = api::current_sequence(&app.events);
+            let state = protocol::ProjectionState {
+                server_generation: app.backend_server_generation.clone(),
+                epoch: projection.epoch,
+                event_sequence: sequence,
+                workspace_id: client.workspace_id.clone().unwrap_or_default(),
+                focused_pane: pane.map(|pane| pane.0.to_string()),
+            };
+            projection.seen_frame =
+                pane.and_then(|pane| app.agent_observation(pane).map(|at| (sequence, pane, at)));
+            message = match message {
+                ServerMessage::Frame(frame) => ServerMessage::ProjectionFrame { state, frame },
+                ServerMessage::FrameDiff(frame) => ServerMessage::ProjectionDiff { state, frame },
+                _ => unreachable!("rendered frame"),
+            };
+        }
+        CHANGED_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
+        if client.graphics.is_some() && (!graphics.is_empty() || !client.last_graphics.is_empty()) {
+            let (state, text) = match message {
+                ServerMessage::Frame(frame) => (None, protocol::GraphicText::Full(frame)),
+                ServerMessage::FrameDiff(frame) => (None, protocol::GraphicText::Diff(frame)),
+                ServerMessage::ProjectionFrame { state, frame } => {
+                    (Some(state), protocol::GraphicText::Full(frame))
+                }
+                ServerMessage::ProjectionDiff { state, frame } => {
+                    (Some(state), protocol::GraphicText::Diff(frame))
+                }
+                _ => unreachable!("rendered frame"),
+            };
+            let updates = crate::terminal::graphics::updates(
+                &graphics,
+                if full { &[] } else { &client.last_graphics },
+            );
+            message = ServerMessage::GraphicFrame {
+                state,
+                text,
+                graphics: updates,
+            };
+        }
+        if client.candidate {
+            let state = protocol::ProjectionState {
+                server_generation: app.backend_server_generation.clone(),
+                epoch: client.projection.as_ref().unwrap().epoch,
+                event_sequence: api::current_sequence(&app.events),
+                workspace_id: client.workspace_id.clone().unwrap_or_default(),
+                focused_pane: projected_pane.map(|pane| pane.0.to_string()),
+            };
+            message = ServerMessage::PreparedWorkspace {
+                state,
+                frame: client
+                    .last_frame
+                    .as_ref()
+                    .expect("candidate is always full")
+                    .clone(),
+                graphics: crate::terminal::graphics::updates(&graphics, &[]),
+            };
+        }
+        if scoped_private {
+            let state = match &message {
+                ServerMessage::ProjectionFrame { state, .. }
+                | ServerMessage::ProjectionDiff { state, .. } => Some(state.clone()),
+                ServerMessage::GraphicFrame { state, .. } => state.clone(),
+                _ => None,
+            };
+            let mut private_frame = client
+                .last_frame
+                .as_ref()
+                .expect("private full frame")
+                .clone();
+            let private_hyperlinks = std::mem::take(&mut private_frame.hyperlinks);
+            // Reuse the passive renderer to make an up-to-date public layer.
+            // It restores hit geometry and never resizes the owner's PTYs.
+            let mut public_buffer = Buffer::empty(area);
+            let mut target = ui::RenderTarget::new(&mut public_buffer, area);
+            target.graphics_enabled = client.graphics.is_some();
+            let projection = if let Some(workspace_id) = client.workspace_id.as_deref() {
+                ui::render_workspace_projection(&mut target, app, workspace_id)
+            } else {
+                ui::render_projection(&mut target, app)
+            };
+            let public_cursor = (target.cursor(), target.cursor_visible());
+            let public_graphics = std::mem::take(&mut target.graphics);
+            let mut frame =
+                protocol::frame_from_buffer(&public_buffer, public_cursor.0, public_cursor.1);
+            let hyperlinks = protocol::frame_hyperlinks(&frame, &projection.hyperlinks);
+            let (public_updates, private_updates) =
+                protocol::scoped_graphic_updates(&mut frame, &public_graphics, &graphics);
+            message = ServerMessage::ScopedFrame {
+                state,
+                origin,
+                frame: Box::new(frame),
+                hyperlinks,
+                graphics: public_updates,
+                private_frame: Box::new(private_frame),
+                private_hyperlinks,
+                private_graphics: private_updates,
+            };
+        }
+        match client.sender.try_send_frame(message) {
+            Ok(()) => {
+                client.private_frame_active = scoped_private;
+                client.last_graphics = graphics;
+                // Rendering before an enqueue that fails under backpressure is not
+                // viewing. Only the interactive display's submitted frame may ack.
+                if interactive && owns_size && client.workspace_id.is_none() {
+                    app.acknowledge_presented_remote_projection();
+                }
+                FRAMES_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+                client.behind = false;
+                client.force_full = false;
+                RenderClientOutcome {
+                    enqueued: true,
+                    disconnected: false,
+                }
             }
+            Err(FrameSendError::Full) => {
+                FRAMES_BACKPRESSURED.fetch_add(1, Ordering::Relaxed);
+                client.behind = true;
+                client.retained_ready = false;
+                RenderClientOutcome::default()
+            }
+            Err(FrameSendError::Disconnected) => RenderClientOutcome {
+                enqueued: false,
+                disconnected: true,
+            },
         }
-        Err(FrameSendError::Full) => {
-            FRAMES_BACKPRESSURED.fetch_add(1, Ordering::Relaxed);
-            client.behind = true;
-            client.retained_ready = false;
-            RenderClientOutcome::default()
-        }
-        Err(FrameSendError::Disconnected) => RenderClientOutcome {
-            enqueued: false,
-            disconnected: true,
-        },
-    }
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2058,85 +2321,81 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
     let mut reader = BufReader::new(stream.clone());
     let mut writer = stream;
 
-    let (version, cols, rows, workspace_id, managed_projection) = match protocol::read_message::<
-        _,
-        ClientMessage,
-    >(&mut reader)
-    {
-        Ok(ClientMessage::Hello {
-            version,
-            cols,
-            rows,
-        }) => {
-            if !protocol::supports_version(version) {
-                crate::logging::event(
-                    crate::logging::EventKind::ServerClientHandshakeRejected,
-                    &[
-                        crate::logging::Field::Reason(crate::logging::Reason::VersionMismatch),
-                        crate::logging::Field::ProtocolVersion(u64::from(version)),
-                    ],
-                );
-                let _ = protocol::write_version_mismatch(&mut writer, Some(version));
-                return;
-            }
-            (version, cols, rows, None, false)
-        }
-        Ok(ClientMessage::HelloWorkspace {
-            version,
-            cols,
-            rows,
-            workspace_id,
-        }) => {
-            if !protocol::supports_version(version) {
-                let _ = protocol::write_message(
-                    &mut writer,
-                    &ServerMessage::Welcome {
-                        version: protocol::PROTOCOL_VERSION,
-                        error: Some("protocol version mismatch".into()),
-                    },
-                );
-                return;
-            }
-            if workspace_id.len() > 128 || workspace_id.is_empty() {
-                let _ = protocol::write_message(
-                    &mut writer,
-                    &ServerMessage::Welcome {
-                        version: protocol::PROTOCOL_VERSION,
-                        error: Some("invalid workspace projection".into()),
-                    },
-                );
-                return;
-            }
-            (version, cols, rows, Some(workspace_id), false)
-        }
-        Ok(ClientMessage::HelloProjection {
-            version,
-            workspace_id,
-        }) => {
-            if !matches!(
+    let (version, cols, rows, workspace_id, managed_projection) =
+        match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::Hello {
                 version,
-                protocol::PROJECTION_PROTOCOL_VERSION | 11 | 12 | 13 | protocol::PROTOCOL_VERSION
-            ) || workspace_id.len() > 128
-            {
-                let _ = protocol::write_message(
-                    &mut writer,
-                    &ServerMessage::Welcome {
-                        version: protocol::PROTOCOL_VERSION,
-                        error: Some("unsupported remote display".into()),
-                    },
-                );
-                return;
+                cols,
+                rows,
+            }) => {
+                if !protocol::supports_version(version) {
+                    crate::logging::event(
+                        crate::logging::EventKind::ServerClientHandshakeRejected,
+                        &[
+                            crate::logging::Field::Reason(crate::logging::Reason::VersionMismatch),
+                            crate::logging::Field::ProtocolVersion(u64::from(version)),
+                        ],
+                    );
+                    let _ = protocol::write_version_mismatch(&mut writer, Some(version));
+                    return;
+                }
+                (version, cols, rows, None, false)
             }
-            (
+            Ok(ClientMessage::HelloWorkspace {
                 version,
-                80,
-                24,
-                (!workspace_id.is_empty()).then_some(workspace_id),
-                true,
-            )
-        }
-        _ => return,
-    };
+                cols,
+                rows,
+                workspace_id,
+            }) => {
+                if !protocol::supports_version(version) {
+                    let _ = protocol::write_message(
+                        &mut writer,
+                        &ServerMessage::Welcome {
+                            version: crate::ipc::protocol::PROTOCOL_VERSION,
+                            error: Some("protocol version mismatch".into()),
+                        },
+                    );
+                    return;
+                }
+                if workspace_id.len() > 128 || workspace_id.is_empty() {
+                    let _ = protocol::write_message(
+                        &mut writer,
+                        &ServerMessage::Welcome {
+                            version: crate::ipc::protocol::PROTOCOL_VERSION,
+                            error: Some("invalid workspace projection".into()),
+                        },
+                    );
+                    return;
+                }
+                (version, cols, rows, Some(workspace_id), false)
+            }
+            Ok(ClientMessage::HelloProjection {
+                version,
+                workspace_id,
+            }) => {
+                if !protocol::supports_version(version)
+                    || version < protocol::PROJECTION_PROTOCOL_VERSION
+                    || workspace_id.len() > 128
+                {
+                    let _ = protocol::write_message(
+                        &mut writer,
+                        &ServerMessage::Welcome {
+                            version: crate::ipc::protocol::PROTOCOL_VERSION,
+                            error: Some("unsupported remote display".into()),
+                        },
+                    );
+                    return;
+                }
+                (
+                    version,
+                    80,
+                    24,
+                    (!workspace_id.is_empty()).then_some(workspace_id),
+                    true,
+                )
+            }
+            _ => return,
+        };
 
     if protocol::write_message(
         &mut writer,
@@ -2171,7 +2430,9 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
         for msg in message_rx {
             let msg = protocol::encode_hyperlinks(msg, version);
             let frame_stats = match &msg {
-                ServerMessage::LinkedFrame { .. } | ServerMessage::Frame(_) => Some((true, 0usize)),
+                ServerMessage::ScopedFrame { .. }
+                | ServerMessage::LinkedFrame { .. }
+                | ServerMessage::Frame(_) => Some((true, 0usize)),
                 ServerMessage::FrameDiff(frame) => Some((false, frame.runs.len())),
                 ServerMessage::ProjectionFrame { .. } | ServerMessage::PreparedWorkspace { .. } => {
                     Some((true, 0))
@@ -2211,9 +2472,11 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
         }
     });
 
+    let tracks_clipboard = version >= 16 && !managed_projection && workspace_id.is_none();
     if app_tx
         .send(AppEvent::ClientConnected {
             id,
+            version,
             messages: message_tx,
             frame_pending,
             cols,
@@ -2229,6 +2492,14 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
 
     loop {
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::InputSourceClosed { origin })
+                if version >= 16 && managed_projection =>
+            {
+                let _ = app_tx.send(AppEvent::ClientInput {
+                    id,
+                    input: ClientInput::InputSourceClosed { origin },
+                });
+            }
             Ok(ClientMessage::ClipboardHelperOrigin(origin))
                 if version >= 14 && managed_projection =>
             {
@@ -2447,6 +2718,14 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                     break;
                 }
             }
+            Ok(ClientMessage::ClipboardSucceeded { receipt }) if tracks_clipboard => {
+                if app_tx
+                    .send(AppEvent::ClientClipboardSucceeded { id, receipt })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             Ok(ClientMessage::Resize { cols, rows }) => {
                 if app_tx
                     .send(AppEvent::ClientInput {
@@ -2463,7 +2742,8 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 break;
             }
             Ok(
-                ClientMessage::ClipboardHelperOrigin(_)
+                ClientMessage::InputSourceClosed { .. }
+                | ClientMessage::ClipboardHelperOrigin(_)
                 | ClientMessage::Hello { .. }
                 | ClientMessage::HelloWorkspace { .. }
                 | ClientMessage::HelloProjection { .. }
@@ -2473,6 +2753,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 | ClientMessage::CommitWorkspace { .. }
                 | ClientMessage::CancelWorkspace { .. }
                 | ClientMessage::CellPixels { .. }
+                | ClientMessage::ClipboardSucceeded { .. }
                 | ClientMessage::TerminalColors(_),
             ) => {}
         }
@@ -2735,6 +3016,7 @@ mod tests {
             false,
             false,
             &HashMap::new(),
+            None,
         );
         assert!(client.behind);
         assert!(
@@ -2752,7 +3034,8 @@ mod tests {
                 true,
                 false,
                 false,
-                &HashMap::new()
+                &HashMap::new(),
+                None
             )
             .enqueued
         );
@@ -2774,7 +3057,8 @@ mod tests {
                 true,
                 false,
                 false,
-                &HashMap::new()
+                &HashMap::new(),
+                None
             )
             .enqueued
         );
@@ -2798,7 +3082,8 @@ mod tests {
                 true,
                 true,
                 false,
-                &HashMap::new()
+                &HashMap::new(),
+                None
             )
             .disconnected
         );
@@ -3068,6 +3353,7 @@ mod tests {
                 true,
                 false,
                 &HashMap::new(),
+                None,
             );
             fixture.input(2, ClientInput::Command("new_tab".into()));
             assert_eq!(fixture.app.display_cell_pixels, Some((12, 24)));
@@ -3104,6 +3390,7 @@ mod tests {
                 true,
                 false,
                 &HashMap::new(),
+                None,
             );
             fixture.app.active_ws = fixture.target_index();
             fixture.api("tab.new", serde_json::json!({}));
@@ -3553,6 +3840,407 @@ mod tests {
             _client_receivers: Vec<mpsc::Receiver<ServerMessage>>,
         }
 
+        #[test]
+        fn scoped_commander_draft_is_private_and_other_input_keeps_its_pane() {
+            use crate::terminal::pty::InputAction;
+            use ratatui::crossterm::event::KeyEventKind;
+
+            let _env = crate::persist::test_env("scoped-commander-source");
+            let mut fixture = Fixture::new();
+            let (target_tx, target_rx) = mpsc::channel();
+            let target = fixture.target_pane();
+            fixture
+                .app
+                .panes
+                .get_mut(&target)
+                .unwrap()
+                .replace_input_sender_for_test(target_tx);
+            let (other_tx, other_rx) = mpsc::channel();
+            fixture
+                .app
+                .panes
+                .get_mut(&fixture.foreground_pane)
+                .unwrap()
+                .replace_input_sender_for_test(other_tx);
+            let key = |kind| {
+                ClientInput::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('z'),
+                    KeyModifiers::NONE,
+                    kind,
+                ))
+            };
+            fixture.input(1, key(KeyEventKind::Press));
+            fixture.input(2, ClientInput::Command("open_commander".into()));
+            fixture.input(2, ClientInput::Paste("PRIVATE-DRAFT".into()));
+            fixture.render();
+            let text = |client: &ClientState| {
+                client
+                    .last_frame
+                    .as_ref()
+                    .unwrap()
+                    .cells
+                    .iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>()
+            };
+            assert!(text(&fixture.clients[&2]).contains("PRIVATE-DRAFT"));
+            assert!(!text(&fixture.clients[&1]).contains("PRIVATE-DRAFT"));
+            assert!(
+                fixture.clients[&1]
+                    .last_frame
+                    .as_ref()
+                    .unwrap()
+                    .cursor_visible
+            );
+            fixture.input(1, key(KeyEventKind::Repeat));
+            fixture.input(1, key(KeyEventKind::Release));
+            assert!(fixture
+                .app
+                .commander
+                .as_ref()
+                .unwrap()
+                .draft
+                .contains("PRIVATE-DRAFT"));
+            fixture.input(1, ClientInput::Paste("FROM-OTHER-PANE".into()));
+            assert!(fixture.app.commander.is_none());
+            assert!(
+                target_rx.try_recv().is_err(),
+                "other display must not write the private target"
+            );
+            let bytes = other_rx
+                .try_iter()
+                .flat_map(|action| match action {
+                    InputAction::Bytes(bytes) => bytes,
+                    _ => panic!("expected pane bytes"),
+                })
+                .collect::<Vec<_>>();
+            assert!(String::from_utf8(bytes)
+                .unwrap()
+                .contains("FROM-OTHER-PANE"));
+            assert_eq!(fixture.foreground, Some(1));
+            assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
+        }
+
+        #[test]
+        fn shared_bridge_commander_is_bound_to_its_outer_display() {
+            use crate::terminal::pty::InputAction;
+            let _env = crate::persist::test_env("scoped-commander-opaque-origin");
+            let mut fixture = Fixture::new();
+            let pane = fixture.target_pane();
+            let (input_tx, input_rx) = mpsc::channel();
+            fixture
+                .app
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .replace_input_sender_for_test(input_tx);
+            fixture.input(2, ClientInput::ClipboardHelperOrigin(Some(77)));
+            fixture.input(2, ClientInput::Command("open_commander".into()));
+            fixture.input(2, ClientInput::Paste("ORIGIN-77".into()));
+            fixture.render();
+            fixture.input(2, ClientInput::ClipboardHelperOrigin(Some(88)));
+            fixture.render();
+            let text = fixture.clients[&2]
+                .last_frame
+                .as_ref()
+                .unwrap()
+                .cells
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>();
+            assert!(
+                text.contains("ORIGIN-77"),
+                "an origin marker alone cannot claim the rendered draft"
+            );
+            fixture.input(2, ClientInput::Paste("ORIGIN-88".into()));
+            assert!(fixture.app.commander.is_none());
+            let bytes = input_rx
+                .try_iter()
+                .flat_map(|action| match action {
+                    InputAction::Bytes(bytes) => bytes,
+                    _ => panic!("expected pane bytes"),
+                })
+                .collect::<Vec<_>>();
+            assert!(String::from_utf8(bytes).unwrap().contains("ORIGIN-88"));
+        }
+
+        #[test]
+        fn scoped_commander_image_completion_keeps_draft_owner_until_detach() {
+            let _env = crate::persist::test_env("scoped-commander-image-owner");
+            let mut fixture = Fixture::new();
+            fixture.input(2, ClientInput::ClipboardHelperOrigin(Some(77)));
+            fixture.input(2, ClientInput::Command("open_commander".into()));
+            let owner = fixture.app.commander.as_ref().unwrap().image_owner.clone();
+            let foreground = fixture.app.active_ws;
+            fixture.app.workspaces[foreground].remote =
+                Some(crate::app::remote::RemoteWorkspaceRef {
+                    host: "isolated-foreground".into(),
+                    session: "fixture".into(),
+                    workspace_id: "foreign-workspace".into(),
+                });
+            assert!(fixture.app.active_remote_pane().is_some());
+            let image = crate::terminal::clipboard::ClipboardImage {
+                extension: "png".into(),
+                bytes: crate::terminal::clipboard::png::encode_rgba_png(1, 1, |_, _| {
+                    [1, 2, 3, 255]
+                })
+                .unwrap(),
+            };
+            let path = crate::terminal::clipboard::stage(&image).unwrap();
+            fixture.app.handle_event(AppEvent::CommanderImageReady {
+                owner,
+                result: Ok(path.clone()),
+            });
+            assert!(path.exists());
+            assert!(fixture
+                .app
+                .commander
+                .as_ref()
+                .unwrap()
+                .draft
+                .contains(path.to_str().unwrap()));
+            assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
+            apply(
+                AppEvent::ClientDetach { id: 2 },
+                &mut fixture.app,
+                &mut fixture.clients,
+                &mut fixture.foreground,
+                &mut fixture.interactive_size,
+                &mut fixture.next_activity,
+            );
+            assert!(fixture.app.commander.is_none());
+            assert!(
+                !path.exists(),
+                "detaching the draft owner must discard its staged image"
+            );
+        }
+
+        #[test]
+        fn shared_bridge_commander_copy_preserves_origin_and_workspace_identity() {
+            let _env = crate::persist::test_env("scoped-commander-private-copy");
+            let mut fixture = Fixture::new();
+            fixture.clients.get_mut(&2).unwrap().projection =
+                Some(super::super::ProjectionSubscription {
+                    active: true,
+                    epoch: 7,
+                    ..Default::default()
+                });
+            fixture.clients.get_mut(&2).unwrap().preparation_epoch = 7;
+            fixture.input(2, ClientInput::ClipboardHelperOrigin(Some(77)));
+            fixture.input(2, ClientInput::Command("open_commander".into()));
+            let commander = fixture.app.commander.as_mut().unwrap();
+            commander.draft = "PRIVATE-77".into();
+            commander.selection_anchor = Some(0);
+            commander.cursor = commander.draft.len();
+            for receiver in &fixture._client_receivers {
+                receiver.try_iter().for_each(drop);
+            }
+            fixture.input(
+                2,
+                ClientInput::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            );
+            let message = fixture._client_receivers[1].try_recv().unwrap();
+            let ServerMessage::WorkspaceEffect {
+                workspace_id,
+                epoch,
+                effect: crate::ipc::protocol::WorkspaceEffect::ScopedClipboard { origin, text },
+            } = message
+            else {
+                panic!("private copy must retain the exact outer display origin");
+            };
+            assert_eq!(workspace_id, fixture.workspace_id);
+            assert_eq!(epoch, 7);
+            assert_eq!(origin, Some(77));
+            assert_eq!(text, "PRIVATE-77");
+            assert!(fixture._client_receivers[0].try_recv().is_err());
+            assert!(fixture.app.pending_clipboard.is_none());
+        }
+
+        #[test]
+        fn scoped_key_phases_keep_newer_viewport_and_bridge_identity() {
+            use crate::terminal::pty::InputAction;
+            use ratatui::crossterm::event::KeyEventKind;
+            let _env = crate::persist::test_env("scoped-key-phases");
+            let mut fixture = Fixture::new();
+            let (mut second, _receiver) = projection_client(fixture.workspace_id.clone(), 0);
+            second.size = (120, 40);
+            second.cell_pixels = Some((12, 30));
+            second.clipboard_helper_origin = Some(Some(77));
+            fixture.clients.insert(3, second);
+            let first = fixture.clients.get_mut(&2).unwrap();
+            first.cell_pixels = Some((8, 16));
+            first.graphics = Some((8, 16));
+            first.clipboard_helper_origin = Some(Some(77));
+            let pane = fixture.target_pane();
+            let (input_tx, input_rx) = mpsc::channel();
+            fixture
+                .app
+                .panes
+                .get_mut(&pane)
+                .unwrap()
+                .replace_input_sender_for_test(input_tx);
+            fixture.app.panes[&pane]
+                .engine
+                .lock()
+                .unwrap()
+                .advance(b"\x1b[>11u");
+            let key = |kind| {
+                ClientInput::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('a'),
+                    KeyModifiers::NONE,
+                    kind,
+                ))
+            };
+            fixture.input(2, key(KeyEventKind::Press));
+            fixture.input(3, key(KeyEventKind::Press));
+            fixture.render();
+            let size = fixture.app.panes[&pane].size();
+            let activity = fixture.next_activity;
+            fixture.input(2, key(KeyEventKind::Repeat));
+            assert_eq!(fixture.next_activity, activity);
+            assert_eq!(fixture.app.panes[&pane].size(), size);
+            assert_eq!(
+                fixture.app.workspaces[fixture.target_index()].cell_pixels,
+                Some((12, 30))
+            );
+            assert!(!fixture.app.workspaces[fixture.target_index()].graphics_enabled);
+            assert_eq!(fixture.app.panes[&pane].cell_pixels(), Some((12, 30)));
+            super::super::apply(
+                AppEvent::ClientDetach { id: 2 },
+                &mut fixture.app,
+                &mut fixture.clients,
+                &mut fixture.foreground,
+                &mut fixture.interactive_size,
+                &mut fixture.next_activity,
+            );
+            fixture.input(3, key(KeyEventKind::Release));
+            assert_eq!(fixture.app.panes[&pane].size(), size);
+            assert_eq!(fixture.foreground, Some(1));
+            let bytes = input_rx
+                .try_iter()
+                .map(|action| {
+                    let InputAction::Bytes(bytes) = action else {
+                        panic!("key PTY write")
+                    };
+                    bytes
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                bytes,
+                [
+                    b"\x1b[97u".to_vec(),
+                    b"\x1b[97u".to_vec(),
+                    b"\x1b[97;1:2u".to_vec(),
+                    b"\x1b[97;1:3u".to_vec(),
+                    b"\x1b[97;1:3u".to_vec()
+                ]
+            );
+        }
+
+        #[test]
+        fn shared_bridge_key_phases_preserve_private_frame_owner_and_size() {
+            use ratatui::crossterm::event::KeyEventKind;
+            let _env = crate::persist::test_env("scoped-commander-phase-origin");
+            let mut fixture = Fixture::new();
+            let key = |kind| {
+                ClientInput::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('z'),
+                    KeyModifiers::NONE,
+                    kind,
+                ))
+            };
+            fixture.input(2, ClientInput::ClipboardHelperOrigin(Some(77)));
+            fixture.input(2, key(KeyEventKind::Press));
+            fixture.input(2, ClientInput::ClipboardHelperOrigin(Some(88)));
+            fixture.input(2, ClientInput::Command("open_commander".into()));
+            fixture.input(2, ClientInput::Paste("PRIVATE-88".into()));
+            fixture.render();
+            let size = fixture.app.panes[&fixture.target_pane()].size();
+            for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+                fixture.input(2, ClientInput::ClipboardHelperOrigin(Some(77)));
+                fixture.input(2, key(kind));
+                fixture.render();
+                assert_eq!(fixture.app.panes[&fixture.target_pane()].size(), size);
+                assert_eq!(fixture.clients[&2].render_origin, Some(88));
+                let private = fixture.clients[&2]
+                    .last_frame
+                    .as_ref()
+                    .unwrap()
+                    .cells
+                    .iter()
+                    .map(|cell| cell.symbol.as_str())
+                    .collect::<String>();
+                assert!(private.contains("PRIVATE-88"));
+            }
+            let message = fixture._client_receivers[1].try_iter().last().unwrap();
+            let ServerMessage::ScopedFrame {
+                origin,
+                frame,
+                private_frame,
+                ..
+            } = message
+            else {
+                panic!("private Commander must travel atomically with its public projection");
+            };
+            assert_eq!(origin, Some(88));
+            assert_eq!(
+                (frame.width, frame.height),
+                (private_frame.width, private_frame.height)
+            );
+            let public = frame
+                .cells
+                .iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>();
+            assert!(!public.contains("PRIVATE-88"));
+            fixture.input(2, ClientInput::ClipboardHelperOrigin(Some(88)));
+            fixture.input(2, ClientInput::Command("open_commander".into()));
+            fixture.render();
+            assert!(fixture.app.commander.is_none());
+            assert!(!fixture.clients[&2].private_frame_active);
+            assert!(!matches!(
+                fixture._client_receivers[1].try_iter().last(),
+                Some(ServerMessage::ScopedFrame { .. })
+            ));
+        }
+
+        #[test]
+        fn shared_bridge_source_detach_closes_only_its_exact_private_draft() {
+            let _env = crate::persist::test_env("scoped-commander-source-detach");
+            let mut fixture = Fixture::new();
+            fixture.input(2, ClientInput::ClipboardHelperOrigin(Some(88)));
+            fixture.input(2, ClientInput::Command("open_commander".into()));
+            fixture.input(2, ClientInput::Paste("PRIVATE-88".into()));
+            fixture.render();
+            let pane = fixture.target_pane();
+            let private_size = fixture.app.panes[&pane].size();
+            fixture.input(2, ClientInput::InputSourceClosed { origin: 77 });
+            assert!(fixture.app.commander.is_some());
+            fixture.input(2, ClientInput::InputSourceClosed { origin: 88 });
+            fixture.render();
+            assert!(fixture.app.commander.is_none());
+            assert!(fixture.clients.contains_key(&2));
+            assert!(!fixture.clients[&2].private_frame_active);
+            assert!(fixture.app.panes[&pane].size().1 > private_size.1);
+        }
+
+        #[test]
+        fn legacy_managed_projection_requires_upgrade_for_private_commander() {
+            let _env = crate::persist::test_env("scoped-commander-legacy-version");
+            let mut fixture = Fixture::new();
+            for version in 9..=15 {
+                fixture.clients.get_mut(&2).unwrap().version = version;
+                fixture.input(2, ClientInput::Command("open_commander".into()));
+                assert!(
+                    fixture.app.commander.is_none(),
+                    "version {version} cannot share private frames"
+                );
+            }
+            fixture.clients.get_mut(&2).unwrap().version = 16;
+            fixture.input(2, ClientInput::Command("open_commander".into()));
+            assert!(fixture.app.commander.is_some());
+        }
+
         impl Fixture {
             fn render_distinct_owner_pixels(&mut self) {
                 for (id, pixels) in [(2, (8, 16)), (1, (12, 24))] {
@@ -3572,6 +4260,7 @@ mod tests {
                         true,
                         false,
                         &HashMap::new(),
+                        None,
                     );
                 }
             }
@@ -3760,12 +4449,28 @@ mod tests {
             let message = input.try_recv().expect(
                 "visible remote MENU interaction must reach its owner, not a stale outer control",
             );
-            let input = match message {
+            let forwarded = match message {
                 ClientMessage::Mouse(mouse) => ClientInput::Mouse(mouse),
                 ClientMessage::Key(key) => ClientInput::Key(key),
                 _ => panic!("unexpected non-mouse/key owner menu input"),
             };
-            owner.input(2, input);
+            let release = if let ClientInput::Key(key) = &forwarded {
+                Some(KeyEvent {
+                    kind: ratatui::crossterm::event::KeyEventKind::Release,
+                    ..*key
+                })
+            } else {
+                None
+            };
+            owner.input(2, forwarded);
+            if let Some(key) = release {
+                outer.handle_event(AppEvent::Key(key));
+                let message = input.try_recv().expect("paired owner key release");
+                let ClientMessage::Key(key) = message else {
+                    panic!("expected owner key release");
+                };
+                owner.input(2, ClientInput::Key(key));
+            }
         }
 
         fn projection_menu_scenario(warm_local_header: bool, same_foreground_workspace: bool) {
@@ -4226,6 +4931,7 @@ mod tests {
                 true,
                 false,
                 &HashMap::new(),
+                None,
             );
             fixture.assert_target_size(expected);
             fixture.assert_foreground_unchanged();
@@ -4270,6 +4976,7 @@ mod tests {
                 true,
                 false,
                 &HashMap::new(),
+                None,
             );
             assert_eq!(fixture.app.ws().cell_pixels, Some((12, 24)));
             assert_eq!(
@@ -4538,6 +5245,7 @@ mod tests {
         assert!(apply(
             AppEvent::ClientConnected {
                 id: 7,
+                version: crate::ipc::protocol::PROTOCOL_VERSION,
                 messages,
                 frame_pending: Arc::new(AtomicBool::new(false)),
                 cols: 80,
@@ -4612,7 +5320,8 @@ mod tests {
                     true,
                     false,
                     false,
-                    &HashMap::new()
+                    &HashMap::new(),
+                    None
                 )
                 .enqueued
             );
@@ -4944,6 +5653,116 @@ mod tests {
     /// A tab switch requests a frame at the same time a finished selection sends
     /// its clipboard payload. Frames may be dropped and repaired, but clipboard
     /// writes must remain queued or the next paste uses stale clipboard content.
+
+    #[test]
+    fn remote_private_clipboard_targets_one_display_and_drops_stale_sources() {
+        use crate::app::remote::tests::{add_remote_workspace, remote_ui_app};
+        use crate::app::remote::RemoteEffect;
+
+        let _env = crate::persist::test_env("remote-private-clipboard-destination");
+        let mut app = remote_ui_app();
+        let (pane, _input, _) = add_remote_workspace(&mut app);
+        let (first, first_rx) = display_client(80, 24, 1);
+        let (second, second_rx) = display_client(80, 24, 2);
+        let mut clients = HashMap::from([(77, first), (88, second)]);
+        let copy = |generation, origin, text: &str| RemoteEffect::ScopedClipboard {
+            pane,
+            generation,
+            origin,
+            text: text.into(),
+        };
+        app.apply_remote_effect(copy(1, Some(77), "PRIVATE-77"));
+        assert!(app.pending_clipboard.is_none());
+        super::dispatch_private_clipboard(&mut app, &clients);
+        assert!(matches!(
+            first_rx.try_recv().unwrap(),
+            ServerMessage::Clipboard(text) if text == "PRIVATE-77"
+        ));
+        assert!(second_rx.try_recv().is_err());
+
+        app.apply_remote_effect(copy(0, Some(88), "STALE-GENERATION"));
+        assert!(app.pending_client_clipboard.is_none());
+        app.apply_remote_effect(copy(1, Some(77), "DISCONNECTED-ORIGIN"));
+        clients.remove(&77);
+        super::dispatch_private_clipboard(&mut app, &clients);
+        assert!(second_rx.try_recv().is_err());
+
+        let second = clients.get_mut(&88).unwrap();
+        second.clipboard_helper_origin = Some(Some(99));
+        app.apply_remote_effect(copy(1, Some(88), "NESTED-ORIGIN"));
+        super::dispatch_private_clipboard(&mut app, &clients);
+        assert!(matches!(
+            second_rx.try_recv().unwrap(),
+            ServerMessage::ScopedClipboard { origin: Some(99), text } if text == "NESTED-ORIGIN"
+        ));
+        clients.get_mut(&88).unwrap().version = 15;
+        app.apply_remote_effect(copy(1, Some(88), "LEGACY-PRIVATE"));
+        super::dispatch_private_clipboard(&mut app, &clients);
+        assert!(second_rx.try_recv().is_err());
+        assert!(app.pending_clipboard.is_none());
+
+        app.apply_remote_effect(copy(1, None, "MONOLITHIC-ONLY"));
+        super::dispatch_private_clipboard(&mut app, &clients);
+        assert!(second_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn clipboard_receipt_requires_current_foreground_copy_and_preserves_legacy() {
+        let _env = crate::persist::test_env("clipboard-receipt-fence");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let (current, rx) = display_client(80, 24, 1);
+        let (mut legacy, legacy_rx) = display_client(60, 20, 2);
+        legacy.version = 15;
+        let mut clients = HashMap::from([(1, current), (2, legacy)]);
+        let mut foreground = Some(1);
+        let mut size = (80, 24);
+        let mut next = 42;
+        super::dispatch_clipboard(&mut clients, foreground, &mut next, "first".into());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerMessage::ClipboardTracked { receipt: 42, .. }
+        ));
+        assert!(
+            matches!(legacy_rx.try_recv().unwrap(), ServerMessage::Clipboard(text) if text == "first")
+        );
+        super::dispatch_clipboard(&mut clients, foreground, &mut next, "second".into());
+        rx.try_recv().unwrap();
+        legacy_rx.try_recv().unwrap();
+        assert!(!apply(
+            AppEvent::ClientClipboardSucceeded { id: 1, receipt: 42 },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            &mut next
+        ));
+        assert!(!apply(
+            AppEvent::ClientClipboardSucceeded { id: 2, receipt: 43 },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            &mut next
+        ));
+        assert!(apply(
+            AppEvent::ClientClipboardSucceeded { id: 1, receipt: 43 },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            &mut next
+        ));
+        assert!(!apply(
+            AppEvent::ClientClipboardSucceeded { id: 1, receipt: 43 },
+            &mut app,
+            &mut clients,
+            &mut foreground,
+            &mut size,
+            &mut next
+        ));
+    }
+
     #[test]
     fn clipboard_is_reliable_when_a_tab_frame_is_already_queued() {
         let (messages, rx) = mpsc::channel();

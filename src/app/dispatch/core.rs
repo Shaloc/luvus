@@ -144,7 +144,7 @@ impl App {
                         if let Some(pane) = self.panes.get(&pane_id) {
                             let runtime = pane.terminal_runtime();
                             let status = self.status.get(&pane_id);
-                            let agent_session_title = self.web_agent_session_title(pane_id);
+                            let agent_session_title = self.agent_session_title(pane_id);
                             json!({
                                 "pane_id":pane_id.0.to_string(),
                                 "kind":"terminal",
@@ -160,7 +160,7 @@ impl App {
                                 "content_revision":pane.content_revision(),
                                 "agent_name":agent_names.get(&pane_id).copied(),
                                 "agent":status.map(|status| status.agent.clone()),
-                                "is_agent":status.is_some_and(|status| self.manifests.is_agent(&status.agent) || status.agent_session.is_some() || status.agent_report.is_some()),
+                                "is_agent":self.is_agent_pane(pane_id),
                                 "title":self.cached_pane_title(pane_id),
                                 "agent_pinned":self.pinned_agents.contains(&pane_id),
                                 "workspace_focused":tab_index == workspace.active_tab && tab.layout.focus == pane_id,

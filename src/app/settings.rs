@@ -127,6 +127,7 @@ pub enum GeneralRow {
     FilesShowHidden,
     ShiftEnter,
     ClipboardHelper,
+    CommanderWorking,
     CheckUpdates,
     /// Replay each agent's own CLI options on resume (docs/62).
     ResumeFlags,
@@ -163,6 +164,7 @@ impl App {
             GeneralRow::FilesShowHidden,
             GeneralRow::ShiftEnter,
             GeneralRow::ClipboardHelper,
+            GeneralRow::CommanderWorking,
             GeneralRow::CheckUpdates,
             GeneralRow::ResumeFlags,
             GeneralRow::NewPaneToWorkspaceRoot,
@@ -401,6 +403,11 @@ impl App {
         // (Esc cancels). This must intercept before the normal handling so keys
         // like Tab / digits can themselves be bound.
         if capturing {
+            // Capture waits for a fresh Press. A held candidate must not
+            // confirm itself as the prefix or rebind a command.
+            if super::is_key_repeat(&key) {
+                return;
+            }
             if cursor == KEYS_PREFIX_ROW {
                 if key.code == KeyCode::Esc {
                     if let Some(ui) = self.settings.as_mut() {
@@ -445,6 +452,31 @@ impl App {
                 ui.prefix_candidate = None;
             }
             return;
+        }
+        // A held key moves the cursor, radio selection, or numeric sliders.
+        // Toggles, activations, resets, tab switches, and cycles run once.
+        if super::is_key_repeat(&key) {
+            let continuous = match key.code {
+                KeyCode::Up | KeyCode::Down => true,
+                KeyCode::Left | KeyCode::Right => match tab {
+                    SettingsTab::Theme | SettingsTab::Language => true,
+                    SettingsTab::Layout => matches!(
+                        self.layout_rows().get(cursor),
+                        Some(
+                            LayoutRow::SidebarWidth
+                                | LayoutRow::RightWidth
+                                | LayoutRow::Scrollback
+                                | LayoutRow::MobileWidth
+                                | LayoutRow::DiffContext
+                        )
+                    ),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !continuous {
+                return;
+            }
         }
         match key.code {
             KeyCode::Char('u') if tab == SettingsTab::Remote && key.modifiers.is_empty() => {
@@ -1645,6 +1677,17 @@ impl App {
             // Flips config *and* the live tree (docs/38), so it applies at once.
             Some(GeneralRow::FilesShowHidden) => self.toggle_files_hidden(),
             Some(GeneralRow::ShiftEnter) => self.cycle_shift_enter(delta),
+            Some(GeneralRow::CommanderWorking) => {
+                self.config.commander_working_policy = match self.config.commander_working_policy {
+                    crate::config::CommanderWorkingPolicy::Ask => {
+                        crate::config::CommanderWorkingPolicy::AutoSend
+                    }
+                    crate::config::CommanderWorkingPolicy::AutoSend => {
+                        crate::config::CommanderWorkingPolicy::Ask
+                    }
+                };
+                self.persist_config();
+            }
             Some(GeneralRow::CheckUpdates) => {
                 self.config.check_updates = !self.config.check_updates;
                 self.persist_config();
@@ -2011,6 +2054,80 @@ mod tests {
         assert!(crate::config::load().remote_hosts.is_empty());
     }
     use super::*;
+    use crate::event::AppEvent;
+    use ratatui::crossterm::event::KeyEventKind;
+
+    fn phase(code: KeyCode, modifiers: KeyModifiers, kind: KeyEventKind) -> AppEvent {
+        AppEvent::Key(KeyEvent::new_with_kind(code, modifiers, kind))
+    }
+
+    #[test]
+    fn a_held_prefix_candidate_never_confirms_itself() {
+        let _env = crate::persist::test_env("settings-prefix-repeat");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let original = app.config.prefix.clone();
+        app.open_settings();
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::Keys;
+            ui.cursor = KEYS_PREFIX_ROW;
+            ui.capturing = true;
+        }
+
+        app.handle_event(phase(
+            KeyCode::F(12),
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        assert_eq!(
+            app.settings.as_ref().unwrap().prefix_candidate.as_deref(),
+            Some("f12"),
+            "the first Press only proposes the candidate"
+        );
+        app.handle_event(phase(
+            KeyCode::F(12),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(app.config.prefix, original, "a held key cannot confirm it");
+        assert!(app.settings.as_ref().unwrap().capturing);
+    }
+
+    #[test]
+    fn a_held_arrow_flips_a_layout_gap_once() {
+        let _env = crate::persist::test_env("settings-gap-repeat");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.open_settings();
+        let row = app
+            .layout_rows()
+            .iter()
+            .position(|row| matches!(row, LayoutRow::ColGap))
+            .expect("column gap row");
+        if let Some(ui) = app.settings.as_mut() {
+            ui.tab = SettingsTab::Layout;
+            ui.cursor = row;
+        }
+        let before = app.config.layout.col_gap;
+
+        app.handle_event(phase(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            KeyEventKind::Press,
+        ));
+        let flipped = app.config.layout.col_gap;
+        assert_ne!(flipped, before, "the Press toggles the gap");
+        // One Repeat is enough: an XOR toggle flipped twice would hide the bug.
+        app.handle_event(phase(
+            KeyCode::Right,
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        assert_eq!(
+            app.config.layout.col_gap, flipped,
+            "a Repeat never flips it back"
+        );
+    }
 
     #[test]
     fn prefix_capture_accepts_safe_non_ctrl_keys_and_exact_modifiers() {
@@ -2483,13 +2600,26 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 14);
+        assert_eq!(app.settings_rows(SettingsTab::General), 15);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
         assert_eq!(
             rows[1],
             GeneralRow::FileClick,
             "click behavior sits next to the viewer it qualifies"
+        );
+        let working = rows
+            .iter()
+            .position(|r| *r == GeneralRow::CommanderWorking)
+            .unwrap();
+        assert_eq!(
+            app.config.commander_working_policy,
+            crate::config::CommanderWorkingPolicy::AutoSend
+        );
+        app.settings_adjust(working, 1);
+        assert_eq!(
+            app.config.commander_working_policy,
+            crate::config::CommanderWorkingPolicy::Ask
         );
 
         let style = rows

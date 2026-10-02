@@ -409,6 +409,9 @@ impl App {
         if pending.size != (frame.width, frame.height) {
             return;
         }
+        if let Some(previous) = self.remote_display_pane {
+            self.release_remote_key_presses(previous);
+        }
         let Some(link) = self
             .remote_session_displays
             .values_mut()
@@ -498,6 +501,14 @@ impl App {
             },
             protocol::WorkspaceEffect::Detach => RemoteEffect::Detach { pane, generation },
             protocol::WorkspaceEffect::Clipboard(text) => RemoteEffect::Clipboard(text),
+            protocol::WorkspaceEffect::ScopedClipboard { origin, text } => {
+                RemoteEffect::ScopedClipboard {
+                    pane,
+                    generation,
+                    origin,
+                    text,
+                }
+            }
             protocol::WorkspaceEffect::OpenUrl(url) => RemoteEffect::OpenUrl(url),
             protocol::WorkspaceEffect::ClipboardHelper { origin, request } => {
                 RemoteEffect::ClipboardHelper {
@@ -511,6 +522,7 @@ impl App {
     }
 
     pub(super) fn suspend_remote_display(&mut self, pane: PaneId) {
+        self.release_remote_key_presses(pane);
         let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) else {
             return;
         };
@@ -631,6 +643,37 @@ mod tests {
                 false,
             ),
         )
+    }
+
+    #[test]
+    fn session_private_clipboard_preserves_origin_and_rejects_stale_switch_identity() {
+        let _env = crate::persist::test_env("session-private-clipboard-identity");
+        let (mut app, connection, _rx) = fixture();
+        let view = app.remote_workspace_view(app.active_ws).unwrap();
+        let workspace = view.target.workspace_id.clone();
+        let epoch = view.projection.epoch;
+        let copy = || protocol::WorkspaceEffect::ScopedClipboard {
+            origin: Some(77),
+            text: "PRIVATE-77".into(),
+        };
+        for (generation, workspace_id, stale_epoch) in [
+            (0, workspace.as_str(), epoch),
+            (1, "wrong-workspace", epoch),
+            (1, workspace.as_str(), epoch + 1),
+        ] {
+            app.apply_session_effect(connection, generation, workspace_id, stale_epoch, copy());
+            assert!(app.pending_client_clipboard.is_none());
+            assert!(app.pending_clipboard.is_none());
+        }
+        app.apply_session_effect(connection, 1, &workspace, epoch, copy());
+        assert_eq!(
+            app.pending_client_clipboard.take(),
+            Some((Some(77), "PRIVATE-77".into()))
+        );
+        assert!(app.pending_clipboard.is_none());
+        app.focus_workspace_now(0);
+        app.apply_session_effect(connection, 1, &workspace, epoch, copy());
+        assert!(app.pending_client_clipboard.is_none());
     }
 
     #[test]

@@ -139,8 +139,9 @@ def host_admission_smoke(repo, root, binary, env):
         # Start returns when the client socket accepts connections, before all
         # startup bookkeeping necessarily finishes (observed on macOS). A real
         # app-loop API response fences PID publication without a fixed sleep.
-        subprocess.run([*owner, "pane", "list", "--json"], env=env, cwd=root,
-                       check=True, capture_output=True, timeout=15)
+        ready = subprocess.run([*owner, "pane", "list"], env=env, cwd=root,
+                               capture_output=True, text=True, timeout=15)
+        assert ready.returncode == 0, ready.stdout + ready.stderr
         pid_before = pid_file.read_bytes()
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
         client = subprocess.Popen(owner, env=dict(env, TERM="xterm-256color"), cwd=root,
@@ -314,7 +315,7 @@ esac
         lines = detailed.splitlines()
         assert len(lines) == 4, detailed
         assert version("--version", "--remote-session-protocol") == lines[0] + "\n"
-        assert re.fullmatch(r"luvus \S+ remote-session=2 transport=15", lines[0]), detailed
+        assert re.fullmatch(r"luvus \S+ remote-session=2 transport=16", lines[0]), detailed
         assert re.fullmatch(r"build-id=[A-Za-z0-9._-]+", lines[1]), detailed
         assert re.fullmatch(r"commit=(?:[A-Fa-f0-9]{40,64}|unknown) source=(?:clean|dirty|unknown)", lines[2]), detailed
         assert re.fullmatch(r"target=\S+ profile=\S+", lines[3]), detailed
@@ -328,7 +329,7 @@ esac
                                     FIXTURE_REDIRECT="https://github.com/other/luvus/releases/tag/fork-bad")
     assert installed.read_bytes() == payload
     if len(sys.argv) == 1:
-        for transport in ("9", "10", "11", "12", "13", "14", "15"):
+        for transport in ("9", "10", "11", "12", "13", "14", "15", "16"):
             run(FIXTURE_TRANSPORT=transport)
         run(FIXTURE_OS="Darwin", FIXTURE_ARCH="arm64")
         run(FIXTURE_OS="Darwin", FIXTURE_ARCH="aarch64")

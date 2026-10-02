@@ -15,7 +15,7 @@
       "path": "valid/responses.jsonl",
       "kind": "response",
       "expect": "valid",
-      "count": 13
+      "count": 16
     },
     {
       "path": "valid/events.jsonl",
@@ -33,7 +33,7 @@
       "path": "invalid/requests.jsonl",
       "kind": "request",
       "expect": "invalid",
-      "count": 10
+      "count": 11
     },
     {
       "path": "invalid/responses.jsonl",

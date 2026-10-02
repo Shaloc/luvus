@@ -50,6 +50,16 @@ def main():
     route = {key: os.environ.get(key, "") for key in
              ("LUVUS_ENV", "LUVUS_SOCKET_PATH", "LUVUS_PANE_ID", "LUVUS_BIN_PATH")}
     if interactive(args) and route["LUVUS_ENV"] == "1" and all(route.values()):
+        # Codex 0.157 uses SSH_TTY as a terminal-clipboard forwarding hint.
+        # Without it, a successful native copy stays on the owner host (notably
+        # macOS) and never reaches an attached Luvus display via OSC 52. Scope
+        # this compatibility hint to the interactive Codex invocation and use
+        # its actual PTY; do not restore the server's stale SSH connection data.
+        if "SSH_TTY" not in os.environ:
+            try:
+                os.environ["SSH_TTY"] = os.ttyname(0)
+            except OSError:
+                pass  # Non-terminal invocations keep their original environment.
         home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
         script = home / "luvus-agent-hook.sh"
         if script.is_file() and os.access(script, os.X_OK):

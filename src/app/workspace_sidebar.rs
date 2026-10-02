@@ -226,6 +226,7 @@ mod tests {
         let mut app = remote_ui_app();
         let (_pane, _input, _) = add_remote_workspace(&mut app);
         app.workspaces[0].worktree = Some(crate::git::WorktreeMembership {
+            directory_identity: None,
             common_dir: "/repo/.git".into(),
             linked: false,
         });
@@ -241,6 +242,7 @@ mod tests {
             branch: Some("feature".into()),
             git_ahead_behind: None,
             worktree: Some(crate::git::WorktreeMembership {
+                directory_identity: None,
                 common_dir: "/repo/.git".into(),
                 linked: true,
             }),

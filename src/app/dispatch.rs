@@ -193,8 +193,8 @@ impl App {
             "search" => self.api_search(method, p),
             "pane.restart" => self.api_pane_restart(method, p),
             "pane.close" => self.api_pane_close(method, p),
-            // A **global** single-pane status lookup (any workspace) — `pane.list` is
-            // scoped to the active workspace, so `luvus wait agent-status` polls this.
+            // A **global** single-pane status lookup (any workspace). `luvus wait
+            // agent-status` polls this instead of fetching every pane with `pane.list`.
             "pane.status" => self.api_pane_status(method, p),
             "pane.processes" => self.api_pane_processes(method, p),
             "pane.report_session" => self.api_pane_report_session(method, p),

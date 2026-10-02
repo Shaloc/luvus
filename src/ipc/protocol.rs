@@ -17,7 +17,7 @@ pub fn local_cell_pixels() -> (u16, u16) {
     crate::platform::terminal_cell_pixels().unwrap_or((0, 0))
 }
 
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 pub const PROJECTION_PROTOCOL_VERSION: u32 = 10;
 pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 
@@ -32,6 +32,7 @@ pub fn supports_version(version: u32) -> bool {
             | 12
             | 13
             | 14
+            | 15
             | PROTOCOL_VERSION
     )
 }
@@ -116,6 +117,15 @@ pub enum ClientMessage {
     /// Transport 14: display origin for subsequent forwarded UI input. None
     /// denotes a monolithic display; the token is opaque to the remote owner.
     ClipboardHelperOrigin(Option<u64>),
+    /// Transport 16: native success for this attachment and exact copy.
+    ClipboardSucceeded {
+        receipt: u64,
+    },
+    /// Transport 16: one outer display detached from a pooled owner bridge.
+    /// This closes only private surfaces from this exact opaque input origin.
+    InputSourceClosed {
+        origin: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -205,6 +215,28 @@ pub enum ServerMessage {
         prepared: bool,
         hyperlinks: Vec<FrameHyperlink>,
     },
+    /// Transport 16: clipboard completion is confirmed by the display client.
+    ClipboardTracked {
+        text: String,
+        receipt: u64,
+    },
+    /// Transport 16: one public projection and the exact originating display's
+    /// private surface share the same workspace, epoch, and full-frame identity.
+    ScopedFrame {
+        state: Option<ProjectionState>,
+        origin: Option<u64>,
+        frame: Box<FrameData>,
+        hyperlinks: Vec<FrameHyperlink>,
+        graphics: Vec<crate::terminal::graphics::GraphicUpdate>,
+        private_frame: Box<FrameData>,
+        private_hyperlinks: Vec<FrameHyperlink>,
+        private_graphics: Vec<crate::terminal::graphics::GraphicUpdate>,
+    },
+    /// Transport 16: private composer copies return only to their display origin.
+    ScopedClipboard {
+        origin: Option<u64>,
+        text: String,
+    },
 }
 
 /// Only a peer that negotiated transport 15 receives the appended variant.
@@ -242,6 +274,52 @@ pub(crate) fn encode_hyperlinks(message: ServerMessage, version: u32) -> ServerM
 /// Restore links into the private render projection before existing owner and
 /// display routing. This cannot weaken workspace generation/epoch checks.
 pub(crate) fn decode_hyperlinks(message: ServerMessage) -> io::Result<ServerMessage> {
+    let message = if let ServerMessage::ScopedFrame {
+        state,
+        origin,
+        frame,
+        hyperlinks,
+        graphics,
+        mut private_frame,
+        private_hyperlinks,
+        private_graphics,
+    } = message
+    {
+        let mut frame = *frame;
+        if frame.width != private_frame.width
+            || frame.height != private_frame.height
+            || frame.cells.len() != usize::from(frame.width) * usize::from(frame.height)
+            || private_frame.cells.len()
+                != usize::from(private_frame.width) * usize::from(private_frame.height)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid scoped frame geometry",
+            ));
+        }
+        restore_frame_hyperlinks(&mut private_frame, private_hyperlinks)?;
+        // The public scene carries full resources. Private placements may reuse
+        // those resources in this same atomic frame, never a previous origin's
+        // scene; their complete list independently controls size and removal.
+        let graphics = crate::terminal::graphics::apply_updates(&[], graphics)?;
+        let private_graphics =
+            crate::terminal::graphics::apply_updates(&graphics, private_graphics)?;
+        let has_graphics = !graphics.is_empty() || !private_graphics.is_empty();
+        frame.scoped = Some(Box::new(ScopedFrameView {
+            origin,
+            frame: *private_frame,
+            graphics: private_graphics,
+        }));
+        ServerMessage::LinkedFrame {
+            state,
+            frame,
+            graphics: has_graphics.then(|| crate::terminal::graphics::updates(&graphics, &[])),
+            prepared: false,
+            hyperlinks,
+        }
+    } else {
+        message
+    };
     let ServerMessage::LinkedFrame {
         state,
         mut frame,
@@ -252,21 +330,7 @@ pub(crate) fn decode_hyperlinks(message: ServerMessage) -> io::Result<ServerMess
     else {
         return Ok(message);
     };
-    if hyperlinks.len() > frame.cells.len()
-        || hyperlinks.iter().any(|link| {
-            link.start >= link.end
-                || link.end as usize > frame.cells.len()
-                || frame.width == 0
-                || link.start / u32::from(frame.width) != (link.end - 1) / u32::from(frame.width)
-                || !super::client::valid_host_hyperlink(&link.uri)
-        })
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid frame hyperlinks",
-        ));
-    }
-    frame.hyperlinks = hyperlinks;
+    restore_frame_hyperlinks(&mut frame, hyperlinks)?;
     if prepared {
         let (Some(state), Some(graphics)) = (state, graphics) else {
             return Err(io::Error::new(
@@ -292,6 +356,75 @@ pub(crate) fn decode_hyperlinks(message: ServerMessage) -> io::Result<ServerMess
     }
 }
 
+fn restore_frame_hyperlinks(
+    frame: &mut FrameData,
+    hyperlinks: Vec<FrameHyperlink>,
+) -> io::Result<()> {
+    if hyperlinks.len() > frame.cells.len()
+        || hyperlinks.iter().any(|link| {
+            link.start >= link.end
+                || link.end as usize > frame.cells.len()
+                || frame.width == 0
+                || link.start / u32::from(frame.width) != (link.end - 1) / u32::from(frame.width)
+                || !super::client::valid_host_hyperlink(&link.uri)
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid frame hyperlinks",
+        ));
+    }
+    frame.hyperlinks = hyperlinks;
+    Ok(())
+}
+
+/// Encode the two complete scenes within the existing composed-graphics budget.
+/// The originating client's private scene remains complete; a passive public
+/// layer may omit extra images when their union exceeds that same budget.
+pub(crate) fn scoped_graphic_updates(
+    public_frame: &mut FrameData,
+    public: &[crate::terminal::graphics::Graphic],
+    private: &[crate::terminal::graphics::Graphic],
+) -> (
+    Vec<crate::terminal::graphics::GraphicUpdate>,
+    Vec<crate::terminal::graphics::GraphicUpdate>,
+) {
+    use crate::terminal::graphics;
+    // Resources are immutable by key. Placements in the two layers can differ
+    // without counting the same payload twice in the atomic resource budget.
+    let mut resources = private.to_vec();
+    let mut retained = Vec::with_capacity(public.len());
+    let slots: Vec<_> = public
+        .iter()
+        .map(|graphic| {
+            if !resources.iter().any(|resource| resource.key == graphic.key)
+                && graphics::add(&mut resources, graphic.clone()).is_none()
+            {
+                return None;
+            }
+            let slot = retained.len() as u32 + 1;
+            retained.push(graphic.clone());
+            Some(slot)
+        })
+        .collect();
+    if retained.len() != public.len() {
+        for cell in &mut public_frame.cells {
+            let Some(index) = graphics::index(&cell.symbol, unpack(cell.fg)) else {
+                continue;
+            };
+            if let Some(Some(slot)) = slots.get(index) {
+                cell.fg = pack(graphics::slot_color(*slot));
+            } else {
+                cell.symbol = " ".into();
+            }
+        }
+    }
+    (
+        graphics::updates(&retained, &[]),
+        graphics::updates(private, &retained),
+    )
+}
+
 /// Effects from a committed workspace carry the same switch identity as frames.
 #[derive(Serialize, Deserialize, Clone)]
 pub enum WorkspaceEffect {
@@ -303,6 +436,11 @@ pub enum WorkspaceEffect {
     ClipboardHelper {
         origin: Option<u64>,
         request: crate::terminal::clipboard::kitten::Request,
+    },
+    /// Transport 16: preserve the display origin across the shared SSH bridge.
+    ScopedClipboard {
+        origin: Option<u64>,
+        text: String,
     },
 }
 
@@ -327,8 +465,15 @@ pub const PROJECTION_CAPABILITY: &str = "projection.v1";
 pub const SESSION_DISPLAY_CAPABILITY: &str = "session_display.v1";
 
 pub fn remote_display_capabilities() -> serde_json::Value {
-    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, 14, PROTOCOL_VERSION],
-        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1", "hyperlinks.v1"]})
+    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, 14, 15, PROTOCOL_VERSION],
+        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1", "hyperlinks.v1", "scoped_frames.v1", "scoped_clipboard.v1"]})
+}
+
+#[derive(Clone, PartialEq)]
+pub struct ScopedFrameView {
+    pub origin: Option<u64>,
+    pub frame: FrameData,
+    pub graphics: Vec<crate::terminal::graphics::Graphic>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
@@ -341,6 +486,10 @@ pub struct FrameData {
     /// frames, so ordinary terminal traffic carries no per-cell link metadata.
     #[serde(skip)]
     pub hyperlinks: Vec<FrameHyperlink>,
+    /// Attachment-private content is reconstructed from transport 16 only.
+    /// Skipping it keeps every released FrameData encoding unchanged.
+    #[serde(skip)]
+    pub scoped: Option<Box<ScopedFrameView>>,
     pub cursor: Option<(u16, u16)>,
     /// When `cursor` is Some, whether the host caret should be shown. Hidden
     /// in-view PTY still parks IME (Pi `?25l` after CUP to its input marker).
@@ -532,6 +681,7 @@ pub fn frame_from_buffer(
         height: area.height,
         cells,
         hyperlinks: Vec::new(),
+        scoped: None,
         cursor,
         cursor_visible: cursor.is_some() && cursor_visible,
     }
@@ -811,6 +961,399 @@ mod tests {
         }
     }
 
+    fn scoped_fixture(state: Option<ProjectionState>, origin: Option<u64>) -> ServerMessage {
+        let mut frame = linked_fixture();
+        frame.cells[0].symbol = "public".into();
+        let mut private_frame = frame.clone();
+        private_frame.cells[0].symbol = "private".into();
+        private_frame.cursor = Some((1, 1));
+        private_frame.hyperlinks[0].uri = "https://example.com/private".into();
+        ServerMessage::ScopedFrame {
+            state,
+            origin,
+            hyperlinks: std::mem::take(&mut frame.hyperlinks),
+            graphics: Vec::new(),
+            private_hyperlinks: std::mem::take(&mut private_frame.hyperlinks),
+            private_graphics: Vec::new(),
+            frame: Box::new(frame),
+            private_frame: Box::new(private_frame),
+        }
+    }
+
+    #[test]
+    fn scoped_frames_do_not_change_transport_nine_through_fifteen_frame_bytes() {
+        let mut frame = linked_fixture();
+        for version in 9..=15 {
+            frame.scoped = None;
+            let before = bincode::serde::encode_to_vec(
+                encode_hyperlinks(ServerMessage::Frame(frame.clone()), version),
+                bincode::config::standard(),
+            )
+            .unwrap();
+            frame.scoped = Some(Box::new(ScopedFrameView {
+                origin: Some(77),
+                frame: linked_fixture(),
+                graphics: Vec::new(),
+            }));
+            let after = bincode::serde::encode_to_vec(
+                encode_hyperlinks(ServerMessage::Frame(frame.clone()), version),
+                bincode::config::standard(),
+            )
+            .unwrap();
+            assert_eq!(before, after, "transport {version}");
+        }
+    }
+
+    #[test]
+    fn scoped_frames_without_graphics_restore_origin_and_owner_identity() {
+        let state = ProjectionState {
+            server_generation: "boot".into(),
+            epoch: 7,
+            event_sequence: 42,
+            workspace_id: "owner-workspace".into(),
+            focused_pane: Some("88".into()),
+        };
+        for scoped_state in [None, Some(state.clone())] {
+            for origin in [None, Some(77)] {
+                let mut bytes = Vec::new();
+                write_message(&mut bytes, &scoped_fixture(scoped_state.clone(), origin)).unwrap();
+                let decoded =
+                    decode_hyperlinks(read_message(&mut bytes.as_slice()).unwrap()).unwrap();
+                let frame = match decoded {
+                    ServerMessage::ProjectionFrame { state, frame } => {
+                        assert_eq!(
+                            serde_json::to_value(state).unwrap(),
+                            serde_json::to_value(scoped_state.as_ref().unwrap()).unwrap()
+                        );
+                        frame
+                    }
+                    ServerMessage::Frame(frame) if scoped_state.is_none() => frame,
+                    _ => panic!("non-graphics scope changed the text codec"),
+                };
+                assert_eq!(frame.cells[0].symbol, "public");
+                assert_eq!(frame.cursor, Some((1, 0)));
+                assert_eq!(frame.hyperlinks[0].uri, "https://example.com/owner");
+                let private = frame.scoped.unwrap();
+                assert_eq!(private.origin, origin);
+                assert_eq!(private.frame.cells[0].symbol, "private");
+                assert_eq!(private.frame.cursor, Some((1, 1)));
+                assert_eq!(
+                    private.frame.hyperlinks[0].uri,
+                    "https://example.com/private"
+                );
+                assert!(private.graphics.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_frames_reject_invalid_public_and_private_layers() {
+        for layer in [false, true] {
+            for invalid in 0..4 {
+                let mut message = scoped_fixture(None, Some(77));
+                let ServerMessage::ScopedFrame {
+                    frame,
+                    hyperlinks,
+                    graphics,
+                    private_frame,
+                    private_hyperlinks,
+                    private_graphics,
+                    ..
+                } = &mut message
+                else {
+                    unreachable!()
+                };
+                let (frame, hyperlinks, graphics) = if layer {
+                    (private_frame.as_mut(), private_hyperlinks, private_graphics)
+                } else {
+                    (frame.as_mut(), hyperlinks, graphics)
+                };
+                match invalid {
+                    0 => frame.height += 1,
+                    1 => {
+                        frame.cells.pop();
+                    }
+                    2 => hyperlinks[0].uri = "https://example.com/\x1b[2J".into(),
+                    3 => graphics.push(crate::terminal::graphics::GraphicUpdate {
+                        key: "missing-resource".into(),
+                        image: None,
+                        crop: [0, 0, 1, 1],
+                        size: [1, 1],
+                    }),
+                    _ => unreachable!(),
+                }
+                assert!(
+                    decode_hyperlinks(message).is_err(),
+                    "layer={layer}, invalid={invalid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_graphic_frames_decode_independent_full_resource_scenes() {
+        let graphic = |payload: &str| crate::terminal::graphics::GraphicUpdate {
+            key: "same-slot-key".into(),
+            image: Some(std::sync::Arc::new(
+                alacritty_terminal::term::graphics::Image {
+                    sequence: 1,
+                    width: 1,
+                    height: 1,
+                    format: 24,
+                    compressed: false,
+                    data: payload.into(),
+                },
+            )),
+            crop: [0, 0, 1, 1],
+            size: [1, 1],
+        };
+        let mut message = scoped_fixture(None, Some(77));
+        let ServerMessage::ScopedFrame {
+            graphics,
+            private_graphics,
+            ..
+        } = &mut message
+        else {
+            unreachable!()
+        };
+        graphics.push(graphic("/wAA"));
+        private_graphics.push(graphic("AAD/"));
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &message).unwrap();
+        let decoded = decode_hyperlinks(read_message(&mut bytes.as_slice()).unwrap()).unwrap();
+        let ServerMessage::GraphicFrame {
+            text: GraphicText::Full(frame),
+            graphics,
+            ..
+        } = decoded
+        else {
+            panic!("graphic layers lost their graphic codec");
+        };
+        assert_eq!(graphics[0].image.as_ref().unwrap().data, "/wAA");
+        let private = frame.scoped.unwrap();
+        assert_eq!(private.origin, Some(77));
+        assert_eq!(private.graphics[0].image.data, "AAD/");
+    }
+
+    #[test]
+    fn scoped_graphic_frames_reuse_only_atomic_public_payload_and_keep_private_placements() {
+        use crate::terminal::graphics::{self, Graphic};
+        let image = std::sync::Arc::new(alacritty_terminal::term::graphics::Image {
+            sequence: 1,
+            width: 1,
+            height: 1,
+            format: 24,
+            compressed: false,
+            data: "/wAA".into(),
+        });
+        let public = vec![Graphic {
+            key: "shared-image".into(),
+            image: image.clone(),
+            crop: [0, 0, 1, 1],
+            size: [6, 3],
+        }];
+        for private in [
+            vec![Graphic {
+                key: "shared-image".into(),
+                image: image.clone(),
+                crop: [0, 0, 1, 1],
+                size: [2, 1],
+            }],
+            Vec::new(),
+        ] {
+            let mut message = scoped_fixture(None, Some(77));
+            let ServerMessage::ScopedFrame {
+                graphics,
+                private_graphics,
+                ..
+            } = &mut message
+            else {
+                unreachable!()
+            };
+            *graphics = graphics::updates(&public, &[]);
+            *private_graphics = graphics::updates(&private, &public);
+            assert!(private_graphics.iter().all(|update| update.image.is_none()));
+            let mut bytes = Vec::new();
+            write_message(&mut bytes, &message).unwrap();
+            assert_eq!(
+                bytes.windows(4).filter(|window| *window == b"/wAA").count(),
+                1
+            );
+            let ServerMessage::GraphicFrame {
+                text: GraphicText::Full(frame),
+                ..
+            } = decode_hyperlinks(read_message(&mut bytes.as_slice()).unwrap()).unwrap()
+            else {
+                panic!("public image lost its codec");
+            };
+            let received = frame.scoped.unwrap().graphics;
+            assert_eq!(received.len(), private.len());
+            if let Some(received) = received.first() {
+                assert_eq!(received.size, [2, 1]);
+                assert_eq!(received.crop, [0, 0, 1, 1]);
+                assert_eq!(received.image.data, "/wAA");
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_graphic_frames_roundtrip_two_shared_2048_rgba_images_under_frame_limit() {
+        use crate::terminal::graphics::{self, Graphic};
+        let data = crate::base64_encode(&vec![128; 2048 * 2048 * 4]);
+        let public: Vec<_> = (1..=2)
+            .map(|sequence| Graphic {
+                key: format!("shared-image-{sequence}"),
+                image: std::sync::Arc::new(alacritty_terminal::term::graphics::Image {
+                    sequence,
+                    width: 2048,
+                    height: 2048,
+                    format: 32,
+                    compressed: false,
+                    data: data.clone(),
+                }),
+                crop: [0, 0, 2048, 2048],
+                size: [8, 4],
+            })
+            .collect();
+        let private: Vec<_> = public
+            .iter()
+            .map(|graphic| Graphic {
+                size: [8, 2],
+                ..graphic.clone()
+            })
+            .collect();
+        let scene_bytes: usize = public.iter().map(|graphic| graphic.image.data.len()).sum();
+        assert!(scene_bytes < MAX_FRAME);
+        assert!(
+            scene_bytes * 2 > MAX_FRAME,
+            "fixture must cover duplicate payload overflow"
+        );
+        let mut message = scoped_fixture(None, Some(77));
+        let ServerMessage::ScopedFrame {
+            graphics,
+            private_graphics,
+            ..
+        } = &mut message
+        else {
+            unreachable!()
+        };
+        *graphics = graphics::updates(&public, &[]);
+        *private_graphics = graphics::updates(&private, &public);
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &message).unwrap();
+        assert!(bytes.len() < MAX_FRAME);
+        let ServerMessage::GraphicFrame {
+            text: GraphicText::Full(frame),
+            graphics,
+            ..
+        } = decode_hyperlinks(read_message(&mut bytes.as_slice()).unwrap()).unwrap()
+        else {
+            panic!("shared images lost their graphic codec");
+        };
+        assert_eq!(graphics.len(), 2);
+        let private = frame.scoped.unwrap().graphics;
+        for (public, private) in graphics.iter().zip(&private) {
+            assert_eq!(private.size, [8, 2]);
+            assert_eq!(public.image.as_ref().unwrap().data.len(), data.len());
+            assert!(std::sync::Arc::ptr_eq(
+                public.image.as_ref().unwrap(),
+                &private.image
+            ));
+        }
+    }
+
+    #[test]
+    fn scoped_graphic_frames_bound_distinct_public_resources_and_remap_their_cells() {
+        use crate::terminal::graphics::{self, Graphic};
+        let data = crate::base64_encode(&vec![128; 2048 * 2048 * 4]);
+        let resources: Vec<_> = (1..=3)
+            .map(|sequence| Graphic {
+                key: format!("image-{sequence}"),
+                image: std::sync::Arc::new(alacritty_terminal::term::graphics::Image {
+                    sequence,
+                    width: 2048,
+                    height: 2048,
+                    format: 32,
+                    compressed: false,
+                    data: data.clone(),
+                }),
+                crop: [0, 0, 2048, 2048],
+                size: [8, 4],
+            })
+            .collect();
+        // Both legitimate scenes fit the existing per-scene budget, but their
+        // three distinct payloads cannot fit a single framed wire message.
+        let public = &resources[..2];
+        let private = &resources[1..];
+        assert!(graphics::apply_updates(&[], graphics::updates(public, &[])).is_ok());
+        assert!(graphics::apply_updates(&[], graphics::updates(private, &[])).is_ok());
+        assert!(
+            resources
+                .iter()
+                .map(|graphic| graphic.image.data.len())
+                .sum::<usize>()
+                > MAX_FRAME
+        );
+        let mut message = scoped_fixture(None, Some(77));
+        let ServerMessage::ScopedFrame {
+            frame,
+            graphics,
+            private_frame,
+            private_graphics,
+            ..
+        } = &mut message
+        else {
+            unreachable!()
+        };
+        for (index, cell) in frame.cells.iter_mut().take(2).enumerate() {
+            cell.symbol = graphics::MARKER.to_string();
+            cell.fg = pack(graphics::slot_color(index as u32 + 1));
+        }
+        *private_frame = frame.clone();
+        (*graphics, *private_graphics) = scoped_graphic_updates(frame, public, private);
+        assert_eq!(graphics.len(), 1);
+        assert_eq!(graphics[0].key, "image-2");
+        assert_eq!(private_graphics.len(), 2);
+        assert!(private_graphics[0].image.is_none());
+        assert!(private_graphics[1].image.is_some());
+        assert_eq!(
+            frame.cells[0].symbol, " ",
+            "omitted public image kept its marker"
+        );
+        assert_eq!(frame.cells[1].fg, pack(graphics::slot_color(1)));
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &message).unwrap();
+        assert!(bytes.len() < MAX_FRAME);
+        let ServerMessage::GraphicFrame {
+            text: GraphicText::Full(frame),
+            graphics,
+            ..
+        } = decode_hyperlinks(read_message(&mut bytes.as_slice()).unwrap()).unwrap()
+        else {
+            panic!("bounded scenes lost their graphic codec");
+        };
+        assert_eq!(graphics[0].key, "image-2");
+        let private = frame.scoped.unwrap();
+        assert_eq!(private.graphics.len(), 2);
+        assert_eq!(private.graphics[0].key, "image-2");
+        assert_eq!(private.graphics[1].key, "image-3");
+        assert_eq!(private.frame.cells[0].symbol, graphics::MARKER.to_string());
+        assert_eq!(private.frame.cells[1].fg, pack(graphics::slot_color(2)));
+    }
+
+    #[test]
+    fn input_source_close_appends_without_changing_legacy_client_wire_ordinals() {
+        let message = ClientMessage::InputSourceClosed { origin: 77 };
+        let bytes = bincode::serde::encode_to_vec(&message, bincode::config::standard()).unwrap();
+        assert_eq!(bytes, [22, 77]);
+        let (decoded, _): (ClientMessage, _) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+        assert!(matches!(
+            decoded,
+            ClientMessage::InputSourceClosed { origin: 77 }
+        ));
+    }
+
     #[test]
     fn linked_frames_preserve_owner_identity_graphics_and_preparation() {
         let frame = linked_fixture();
@@ -876,6 +1419,47 @@ mod tests {
             assert_eq!(received_state.workspace_id, "owner-workspace");
             assert_eq!(received_state.focused_pane.as_deref(), Some("88"));
             assert_eq!(received_frame.hyperlinks, frame.hyperlinks);
+        }
+    }
+
+    #[test]
+    fn private_clipboard_roundtrips_origin_and_committed_workspace() {
+        for origin in [None, Some(77)] {
+            let mut bytes = Vec::new();
+            write_message(
+                &mut bytes,
+                &ServerMessage::ScopedClipboard {
+                    origin,
+                    text: "private draft".into(),
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                read_message::<_, ServerMessage>(&mut bytes.as_slice()).unwrap(),
+                ServerMessage::ScopedClipboard { origin: received, text }
+                    if received == origin && text == "private draft"
+            ));
+            bytes.clear();
+            write_message(
+                &mut bytes,
+                &ServerMessage::WorkspaceEffect {
+                    workspace_id: "workspace-owner".into(),
+                    epoch: 3,
+                    effect: WorkspaceEffect::ScopedClipboard {
+                        origin,
+                        text: "private draft".into(),
+                    },
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                read_message::<_, ServerMessage>(&mut bytes.as_slice()).unwrap(),
+                ServerMessage::WorkspaceEffect {
+                    workspace_id,
+                    epoch: 3,
+                    effect: WorkspaceEffect::ScopedClipboard { origin: received, text },
+                } if workspace_id == "workspace-owner" && received == origin && text == "private draft"
+            ));
         }
     }
 
@@ -998,7 +1582,8 @@ mod tests {
         assert!(supports_version(13));
         assert!(supports_version(14));
         assert!(supports_version(15));
-        assert!(!supports_version(16));
+        assert!(supports_version(16));
+        assert!(!supports_version(17));
     }
 
     #[test]
@@ -1050,6 +1635,7 @@ mod tests {
                 },
             ],
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((1, 0)),
             cursor_visible: true,
         });
@@ -1228,6 +1814,7 @@ mod tests {
             height: 1,
             cells: vec![cell("a"), cell("b"), cell("c")],
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((0, 0)),
             cursor_visible: true,
         };
@@ -1272,6 +1859,7 @@ mod tests {
             height: 1,
             cells,
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: None,
             cursor_visible: false,
         };
@@ -1331,6 +1919,7 @@ mod tests {
             height: 1,
             cells: vec![c(" ", 0), c(" ", 0), c(" ", 0), c(" ", 0), c(" ", 0)],
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: None,
             cursor_visible: false,
         };
@@ -1365,6 +1954,7 @@ mod tests {
             height: 2,
             cells: vec![cell("a", 1), cell("b", 2), cell("c", 3), cell("d", 4)],
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((0, 0)),
             cursor_visible: true,
         };
@@ -1439,6 +2029,7 @@ mod size_probe {
             height: h,
             cells,
             hyperlinks: Vec::new(),
+            scoped: None,
             cursor: Some((0, 0)),
             cursor_visible: true,
         }
