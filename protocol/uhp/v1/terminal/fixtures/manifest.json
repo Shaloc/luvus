@@ -27,7 +27,7 @@
       "path": "valid/control-frames.jsonl",
       "kind": "control",
       "expect": "valid",
-      "count": 11
+      "count": 13
     },
     {
       "path": "invalid/requests.jsonl",
@@ -51,7 +51,7 @@
       "path": "invalid/control-frames.jsonl",
       "kind": "control",
       "expect": "invalid",
-      "count": 6
+      "count": 7
     }
   ],
   "framing": [

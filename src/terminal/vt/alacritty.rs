@@ -1269,6 +1269,15 @@ impl VtEngine for AlacrittyEngine {
         self.title.lock().ok().and_then(|g| g.value.clone())
     }
 
+    fn program_status(&self) -> Option<alacritty_terminal::term::program_status::Record> {
+        self.term.program_status.active()
+    }
+
+    fn end_program_status(&mut self) {
+        self.term.program_status.end_command();
+        self.output_generation = self.output_generation.wrapping_add(1);
+    }
+
     fn title_generation(&self) -> u64 {
         self.title.lock().map_or(0, |title| title.generation)
     }
@@ -1677,6 +1686,56 @@ fn map_flags(fl: Flags) -> Modifier {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn osc7501_streaming_query_order_lifecycle_and_limits() {
+        use alacritty_terminal::term::program_status::State;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut engine = super::AlacrittyEngine::new(80, 24, tx, 0);
+        use crate::terminal::vt::VtEngine;
+        let bytes = b"\x1b]7501;?\x1b\\\x1b[c\x1b]7501;state=working:app=codex:progress=20\x07";
+        for byte in bytes {
+            engine.advance(&[*byte]);
+        }
+        assert!(
+            matches!(rx.try_recv().unwrap(), crate::terminal::pty::InputAction::Bytes(bytes) if bytes == b"\x1b]7501;?\x1b\\")
+        );
+        assert!(
+            matches!(rx.try_recv().unwrap(), crate::terminal::pty::InputAction::Bytes(bytes) if bytes.starts_with(b"\x1b[?"))
+        );
+        assert_eq!(engine.program_status().unwrap().progress, Some(20));
+        engine.advance(b"\x1b[?1049h\x1b[!p\x1b[?1049l");
+        assert_eq!(engine.program_status().unwrap().state, State::Working);
+        engine.advance(b"\x1b]7501;state=done:id=child\x07\x1b]133;A\x07");
+        assert_eq!(engine.program_status().unwrap().state, State::Done);
+        engine.end_program_status();
+        assert_eq!(engine.program_status().unwrap().state, State::Done);
+        engine.advance(b"\x1b]7501;state=blocked:id=bad\x1b");
+        assert_eq!(
+            engine.program_status().unwrap().state,
+            State::Done,
+            "ESC alone is not ST"
+        );
+        engine.advance(b"[0m");
+        assert_eq!(
+            engine.program_status().unwrap().state,
+            State::Done,
+            "aborted report is atomic"
+        );
+        engine
+            .advance(format!("\x1b]7501;state=blocked:unused={}\x07", "x".repeat(9000)).as_bytes());
+        assert_eq!(engine.program_status().unwrap().state, State::Done);
+        engine.advance(b"\x1b]7501;state=blocked\x18");
+        assert_eq!(engine.program_status().unwrap().state, State::Done);
+        engine.advance(b"\x1b]7501;ignored=bad;pair:state=error\x07");
+        assert_eq!(engine.program_status().unwrap().state, State::Error);
+        assert!(
+            rx.try_recv().is_err(),
+            "reports must never reflect text to the child"
+        );
+        engine.advance(b"\x1bc");
+        assert!(engine.program_status().is_none());
+    }
+
     use super::*;
     use std::sync::mpsc::channel;
 

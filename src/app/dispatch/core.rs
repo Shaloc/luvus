@@ -281,6 +281,12 @@ impl App {
         self.file_tree.scroll = 0;
         self.apply_agents_filter(next.agents_active_only);
         self.apply_agents_scope(next.agents_this_workspace);
+        if self.config.agents_group_by_workspace != next.agents_group_by_workspace
+            || self.config.agents_status_filter != next.agents_status_filter
+        {
+            self.agents_scroll = 0;
+            self.agent_cursor = 0;
+        }
         crate::layout::set_gaps(next.layout.col_gap, next.layout.row_gap);
         for pane in self.panes.values() {
             pane.set_history_budget(history_budget);

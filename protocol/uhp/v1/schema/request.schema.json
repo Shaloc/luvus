@@ -240,7 +240,8 @@
         "terminal.backend.close",
         "terminal.backend.wait_change",
         "terminal.backend.wait_output",
-        "terminal.backend.events.subscribe"
+        "terminal.backend.events.subscribe",
+        "module.update"
       ]
     },
     "params": {
@@ -1458,6 +1459,53 @@
           "description": "Fraction of the model context window already consumed. This is not task-completion progress."
         }
       }
+    },
+    "moduleUpdateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "path",
+        "source",
+        "expected_root",
+        "expected_source"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "expected_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "git_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
     }
   },
   "allOf": [
@@ -2318,6 +2366,22 @@
         "properties": {
           "params": {
             "$ref": "https://luvus.dev/protocol/uhp/v1/schema/terminal/methods/events.schema.json"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "module.update"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/moduleUpdateParams"
           }
         }
       }

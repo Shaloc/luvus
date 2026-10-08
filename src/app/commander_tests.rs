@@ -27,6 +27,7 @@ fn add_commander_test_module(
         root,
         enabled: true,
         source: None,
+        git_ref: None,
         manifest,
         warning: None,
     });
@@ -1302,6 +1303,13 @@ fn working_agent_requires_second_enter_unless_auto_send_and_blocked_never_sends(
     let mut app = App::new(80, 24, tx).unwrap();
     app.config.commander_working_policy = crate::config::CommanderWorkingPolicy::Ask;
     let pane = app.layout().focus;
+    // An explicit busy report must still allow existing positive composer
+    // evidence to reach the configured Ask/AutoSend policy.
+    app.panes[&pane]
+        .engine
+        .lock()
+        .unwrap()
+        .advance(b"\x1b]7501;state=working\x07");
     let generation = app.panes[&pane].engine.lock().unwrap().output_generation();
     let status = app.status.get_mut(&pane).unwrap();
     status.agent = "claude".into();

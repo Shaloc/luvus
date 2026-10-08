@@ -255,6 +255,14 @@ lock scopes short and never hold it across unrelated slow work.
   file/preview views. Preserve OSC 8 hyperlink targets and forward bounded
   pane-originated OSC 52 clipboard writes through the client clipboard path;
   never enable OSC 52 clipboard reads implicitly.
+- OSC 7501 records belong to the owning terminal, survive alternate-screen
+  switches, and remain bounded untrusted status metadata. They may override
+  screen-state heuristics but never authenticated integration leases, native
+  agent identity, session recovery, or positive composer readiness. Map `error`
+  to the existing Done state and retain the original value in `agent.explain`.
+- Active-agent workspace grouping and state filters are local display
+  preferences. Keep owner actions unchanged and keep mouse rows and keyboard
+  targets in the same filtered order, skipping non-interactive group headings.
 
 ## CLI API UHP and documentation parity
 

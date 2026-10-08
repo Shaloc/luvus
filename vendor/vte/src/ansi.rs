@@ -648,6 +648,12 @@ pub trait Handler {
     /// Reset terminal state.
     fn reset_state(&mut self) {}
 
+    /// Bounded program-status metadata from OSC 7501, including feature query.
+    fn program_status(&mut self, _body: &[u8]) {}
+
+    /// A new shell prompt (OSC 133 A) ends transient program status.
+    fn shell_prompt(&mut self) {}
+
     /// Reverse Index.
     ///
     /// Move the active position to the same horizontal position on the
@@ -1406,6 +1412,8 @@ where
         }
 
         match params[0] {
+            b"7501" if params.len() == 2 => self.handler.program_status(params[1]),
+            b"133" if params.get(1) == Some(&b"A".as_slice()) => self.handler.shell_prompt(),
             // Set window title.
             b"0" | b"2" => {
                 if params.len() >= 2 {

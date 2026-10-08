@@ -151,6 +151,7 @@ pub const METHODS: &[&str] = &[
     "module.list",
     "module.info",
     "module.link",
+    "module.update",
     "module.unlink",
     "module.uninstall",
     "module.enable",
@@ -501,6 +502,7 @@ mod tests {
             "upload_chunk",
             "upload_finish",
             "upload_cancel",
+            "set_viewport",
         ] {
             assert!(
                 terminal_capabilities.iter().any(|value| value == action),

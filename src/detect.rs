@@ -170,6 +170,10 @@ enum Cond {
     /// in the OSC title, so the generic start-of-line spinner rule cannot see it.
     SpinnerAfterPrefix(Vec<String>),
     LastLine(Vec<String>),
+    /// The last non-empty line, or the non-empty line above one trailing row,
+    /// contains one of these substrings. A live menu footer can sit directly
+    /// above a model-status row.
+    LastTwoLines(Vec<String>),
 }
 
 impl Cond {
@@ -195,6 +199,12 @@ impl Cond {
                 .rev()
                 .find(|line| !line.trim().is_empty())
                 .is_some_and(|line| subs.iter().any(|s| line.contains(s))),
+            Cond::LastTwoLines(subs) => low
+                .lines()
+                .rev()
+                .filter(|line| !line.trim().is_empty())
+                .take(2)
+                .any(|line| subs.iter().any(|s| line.contains(s))),
         }
     }
 }
@@ -378,11 +388,12 @@ pub(crate) fn screen_rows(known_agent: &str, running: &[String], manifests: &Man
     }
 }
 
-/// Claude, Codex, Hermes, Devin, and Arc Studio can place an interaction above a
-/// tall blank footer. Keep their most recent non-empty live rows without pulling
-/// in scrollback. For Codex this also keeps the first-run sign-in chooser
-/// visible to prompt admission instead of mistaking its blank footer for a
-/// composer; for Devin, the first-run workspace-trust menu.
+/// Claude, Codex, Hermes, Devin, Arc Studio, and Antigravity can place an
+/// interaction above a tall blank footer. Keep their most recent non-empty
+/// live rows without pulling in scrollback. For Codex this also keeps the
+/// first-run sign-in chooser visible to prompt admission instead of mistaking
+/// its blank footer for a composer; for Devin and Antigravity, the first-run
+/// workspace-trust menu.
 pub(crate) fn screen_uses_non_empty_rows(
     known_agent: &str,
     running: &[String],
@@ -398,6 +409,8 @@ pub(crate) fn screen_uses_non_empty_rows(
         || manifests.process_has_agent(running, "hermes")
         || known_agent.eq_ignore_ascii_case("devin")
         || manifests.process_has_agent(running, "devin")
+        || known_agent.eq_ignore_ascii_case("antigravity")
+        || manifests.process_has_agent(running, "antigravity")
 }
 
 /// Probe a blank bottom window for Arc Studio's full live banner only while
@@ -925,6 +938,24 @@ fn builtin_rules() -> Vec<Rule> {
             vec![
                 all(&["trust this folder?", "trust and continue"]),
                 Cond::LastLine(vec!["enter continue".to_string()]),
+            ],
+        ),
+        // Antigravity's first-run workspace-trust screen ends on
+        // "↑/↓ Navigate · enter Confirm", sometimes with one model-status row
+        // after it. The footer has to be one of those last rows. The same
+        // menu text above the composer ends on the composer.
+        per(
+            "antigravity",
+            State::Blocked,
+            310,
+            Region::Screen,
+            vec![
+                all(&[
+                    "do you trust the contents of this project?",
+                    "yes, i trust this folder",
+                    "enter confirm",
+                ]),
+                Cond::LastTwoLines(vec!["enter confirm".to_string()]),
             ],
         ),
     ]
@@ -4125,5 +4156,154 @@ For security, devin.exe should not be run in directories with untrusted content.
             .state,
             State::Idle
         );
+    }
+
+    // The first launch in an untrusted folder, from issue #477. Antigravity
+    // paints this menu on the first rows and leaves a blank footer under it,
+    // with the model status on the last row.
+    const ANTIGRAVITY_WORKSPACE_TRUST_SCREEN: &str = r#"Accessing workspace:
+/tmp/example-project
+Do you trust the contents of this project?
+Antigravity CLI requires permission to read, edit, and execute files here.
+> Yes, I trust this folder
+  No, exit
+  ↑/↓ Navigate · enter Confirm"#;
+
+    fn antigravity_detection(bottom: &str, running: &[String]) -> Detection {
+        classify(
+            Some("agy"),
+            bottom,
+            true,
+            false,
+            "agy",
+            "antigravity",
+            running,
+            &Manifests::builtin(),
+        )
+    }
+
+    #[test]
+    fn antigravity_workspace_trust_screen_is_blocked() {
+        let running = ["/usr/bin/agy --model gemini-3.8-flash-low -i Reply ok.".to_string()];
+        let trust = antigravity_detection(ANTIGRAVITY_WORKSPACE_TRUST_SCREEN, &running);
+        assert_eq!(trust.agent, "antigravity");
+        assert_eq!(trust.state, State::Blocked);
+        assert_eq!(trust.state_source, "manifest_rule");
+        assert_eq!(trust.prompt_evidence, PromptEvidence::Blocked);
+        assert_eq!(trust.rule_priority, Some(310));
+        assert_eq!(trust.rule_region, Some("screen"));
+
+        // The model status can sit on its own last row. The menu is still blocked.
+        let with_status = antigravity_detection(
+            &format!("{ANTIGRAVITY_WORKSPACE_TRUST_SCREEN}\nGemini 3.5 Flash (High)"),
+            &running,
+        );
+        assert_eq!(with_status.state, State::Blocked);
+        assert_eq!(with_status.prompt_evidence, PromptEvidence::Blocked);
+        // Moving the cursor to the exit row leaves the same menu on screen.
+        assert_eq!(
+            antigravity_detection(
+                "Do you trust the contents of this project?\n  Yes, I trust this folder\n> No, exit\n  ↑/↓ Navigate · enter Confirm",
+                &running,
+            )
+            .state,
+            State::Blocked
+        );
+
+        // A trusted folder's composer and an in-progress turn keep their readings.
+        let idle = antigravity_detection(
+            "────────────────────────────────\n>\n────────────────────────────────\n? for shortcuts",
+            &running,
+        );
+        assert_eq!(idle.state, State::Idle);
+        assert_eq!(idle.state_source, "no_positive_state_evidence");
+        assert_eq!(
+            antigravity_detection("⣾ Working...\nesc to cancel", &running).state,
+            State::Working
+        );
+        // Quoting the question, or the menu without its confirm hint, is not
+        // the live trust screen.
+        assert_eq!(
+            antigravity_detection(
+                "The CLI asked \"Do you trust the contents of this project?\" before the turn.\n>\n? for shortcuts",
+                &running,
+            )
+            .state,
+            State::Idle
+        );
+        assert_eq!(
+            antigravity_detection(
+                "Do you trust the contents of this project?\n> Yes, I trust this folder\n>\n? for shortcuts",
+                &running,
+            )
+            .state,
+            State::Idle
+        );
+        // The full menu can remain above the composer after it is dismissed.
+        // The live rows are the composer, so this is idle.
+        let inactive = antigravity_detection(
+            "Do you trust the contents of this project?\n\
+             Antigravity CLI requires permission to read, edit, and execute files here.\n\
+             > Yes, I trust this folder\n\
+               No, exit\n\
+               ↑/↓ Navigate · enter Confirm\n\
+             ────────────────────────────────\n\
+             >\n\
+             ────────────────────────────────\n\
+             ? for shortcuts",
+            &running,
+        );
+        assert_eq!(inactive.state, State::Idle);
+        assert_eq!(inactive.state_source, "no_positive_state_evidence");
+        assert_eq!(inactive.prompt_evidence, PromptEvidence::Unknown);
+    }
+
+    #[test]
+    fn antigravity_trust_screen_sits_above_the_bottom_rows() {
+        let manifests = Manifests::builtin();
+        let running = ["/usr/bin/agy".to_string()];
+        assert!(screen_uses_non_empty_rows("", &running, &manifests));
+        assert!(screen_uses_non_empty_rows("antigravity", &[], &manifests));
+        assert!(screen_uses_non_empty_rows(
+            "",
+            &[r"C:\Users\me\AppData\Local\agy\bin\agy.exe".to_string()],
+            &manifests
+        ));
+
+        let rows = screen_rows("antigravity", &running, &manifests);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut engine = AlacrittyEngine::new(80, 30, tx, 1024 * 1024);
+        let screen = ANTIGRAVITY_WORKSPACE_TRUST_SCREEN.replace('\n', "\r\n");
+        engine
+            .advance(format!("\x1b[2J\x1b[H{screen}\x1b[30;1HGemini 3.5 Flash (High)").as_bytes());
+
+        let bottom = engine.detection_text(rows);
+        assert!(
+            !bottom.to_lowercase().contains("yes, i trust this folder"),
+            "the trust menu is above the ordinary bottom-row window"
+        );
+        assert_eq!(antigravity_detection(&bottom, &running).state, State::Idle);
+
+        let visible = engine.detection_text_non_empty(rows);
+        let detection = antigravity_detection(&visible, &running);
+        assert_eq!(detection.state, State::Blocked);
+        assert_eq!(detection.state_source, "manifest_rule");
+        assert_eq!(detection.prompt_evidence, PromptEvidence::Blocked);
+
+        // A bottom-aligned working footer and a trusted composer stay put when
+        // the same non-empty window is used.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut working = AlacrittyEngine::new(80, 30, tx, 1024 * 1024);
+        working.advance("\x1b[2J\x1b[28;1H⠹ Working...\r\nesc to cancel".as_bytes());
+        assert_eq!(
+            antigravity_detection(&working.detection_text_non_empty(rows), &running).state,
+            State::Working
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut idle = AlacrittyEngine::new(80, 30, tx, 1024 * 1024);
+        idle.advance(b"\x1b[2J\x1b[28;1H>\r\n? for shortcuts");
+        let idle_detection = antigravity_detection(&idle.detection_text_non_empty(rows), &running);
+        assert_eq!(idle_detection.state, State::Idle);
+        assert_eq!(idle_detection.state_source, "no_positive_state_evidence");
     }
 }

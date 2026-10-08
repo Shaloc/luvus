@@ -671,6 +671,7 @@ impl App {
                                 engine.title().map(Arc::<str>::from),
                                 Arc::<str>::from(text),
                                 composer_ready,
+                                engine.program_status(),
                             ))
                         } else {
                             None
@@ -681,15 +682,18 @@ impl App {
             };
             let inspected_composer_ready = inspected
                 .as_ref()
-                .and_then(|(_, _, _, composer_ready)| *composer_ready);
+                .and_then(|(_, _, _, composer_ready, _)| *composer_ready);
             if let Some(s) = self.status.get_mut(&id) {
-                if let Some((generation, title, bottom, composer_ready)) = inspected {
+                if let Some((generation, title, bottom, composer_ready, program_status)) = inspected
+                {
                     if audit_only {
                         self.detection_audit_recoveries =
                             self.detection_audit_recoveries.saturating_add(1);
                     }
                     s.last_detect_generation = Some(generation);
                     presentation_metadata_changed |= s.detected_title != title;
+                    presentation_metadata_changed |= s.detected_program_status != program_status;
+                    s.detected_program_status = program_status;
                     s.detected_title = title;
                     s.detected_bottom = bottom;
                     s.detected_composer_ready = composer_ready;
@@ -729,7 +733,7 @@ impl App {
             let known = known_agent.as_str();
             // Ground truth for identity, when the last scan could see this pane.
             let running = self.running_for_detection(id);
-            let det = match report.as_ref() {
+            let mut det = match report.as_ref() {
                 Some(report) => detect::Detection {
                     state: report.state,
                     agent: report.agent.clone(),
@@ -759,6 +763,33 @@ impl App {
                 ),
             };
 
+            // Explicit status is independent of screen repaint and quiet-dwell
+            // heuristics. Integrations retain their existing authenticated lease
+            // precedence. OSC app stays metadata: native identity consumers
+            // also control session discovery and automatic resume.
+            let program_status = self
+                .status
+                .get(&id)
+                .and_then(|s| s.detected_program_status.as_ref())
+                .filter(|_| report.is_none());
+            if let Some(program) = program_status {
+                use alacritty_terminal::term::program_status::State as ProgramState;
+                det.state = match program.state {
+                    ProgramState::Idle => State::Idle,
+                    ProgramState::Working => State::Working,
+                    ProgramState::Blocked => State::Blocked,
+                    ProgramState::Done | ProgramState::Error => State::Done,
+                };
+                det.state_source = "osc7501";
+                det.rule_priority = None;
+                det.rule_region = None;
+                if det.state == State::Blocked {
+                    det.prompt_evidence = detect::PromptEvidence::Blocked;
+                }
+            }
+            let explicit_status = program_status.is_some();
+            let program_hint = program_status.and_then(|r| r.msg.clone());
+
             if let Some(s) = self.status.get_mut(&id) {
                 s.identity_source = det.identity_source;
                 s.state_source = det.state_source;
@@ -778,8 +809,9 @@ impl App {
                 // would flip an idle agent to "working" for the whole ~2.5s Idle
                 // dwell. The pane keeps whatever state it already had until the
                 // grid settles (docs/07).
-                if s.last_resize
-                    .is_some_and(|t| now.duration_since(t) < RESIZE_GRACE)
+                if !explicit_status
+                    && s.last_resize
+                        .is_some_and(|t| now.duration_since(t) < RESIZE_GRACE)
                 {
                     s.prompt_evidence = if det.prompt_evidence == detect::PromptEvidence::Blocked {
                         detect::PromptEvidence::Blocked
@@ -790,7 +822,9 @@ impl App {
                 }
                 s.last_resize = None;
                 // The done-latch and working history track the *raw* reading.
-                if s.prev_working && det.state == State::Idle && !focused {
+                if explicit_status {
+                    s.done = false;
+                } else if s.prev_working && det.state == State::Idle && !focused {
                     s.done = true;
                 }
                 s.prev_working = det.state == State::Working;
@@ -860,7 +894,10 @@ impl App {
                     s.candidate = desired;
                     s.candidate_since = now;
                 }
-                let dwell = if report.is_some() {
+                if explicit_status && desired == State::Blocked {
+                    s.blocked_hint = program_hint.clone();
+                }
+                let dwell = if report.is_some() || explicit_status {
                     Duration::ZERO
                 } else {
                     commit_dwell(desired)
@@ -877,7 +914,11 @@ impl App {
                     // Control's "why blocked / answer inline" (docs/54); cleared
                     // when it leaves. No per-tick string allocation.
                     s.blocked_hint = if desired == State::Blocked {
-                        blocking_hint(&bottom)
+                        if explicit_status {
+                            program_hint
+                        } else {
+                            blocking_hint(&bottom)
+                        }
                     } else {
                         None
                     };

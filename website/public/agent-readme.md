@@ -351,7 +351,11 @@ or bar placement.
 - Use UHP 1.0 for harnesses, orchestrators, typed discovery, event streams,
   atomic prompts, terminal access, and revision-safe mutations.
 - Use modules for reusable, explicitly installed extensions with UI surfaces
-  or event hooks.
+  or event hooks. With explicit approval, update a managed module via
+  `luvus module update <id|owner/repo[/sub]> [--ref REF] [--yes]` against its
+  running session. Saved refs, settings, and enabled state survive; local links
+  are updated in their own checkout. Existing module panes stay on old code
+  and may need reopening to publish UI with the new credentials.
 
 CLI commands and UHP methods control the same server state. UHP is the public
 automation protocol. The binary client-frame transport is an internal rendering
@@ -530,7 +534,9 @@ discovery rather than inferring support from an agent name.
 - `luvus integration install devin` adds one `SessionStart` hook that reports
   only the exact Devin session ID selected in that pane, including after
   `/clear` or an in-TUI `/resume`. Detection remains native, and Luvus does not
-  open Devin's private session database.
+  open Devin's private session database. A scheduled Devin worker accepts
+  `read_only` or `full_access` and rejects `workspace`, because Devin's
+  `accept-edits` mode cannot commit worktree changes.
 
 Do not claim every shell command resumes after restart. Do not guess native
 session IDs. List sessions and use the exact returned identifier.
@@ -685,6 +691,12 @@ proposing `luvus server restart`. If an agent is missing or misclassified, use
 `luvus agent explain <target>`. Detection, hooks, usage, and resume are
 independent layers. If a key fails, the outer terminal or operating system may
 have consumed it; use `luvus doctor` and the keybinding reference.
+
+OSC 7501 program status is terminal-supplied, self-reported evidence. Inspect
+`state_evidence.program_status` in `agent.explain` for its original state and
+metadata; `error` appears as Done in Luvus. A status report never proves that
+an input composer is ready or grants approval authority. Remote owner servers
+parse these reports and project their state to attached displays.
 
 ## Help humans clearly
 

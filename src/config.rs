@@ -16,6 +16,49 @@ use crate::app::{SIDEBAR_WIDTH_DEFAULT, SIDEBAR_WIDTH_MAX, SIDEBAR_WIDTH_MIN};
 
 const CONFIG_VERSION: u32 = 2;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentStatusFilter {
+    pub working: bool,
+    pub blocked: bool,
+    pub idle: bool,
+    pub done: bool,
+}
+
+impl Default for AgentStatusFilter {
+    fn default() -> Self {
+        Self {
+            working: true,
+            blocked: true,
+            idle: true,
+            done: true,
+        }
+    }
+}
+
+impl AgentStatusFilter {
+    pub fn includes(&self, state: crate::ui::theme::State) -> bool {
+        use crate::ui::theme::State;
+        match state {
+            State::Working => self.working,
+            State::Blocked => self.blocked,
+            State::Idle | State::Unknown => self.idle,
+            State::Done => self.done,
+        }
+    }
+
+    pub fn toggle(&mut self, state: crate::ui::theme::State) {
+        use crate::ui::theme::State;
+        let enabled = match state {
+            State::Working => &mut self.working,
+            State::Blocked => &mut self.blocked,
+            State::Idle | State::Unknown => &mut self.idle,
+            State::Done => &mut self.done,
+        };
+        *enabled = !*enabled;
+    }
+}
+
 /// Commander admission for an agent that is working but has a ready prompt.
 /// This never changes the agent's own permission or approval policy.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +137,11 @@ pub struct Config {
     /// visible scope chip updates this preference.
     #[serde(default)]
     pub agents_this_workspace: bool,
+    /// Active AGENTS presentation, independent of All/history and scope.
+    #[serde(default)]
+    pub agents_group_by_workspace: bool,
+    #[serde(default)]
+    pub agents_status_filter: AgentStatusFilter,
     /// Explicitly enabled SSH config aliases for managed remote sessions.
     /// Empty means no managed remote connections are allowed. Selecting an
     /// alias connects and discovers sessions; attach and merge remain explicit.
@@ -571,6 +619,8 @@ impl Default for Config {
             commander_working_policy: CommanderWorkingPolicy::AutoSend,
             agents_active_only: false,
             agents_this_workspace: false,
+            agents_group_by_workspace: false,
+            agents_status_filter: AgentStatusFilter::default(),
             remote_hosts: Vec::new(),
             remote_auto_install: false,
             keybindings: std::collections::HashMap::new(),

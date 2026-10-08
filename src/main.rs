@@ -903,7 +903,10 @@ fn managed_remote_local_only_command(args: &[String]) -> Option<&str> {
             | "--local"
             | "--remote"
     ) || (command == "module"
-        && matches!(args.get(2).map(String::as_str), Some("install" | "search")))
+        && matches!(
+            args.get(2).map(String::as_str),
+            Some("install" | "search" | "update")
+        ))
         || (command == "uhp"
             && matches!(args.get(2).map(String::as_str), Some("access" | "schema")));
     local_only.then_some(command)
@@ -2384,6 +2387,12 @@ mod tests {
         );
         assert_eq!(
             managed_remote_local_only_command(&args(&["luvus", "module", "install", "a/b"])),
+            Some("module")
+        );
+        assert_eq!(
+            managed_remote_local_only_command(&args(&[
+                "luvus", "module", "update", "example", "--yes"
+            ])),
             Some("module")
         );
         assert_eq!(

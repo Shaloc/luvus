@@ -1659,6 +1659,22 @@ def main():
                                          and a["agent"] == "codex" and a["status"] == expected
                                          for a in api("agent.list", remote=remote)["agents"]))
                 print(f"PASS: Codex {expected} matches on owner and display with composer decoration", flush=True)
+            # OSC-only output must invalidate the owner's detection cache and
+            # refresh the projected row without a keypress on the display.
+            for expected, report in (("working", "state=working:app=claude"),
+                                     ("blocked", "state=blocked:id=review:kind=permission:msg=QXBwcm92ZT8="),
+                                     ("working", "state=clear:id=review"),
+                                     ("done", "state=error:msg=RmFpbGVk"),
+                                     ("idle", "state=idle")):
+                api("pane.run", {"pane": pane, "command": "OSC7501:" + report}, remote=True)
+                for remote in (True, False):
+                    wait_for(lambda: any(a.get("pane" if remote else "owner_pane") == pane
+                                         and a["agent"] == "codex" and a["status"] == expected
+                                         for a in api("agent.list", remote=remote)["agents"]))
+                assert process.poll() is None
+                print(f"PASS: OSC 7501 {expected} matches on owner and display without navigation", flush=True)
+            api("pane.run", {"pane": pane, "command": "OSC7501:state=clear"}, remote=True)
+            wait_for(lambda: api("agent.explain", {"target": pane}, remote=True)["state_evidence"]["source"] != "osc7501")
             return
 
         if clipboard_only:
@@ -2514,6 +2530,9 @@ if __name__ == "__main__":
         print("CODEX_FIXTURE_READY" if codex else "QODER_FIXTURE_READY", flush=True)
         for line in sys.stdin:
             text = line.strip()
+            if text.startswith("OSC7501:"):
+                print("\033]7501;" + text[len("OSC7501:"):] + "\007", end="", flush=True)
+                continue
             if codex and text == "CODEX_IDLE_DECORATION":
                 text = "done 8:33 PM\n\n  ⢀  ⠈    ⠂ ⠄    ⠄  ⠈\n› Ask Codex to do anything⡀  ⠈  ⠂\n  ⠠  ⠄   ⢀  ⠈\n  gpt-6-astra high"
             title = "Codex" if codex else "Qoder CLI"

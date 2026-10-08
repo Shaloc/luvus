@@ -612,6 +612,128 @@ mod tests {
         );
         assert_ne!(app.sidebar_focus, Some(SidebarListFocus::Agents));
     }
+
+    #[test]
+    fn active_grouping_multiselect_matches_remote_mouse_and_keyboard_rows() {
+        use crate::app::{AgentDockTarget, PaneStatus, SidebarListFocus};
+        use crate::event::AppEvent;
+        use crate::ui::theme::State;
+        use ratatui::crossterm::event::{KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("active-agent-grouping");
+        let mut app = remote_ui_app();
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        app.app_tx = events_tx;
+        let (view, input, _) = add_remote_workspace(&mut app);
+        let local = app.workspaces[0].tabs[0].layout.focus;
+        app.status.insert(local, PaneStatus::new("codex".into()));
+        app.status.get_mut(&local).unwrap().state = State::Working;
+        remote_view(&mut app, view).agents = vec![agent(7, true), agent(8, false)];
+        remote_view(&mut app, view).agents[1].state = State::Done;
+        app.set_agents_filter(true);
+        let target = AgentTarget::RemoteLive {
+            view,
+            pane: PaneId(7),
+        };
+        app.open_agent_menu(target, 2, 2);
+        app.agent_menu_action(AgentMenuItem::ToggleWorkspaceGrouping);
+        app.agent_menu_action(AgentMenuItem::ToggleStatus(State::Done));
+        app.agent_menu_action(AgentMenuItem::ToggleStatus(State::Idle));
+        assert!(app.agent_menu.is_some(), "checkbox menu stays open");
+        assert!(
+            input.try_recv().is_err(),
+            "display filters must not send owner commands"
+        );
+        app.flush_config_for_test(&events_rx);
+        let saved = crate::config::load();
+        assert!(saved.agents_group_by_workspace);
+        assert!(!saved.agents_status_filter.done && !saved.agents_status_filter.idle);
+        let expected = vec![
+            AgentDockTarget::Workspace(0),
+            AgentDockTarget::Live(local),
+            AgentDockTarget::Workspace(1),
+            AgentDockTarget::RemoteLive {
+                view,
+                pane: "7".into(),
+            },
+        ];
+        assert_eq!(app.agent_dock_targets(), expected);
+        app.agent_menu = None;
+        // Filter changes and Enter can arrive in one input batch without a render.
+        app.set_agents_filter(false);
+        app.sidebar_focus = Some(SidebarListFocus::Agents);
+        app.handle_agents_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.agent_cursor, 1);
+        app.handle_agents_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.layout().focus, local);
+        assert!(app.sidebar_focus.is_none());
+        app.handle_agents_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(
+            app.agent_cursor, 0,
+            "All starts at its first selectable row"
+        );
+        app.set_agents_filter(true);
+        for paths in [true, false] {
+            app.config.layout.agent_paths = paths;
+            render(&mut app);
+            let stride = if paths { 2 } else { 1 };
+            assert_eq!(app.agent_rects[0].1.y, app.agents_area.y + stride);
+            assert_eq!(app.remote_agent_rects.len(), 1);
+            assert_eq!(app.remote_agent_rects[0].1, "7");
+            assert_eq!(
+                app.remote_agent_rects[0].2.y,
+                app.agents_area.y + 3 * stride
+            );
+            app.agent_cursor = 1;
+            app.handle_agents_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            assert_eq!(app.agent_cursor, 3, "skip group headers");
+            app.handle_agents_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            assert_eq!(app.agent_cursor, 1);
+        }
+        app.open_agent_menu(AgentTarget::Dock, 2, 2);
+        app.agent_menu_action(AgentMenuItem::ToggleStatus(State::Working));
+        app.agent_menu_action(AgentMenuItem::ToggleStatus(State::Blocked));
+        assert!(app.agent_dock_targets().is_empty());
+        app.agent_menu = None;
+        render(&mut app);
+        let area = app.agents_area;
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: area.x + 1,
+            row: area.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.agent_menu.as_ref().unwrap().target, AgentTarget::Dock);
+        app.agent_menu_action(AgentMenuItem::AllStatuses);
+        assert_eq!(app.agent_dock_targets().len(), 5);
+        let toggle = app
+            .agent_menu_items(AgentTarget::Dock)
+            .iter()
+            .position(|item| *item == AgentMenuItem::ToggleStatus(State::Working))
+            .unwrap();
+        app.agent_menu.as_mut().unwrap().selected = Some(toggle);
+        for kind in [
+            KeyEventKind::Press,
+            KeyEventKind::Repeat,
+            KeyEventKind::Repeat,
+            KeyEventKind::Release,
+        ] {
+            app.handle_event(AppEvent::Key(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                kind,
+            )));
+            assert!(
+                !app.config.agents_status_filter.working,
+                "held Space must only toggle once"
+            );
+            assert!(app.agent_menu.is_some());
+        }
+        app.set_agents_filter(false);
+        assert!(!app
+            .agent_dock_targets()
+            .iter()
+            .any(|row| matches!(row, AgentDockTarget::Workspace(_))));
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

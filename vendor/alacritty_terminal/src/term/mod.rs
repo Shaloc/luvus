@@ -29,6 +29,7 @@ use crate::vte::ansi::{
 pub mod cell;
 pub mod color;
 pub mod graphics;
+pub mod program_status;
 pub mod search;
 
 /// Minimum number of columns.
@@ -270,6 +271,7 @@ impl TermDamageState {
 
 pub struct Term<T> {
     pub graphics: graphics::Graphics,
+    pub program_status: program_status::ProgramStatus,
     cell_pixels: (u16, u16),
     graphics_enabled: bool,
     /// Terminal focus controlling the cursor shape.
@@ -460,6 +462,7 @@ impl<T> Term<T> {
 
         Term {
             graphics: Default::default(),
+            program_status: Default::default(),
             cell_pixels: (8, 16),
             graphics_enabled: false,
             inactive_grid,
@@ -2096,6 +2099,7 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn reset_state(&mut self) {
         self.graphics.reset();
+        self.program_status.reset();
         if self.mode.contains(TermMode::ALT_SCREEN) {
             mem::swap(&mut self.grid, &mut self.inactive_grid);
         }
@@ -2490,6 +2494,18 @@ impl<T: EventListener> Handler for Term<T> {
     }
 
     #[inline]
+    fn program_status(&mut self, body: &[u8]) {
+        if body == b"?" {
+            self.event_proxy.send_event(Event::PtyWrite("\x1b]7501;?\x1b\\".into()));
+        } else {
+            self.program_status.report(body);
+        }
+    }
+
+    fn shell_prompt(&mut self) {
+        self.program_status.end_command();
+    }
+
     fn set_title(&mut self, title: Option<String>) {
         trace!("Setting title to '{title:?}'");
 

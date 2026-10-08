@@ -4,6 +4,7 @@
 pub mod appearance;
 pub mod backend;
 pub mod clipboard;
+pub mod color_depth;
 pub(crate) mod graphics;
 mod graphics_diacritics;
 #[cfg(any(windows, test))]

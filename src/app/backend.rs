@@ -1284,6 +1284,73 @@ impl App {
         })
     }
 
+    /// Size one terminal for an API control stream.
+    ///
+    /// Native render clients keep geometry authority: while one is drawing,
+    /// the interactive render sizes every visible pane, so the request is
+    /// refused and nothing changes. Without one there is no render to size the
+    /// PTY at all, and the stream's viewport stands until a native client
+    /// attaches and lays the pane out again.
+    pub(crate) fn backend_set_viewport(
+        &mut self,
+        params: &Value,
+        native_geometry: bool,
+    ) -> BackendResult {
+        reject_mutation_fields(
+            params,
+            &[
+                "server_generation",
+                "terminal_id",
+                "pane_id",
+                "cols",
+                "rows",
+            ],
+        )?;
+        let (Some(cols), Some(rows)) = (
+            backend::viewport_dimension(params.get("cols"), backend::MAX_VIEWPORT_COLS),
+            backend::viewport_dimension(params.get("rows"), backend::MAX_VIEWPORT_ROWS),
+        ) else {
+            return Err(BackendError::mutation(
+                "invalid_params",
+                "cols and rows must be integers within the advertised viewport limits",
+                DispatchEvidence::NotStarted,
+            ));
+        };
+        let pane_id = self.resolve_backend_runtime(params, true)?;
+        if native_geometry {
+            return Err(mutation_error(
+                "unavailable",
+                "a native client owns terminal geometry",
+            ));
+        }
+        let resized = self
+            .panes
+            .get_mut(&pane_id)
+            .is_some_and(|pane| pane.resize(cols, rows));
+        if resized {
+            // Same bookkeeping as a resize from the interactive render: the
+            // child repaints, so detection pauses and stale matches are dropped.
+            if let Some(search) = self
+                .pane_search
+                .as_mut()
+                .filter(|search| search.pane == pane_id)
+            {
+                search.invalidate_matches();
+            }
+            if let Some(status) = self.status.get_mut(&pane_id) {
+                status.last_resize = Some(Instant::now());
+                status.force_detect = true;
+            }
+            // A reflow changes the captured text even when the child stays
+            // quiet; publish it so the stream sends a frame at the new size.
+            if let Some(pane) = self.panes.get(&pane_id) {
+                pane.note_reflow();
+            }
+            self.backend_output_changed(pane_id);
+        }
+        Ok(executed_action_json())
+    }
+
     pub(super) fn start_backend_wait(&mut self, req: ApiRequest) {
         let parsed = (|| -> Result<_, BackendError> {
             let output_wait = req.method == "terminal.backend.wait_output";
@@ -1690,11 +1757,23 @@ fn backend_key_bytes(key: &str, application_cursor: bool) -> Option<Vec<u8>> {
         "delete" => b"\x1b[3~",
         "pageup" => b"\x1b[5~",
         "pagedown" => b"\x1b[6~",
+        "ctrl-a" => b"\x01",
+        "ctrl-b" => b"\x02",
         "ctrl-c" => b"\x03",
         "ctrl-d" => b"\x04",
+        "ctrl-e" => b"\x05",
+        "ctrl-f" => b"\x06",
+        "ctrl-g" => b"\x07",
         "ctrl-k" => b"\x0b",
+        "ctrl-l" => b"\x0c",
+        "ctrl-n" => b"\x0e",
+        "ctrl-o" => b"\x0f",
+        "ctrl-p" => b"\x10",
+        "ctrl-r" => b"\x12",
+        "ctrl-t" => b"\x14",
         "ctrl-u" => b"\x15",
         "ctrl-w" => b"\x17",
+        "ctrl-y" => b"\x19",
         "alt-d" => b"\x1bd",
         "space" => b" ",
         "digit-0" => b"0",
@@ -2431,6 +2510,73 @@ mod tests {
     }
 
     #[test]
+    fn set_viewport_resizes_only_without_native_geometry() {
+        let _env = crate::persist::test_env("backend-set-viewport");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let runtime = app.panes[&pane].terminal_runtime().unwrap();
+        let params = json!({
+            "server_generation":app.backend_server_generation,
+            "terminal_id":runtime.terminal_id,
+            "pane_id":pane.0.to_string(),
+            "cols":40,
+            "rows":18,
+        });
+        let native_size = app.panes[&pane].size();
+        assert_ne!(native_size, (40, 18));
+
+        let refused = app.backend_set_viewport(&params, true).err().unwrap();
+        assert_eq!(refused.code, "unavailable");
+        assert_eq!(refused.dispatch, Some(DispatchEvidence::Rejected));
+        assert_eq!(
+            app.panes[&pane].size(),
+            native_size,
+            "a native client keeps geometry authority"
+        );
+
+        let revision = app.panes[&pane].content_revision();
+        let applied = app.backend_set_viewport(&params, false).unwrap();
+        assert_eq!(applied["type"], "terminal_backend_action");
+        assert_eq!(applied["dispatch"], "executed");
+        assert_eq!(app.panes[&pane].size(), (40, 18));
+        assert!(
+            app.panes[&pane].content_revision() > revision,
+            "a reflow publishes a new revision so quiet panes still send a frame"
+        );
+        assert_eq!(app.layout().focus, pane, "sizing never moves focus");
+
+        for (cols, rows) in [
+            (json!(1), json!(18)),
+            (json!(40), json!(1)),
+            (json!(backend::MAX_VIEWPORT_COLS + 1), json!(18)),
+            (json!(40), json!(backend::MAX_VIEWPORT_ROWS + 1)),
+            (json!("40"), json!(18)),
+            (json!(40.5), json!(18)),
+        ] {
+            let mut invalid = params.clone();
+            invalid["cols"] = cols;
+            invalid["rows"] = rows;
+            let error = app.backend_set_viewport(&invalid, false).err().unwrap();
+            assert_eq!(error.code, "invalid_params");
+            assert_eq!(error.dispatch, Some(DispatchEvidence::NotStarted));
+        }
+        let mut extra = params.clone();
+        extra["text"] = json!("ls");
+        assert_eq!(
+            app.backend_set_viewport(&extra, false).err().unwrap().code,
+            "invalid_params"
+        );
+        let mut stale = params;
+        stale["terminal_id"] = json!(backend::random_id().unwrap());
+        assert_eq!(
+            app.backend_set_viewport(&stale, false).err().unwrap().code,
+            "stale_terminal"
+        );
+        assert_eq!(app.panes[&pane].size(), (40, 18));
+    }
+
+    #[test]
     fn observe_target_is_identity_safe_bounded_and_focus_preserving() {
         let _env = crate::persist::test_env("backend-observe-target");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -2490,6 +2636,10 @@ mod tests {
         assert_eq!(backend_key_bytes("left", true).unwrap(), b"\x1bOD");
         assert_eq!(backend_key_bytes("ctrl-k", false).unwrap(), b"\x0b");
         assert_eq!(backend_key_bytes("alt-d", false).unwrap(), b"\x1bd");
+        assert_eq!(backend_key_bytes("ctrl-a", false).unwrap(), b"\x01");
+        assert_eq!(backend_key_bytes("ctrl-r", false).unwrap(), b"\x12");
+        assert_eq!(backend_key_bytes("ctrl-y", false).unwrap(), b"\x19");
+        assert!(backend_key_bytes("ctrl-z", false).is_none());
         assert!(backend_key_bytes("raw-escape", false).is_none());
     }
 

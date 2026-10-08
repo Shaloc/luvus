@@ -58,12 +58,56 @@ The **All / Active** toggle in the header switches between the full resumable
 history and live agents only. A new configuration starts with **All**, then
 luvus remembers whichever view you select across restarts.
 
+In **Active**, right-click an agent row, the header tabs, or the empty list to
+choose **Group by Workspace** and status checkboxes (**Working**, **Waiting for
+Input**, **Idle**, **Done**). Multiple checked states are combined with OR.
+**All Statuses** restores the complete list; unchecking every state shows an
+empty list. The menu stays open while selecting states (Space or Enter also
+toggles the selected checkbox). These preferences persist, apply equally to
+local and registered remote agents, and leave **All** history unchanged.
+Groups follow workspace order; pins stay first within their workspace. Keyboard
+navigation skips group headings. Scheduled placeholders use Idle, starting or
+restoring ones use Working, and those needing a rebind use Waiting for Input.
+
 When **Show agent session title** is on, the second line of each agent row
-prefers the live OSC title, then a title a module published with
+prefers the live window title (OSC 0/2), then a title a module published with
 `ui.agent_title.push`. If neither is set, live rows keep `workspace · =pane`
 and resumable rows keep the project folder. Luvus pane aliases (`=name`) are
 not used as titles. Core Luvus does not parse an agent's native session store
 for this line; a module supplies names such as Pi's `session_info.name`.
+
+### Explicit program status (OSC 7501)
+
+Luvus supports revision 0.2 of the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status).
+Programs can report state directly instead of relying on screen heuristics:
+
+```sh
+printf '\033]7501;state=working:app=codex:progress=30\033\\'
+printf '\033]7501;state=blocked:kind=permission:msg=QXBwcm92ZT8=\033\\'
+printf '\033]7501;state=done\033\\'
+```
+
+`idle`, `working`, and `blocked` use their existing Luvus states. Both `done`
+and `error` appear as **Done**, including in status filters. The original state,
+record id, inherited app, kind, progress, title, and message are available in
+`luvus agent explain <pane>` under `state_evidence.program_status`.
+Messages are plain text, never approval instructions or executable commands.
+
+Records are terminal-local, support hierarchical ids and subtree clearing, and
+replace previous records completely. The displayed record follows
+blocked → working → error → done → idle priority, newest first on ties.
+Alternate-screen switches preserve records; RIS clears them. OSC 133 A (a new
+shell prompt) and attached-process exit clear transient records. Completed and
+failed records survive until replaced or cleared while the terminal exists.
+The fixed `OSC 7501 ; ? ST` support reply precedes a following device-attributes
+reply. Reports are bounded to 4096 bytes and 256 records per terminal.
+
+Explicit state bypasses screen debounce and repaint grace. Existing integration
+leases keep precedence. OSC app names do not replace process evidence or bind
+native sessions, and idle/done reports do not grant composer readiness for
+automated input. Owners parse remote reports and publish the resulting state
+through the existing remote snapshot and event path; no transport upgrade is
+required for the existing four displayed states.
 
 ## Usage in Mission Control
 
@@ -303,7 +347,8 @@ session database, so its sessions are never listed as resumable and
 `luvus agent resume <id>` cannot find them. A pane resumes on restore only from
 an exact binding that was reported and persisted, which restores as
 `devin --resume <id>`. The optional integration reports it automatically;
-without it, use `luvus pane report --agent devin --session <id>`.
+without it, use `luvus pane report --agent devin --session <id>`. Scheduled
+Devin work is offered with **Read only** or **Full access**, not **Workspace**.
 
 Muse Code supports native detection and resume, but not **Fork to New Pane**.
 Its `/fork` command exists only inside the active TUI, and its CLI refuses to

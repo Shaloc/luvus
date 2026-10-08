@@ -17,7 +17,7 @@ PACKAGE = ROOT / "protocol" / "uhp" / "v1" / "terminal"
 OPAQUE = re.compile(r"^[0-9a-f]{32}$")
 REQUEST_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 BASE64 = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
-KEYS = {"enter", "escape", "tab", "backtab", "up", "down", "left", "right", "home", "end", "backspace", "delete", "pageup", "pagedown", "ctrl-c", "ctrl-d", "ctrl-k", "ctrl-u", "ctrl-w", "alt-d", "space", *(f"digit-{n}" for n in range(10))}
+KEYS = {"enter", "escape", "tab", "backtab", "up", "down", "left", "right", "home", "end", "backspace", "delete", "pageup", "pagedown", "ctrl-a", "ctrl-b", "ctrl-c", "ctrl-d", "ctrl-e", "ctrl-f", "ctrl-g", "ctrl-k", "ctrl-l", "ctrl-n", "ctrl-o", "ctrl-p", "ctrl-r", "ctrl-t", "ctrl-u", "ctrl-w", "ctrl-y", "alt-d", "space", *(f"digit-{n}" for n in range(10))}
 METHOD_FIELDS = {
     "uhp.capabilities": set(),
     "terminal.backend.inventory": set(),
@@ -173,6 +173,17 @@ def valid_control_frame(value):
     if action in {"upload_finish", "upload_cancel"}:
         upload_id = params.get("upload_id")
         return set(params) == {"upload_id"} and isinstance(upload_id, str) and OPAQUE.fullmatch(upload_id) is not None
+    if action == "set_viewport":
+        cols, rows = params.get("cols"), params.get("rows")
+        return (
+            set(params) == {"cols", "rows"}
+            and isinstance(cols, int)
+            and not isinstance(cols, bool)
+            and 2 <= cols <= 500
+            and isinstance(rows, int)
+            and not isinstance(rows, bool)
+            and 2 <= rows <= 300
+        )
     return action == "send_key" and set(params) == {"key"} and params.get("key") in KEYS
 
 

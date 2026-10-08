@@ -679,6 +679,12 @@ impl App {
                 let _ = reply.send(self.prepare_backend_observe(&params));
                 return false;
             }
+            // Reached only without a server loop: this process is the native
+            // client, and it owns terminal geometry.
+            AppEvent::BackendViewport { params, reply } => {
+                let _ = reply.send(self.backend_set_viewport(&params, true));
+                return false;
+            }
             AppEvent::ThemeUninstalled { id, result } => {
                 self.finish_theme_uninstall(id, result);
                 return true;
@@ -1781,6 +1787,7 @@ impl App {
             | AppEvent::BackendCreateReady { .. }
             | AppEvent::BackendCreatePreflight { .. }
             | AppEvent::BackendObserve { .. }
+            | AppEvent::BackendViewport { .. }
             | AppEvent::PtyReady { .. }
             | AppEvent::PtyClipboard { .. }
             | AppEvent::SearchFilesIndexed { .. }
@@ -2973,6 +2980,11 @@ impl App {
                 }
             } else if let Some((i, _)) = self.session_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_agent_menu(AgentTarget::Session(*i), c, r); // session → Resume/Close
+            } else if self.agents_active_only
+                && (hit(self.agents_area)
+                    || self.agents_filter_rects.iter().any(|(_, rect)| hit(*rect)))
+            {
+                self.open_agent_menu(AgentTarget::Dock, c, r);
             } else if let Some((row, _)) = self.diff_row_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_diff_menu(*row, c, r);
             } else if let Some((i, _)) = self.file_tree_rects.iter().find(|(_, rect)| hit(*rect)) {
@@ -6112,6 +6124,9 @@ fn mouse_wheel_seq(up: bool, col: u16, row: u16, sgr: bool) -> Vec<u8> {
 /// in the multiline editors that insert a newline for it. Elsewhere a modified
 /// Enter still reaches the receiver's activation branch, so it never replays.
 fn replay_is_ui_action(press: KeyEvent, context: UiRepeatContext) -> bool {
+    if press.code == KeyCode::Char(' ') && matches!(context, UiRepeatContext::AgentMenu) {
+        return true;
+    }
     if press.code == KeyCode::Esc {
         return true;
     }

@@ -700,6 +700,7 @@ impl App {
         };
         let state_confidence = match status.state_source {
             "integration_report" => "authoritative",
+            "osc7501" => "self_reported",
             "manifest_rule" => "high",
             "shell_activity" => "heuristic",
             _ => "none",
@@ -717,6 +718,11 @@ impl App {
                 "rule_priority":status.rule_priority,
                 "rule_region":status.rule_region,
                 "blocked_hint":status.blocked_hint,
+                "program_status":status.detected_program_status.as_ref().map(|record| json!({
+                    "id":record.id, "state":record.state.as_str(), "app":record.app,
+                    "kind":record.kind, "progress":record.progress,
+                    "title":record.title, "msg":record.msg,
+                })),
             },
             "authority":report.map(|report| json!({
                 "source":report.source,

@@ -65,6 +65,8 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     osc_raw: Vec<u8>,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
+    osc_program_status: bool,
+    osc_bytes: usize,
     ignoring: bool,
     apc_truncated: bool,
     partial_utf8: [u8; 4],
@@ -152,8 +154,9 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 continue;
             }
             match self.state {
-                State::Ground if performer.ascii_print_never_terminates()
-                    && matches!(bytes[i], b' '..=b'~') =>
+                State::Ground
+                    if performer.ascii_print_never_terminates()
+                        && matches!(bytes[i], b' '..=b'~') =>
                 {
                     let start = i;
                     while i < bytes.len() && matches!(bytes[i], b' '..=b'~') {
@@ -191,6 +194,19 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
+            State::ProgramStatusEscape => {
+                if byte == b'\\' {
+                    if self.osc_bytes <= 4092 {
+                        self.osc_end(performer, byte);
+                    }
+                    self.state = State::Ground;
+                } else {
+                    self.osc_raw.clear();
+                    self.osc_num_params = 0;
+                    self.state = State::Escape;
+                    self.advance_esc(performer, byte);
+                }
+            },
             State::ApcString => self.advance_apc_string(performer, byte),
             State::ApcEscape => {
                 if byte == b'\\' {
@@ -398,6 +414,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x5D => {
                 self.osc_raw.clear();
                 self.osc_num_params = 0;
+                self.osc_program_status = false;
+                self.osc_bytes = 0;
                 self.state = State::OscString
             },
             0x5E => self.state = State::SosPmApcString,
@@ -436,6 +454,42 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     #[inline(always)]
     fn advance_osc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        // OSC 7501 has its own wire cap. Count separators and ignored bytes too,
+        // never buffer an oversized report, and only dispatch a complete ST.
+        // Keep the body together so malformed semicolons cannot hide later pairs
+        // behind the generic OSC parameter limit.
+        if self.osc_program_status {
+            match byte {
+                0x07 => {
+                    if self.osc_bytes <= 4092 {
+                        self.osc_end(performer, byte);
+                    }
+                    self.state = State::Ground;
+                },
+                0x1B => self.state = State::ProgramStatusEscape,
+                0x18 | 0x1A => {
+                    self.osc_raw.clear();
+                    self.osc_num_params = 0;
+                    performer.execute(byte);
+                    self.state = State::Ground;
+                },
+                _ => {
+                    self.osc_bytes = self.osc_bytes.saturating_add(1);
+                    #[cfg(not(feature = "std"))]
+                    if self.osc_raw.is_full() {
+                        self.osc_bytes = 4093;
+                    }
+                    if self.osc_bytes <= 4092 {
+                        self.action_osc_put(byte);
+                    }
+                },
+            }
+            return;
+        }
+        self.osc_bytes = self.osc_bytes.saturating_add(1);
+        if byte == b';' && self.osc_num_params == 0 && self.osc_raw.as_slice() == b"7501" {
+            self.osc_program_status = true;
+        }
         match byte {
             0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => (),
             0x07 => {
@@ -802,6 +856,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
 #[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
 enum State {
+    ProgramStatusEscape,
     CsiEntry,
     CsiIgnore,
     CsiIntermediate,

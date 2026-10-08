@@ -4,6 +4,11 @@ Read this reference only for explicit Luvus API, harness, protocol, event,
 revision, token, layout, or terminal-backend work. Use the semantic `luvus`
 commands in `SKILL.md` for ordinary one-shot control.
 
+OSC 7501 reports are self-reported terminal evidence, visible in
+`agent.explain` under `state_evidence.program_status`. The raw `error` state is
+displayed as Done. A report never grants input readiness, session identity, or
+approval authority; remote reports are interpreted on the owning server.
+
 ## Discover the installed contract
 
 Treat the selected running server as authoritative:
@@ -114,6 +119,9 @@ read current state and reconcile instead of blindly retrying.
   - Kilo Code new-worker schedules support only an explicitly selected
     `full_access` profile because its reviewed unattended command is
     `kilo run --auto`. Never broaden a Kilo schedule automatically.
+  - Devin new-worker schedules support `read_only` and `full_access` only.
+    `workspace` is rejected because Devin's `accept-edits` mode cannot commit
+    worktree changes. Never broaden a Devin schedule automatically.
   - `target` defaults to `new_worker`. Use `active_agent` only with the exact
     live `pane_id`, `terminal_id`, `task.agent_id`, and `task.workspace_id`
     returned by discovery. Its `if_busy` policy is `wait` or `skip`; it creates

@@ -543,7 +543,24 @@ pub(super) fn draw_agent_menu(
     let rows: Vec<MenuRow> = items
         .iter()
         .map(|it| MenuRow {
-            text: agent_label(*it, cat, &extras, scoped, app.config.layout.agent_paths),
+            text: {
+                let label = agent_label(*it, cat, &extras, scoped, app.config.layout.agent_paths);
+                let checked = match it {
+                    AgentMenuItem::ToggleWorkspaceGrouping => {
+                        Some(app.config.agents_group_by_workspace)
+                    }
+                    AgentMenuItem::ToggleStatus(state) => {
+                        Some(app.config.agents_status_filter.includes(*state))
+                    }
+                    AgentMenuItem::AllStatuses => {
+                        Some(app.config.agents_status_filter == Default::default())
+                    }
+                    _ => None,
+                };
+                checked.map_or(label.clone(), |checked| {
+                    format!("[{}] {label}", if checked { "x" } else { " " })
+                })
+            },
             divider: matches!(it, AgentMenuItem::Divider),
             destructive: matches!(it, AgentMenuItem::Close | AgentMenuItem::AutomationDelete),
         })
@@ -575,6 +592,18 @@ fn agent_label(
     paths_visible: bool,
 ) -> String {
     match it {
+        AgentMenuItem::ToggleWorkspaceGrouping => cat.menu_group_workspaces.into(),
+        AgentMenuItem::AllStatuses => cat.menu_all_statuses.into(),
+        AgentMenuItem::ToggleStatus(state) => {
+            use crate::ui::theme::State;
+            cat.menu_agent_states[match state {
+                State::Working => 0,
+                State::Blocked => 1,
+                State::Idle | State::Unknown => 2,
+                State::Done => 3,
+            }]
+            .into()
+        }
         AgentMenuItem::ToggleWorkspaceScope => if scoped {
             cat.menu_show_all_workspaces
         } else {

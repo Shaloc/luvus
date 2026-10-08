@@ -65,11 +65,14 @@ type ScheduledDockRow = (
     bool,
     Option<crate::automation::ActiveTargetState>,
     Option<PaneId>,
+    usize,
 );
 
 enum AgentDockRow {
-    Local(PaneId, String),
+    Local(PaneId, usize),
     Remote(usize, usize),
+    Scheduled(usize),
+    Workspace(usize),
 }
 
 /// Rows of sidebar chrome above the dock stack: the brand/menu row plus one
@@ -783,9 +786,12 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         let visible = !scoped || wi == app.active_ws;
         if let Some(view) = app.remote_workspace_view(wi) {
             for (agent_index, agent) in view.agents.iter().enumerate() {
-                if visible {
+                if visible && app.agent_state_visible(agent.state) {
                     live.push(AgentDockRow::Remote(wi, agent_index));
-                } else if agent.state == State::Blocked {
+                } else if !visible
+                    && agent.state == State::Blocked
+                    && app.agent_state_visible(State::Blocked)
+                {
                     remote_blocked_elsewhere.push((view.target.clone(), agent.pane.clone()));
                 }
             }
@@ -798,9 +804,12 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     if !is_agent {
                         continue;
                     }
-                    if visible {
-                        live.push(AgentDockRow::Local(id, ws.name.clone()));
-                    } else if s.state == State::Blocked {
+                    if visible && app.agent_state_visible(s.state) {
+                        live.push(AgentDockRow::Local(id, wi));
+                    } else if !visible
+                        && s.state == State::Blocked
+                        && app.agent_state_visible(State::Blocked)
+                    {
                         blocked_elsewhere.push(id);
                     }
                 }
@@ -816,6 +825,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             |row| match row {
                 AgentDockRow::Local(id, _) => !app.pinned_agents.contains(id),
                 AgentDockRow::Remote(wi, ai) => !app.remote_workspace_view(*wi).is_some_and(|view| view.agents[*ai].pinned),
+                _ => true,
             },
         );
     }
@@ -832,7 +842,9 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 .iter()
                 .enumerate()
                 .find(|(_, workspace)| workspace.id == row.workspace_id)?;
-            if scoped && index != app.active_ws {
+            if (scoped && index != app.active_ws)
+                || !app.scheduled_agent_visible(row.starting, row.target_state)
+            {
                 return None;
             }
             Some((
@@ -843,6 +855,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 row.starting,
                 row.target_state,
                 None,
+                index,
             ))
         })
         .collect();
@@ -856,6 +869,9 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         };
         let pane = workspace.tabs[0].layout.focus;
         for row in &view.scheduled {
+            if !app.scheduled_agent_visible(row.starting, row.target_state) {
+                continue;
+            }
             scheduled.push((
                 row.id.clone(),
                 if paths_visible {
@@ -868,6 +884,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 row.starting,
                 row.target_state,
                 Some(pane),
+                index,
             ));
         }
         if !active_only {
@@ -908,7 +925,24 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     } else {
         app.resumable.len()
     };
-    let atotal = live.len() + scheduled.len() + resumable_total + remote_history.len();
+    let mut owned: Vec<_> = live
+        .into_iter()
+        .map(|row| {
+            let workspace = match &row {
+                AgentDockRow::Local(_, wi) | AgentDockRow::Remote(wi, _) => *wi,
+                _ => unreachable!(),
+            };
+            (workspace, row)
+        })
+        .collect();
+    owned.extend(
+        scheduled
+            .iter()
+            .enumerate()
+            .map(|(i, row)| (row.7, AgentDockRow::Scheduled(i))),
+    );
+    let live = app.group_agent_dock_rows(owned, AgentDockRow::Workspace);
+    let atotal = live.len() + resumable_total + remote_history.len();
     // The overflow line is always visible while attention is hidden, even if no
     // local rows exist. Reserve exactly one terminal row for it.
     let blocked_count = blocked_elsewhere.len() + remote_blocked_elsewhere.len();
@@ -916,6 +950,9 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let keyboard_focused = app.sidebar_focus == Some(SidebarListFocus::Agents);
     let keyboard_total = atotal + usize::from(has_elsewhere);
     app.agent_cursor = app.agent_cursor.min(keyboard_total.saturating_sub(1));
+    if matches!(live.get(app.agent_cursor), Some(AgentDockRow::Workspace(_))) {
+        app.agent_cursor = (app.agent_cursor + 1).min(keyboard_total.saturating_sub(1));
+    }
     app.agents_elsewhere_rect = None;
     let acap = list_capacity(arows.saturating_sub(u16::from(has_elsewhere)), row_stride);
     if keyboard_focused && app.agent_cursor < atotal {
@@ -945,10 +982,28 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         for (vi, k) in (ascroll..atotal).take(acap).enumerate() {
             let y = alist_top + vi as u16 * row_stride;
             let selected = keyboard_focused && app.agent_cursor == k;
-            if let Some(row) = live.get(k) {
+            if let Some(AgentDockRow::Workspace(wi)) = live.get(k) {
+                let ws = &app.workspaces[*wi];
+                let label = if let Some(remote) = &ws.remote {
+                    format!("[{}] {}", remote.host, ws.name)
+                } else {
+                    ws.name.clone()
+                };
+                line_at(
+                    f,
+                    y,
+                    Line::from(Span::styled(
+                        crate::ui::truncate(&label, cw as usize),
+                        Style::new().fg(t.subtext0).bold(),
+                    )),
+                );
+                continue;
+            }
+            if let Some(row @ (AgentDockRow::Local(..) | AgentDockRow::Remote(..))) = live.get(k) {
                 let rect = Rect::new(area.x, y, area.width, row_stride);
                 let (st, agent, focused, meta) = match row {
-                    AgentDockRow::Local(id, wsname) => {
+                    AgentDockRow::Local(id, wi) => {
+                        let wsname = &app.workspaces[*wi].name;
                         agent_rects.push((*id, rect));
                         let mention = app
                             .agent_name_for(*id)
@@ -1003,6 +1058,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         app.remote_agent_rects.push(hit);
                         presentation
                     }
+                    _ => unreachable!(),
                 };
                 let name_style = if focused {
                     Style::new().fg(t.accent).bold()
@@ -1050,8 +1106,11 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 starting,
                 target_state,
                 owner,
-            )) = scheduled.get(k.saturating_sub(live.len()))
-            {
+                _,
+            )) = live.get(k).and_then(|row| match row {
+                AgentDockRow::Scheduled(i) => scheduled.get(*i),
+                _ => None,
+            }) {
                 let rect = Rect::new(area.x, y, area.width, row_stride);
                 if let Some(view) = owner {
                     app.remote_automation_rects
@@ -1098,7 +1157,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 }
             } else {
                 // A resumable session discovered on disk — click to reopen.
-                let visible_index = k - live.len() - scheduled.len();
+                let visible_index = k - live.len();
                 let row = Rect::new(area.x, y, area.width, row_stride);
                 let (agent, proj) = if visible_index >= resumable_total {
                     let (view, session, host) = &remote_history[visible_index - resumable_total];

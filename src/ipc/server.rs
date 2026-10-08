@@ -1439,6 +1439,20 @@ fn apply(
             bind_session_navigation_origin(app, id, relay_origin);
             changed
         }
+        // Geometry belongs to the target workspace's active native surface,
+        // including remote projections. An unrelated workspace or a suspended
+        // projection must not prevent a control stream from sizing its PTY.
+        AppEvent::BackendViewport { params, reply } => {
+            let native_geometry = params["terminal_id"]
+                .as_str()
+                .and_then(|id| app.backend_terminal_index.get(id))
+                .and_then(|pane| app.workspace_of_pane(*pane))
+                .is_some_and(|workspace| {
+                    workspace_size_owner(app, clients, *foreground, &workspace.id).is_some()
+                });
+            let _ = reply.send(app.backend_set_viewport(&params, native_geometry));
+            false
+        }
         // Redraw only if the event actually changed the UI — a plain keystroke
         // forwarded to a pane does not (its echo arrives as a separate `PtyData`).
         other => app.handle_event(other),
@@ -5883,6 +5897,66 @@ mod tests {
             (content.width, content.height),
             "secondary projection must not resize the shared PTY"
         );
+    }
+
+    #[test]
+    fn api_viewport_applies_only_while_no_client_renders() {
+        let _env = crate::persist::test_env("api-viewport-gate");
+        let (app_tx, _app_rx) = mpsc::channel();
+        let mut app = App::new(120, 40, app_tx).expect("app starts");
+        app.server_mode = true;
+        let pane = app.layout().focus;
+        let runtime = app.panes[&pane].terminal_runtime().expect("runtime");
+        let params = serde_json::json!({
+            "server_generation":app.backend_server_generation,
+            "terminal_id":runtime.terminal_id,
+            "pane_id":pane.0.to_string(),
+            "cols":40,
+            "rows":18,
+        });
+        let native_size = app.panes[&pane].size();
+        let (client, _client_rx) = display_client(120, 40, 1);
+        let mut clients = HashMap::from([(1, client)]);
+        let mut foreground = Some(1);
+        let mut interactive_size = (120, 40);
+        let mut next_activity = 2;
+        let mut request = |app: &mut App, clients: &mut HashMap<u64, ClientState>| {
+            let (reply, result) = mpsc::channel();
+            assert!(!apply(
+                AppEvent::BackendViewport {
+                    params: params.clone(),
+                    reply,
+                },
+                app,
+                clients,
+                &mut foreground,
+                &mut interactive_size,
+                &mut next_activity,
+            ));
+            result.recv().expect("viewport reply")
+        };
+
+        let refused = request(&mut app, &mut clients).expect_err("native client owns geometry");
+        assert_eq!(refused.code, "unavailable");
+        assert_eq!(app.panes[&pane].size(), native_size);
+
+        clients.get_mut(&1).unwrap().workspace_id = Some("another-workspace".into());
+        request(&mut app, &mut clients).expect("an unrelated projection owns no target geometry");
+        clients.get_mut(&1).unwrap().workspace_id = Some(app.workspaces[0].id.clone());
+        assert_eq!(
+            request(&mut app, &mut clients).unwrap_err().code,
+            "unavailable",
+            "a live remote projection retains target geometry authority"
+        );
+
+        // A suspended endpoint renders nothing, so it holds no geometry.
+        clients.get_mut(&1).unwrap().projection = Some(super::ProjectionSubscription::default());
+        request(&mut app, &mut clients).expect("suspended clients do not block a viewport");
+        assert_eq!(app.panes[&pane].size(), (40, 18));
+
+        clients.clear();
+        request(&mut app, &mut clients).expect("a detached server accepts a viewport");
+        assert_eq!(app.panes[&pane].size(), (40, 18));
     }
 
     #[test]

@@ -517,6 +517,16 @@ impl App {
         let Ok(engine) = pane.engine.lock() else {
             return false;
         };
+        if report.is_none()
+            && engine.program_status().is_some_and(|record| {
+                matches!(
+                    record.state,
+                    alacritty_terminal::term::program_status::State::Blocked
+                )
+            })
+        {
+            return false;
+        }
         if !status.force_detect
             && status.last_detect_generation == Some(engine.output_generation())
             && !(positive_evidence_required
