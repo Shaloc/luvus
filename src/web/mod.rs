@@ -1,5 +1,6 @@
 mod assets;
 mod auth;
+mod remote;
 mod server;
 mod uhp;
 

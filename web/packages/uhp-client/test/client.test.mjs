@@ -7,7 +7,7 @@ test("package exports are built", async () => {
   assert.equal(typeof module.LiveSession, "function");
 });
 
-test("closing a stream rejects pending and future actions immediately", async () => {
+test("closing a stream rejects pending and future actions immediately", async (t) => {
   class FakeWebSocket extends EventTarget {
     static CONNECTING = 0;
     static OPEN = 1;
@@ -16,6 +16,8 @@ test("closing a stream rejects pending and future actions immediately", async ()
     static instances = [];
 
     readyState = FakeWebSocket.CONNECTING;
+    acknowledgeStreams = true;
+    sent = [];
 
     constructor() {
       super();
@@ -28,13 +30,14 @@ test("closing a stream rejects pending and future actions immediately", async ()
 
     send(raw) {
       const frame = JSON.parse(raw);
+      this.sent.push(frame);
       if (frame.type === "authenticate") {
         this.server({
           type: "ready",
           expires_at: Math.floor(Date.now() / 1_000) + 60,
           authority: { mode: "control", scopes: [] },
         });
-      } else if (frame.type === "stream.open") {
+      } else if (frame.type === "stream.open" && this.acknowledgeStreams) {
         this.server({ type: "response", id: frame.id, result: { type: "terminal_backend_stream" } });
       }
     }
@@ -75,6 +78,24 @@ test("closing a stream rejects pending and future actions immediately", async ()
     FakeWebSocket.instances[0].readyState = FakeWebSocket.CLOSING;
     assert.doesNotThrow(() => closingStream.close());
     await assert.rejects(closingAction, (error) => error.code === "stale_stream");
+    const socket = FakeWebSocket.instances[0];
+    socket.readyState = FakeWebSocket.OPEN;
+    socket.acknowledgeStreams = false;
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const pendingOpen = bridge.openStream("terminal.backend.control", {terminal_id:"remote:owner:term"}, () => {}, () => {});
+    const rejectedOpen = assert.rejects(pendingOpen, (error) => error.code === "timeout");
+    const openId = socket.sent.at(-1).id;
+    t.mock.timers.tick(10_000);
+    await Promise.resolve();
+    assert.ok(!socket.sent.some(frame => frame.type === "stream.close" && frame.stream_id === openId), "SSH setup may outlive the local stream deadline");
+    t.mock.timers.tick(35_000);
+    await rejectedOpen;
+    assert.ok(socket.sent.some(frame => frame.type === "stream.close" && frame.stream_id === openId), "late upstream setup must be cancelled after the browser gives up");
+    t.mock.timers.reset();
+    const interruptedOpen = bridge.openStream("terminal.backend.control", {terminal_id:"remote:owner:term"}, () => {}, () => {});
+    const interruptedId = socket.sent.at(-1).id;
+    socket.server({type:"stream.closed",stream_id:interruptedId,reason:"SSH closed before acknowledgement"});
+    await assert.rejects(interruptedOpen, (error) => error.code === "stale_stream");
     bridge.close();
   } finally {
     globalThis.WebSocket = previous;

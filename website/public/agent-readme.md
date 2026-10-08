@@ -229,6 +229,13 @@ remaining sessions are still attempted, and any failure yields a nonzero exit.
 Add `--json` for per-session outcomes. `--host <host> server restart --all`
 applies only on that enabled host; local batches do not restart remote owners.
 
+
+In this fork, `luvus web --control` includes SSH workspaces already projected into
+its selected session. Remote terminal input and uploads go to the owner over the
+existing SSH bridge; no web bridge is needed on that host. `session.snapshot`
+may expose cached owner topology in each workspace's `remote` field. Those IDs
+remain owner-local; Web's namespaced IDs must not be passed to native CLI/UHP.
+
 Managed SSH remotes are local projections backed by one literal `Host`
 alias from `~/.ssh/config`. Their canonical names are
 `remote-<host>-<actual-session-name>`. `luvus session remote add <host> <name>`

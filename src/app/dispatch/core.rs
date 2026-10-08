@@ -197,6 +197,7 @@ impl App {
                 "branch":workspace.branch,
                 "worktree":workspace.worktree.as_ref().map(|membership| json!({"common_dir":membership.common_dir,"linked":membership.linked})),
                 "host":workspace.remote.as_ref().map(|remote| remote.host.clone()),
+                "remote":self.remote_runtime_snapshot(workspace),
                 "pinned":workspace.pinned,
                 "active":workspace_index == self.active_ws,
                 "tabs":tabs,

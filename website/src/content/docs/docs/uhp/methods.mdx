@@ -538,7 +538,15 @@ resynchronization rules.
 limits. `session.snapshot` returns every workspace, tab, terminal pane, native
 view, stable terminal identity, root process, and agent state in one response.
 Merged remote workspace rows also include their SSH Host alias in `host`; local
-workspace rows use `host:null`.
+workspace rows use `host:null`. In this fork a merged workspace may also include
+`remote: {host, session, workspace_id, server_generation, connected, tabs}`.
+This is cached owner topology from the existing subscription; its pane and
+terminal IDs belong to that owner, not the local server. Local workspaces use
+`remote:null`. Changes and loss/recovery of the topology connection publish
+`workspace.metadata_reported` with the local 0-based workspace index. The native
+Web bridge expands these cached tabs, namespaces their IDs, and resolves remote
+terminal streams through the existing-only SSH control bridge; native API callers
+continue to route requests explicitly to the owner.
 Both responses optionally advertise `remote_display`, with `transport`,
 `compatible_transports` and `capabilities`. The modified build accepts transport
 9 and 10. Managed clients use transport 10's `projection.v1` only when advertised;

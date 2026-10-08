@@ -129,6 +129,13 @@ an explicit `--all` batch.
 
 ### Manage SSH remote sessions
 
+In this fork, `luvus web --control` includes SSH workspaces already projected into
+its selected session. Remote terminal input and uploads go to the owner over the
+existing SSH bridge; no web bridge is needed on that host. `session.snapshot`
+may expose cached owner topology in each workspace's `remote` field. Those IDs
+remain owner-local; Web's namespaced IDs must not be passed to native CLI/UHP.
+
+
 A managed remote session is displayed locally but owned by a Luvus server on
 one literal `Host` alias from `~/.ssh/config`. The UI shows its actual session
 name with remote/host tags. The legacy CLI routing name remains

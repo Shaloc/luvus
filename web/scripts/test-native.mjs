@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, readFile, readdir } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
@@ -11,19 +11,44 @@ const repoRoot = path.resolve(webRoot, "..");
 const executable = path.resolve(process.env.LUVUS_BIN
   || path.join(repoRoot, "target", "debug", process.platform === "win32" ? "luvus.exe" : "luvus"));
 await mkdir(path.join(repoRoot, "target"), { recursive: true });
-const home = await mkdtemp(path.join(repoRoot, "target", "luvus-native-web-"));
+const remoteFixture = process.env.LUVUS_WEB_REMOTE_FIXTURE;
+if (remoteFixture) {
+  assert.equal(path.dirname(remoteFixture), path.join(repoRoot, "target"));
+  assert.ok(path.basename(remoteFixture).startsWith("remote-smoke-"));
+  assert.equal(await readFile(path.join(remoteFixture, ".isolated-smoke"), "utf8"), remoteFixture);
+  assert.ok(executable.startsWith(path.join(repoRoot, "target") + path.sep));
+}
+const home = remoteFixture ? path.join(remoteFixture, "local-state")
+  : await mkdtemp(path.join(repoRoot, "target", "luvus-native-web-"));
 const workspace = path.join(home, "workspace");
 await mkdir(workspace);
-const session = "native-web-" + process.pid;
+const session = remoteFixture ? "api" : "native-web-" + process.pid;
 const env = { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("LUVUS_"))), LUVUS_HOME: home };
 delete env.LUVUS_SOCKET_PATH;
 delete env.LUVUS_SESSION;
 delete env.LUVUS_BIN_PATH;
+if (remoteFixture) {
+  env.LUVUS_SMOKE_ROOT = remoteFixture;
+  env.LUVUS_SMOKE_BINARY = executable;
+  env.LUVUS_SMOKE_REMOTE_BINARY = executable;
+}
 let child;
 let stderr = "";
 const sockets = new Set();
 
 try {
+  await (remoteFixture ? testRemote() : testLocal());
+} finally {
+  for (const socket of sockets) socket.terminate();
+  if (child?.exitCode === null) child.kill("SIGINT");
+  if (!remoteFixture) {
+    run(["--session", session, "server", "stop"], env, true);
+    run(["session", "delete", session], env, true);
+    await rm(home, { recursive: true, force: true });
+  }
+}
+
+async function testLocal() {
   const paired = await startBridge();
   const code = paired.hash.startsWith("#pair=") ? decodeURIComponent(paired.hash.slice(6)) : "";
   assert.ok(code);
@@ -181,18 +206,12 @@ try {
   await exited(child, 10_000);
   child = undefined;
   process.stdout.write(`native luvus web integration passed (viewport, validation, reflow, multi-tab, reconnect, revoke, finite expiry, shutdown; ${burstCount} inputs in ${Math.round(burstElapsed)}ms)\n`);
-} finally {
-  for (const socket of sockets) socket.terminate();
-  if (child?.exitCode === null) child.kill("SIGINT");
-  run(["--session", session, "server", "stop"], env, true);
-  run(["session", "delete", session], env, true);
-  await rm(home, { recursive: true, force: true });
 }
 
 async function startBridge(extra = []) {
   stderr = "";
   child = spawn(executable, [
-    "--session", session, "web", "--control", "--port", "0", "--no-open", ...extra,
+    "--session", session, "web", ...(extra.includes("--read-only") ? [] : ["--control"]), "--port", "0", "--no-open", ...extra,
   ], { cwd: workspace, env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(-8192); });
@@ -285,7 +304,7 @@ function streamAction(socket, id, action, params) {
 
 function waitFor(socket, predicate, timeoutMs = 5_000) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => finish(new Error("WebSocket response timed out")), timeoutMs);
+    const timer = setTimeout(() => finish(new Error("WebSocket response timed out: " + predicate.toString())), timeoutMs);
     const onMessage = (data) => {
       let frame;
       try { frame = JSON.parse(data.toString()); } catch { return; }
@@ -339,4 +358,179 @@ function exited(process, timeoutMs) {
       resolve();
     });
   });
+}
+
+
+// Reuses the real SSH-owner fixture from scripts/test-remote-sessions.py --web-only.
+async function testRemote() {
+  const paired = await startBridge();
+  const { socket } = await authenticate(paired, { code: paired.hash.slice(6) });
+  let serial = 0;
+  const snapshot = () => request(socket, `snapshot-${serial++}`, "session.snapshot", {});
+  const allPanes = (s) => s.workspaces.flatMap(w => w.tabs.flatMap(t => t.panes));
+  const remotePane = (s) => s.workspaces.filter(w => w.host === "fake-dev").flatMap(w => w.tabs.flatMap(t => t.panes)).find(p => p.terminal_id);
+  const native = (method, params = {}, remote = false) => {
+    const runEnv = remote ? { ...env, HOME: path.join(remoteFixture, "remote-home"), LUVUS_HOME: path.join(remoteFixture, "remote-state") } : env;
+    const result = spawnSync(executable, ["--session", "api", "uhp", "proxy"], {
+      cwd: workspace, env: runEnv, encoding: "utf8", timeout: 20_000,
+      input: JSON.stringify({ id: "fixture", method, params }) + "\n",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const response = JSON.parse(result.stdout);
+    assert.ok(response.result, JSON.stringify(response));
+    return response.result;
+  };
+  const original = await snapshot();
+  const pane = remotePane(original);
+  assert.ok(pane, JSON.stringify(original));
+  const local = original.workspaces.filter(w => !w.host).flatMap(w => w.tabs.flatMap(t => t.panes)).find(p => p.terminal_id);
+  assert.ok(local);
+  assert.notEqual(local.pane_id, pane.pane_id);
+  const remoteNative = allPanes(native("session.snapshot", {}, true)).find(p => p.terminal_id);
+  assert.equal(pane.display_pane_id, remoteNative.pane_id);
+  assert.equal(local.pane_id, remoteNative.pane_id, "fixture exercises colliding owner-local pane IDs");
+  const target = { server_generation: original.server_generation, terminal_id: pane.terminal_id,
+    pane_id: pane.pane_id, mode: "recent_unwrapped", lines: 80, ansi: false };
+  async function open(ws, id, params, control = true) {
+    const ack = waitFor(ws, f => f.type === "response" && f.id === id, 20_000);
+    ws.send(JSON.stringify({ type: "stream.open", id, method: `terminal.backend.${control ? "control" : "observe"}`, params }));
+    return ack;
+  }
+  const first = waitFor(socket, f => f.stream_id === "control" && f.frame?.event === "terminal.frame", 20_000);
+  assert.equal((await open(socket, "control", target)).result.type, "terminal_backend_stream");
+  assert.equal((await first).frame.data.pane_id, pane.pane_id);
+  assert.equal((await streamAction(socket, "resize", "set_viewport", {cols: 71, rows: 21})).result.dispatch, "executed");
+  const marker = `WEB_REMOTE_${process.pid}`;
+  const output = waitFor(socket, f => f.frame?.data?.text?.includes(`${marker} 21 71`), 15_000);
+  await streamAction(socket, "remote-command", "submit_text", {
+    text: `printf '${marker} '; stty size; printf '${marker}' > "$HOME/web-owner-proof"`,
+  });
+  await output;
+  assert.equal(await readFile(path.join(remoteFixture, "remote-home/web-owner-proof"), "utf8"), marker);
+  await assert.rejects(readFile(path.join(remoteFixture, "local-home/web-owner-proof")));
+  assert.ok(!JSON.stringify(native("pane.read", { pane: local.pane_id })).includes(marker));
+
+  const pasted = waitFor(socket, f => f.frame?.data?.text?.includes("PASTE_OK_" + marker), 10_000);
+  await streamAction(socket, "literal", "type_literal", {text:"printf "});
+  await streamAction(socket, "paste", "paste_text", {text:"'PASTE_OK_" + marker + "\\n'"});
+  await streamAction(socket, "enter", "send_key", {key:"enter"});
+  await pasted;
+
+  const upload = (await streamAction(socket, "upload-start", "upload_start", {name: "remote proof.txt", size: 8})).result;
+  assert.equal(upload.type, "terminal_upload");
+  assert.equal((await streamAction(socket, "upload-chunk", "upload_chunk", {
+    upload_id: upload.upload_id, offset: 0, data_base64: "d2ViIGZpbGU=",
+  })).result.received, 8);
+  assert.equal((await streamAction(socket, "upload-finish", "upload_finish", {upload_id: upload.upload_id})).result.type, "terminal_backend_action");
+  const files = await readdir(path.join(remoteFixture, "remote-state"), {recursive: true});
+  const uploaded = files.find(f => f.endsWith("remote_proof.txt"));
+  assert.ok(uploaded, JSON.stringify(files));
+  assert.equal(await readFile(path.join(remoteFixture, "remote-state", uploaded), "utf8"), "web file");
+  assert.ok(!(await readdir(home, {recursive: true})).some(f => f.endsWith("remote_proof.txt")));
+  await streamAction(socket, "clear-upload", "send_key", {key: "ctrl-c"});
+
+  // The existing topology feed must carry agent/title changes to Web without polling SSH.
+  const eventAck = waitFor(socket, f => f.type === "response" && f.id === "events");
+  socket.send(JSON.stringify({type:"stream.open", id:"events", method:"events.subscribe", params:{}}));
+  await eventAck;
+  const fixtureReady = waitFor(socket, f => f.frame?.data?.text?.includes("CODEX_FIXTURE_READY"), 15_000);
+  const quote = text => "'" + text.replaceAll("'", "'\\''") + "'";
+  const command = "exec -a codex " + quote(process.env.LUVUS_WEB_REMOTE_PYTHON) + " " + quote(path.join(repoRoot, "scripts/test-remote-sessions.py")) + " --codex-fixture";
+  await streamAction(socket, "start-agent", "submit_text", {text:"bash -c " + quote(command)});
+  await fixtureReady;
+  const changed = waitFor(socket, f => f.stream_id === "events" && f.frame?.event === "workspace.metadata_reported", 15_000);
+  await streamAction(socket, "status-report", "submit_text", {
+    text: "OSC7501:state=blocked:app=codex:msg=V2ViIHJlbW90ZQ==",
+  });
+  await changed;
+  let current;
+  for (let n = 0; n < 30; n++) {
+    current = await snapshot();
+    if (remotePane(current)?.agent_status === "blocked") break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.equal(remotePane(current)?.agent_status, "blocked");
+  assert.equal(remotePane(current)?.is_agent, true);
+
+  const renamed = waitFor(socket, f => f.stream_id === "events" && f.frame?.event === "workspace.metadata_reported", 15_000);
+  native("pane.rename", {pane:remoteNative.pane_id, name:"web-owner-agent"}, true);
+  await renamed;
+  for (let n=0; n<30; n++) {
+    current = await snapshot();
+    if (remotePane(current)?.agent_name === "web-owner-agent") break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.equal(remotePane(current)?.agent_name, "web-owner-agent");
+
+  // A forged same-host ID cannot land on a local pane or a different remote.
+  assert.equal((await open(socket, "forged", {...target, pane_id: local.pane_id})).error.code, "stale_terminal");
+  socket.send(JSON.stringify({type:"stream.close", stream_id:"control"}));
+  socket.close();
+  await closed(socket);
+  child.kill("SIGINT"); await exited(child, 10_000); child = undefined;
+
+  const ro = await startBridge(["--read-only"]);
+  const readOnly = (await authenticate(ro, {code:ro.hash.slice(6)})).socket;
+  assert.equal((await open(readOnly, "denied", target)).error.code, "forbidden");
+  const roFrame = waitFor(readOnly, f => f.stream_id === "observe" && f.frame?.event === "terminal.frame", 15_000);
+  assert.equal((await open(readOnly, "observe", target, false)).result.type, "terminal_backend_stream");
+  await roFrame;
+  const actionReply = waitFor(readOnly, f => f.type === "stream.closed" && f.stream_id === "observe");
+  readOnly.send(JSON.stringify({type:"stream.action",stream_id:"observe",id:"ro-input",action:"submit_text",params:{text:`touch ${remoteFixture}/readonly-must-not-exist`}}));
+  await actionReply;
+  readOnly.close(); await closed(readOnly);
+  child.kill("SIGINT"); await exited(child, 10_000); child = undefined;
+
+  // Offline owners keep their labels, but cannot accept stale terminal input.
+  const offlineUrl = await startBridge();
+  const offline = (await authenticate(offlineUrl, {code:offlineUrl.hash.slice(6)})).socket;
+  run(["--session","api","server","stop"], {...env, HOME:path.join(remoteFixture,"remote-home"), LUVUS_HOME:path.join(remoteFixture,"remote-state")});
+  let disconnected;
+  for (let n=0; n<40; n++) {
+    disconnected = await request(offline, `offline-${n}`, "session.snapshot", {});
+    if (!remotePane(disconnected)) break;
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  assert.ok(!remotePane(disconnected));
+  assert.ok(disconnected.workspaces.some(w => w.host === "fake-dev" && w.name.includes("offline")));
+  assert.equal((await open(offline, "offline-owner", target)).error.code, "stale_terminal");
+  assert.equal((await open(offline, "local-live", {...target,pane_id:local.pane_id,terminal_id:local.terminal_id})).result.type, "terminal_backend_stream");
+  offline.close(); await closed(offline);
+  child.kill("SIGINT"); await exited(child, 10_000); child = undefined;
+
+  // Restart only the isolated owner: old routes fail closed even if pane IDs recur.
+  const restarted = await startBridge();
+  const again = (await authenticate(restarted, {code:restarted.hash.slice(6)})).socket;
+  run(["--session","api","server","restart"], {...env, HOME:path.join(remoteFixture,"remote-home"), LUVUS_HOME:path.join(remoteFixture,"remote-state")});
+  let fresh;
+  for (let n=0; n<50; n++) {
+    fresh = await request(again, `restart-snapshot-${n}`, "session.snapshot", {});
+    if (remotePane(fresh)?.terminal_id !== target.terminal_id && remotePane(fresh)) break;
+    await new Promise(resolve => setTimeout(resolve, 150));
+  }
+  assert.ok(remotePane(fresh));
+  assert.notEqual(remotePane(fresh).terminal_id, target.terminal_id);
+  assert.equal((await open(again, "old-owner", target)).error.code, "stale_terminal");
+  const live = remotePane(fresh);
+  const recovered = await open(again, "recovered", {...target, pane_id:live.pane_id, terminal_id:live.terminal_id});
+  assert.equal(recovered.result.type, "terminal_backend_stream");
+  run(["--session", "web-switch", "server", "start"], env);
+  const switchLink = await request(again, "switch-link", "web.devices.create_pairing", {});
+  const switcher = (await authenticate(restarted, {code:switchLink.code})).socket;
+  const oldStreamClosed = waitFor(again, f => f.type === "stream.closed" && f.stream_id === "recovered", 10_000);
+  await request(switcher, "switch-session", "web.sessions.switch", {name:"web-switch"});
+  await oldStreamClosed;
+  assert.equal((await open(again, "old-session", {...target,pane_id:live.pane_id,terminal_id:live.terminal_id})).error.code, "stale_server");
+  await request(switcher, "switch-back", "web.sessions.switch", {name:"api"});
+  const shutdownSnapshot = await request(again, "shutdown-snapshot", "session.snapshot", {});
+  const shutdownPane = remotePane(shutdownSnapshot);
+  assert.ok(shutdownPane);
+  assert.equal((await open(again, "shutdown-stream", {...target, server_generation:shutdownSnapshot.server_generation,
+    pane_id:shutdownPane.pane_id, terminal_id:shutdownPane.terminal_id})).result.type, "terminal_backend_stream");
+  const shutdownClients = Promise.all([closed(again), closed(switcher)]);
+  child.kill("SIGINT"); await exited(child, 10_000); child = undefined;
+  await shutdownClients;
+  assert.equal(run(["--session","api","server","status"], env).status, 0);
+  native("session.snapshot", {}, true);
+  console.log("PASS: native Web remote snapshot, namespaces, status events, PTY input/resize, owner-side upload, read-only, offline/local independence, restart fencing, cross-device session switch and bridge cleanup");
 }

@@ -96,6 +96,36 @@ One bridge has one selected upstream session, so a session switch moves every
 browser device paired with that bridge. TUI and CLI clients keep their own
 attachments.
 
+## Control SSH workspaces from one browser
+
+In this fork, the selected session's merged SSH workspaces appear alongside
+local workspaces. Enable the host and merge its session using the existing
+[Remote Sessions](/docs/guides/remote/) controls, then start the local bridge:
+
+```sh
+luvus web --control
+```
+
+No second web bridge or HTTP port is needed on the SSH host. Workspace labels
+include the host and owner session. Select a remote agent or use **All panes**
+to open a remote shell. Live status, terminal output, typing, paste, control
+keys, viewport sizing and file/image uploads use the actual remote terminal.
+Uploaded files are stored on the remote owner and its path is pasted there.
+The browser's navigation does not change the TUI's selected workspace.
+
+Without `--control`, both local and remote terminals remain read-only. Closing
+the browser or bridge releases its SSH streams and terminal control; owner
+servers and PTYs remain alive. Offline owners lose their live routes, and an
+owner restart invalidates old terminal identities: select the restored pane
+again. Browser input cannot name an arbitrary SSH destination or start a
+stopped remote server.
+
+The **local server and web bridge** must be running this fork's updated build;
+replacing a binary does not update an already-running server. Remote owners
+must support the UHP terminal stream features being used (keep both ends on
+the same release). Browser federation follows the selected server's projected
+workspaces, not every host in SSH config or every session on a host.
+
 ## Pair more devices
 
 The initial URL contains a one-use pairing code in its fragment. After the first

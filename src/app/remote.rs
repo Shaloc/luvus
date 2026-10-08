@@ -187,8 +187,18 @@ fn parse_focused_pane_metadata(workspace: &Value) -> Option<crate::bar::FocusedP
     })
 }
 
+/// Owner terminal topology, refreshed by the existing event subscription.
+/// IDs remain owner-local; browser federation namespaces them at its boundary.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct RemoteWorkspaceRuntime {
+    pub server_generation: String,
+    pub connected: bool,
+    pub tabs: Vec<Value>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteWorkspaceMeta {
+    pub runtime: Option<RemoteWorkspaceRuntime>,
     pub focused_pane: Option<crate::bar::FocusedPaneMetadata>,
     pub agents: Vec<RemoteAgentMeta>,
     pub history: Vec<super::remote_agents::AgentHistoryRow>,
@@ -290,6 +300,7 @@ pub(super) struct PendingRemoteNavigation {
 }
 
 pub struct RemoteView {
+    pub runtime: Option<RemoteWorkspaceRuntime>,
     pub graphics: Vec<crate::terminal::graphics::Graphic>,
     pub focused_pane: Option<crate::bar::FocusedPaneMetadata>,
     pub agents: Vec<RemoteAgentMeta>,
@@ -573,6 +584,7 @@ impl App {
         self.views.insert(
             pane,
             ViewKind::Remote(RemoteView {
+                runtime: None,
                 graphics: Vec::new(),
                 focused_pane: None,
                 agents: Vec::new(),
@@ -1006,11 +1018,55 @@ impl App {
             .is_some_and(|watcher| watcher.generation == generation)
     }
 
+    fn remote_runtime_changed(&mut self, target: &RemoteSession, disconnected: bool) {
+        for (index, workspace) in self.workspaces.iter().enumerate() {
+            if !workspace.remote.as_ref().is_some_and(|remote| {
+                remote.host == target.host && remote.session == target.session
+            }) {
+                continue;
+            }
+            if disconnected {
+                for tab in &workspace.tabs {
+                    for pane in tab.layout.leaves() {
+                        if let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) {
+                            if let Some(runtime) = &mut view.runtime {
+                                runtime.connected = false;
+                            }
+                        }
+                    }
+                }
+            }
+            crate::ipc::api::publish_event(
+                &self.events,
+                "workspace.metadata_reported",
+                json!({"workspace":index.to_string()}),
+            );
+        }
+    }
+
+    pub(crate) fn remote_runtime_snapshot(&self, workspace: &Workspace) -> Option<Value> {
+        let remote = workspace.remote.as_ref()?;
+        let pane = workspace.tabs.first()?.layout.focus;
+        let ViewKind::Remote(view) = self.views.get(&pane)? else {
+            return None;
+        };
+        let runtime = view.runtime.as_ref()?;
+        Some(json!({
+            "host":remote.host, "session":remote.session,
+            "workspace_id":remote.workspace_id,
+            "server_generation":runtime.server_generation,
+            "connected":runtime.connected, "tabs":runtime.tabs,
+        }))
+    }
+
     pub(crate) fn apply_remote_session_discovered(
         &mut self,
         target: RemoteSession,
         result: Result<RemoteSessionSnapshot, String>,
     ) {
+        if result.is_err() {
+            self.remote_runtime_changed(&target, true);
+        }
         self.discard_stale_remote_navigation();
         if let Some(watcher) = self
             .remote_session_watchers
@@ -1075,6 +1131,7 @@ impl App {
                     == Some(&target))
         {
             metadata.push(RemoteWorkspaceMeta {
+                runtime: None,
                 focused_pane: None,
                 id: String::new(),
                 name: target.session.clone(),
@@ -1110,6 +1167,7 @@ impl App {
                 workspace.worktree = meta.worktree;
                 if let Some(pane) = workspace.tabs.first().map(|tab| tab.layout.focus) {
                     if let Some(ViewKind::Remote(view)) = self.views.get_mut(&pane) {
+                        view.runtime = meta.runtime;
                         view.agents = meta.agents;
                         view.focused_pane = meta.focused_pane;
                         // Focus belongs to the displayed frame. The topology
@@ -1212,6 +1270,7 @@ impl App {
         self.rebalance_remote_effect_leader(&target);
         self.finish_remote_workspace_picker();
         self.finish_remote_navigation();
+        self.remote_runtime_changed(&target, false);
     }
 
     pub(crate) fn apply_remote_session_watcher_closed(
@@ -1219,6 +1278,7 @@ impl App {
         target: RemoteSession,
         error: String,
     ) {
+        self.remote_runtime_changed(&target, true);
         if self.retry_remote_session(&target, &error) {
             return;
         }
@@ -1266,6 +1326,7 @@ impl App {
         self.views.insert(
             pane,
             ViewKind::Remote(RemoteView {
+                runtime: meta.runtime,
                 graphics: Vec::new(),
                 focused_pane: meta.focused_pane,
                 agents: meta.agents,
@@ -2388,6 +2449,13 @@ pub(super) fn parse_remote_snapshot(
         .filter(|workspace| workspace.get("host").is_none_or(Value::is_null))
         .map(|workspace| {
             Ok(RemoteWorkspaceMeta {
+                runtime: response["result"]["server_generation"]
+                    .as_str()
+                    .map(|generation| RemoteWorkspaceRuntime {
+                        server_generation: generation.to_string(),
+                        connected: true,
+                        tabs: workspace["tabs"].as_array().cloned().unwrap_or_default(),
+                    }),
                 focused_pane: parse_focused_pane_metadata(workspace),
                 agents: parse_remote_agents(workspace),
                 history: serde_json::from_value(
@@ -2641,11 +2709,14 @@ fn watch_remote_session(
                     | "pane.created"
                     | "pane.closed"
                     | "pane.moved"
+                    | "pane.renamed"
+                    | "pane.swapped"
                     | "pane.focused"
                     | "tab.created"
                     | "tab.closed"
                     | "tab.renamed"
                     | "tab.focused"
+                    | "terminal.created"
                     | "terminal.metadata_changed"
                     | "terminal.moved"
             ) {
@@ -3385,7 +3456,7 @@ pub(crate) mod tests {
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(120, 40, tx).unwrap();
         let (_pane, _input, _) = add_remote_workspace(&mut app);
-        let response = json!({"result": {"event_sequence": 12, "workspaces": [{
+        let response = json!({"result": {"event_sequence": 12, "server_generation":"owner-boot", "workspaces": [{
             "id": "workspace_remote", "name": "remote-api", "cwd": "/srv/api",
             "tabs": [{"index": 2, "panes": [{"pane_id": "7", "kind": "terminal",
                 "agent": "codex", "terminal_id": "owner-terminal", "is_agent": true,
@@ -3396,6 +3467,23 @@ pub(crate) mod tests {
             RemoteSession::new("dev-207", "api").unwrap(),
             Ok(snapshot),
         );
+        let runtime = app.runtime_snapshot();
+        let projected = runtime["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|workspace| workspace["host"] == "dev-207")
+            .unwrap();
+        assert_eq!(projected["remote"]["server_generation"], "owner-boot");
+        assert_eq!(
+            projected["remote"]["tabs"][0]["panes"][0]["terminal_id"],
+            "owner-terminal"
+        );
+        assert_eq!(
+            projected["remote"]["tabs"][0]["panes"][0]["agent_status"],
+            "blocked"
+        );
+        assert_eq!(projected["remote"]["connected"], true);
         let agents = app.dispatch("agent.list", &json!({})).unwrap();
         let agent = agents["agents"]
             .as_array()
@@ -3438,6 +3526,7 @@ pub(crate) mod tests {
         app.views.insert(
             pane,
             ViewKind::Remote(RemoteView {
+                runtime: None,
                 graphics: Vec::new(),
                 focused_pane: None,
                 agents: Vec::new(),
@@ -3716,6 +3805,7 @@ pub(crate) mod tests {
         let metadata = ["source", "destination"]
             .into_iter()
             .map(|id| RemoteWorkspaceMeta {
+                runtime: None,
                 focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
@@ -3824,6 +3914,7 @@ pub(crate) mod tests {
         let metadata = ["source", "destination"]
             .into_iter()
             .map(|id| RemoteWorkspaceMeta {
+                runtime: None,
                 focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
@@ -5493,6 +5584,7 @@ pub(crate) mod tests {
                 display: RemoteDisplay::default(),
                 event_sequence: 2,
                 workspaces: vec![RemoteWorkspaceMeta {
+                    runtime: None,
                     focused_pane: None,
                     agents: Vec::new(),
                     history: Vec::new(),
@@ -5525,6 +5617,7 @@ pub(crate) mod tests {
                 display: RemoteDisplay::default(),
                 event_sequence: 4,
                 workspaces: vec![RemoteWorkspaceMeta {
+                    runtime: None,
                     focused_pane: None,
                     agents: Vec::new(),
                     history: Vec::new(),
@@ -5605,6 +5698,7 @@ pub(crate) mod tests {
             display: RemoteDisplay::default(),
             event_sequence: 9,
             workspaces: vec![RemoteWorkspaceMeta {
+                runtime: None,
                 focused_pane: None,
                 agents: Vec::new(),
                 history: Vec::new(),
@@ -5999,6 +6093,7 @@ pub(crate) mod tests {
         app.views.insert(
             second,
             ViewKind::Remote(RemoteView {
+                runtime: None,
                 graphics: Vec::new(),
                 focused_pane: None,
                 agents: Vec::new(),
@@ -6091,6 +6186,7 @@ pub(crate) mod tests {
                 display: RemoteDisplay::default(),
                 event_sequence: 7,
                 workspaces: vec![RemoteWorkspaceMeta {
+                    runtime: None,
                     focused_pane: None,
                     agents: Vec::new(),
                     history: Vec::new(),

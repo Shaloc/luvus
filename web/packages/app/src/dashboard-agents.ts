@@ -43,7 +43,7 @@ export function agentCardTitle(pane: PaneSnapshot): { title: string; titleAbsent
   const isAgent = pane.is_agent === true;
   const sessionTitle = displayText(pane.agent_session_title, "");
   return {
-    title: isAgent ? sessionTitle || "Untitled session" : `Pane ${pane.pane_id}`,
+    title: isAgent ? sessionTitle || "Untitled session" : `Pane ${pane.display_pane_id ?? pane.pane_id}`,
     titleAbsent: isAgent && !sessionTitle,
   };
 }

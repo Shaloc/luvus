@@ -771,7 +771,7 @@ fn device_request(
 }
 
 struct BrowserStream {
-    writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    writer: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<super::remote::Stream>>>,
     closed: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
@@ -811,7 +811,9 @@ async fn open_stream(
         Ok(stream) => stream,
         Err(error) => return response_uhp_error(outgoing, &id, error),
     };
-    let (reader, writer) = stream.into_split();
+    let route = stream.route();
+    let remote_child = stream.child();
+    let (reader, writer) = tokio::io::split(stream);
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let closed = Arc::new(AtomicBool::new(false));
     let stream_id = id.clone();
@@ -821,13 +823,29 @@ async fn open_stream(
         let mut reader = BufReader::new(reader);
         let mut acknowledged = false;
         loop {
-            let line = match read_line(&mut reader, MAX_UPSTREAM_LINE).await {
+            let next = read_line(&mut reader, MAX_UPSTREAM_LINE);
+            let line_result = if acknowledged {
+                next.await
+            } else {
+                tokio::time::timeout(Duration::from_secs(12), next)
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "stream acknowledgement timed out",
+                        ))
+                    })
+            };
+            let line = match line_result {
                 Ok(line) => line,
                 Err(_) => break,
             };
-            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+            let Ok(mut frame) = serde_json::from_str::<Value>(&line) else {
                 break;
             };
+            if let Some(route) = &route {
+                route.project_frame(&mut frame);
+            }
             let browser =
                 if !acknowledged && frame.get("id").and_then(Value::as_str) == Some(&stream_id) {
                     acknowledged = true;
@@ -851,6 +869,11 @@ async fn open_stream(
                 sender.terminal(&stream_id, browser);
             } else if sender.reliable_wait(browser).await.is_err() {
                 break;
+            }
+        }
+        if let Some(child) = remote_child.and_then(|child| child.upgrade()) {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.start_kill();
             }
         }
         task_closed.store(true, Ordering::Release);

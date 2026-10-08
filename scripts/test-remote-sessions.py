@@ -2,6 +2,7 @@
 """Unix smoke test: real Luvus servers/PTY clients with a local SSH substitute.
 
 Run after cargo build: python3 scripts/test-remote-sessions.py
+Use --web-only for native Web remote control, upload, read-only and restart routing.
 Use --ssh-admission-only for 16-workspace SSH startup admission.
 Use --upstream-only for owner-routed agent input revision checks.
 Use --restart-only for the isolated server restart --all smoke test.
@@ -200,8 +201,9 @@ def main():
     clipboard_only = "--clipboard-helper-only" in sys.argv[1:]
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
+    web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -442,6 +444,14 @@ def main():
         assert api("config.get", remote=True)["config"]["layout"]["auto_workspace_rehome"] is False
         api("config.patch", {"patch": {"layout": {"auto_workspace_rehome": False}}})
         print("PASS: automatic workspace rehome defaults off on both owners; live settings stay owner-local", flush=True)
+        if web_only:
+            select_hosts(["fake-dev"])
+            run("session", "remote", "add", "fake-dev", "api", "--merge")
+            wait_for(lambda: len(projected()) == 1)
+            subprocess.run(["node", str(repo / "web/scripts/test-native.mjs")],
+                           env=dict(env, LUVUS_BIN=str(binary), LUVUS_WEB_REMOTE_FIXTURE=str(root), LUVUS_WEB_REMOTE_PYTHON=sys.executable),
+                           cwd=repo, check=True, timeout=180)
+            return
         if ssh_admission_only:
             for i in range(15):
                 path = root / f"workspace-{i}"

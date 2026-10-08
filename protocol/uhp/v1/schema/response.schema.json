@@ -437,6 +437,24 @@
               "tabs"
             ],
             "properties": {
+              "remote": {
+                "description": "Optional fork projection; nested terminal IDs belong to the named SSH owner, never this server.",
+                "anyOf": [
+                  { "type": "null" },
+                  {
+                    "type": "object",
+                    "required": ["host", "session", "workspace_id", "server_generation", "connected", "tabs"],
+                    "properties": {
+                      "host": { "type": "string", "minLength": 1 },
+                      "session": { "type": "string", "minLength": 1 },
+                      "workspace_id": { "type": "string" },
+                      "server_generation": { "type": "string", "minLength": 1, "maxLength": 512 },
+                      "connected": { "type": "boolean" },
+                      "tabs": { "$ref": "#/$defs/snapshotAliases/properties/workspaces/items/properties/tabs" }
+                    }
+                  }
+                ]
+              },
               "tabs": {
                 "type": "array",
                 "items": {

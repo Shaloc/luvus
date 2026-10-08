@@ -132,9 +132,19 @@ export class BridgeClient extends EventTarget {
     const id = this.#nextId("stream");
     this.#streams.set(id, { onFrame, onClose });
     try {
-      await this.#sendPending(id, { type: "stream.open", id, method, params }, 10_000);
+      // Remote setup includes the bounded owner snapshot, SSH preflight and
+      // handshake. Leave room for those before abandoning an otherwise live route.
+      const timeout = typeof params.terminal_id === "string" && params.terminal_id.startsWith("remote:") ? 45_000 : 10_000;
+      await this.#sendPending(id, { type: "stream.open", id, method, params }, timeout, id);
     } catch (error) {
       this.#streams.delete(id);
+      try {
+        // Setup can finish after the browser deadline. Revoke that late stream
+        // too, so it cannot hold a terminal lease with no live browser handle.
+        this.#send({ type: "stream.close", stream_id: id });
+      } catch {
+        // A disconnected socket releases its upstream streams independently.
+      }
       throw error;
     }
     return {

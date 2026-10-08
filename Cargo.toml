@@ -93,7 +93,7 @@ getrandom = "0.3"
 # not start an async runtime or bind a network listener.
 axum = { version = "0.8", default-features = false, features = ["http1", "original-uri", "tokio", "ws"] }
 futures-util = "0.3"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 # Calendar-safe IANA timezone conversion for daily and weekly automations.
 # Jiff is local-only: it reads the OS timezone database (with a Windows bundle)
 # and performs no runtime network access.

@@ -40,14 +40,14 @@ pub(super) struct UhpError {
 }
 
 impl UhpError {
-    fn unavailable(message: impl Into<String>) -> Self {
+    pub(super) fn unavailable(message: impl Into<String>) -> Self {
         Self {
             code: "unavailable".to_string(),
             message: message.into(),
         }
     }
 
-    fn coded(code: &str, message: impl Into<String>) -> Self {
+    pub(super) fn coded(code: &str, message: impl Into<String>) -> Self {
         Self {
             code: code.to_string(),
             message: message.into(),
@@ -70,6 +70,7 @@ pub(super) struct UhpAccess {
 
 struct Inner {
     child: Child,
+    remote_children: Vec<std::sync::Weak<Mutex<tokio::process::Child>>>,
     port: u16,
     token: String,
     authority: Authority,
@@ -77,6 +78,20 @@ struct Inner {
     allowed: HashSet<String>,
     session: String,
     control: bool,
+}
+
+impl Inner {
+    fn close_remotes(&mut self) {
+        for child in self
+            .remote_children
+            .drain(..)
+            .filter_map(|child| child.upgrade())
+        {
+            if let Ok(mut child) = child.lock() {
+                let _ = child.start_kill();
+            }
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -143,6 +158,19 @@ impl UhpAccess {
     }
 
     pub async fn request(&self, method: &str, params: Value, id: &str) -> Result<Value, UhpError> {
+        let mut result = self.local_request(method, params, id).await?;
+        if method == "session.snapshot" {
+            super::remote::project(&mut result);
+        }
+        Ok(result)
+    }
+
+    async fn local_request(
+        &self,
+        method: &str,
+        params: Value,
+        id: &str,
+    ) -> Result<Value, UhpError> {
         let (port, token) = self.endpoint();
         let mut stream = timeout(
             CONNECT_TIMEOUT,
@@ -173,7 +201,40 @@ impl UhpAccess {
         method: &str,
         params: Value,
         id: &str,
-    ) -> Result<AsyncTcpStream, UhpError> {
+    ) -> Result<super::remote::Stream, UhpError> {
+        if !self.method_allowed(method) {
+            return Err(UhpError::coded("forbidden", "Stream method is not allowed"));
+        }
+        if params["terminal_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("remote:"))
+        {
+            if !matches!(
+                method,
+                "terminal.backend.control" | "terminal.backend.observe"
+            ) {
+                return Err(UhpError::coded(
+                    "invalid_params",
+                    "Remote route requires a terminal stream",
+                ));
+            }
+            // Resolve from the selected server each time. The browser cannot
+            // supply an SSH host, bypass a closed workspace, or reuse old IDs.
+            let _switch = self.switching.lock().await;
+            let mut snapshot = self
+                .local_request("session.snapshot", json!({}), id)
+                .await?;
+            let route = super::remote::resolve(&mut snapshot, &params)?;
+            let stream = route.open(method, params, id).await?;
+            if let Some(child) = stream.child() {
+                let mut inner = self.inner.lock().expect("web UHP state poisoned");
+                inner
+                    .remote_children
+                    .retain(|child| child.strong_count() > 0);
+                inner.remote_children.push(child);
+            }
+            return Ok(stream);
+        }
         let (port, token) = self.endpoint();
         let mut stream = timeout(
             CONNECT_TIMEOUT,
@@ -187,7 +248,7 @@ impl UhpAccess {
             .write_all(format!("{frame}\n").as_bytes())
             .await
             .map_err(|error| UhpError::unavailable(error.to_string()))?;
-        Ok(stream)
+        Ok(super::remote::Stream::Local(stream))
     }
 
     pub async fn sessions(&self) -> Result<Vec<BrowserSession>, UhpError> {
@@ -261,6 +322,7 @@ impl UhpAccess {
             .map_err(|error| UhpError::unavailable(error.to_string()))??;
         let mut inner = access.inner.lock().expect("web UHP state poisoned");
         let mut old = std::mem::replace(&mut *inner, next);
+        old.close_remotes();
         terminate(&mut old.child);
         Ok(target)
     }
@@ -274,6 +336,7 @@ impl UhpAccess {
 impl Drop for UhpAccess {
     fn drop(&mut self) {
         if let Ok(inner) = self.inner.get_mut() {
+            inner.close_remotes();
             terminate(&mut inner.child);
         }
     }
@@ -353,6 +416,7 @@ fn start_child(session: String, control: bool) -> Result<Inner, UhpError> {
     match setup {
         Ok((descriptor, token, capabilities, allowed)) => Ok(Inner {
             child,
+            remote_children: Vec::new(),
             port: descriptor.endpoint.port,
             token,
             authority: descriptor.authority,

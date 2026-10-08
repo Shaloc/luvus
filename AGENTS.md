@@ -241,9 +241,14 @@ lock scopes short and never hold it across unrelated slow work.
   session switch moves all devices on that bridge, not attached TUI clients.
   Keep browser input and terminal output bounded, with reliable action
   responses and coalesced visual frames. Agent session-title changes need a
-  snapshot-refresh event. The browser bridge does not inherit the TUI client's
-  saved SSH-machine connections; remote browser access requires a bridge on
-  the destination host behind a trusted TLS/WSS tunnel.
+  snapshot-refresh event. The browser bridge projects remote terminals from the selected server's
+  existing SSH workspace topology. Namespace owner-local IDs, resolve streams
+  from fresh projected routes, and retain owner-generation checks. Reuse the
+  existing-only SSH control bridge; never let browser parameters choose an SSH
+  destination or start/restart a remote owner. Remote uploads stay on that owner.
+  Read-only authority, device limits and shutdown revocation apply equally to
+  local and remote terminals. External browser access still requires a trusted
+  TLS/WSS tunnel.
 - A configured module worktree provider may create worktrees and optionally
   remove them, but remains out of process and cannot bypass validation or
   mutate `App` directly. Internal rollback and task merge remain Git-backed.

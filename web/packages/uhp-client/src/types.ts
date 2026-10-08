@@ -2,6 +2,7 @@ export type JsonObject = Record<string, unknown>;
 
 export interface PaneSnapshot {
   pane_id: string;
+  display_pane_id?: string;
   kind: "terminal" | "view";
   focused: boolean;
   cwd?: string;
