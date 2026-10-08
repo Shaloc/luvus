@@ -5,7 +5,7 @@
 //! existing binary display protocol. The remote server remains the sole writer
 //! of that workspace, its tabs, panes, PTYs, and agent state.
 
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,7 +22,9 @@ use crate::layout::TileLayout;
 use crate::session::remote::{RemoteBinaryLocation, RemoteInput, RemoteSession};
 
 mod display;
+mod events;
 pub(super) use display::{PendingWorkspaceSwitch, SessionDisplay};
+use events::watch_remote_session;
 
 const REMOTE_RETRY_INITIAL: Duration = Duration::from_millis(250);
 const REMOTE_RETRY_MAX: Duration = Duration::from_secs(10);
@@ -951,7 +953,7 @@ impl App {
                 return;
             };
             let sequence = snapshot.event_sequence;
-            let location = snapshot.display.location;
+            let display = snapshot.display.clone();
             if tx
                 .send(AppEvent::RemoteSessionDiscovered {
                     generation,
@@ -963,7 +965,7 @@ impl App {
                 return;
             }
             if let Err(error) =
-                watch_remote_session(&target, location, sequence, generation, &scope, &tx)
+                watch_remote_session(&target, &display, sequence, generation, &scope, &tx)
             {
                 let _ = tx.send(AppEvent::RemoteSessionWatcherClosed {
                     generation,
@@ -2617,120 +2619,6 @@ pub(super) fn parse_remote_snapshot(
         return Err("remote projection protocol mismatch: missing server generation".into());
     }
     Ok(snapshot)
-}
-
-fn watch_remote_session(
-    target: &RemoteSession,
-    location: RemoteBinaryLocation,
-    mut after_sequence: u64,
-    generation: u64,
-    scope: &crate::session::remote::ConnectionScope,
-    app_tx: &mpsc::Sender<AppEvent>,
-) -> Result<(), String> {
-    loop {
-        let mut connection =
-            crate::session::remote::connect_control_at(target, location)?.in_scope(scope)?;
-        let deadline = connection.deadline(REMOTE_RESPONSE_TIMEOUT);
-        writeln!(
-            connection,
-            "{}",
-            json!({
-                "id":"remote-session-events",
-                "method":"events.subscribe",
-                "params":{"after_sequence":after_sequence},
-            })
-        )
-        .map_err(|error| error.to_string())?;
-        let mut reader = BufReader::new(connection);
-        let response = crate::ipc::api::read_response_frame(&mut reader)
-            .map_err(|error| deadline.error("remote event subscription", error))?;
-        drop(deadline);
-        let response: Value = serde_json::from_str(&response).map_err(|error| error.to_string())?;
-        if let Some(error) = response.get("error") {
-            if error.get("code").and_then(Value::as_str) == Some("resync_required") {
-                let snapshot = remote_snapshot_at(target, location, scope)?;
-                after_sequence = snapshot.event_sequence;
-                app_tx
-                    .send(AppEvent::RemoteSessionDiscovered {
-                        generation,
-                        target: target.clone(),
-                        result: Ok(snapshot),
-                    })
-                    .map_err(|_| "local session closed".to_string())?;
-                continue;
-            }
-            return Err(format!("remote event subscription failed: {error}"));
-        }
-
-        loop {
-            let line = crate::ipc::api::read_stream_frame(&mut reader)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "remote event subscription closed".to_string())?;
-            let event: Value = serde_json::from_str(&line).map_err(|error| error.to_string())?;
-            let name = event
-                .get("event")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if name == "events.resync_required" {
-                let snapshot = remote_snapshot_at(target, location, scope)?;
-                after_sequence = snapshot.event_sequence;
-                app_tx
-                    .send(AppEvent::RemoteSessionDiscovered {
-                        generation,
-                        target: target.clone(),
-                        result: Ok(snapshot),
-                    })
-                    .map_err(|_| "local session closed".to_string())?;
-                break;
-            }
-            if matches!(
-                name,
-                "workspace.created"
-                    | "agent.history_changed"
-                    | "agent.title_changed"
-                    | "agent.pin_changed"
-                    | "automation.created"
-                    | "automation.updated"
-                    | "automation.rebound"
-                    | "automation.enabled"
-                    | "automation.disabled"
-                    | "automation.deleted"
-                    | "automation.run_queued"
-                    | "automation.run_materialized"
-                    | "automation.run_started"
-                    | "automation.run_finished"
-                    | "automation.run_failed"
-                    | "automation.run_updated"
-                    | "task.updated"
-                    | "workspace.closed"
-                    | "workspace.renamed"
-                    | "workspace.metadata_reported"
-                    | "pane.agent_status_changed"
-                    | "pane.created"
-                    | "pane.closed"
-                    | "pane.moved"
-                    | "pane.renamed"
-                    | "pane.swapped"
-                    | "pane.focused"
-                    | "tab.created"
-                    | "tab.closed"
-                    | "tab.renamed"
-                    | "tab.focused"
-                    | "terminal.created"
-                    | "terminal.metadata_changed"
-                    | "terminal.moved"
-            ) {
-                let snapshot = remote_snapshot_at(target, location, scope)?;
-                app_tx
-                    .send(AppEvent::RemoteSessionDiscovered {
-                        generation,
-                        target: target.clone(),
-                        result: Ok(snapshot),
-                    })
-                    .map_err(|_| "local session closed".to_string())?;
-            }
-        }
-    }
 }
 
 #[allow(clippy::too_many_arguments)]

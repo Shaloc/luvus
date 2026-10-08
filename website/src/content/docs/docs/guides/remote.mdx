@@ -872,6 +872,27 @@ The equivalent Luvus form places passthrough options after its host argument:
 luvus --remote alice@203.0.113.10 -p 2222 -i ~/.ssh/work_ed25519
 ```
 
+### Event stream read errors on an otherwise working SSH connection
+
+Managed sessions use separate connections for topology events and terminal
+display. An `event frame read failed` message refers to the topology event
+stream; it does not by itself establish that the network is unstable or that a
+terminal display frame was too large. Current builds include the underlying
+IO or SSH error in that message.
+
+The remote owner keeps receive-side disconnect checks separate from its bounded
+send timeout on Unix. The display machine continues draining events while it
+loads a fresh snapshot, and merges changes already covered by that snapshot.
+Update both machines to receive both fixes. Persistent slow consumers remain
+bounded: a full event queue requires resynchronization rather than silently
+losing updates.
+
+For a recurring failure, record the time, the complete error, and `luvus --version`
+on both machines. In the owner's logs, `uhp.subscription.close` distinguishes
+`write_timeout`, `write_failed`, `overflow`, and peer `eof`; older builds reported
+all of these as `eof`. The installed binary's version may differ from the one
+used by an already-running server.
+
 ### Ordinary SSH works but opening many remote workspaces fails
 
 With transport 13 (`session_display.v1`) on both ends, a local presentation server

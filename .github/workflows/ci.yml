@@ -98,6 +98,13 @@ jobs:
         run: |
           cargo test --manifest-path vendor/vte/Cargo.toml --lib
           cargo test --manifest-path vendor/alacritty_terminal/Cargo.toml --lib
+      - name: Validate remote event backpressure
+        # The existing remote harness uses pyte to apply incremental TUI frames.
+        # Keep this test-only dependency in a disposable environment.
+        run: |
+          python3 -m venv target/remote-event-test-env
+          target/remote-event-test-env/bin/pip install pyte==0.8.2
+          target/remote-event-test-env/bin/python scripts/test-remote-sessions.py target/debug/luvus --event-backpressure-only
       # Cargo strips local patches from published manifests. Verify the exact
       # three-crate registry graph so `cargo install luvus` cannot regress.
       - name: Verify publishable crate graph

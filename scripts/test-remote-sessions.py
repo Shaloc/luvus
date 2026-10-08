@@ -15,6 +15,7 @@ Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
 Use --colors-only for child color queries and composed local/remote backgrounds (requires pyte).
 Use --reconnect-only for remote owner restart and automatic reconnection.
+Use --event-backpressure-only for event draining during a stalled topology snapshot.
 That mode uses a real VT decoder: uv run --with pyte==0.8.2 scripts/test-remote-sessions.py target/debug/luvus --reconnect-only
 All homes, sockets, files and child processes are isolated below target/.
 No production server or actual SSH destination is accessed by default.
@@ -158,6 +159,37 @@ def ssh_substitute():
                     (root / "stalled-bridge").write_text(str(os.getpid()))
                     while True:
                         signal.pause()
+    if (os.environ.get("LUVUS_SMOKE_EVENT_BACKPRESSURE")
+            and "remote-control-bridge" in command and command[2] == "api"):
+        # Gate one real snapshot request, while allowing the independent event
+        # subscription to keep delivering. Inspect only our private fixture's
+        # first NDJSON request; replay it before execing the actual bridge.
+        first = bytearray()
+        while not first.endswith(b"\n"):
+            chunk = os.read(0, 1)
+            assert chunk and len(first) < 1024 * 1024
+            first.extend(chunk)
+        method = json.loads(first)["method"]
+        with (root / "event-control-calls").open("a") as log:
+            log.write(method + "\n")
+        if method == "session.snapshot":
+            try:
+                (root / "hold-next-snapshot").unlink()
+            except FileNotFoundError:
+                pass
+            else:
+                (root / "snapshot-held").touch()
+                deadline = time.monotonic() + 15
+                while not (root / "release-snapshot").exists():
+                    assert time.monotonic() < deadline, "fixture snapshot release timed out"
+                    time.sleep(0.02)
+        incoming, keep_open = os.pipe()
+        os.write(keep_open, first)
+        os.dup2(incoming, 0)
+        os.close(incoming)
+        # A subscription is one request. Keep its input open until the exact
+        # bridge exits/is cancelled, matching ControlConnection's stdin owner.
+        os.set_inheritable(keep_open, True)
     os.execv(str(binary), command)
 
 
@@ -190,10 +222,11 @@ def main():
     agent_seen_only = "--agent-seen-only" in sys.argv[1:]
     reconnect_only = "--reconnect-only" in sys.argv[1:]
     network_reconnect_only = "--network-reconnect-only" in sys.argv[1:]
+    event_backpressure_only = "--event-backpressure-only" in sys.argv[1:]
     graphics_only = "--graphics-only" in sys.argv[1:]
     theme_sync_only = "--theme-sync-only" in sys.argv[1:]
     colors_only = "--colors-only" in sys.argv[1:]
-    if reconnect_only or network_reconnect_only or colors_only:
+    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -203,7 +236,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -258,6 +291,8 @@ def main():
         env["LUVUS_SMOKE_SSH_ADMISSION"] = "1"
     if network_reconnect_only:
         env["LUVUS_SMOKE_NETWORK_RECONNECT"] = "1"
+    if event_backpressure_only:
+        env["LUVUS_SMOKE_EVENT_BACKPRESSURE"] = "1"
     if graphics_only:
         env["TERM"] = os.environ.get("LUVUS_TEST_KITTY_TERM", "xterm-kitty")
         env["KITTY_WINDOW_ID"] = "1"
@@ -632,7 +667,7 @@ def main():
             if colors_only:
                 color_output.clear()
                 color_output.extend(screen)
-            if reconnect_only or network_reconnect_only or colors_only:
+            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -1362,6 +1397,43 @@ def main():
             assert saved_dir(False).exists()
             assert api("uhp.capabilities", remote=True)["server_generation"] == owner_generation
             print("PASS: unmerged remote stopped row: outside click cancels; confirmed Delete removes remote only", flush=True)
+            return
+
+        if event_backpressure_only:
+            run("session", "merge", "on")
+            wait_for(projected)
+            workspace = next(w for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
+            api("workspace.focus", {"workspace": workspace["workspace"]})
+            process, master = start_client(["--session", "api"])
+            drain(master, 1)
+            owner_generation = api("uhp.capabilities", remote=True)["server_generation"]
+            owner_workspace = api("workspace.list", remote=True)["workspaces"][0]["workspace"]
+            def calls(method):
+                return (root / "event-control-calls").read_text().splitlines().count(method)
+            # Let setup settle before counting requests in the actual burst.
+            drain(master, 0.5)
+            initial = calls("session.snapshot")
+            subscriptions = calls("events.subscribe")
+            (root / "hold-next-snapshot").touch()
+            api("workspace.rename", {"workspace": owner_workspace, "name": "event-burst-start"}, remote=True)
+            wait_for(lambda: (root / "snapshot-held").exists())
+            for index in range(40):
+                api("workspace.rename", {"workspace": owner_workspace, "name": f"event-burst-{index}"}, remote=True)
+            (root / "release-snapshot").touch()
+            wait_for(lambda: any(w["name"] == "event-burst-39" for w in projected()))
+            drain(master, 0.5)
+            refreshes = calls("session.snapshot") - initial
+            assert refreshes <= 2, f"41 changes reopened SSH {refreshes} times instead of coalescing"
+            assert calls("events.subscribe") == subscriptions, "healthy subscription must survive the burst"
+            selected_pane = next(p["pane"] for p in api("pane.list", remote=True)["panes"] if p["focused"])
+            api("pane.run", {"pane": selected_pane, "command": "printf 'EVENT_%s\\n' RECOVERED"}, remote=True)
+            def visible():
+                drain(master, 0.1)
+                return "EVENT_RECOVERED" in "\n".join(client_terminals[master][0].display)
+            wait_for(visible)
+            assert process.poll() is None
+            assert api("uhp.capabilities", remote=True)["server_generation"] == owner_generation
+            print(f"PASS: 41 topology changes coalesced into {refreshes} snapshots; event subscription, owner and PTY client survive", flush=True)
             return
 
         if network_reconnect_only:

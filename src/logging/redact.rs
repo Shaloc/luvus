@@ -218,6 +218,8 @@ pub enum Reason {
     Protocol,
     Overflow,
     Lock,
+    WriteTimeout,
+    WriteFailed,
 }
 
 impl Reason {
@@ -232,6 +234,8 @@ impl Reason {
             Self::Protocol => "protocol",
             Self::Overflow => "overflow",
             Self::Lock => "lock",
+            Self::WriteTimeout => "write_timeout",
+            Self::WriteFailed => "write_failed",
         }
     }
 }

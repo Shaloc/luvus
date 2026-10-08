@@ -468,13 +468,13 @@ fn handle_auth_method(
 
 static NEXT_SUB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 enum FrameError {
     Eof,
     MissingLf,
     TooLarge,
     Timeout,
-    Io,
+    Io(io::Error),
 }
 
 /// Read the one request permitted on a fresh connection with a hard deadline.
@@ -491,7 +491,7 @@ fn read_initial_frame(
     #[cfg(not(windows))]
     let timeout_mode = stream
         .set_recv_timeout(INITIAL_FRAME_POLL)
-        .map_err(|_| FrameError::Io)?;
+        .map_err(FrameError::Io)?;
     let mut frame = Vec::new();
     let mut chunk = [0_u8; 1024];
     loop {
@@ -505,7 +505,7 @@ fn read_initial_frame(
                 continue;
             }
             Ok(true) => {}
-            Err(_) => return Err(FrameError::Io),
+            Err(error) => return Err(FrameError::Io(error)),
         }
         match stream.read(&mut chunk) {
             Ok(0) => {
@@ -547,6 +547,7 @@ fn read_initial_frame(
                     thread::sleep(std::time::Duration::from_millis(10));
                 }
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 #[cfg(not(windows))]
                 if timeout_mode == transport::TimeoutMode::Nonblocking
@@ -555,8 +556,7 @@ fn read_initial_frame(
                     thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
-                let _ = error;
-                return Err(FrameError::Io);
+                return Err(FrameError::Io(error));
             }
         }
     }
@@ -567,7 +567,10 @@ fn read_initial_frame(
 fn read_frame(reader: &mut impl BufRead) -> Result<Vec<u8>, FrameError> {
     let mut frame = Vec::new();
     loop {
-        let available = reader.fill_buf().map_err(|_| FrameError::Io)?;
+        let available = match reader.fill_buf() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result.map_err(FrameError::Io)?,
+        };
         if available.is_empty() {
             return Err(if frame.is_empty() {
                 FrameError::Eof
@@ -605,7 +608,7 @@ fn frame_error(error: FrameError, frame_kind: &str) -> io::Error {
             format!("{frame_kind} is empty"),
         ),
         FrameError::Timeout => (io::ErrorKind::TimedOut, format!("{frame_kind} timed out")),
-        FrameError::Io => (io::ErrorKind::Other, format!("{frame_kind} read failed")),
+        FrameError::Io(error) => (error.kind(), format!("{frame_kind} read failed: {error}")),
     };
     io::Error::new(kind, message)
 }
@@ -628,18 +631,24 @@ pub(crate) fn read_stream_frame(reader: &mut impl BufRead) -> io::Result<Option<
     let frame = match read_frame(reader) {
         Ok(frame) => frame,
         Err(FrameError::Eof) => return Ok(None),
+        Err(FrameError::Io(error)) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("event frame read failed: {error}"),
+            ));
+        }
         Err(error) => {
             let message = match error {
                 FrameError::TooLarge => "event frame is too large",
                 FrameError::MissingLf => "event frame is missing LF",
-                FrameError::Io => "event frame read failed",
+                FrameError::Io(_) => unreachable!(),
                 FrameError::Timeout => "event frame timed out",
                 FrameError::Eof => unreachable!(),
             };
             let kind = match error {
                 FrameError::TooLarge => io::ErrorKind::InvalidData,
                 FrameError::MissingLf => io::ErrorKind::UnexpectedEof,
-                FrameError::Io => io::ErrorKind::Other,
+                FrameError::Io(_) => unreachable!(),
                 FrameError::Timeout => io::ErrorKind::TimedOut,
                 FrameError::Eof => unreachable!(),
             };
@@ -2322,7 +2331,10 @@ fn handle_conn(
             "loss_behavior":"resync_required_then_close",
         }})
         .to_string();
-        let _ = write_response(&mut writer, &id, &response);
+        if write_response(&mut writer, &id, &response).is_err() {
+            unsubscribe(&bus, sub_id);
+            return;
+        }
         // Forward bus events to the socket on a helper thread…
         let mut fwd_writer = writer.clone();
         let fwd_active = active.clone();
@@ -2338,16 +2350,25 @@ fn handle_conn(
                                 &mut fwd_writer,
                                 &resync_event(filter, dropped_at),
                             );
+                            return Some(crate::logging::Reason::Overflow);
                         }
                         break;
                     }
-                    if evt.len().saturating_add(1) > crate::terminal::backend::MAX_FRAME_BYTES
-                        || write_event_frame(&mut fwd_writer, &evt).is_err()
-                    {
+                    if evt.len().saturating_add(1) > crate::terminal::backend::MAX_FRAME_BYTES {
                         fwd_active.store(false, Ordering::Release);
-                        break;
+                        return Some(crate::logging::Reason::Protocol);
+                    }
+                    if let Err(error) = write_event_frame(&mut fwd_writer, &evt) {
+                        fwd_active.store(false, Ordering::Release);
+                        return Some(match error.kind() {
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                                crate::logging::Reason::WriteTimeout
+                            }
+                            _ => crate::logging::Reason::WriteFailed,
+                        });
                     }
                 }
+                None
             })
             .ok();
         if fwd.is_none() {
@@ -2356,10 +2377,20 @@ fn handle_conn(
         // …while this thread watches the read side: EOF/error = the client is
         // gone, so unsubscribe NOW instead of lingering in the bus until the
         // next publish happens to notice the dead channel.
+        // Conn clones share socket options. Poll only the receive side here;
+        // retaining the existing bounded send timeout lets a briefly stalled
+        // consumer resume instead of truncating an event after 250ms.
+        #[cfg(not(windows))]
+        let timeout_mode = reader
+            .get_ref()
+            .set_recv_timeout(std::time::Duration::from_millis(250))
+            .ok();
+        #[cfg(windows)]
         let timeout_mode = reader
             .get_ref()
             .set_timeouts(std::time::Duration::from_millis(250))
             .ok();
+        let mut close_reason = crate::logging::Reason::Eof;
         let mut probe = [0_u8; 1024];
         while active.load(Ordering::Acquire) {
             match reader.read(&mut probe) {
@@ -2390,14 +2421,26 @@ fn handle_conn(
                 {
                     thread::sleep(std::time::Duration::from_millis(25));
                 }
-                Err(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    close_reason = crate::logging::Reason::Io;
+                    break;
+                }
             }
         }
         unsubscribe(&bus, sub_id);
         if let Some(fwd) = fwd {
-            let _ = fwd.join(); // its sender just left the bus → the rx loop ends
+            // Its sender just left the bus, so the rx loop ends. Preserve a
+            // forwarder failure instead of labelling every closure peer EOF.
+            match fwd.join() {
+                Ok(Some(reason)) => close_reason = reason,
+                Err(_) => close_reason = crate::logging::Reason::Io,
+                Ok(None) => {}
+            }
+        } else {
+            close_reason = crate::logging::Reason::Io;
         }
-        finish_subscription_log(crate::logging::Reason::Eof);
+        finish_subscription_log(close_reason);
         return;
     }
 
@@ -2825,11 +2868,17 @@ mod tests {
         assert_eq!(two.position(), 11, "the second frame remains unread");
 
         let mut missing = std::io::Cursor::new(b"{}".to_vec());
-        assert_eq!(read_frame(&mut missing), Err(FrameError::MissingLf));
+        assert!(matches!(
+            read_frame(&mut missing),
+            Err(FrameError::MissingLf)
+        ));
 
         let mut oversized =
             std::io::Cursor::new(vec![b'x'; crate::terminal::backend::MAX_FRAME_BYTES + 1]);
-        assert_eq!(read_frame(&mut oversized), Err(FrameError::TooLarge));
+        assert!(matches!(
+            read_frame(&mut oversized),
+            Err(FrameError::TooLarge)
+        ));
     }
 
     #[test]
@@ -2930,6 +2979,160 @@ mod tests {
             read_stream_frame(&mut missing).unwrap_err().kind(),
             io::ErrorKind::UnexpectedEof
         );
+    }
+
+    #[test]
+    fn bounded_stream_frame_preserves_bridge_error_and_retries_interrupted_reads() {
+        struct FailingRead(io::ErrorKind);
+        impl Read for FailingRead {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "SSH control bridge closed: fixture"))
+            }
+        }
+        let mut reader = BufReader::new(FailingRead(io::ErrorKind::UnexpectedEof));
+        let error = read_stream_frame(&mut reader).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(error
+            .to_string()
+            .contains("SSH control bridge closed: fixture"));
+
+        struct InterruptedRead(usize);
+        impl Read for InterruptedRead {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                self.0 += 1;
+                match self.0 {
+                    1 => {
+                        bytes[0] = b'a';
+                        Ok(1)
+                    }
+                    2 => Err(io::ErrorKind::Interrupted.into()),
+                    3 => {
+                        bytes[0] = b'\n';
+                        Ok(1)
+                    }
+                    _ => Ok(0),
+                }
+            }
+        }
+        let mut reader = BufReader::new(InterruptedRead(0));
+        assert_eq!(read_stream_frame(&mut reader).unwrap(), Some("a".into()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_subscription_survives_a_short_reader_pause() {
+        let _env = crate::persist::test_env("event-pause");
+        let root = crate::persist::ensure_config_dir();
+        let path = root.join("events.sock");
+        let lock = transport::acquire_server_startup_lock(&root).unwrap();
+        let listener = bind_server(&path, &lock).unwrap();
+        let (events, _rx) = mpsc::channel();
+        let bus = new_bus();
+        start_server(listener, events, bus.clone());
+        drop(lock);
+
+        let mut client = transport::connect(&path).unwrap();
+        client
+            .set_recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        writeln!(
+            client,
+            "{}",
+            json!({"id":"pause", "method":"events.subscribe", "params":{}})
+        )
+        .unwrap();
+        let mut reader = BufReader::new(client);
+        let ack = read_stream_frame(&mut reader).unwrap().unwrap();
+        assert!(ack.contains("subscription_started"));
+        // One legal event exceeds the socket send buffer, without overflowing
+        // the event queue. Simulate a brief client scheduling/processing pause.
+        let payload = "x".repeat(512 * 1024);
+        publish_event(&bus, "test.large", json!({"payload":payload}));
+        thread::sleep(std::time::Duration::from_millis(600));
+        let frame = read_stream_frame(&mut reader).unwrap().unwrap();
+        let frame: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(frame["event"], "test.large");
+        assert_eq!(frame["data"]["payload"], payload);
+        publish_event(&bus, "test.next", json!({}));
+        assert!(read_stream_frame(&mut reader)
+            .unwrap()
+            .unwrap()
+            .contains("test.next"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_subscription_bounds_stalled_readers_and_signals_overflow() {
+        for overflow in [false, true] {
+            let _env = crate::persist::test_env("event-stall");
+            let root = crate::persist::ensure_config_dir();
+            let path = root.join("events.sock");
+            let lock = transport::acquire_server_startup_lock(&root).unwrap();
+            let listener = bind_server(&path, &lock).unwrap();
+            let (events, _rx) = mpsc::channel();
+            let bus = new_bus();
+            start_server(listener, events, bus.clone());
+            drop(lock);
+
+            let mut client = transport::connect(&path).unwrap();
+            client
+                .set_recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            writeln!(
+                client,
+                "{}",
+                json!({"id":"stall", "method":"events.subscribe", "params":{}})
+            )
+            .unwrap();
+            let mut reader = BufReader::new(client);
+            assert!(read_stream_frame(&mut reader)
+                .unwrap()
+                .unwrap()
+                .contains("subscription_started"));
+            publish_event(
+                &bus,
+                "test.large",
+                json!({"payload":"x".repeat(512 * 1024)}),
+            );
+            if overflow {
+                // Fill the bounded queue behind the blocked large write. The
+                // resumed consumer must receive resync, not a truncated frame.
+                for index in 0..=EVENT_QUEUE_CAPACITY {
+                    publish_event(&bus, "test.next", json!({"index":index}));
+                }
+                thread::sleep(std::time::Duration::from_millis(600));
+                let first: Value =
+                    serde_json::from_str(&read_stream_frame(&mut reader).unwrap().unwrap())
+                        .unwrap();
+                // The writer can notice overflow before beginning the large
+                // frame, or finish that frame before emitting resync.
+                let resync = if first["event"] == "test.large" {
+                    serde_json::from_str::<Value>(&read_stream_frame(&mut reader).unwrap().unwrap())
+                        .unwrap()
+                } else {
+                    first
+                };
+                assert_eq!(resync["event"], "events.resync_required");
+                assert_eq!(resync["data"]["reason"], "subscriber_overflow");
+                assert_eq!(read_stream_frame(&mut reader).unwrap(), None);
+            } else {
+                // No queue overflow: a consumer that never resumes still has
+                // a bounded lifetime. write_all may first make partial progress
+                // and then wait once more for the remaining bytes.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                while !bus.0.lock().unwrap().subscribers.is_empty() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "stalled subscriber leaked"
+                    );
+                    thread::sleep(std::time::Duration::from_millis(20));
+                }
+                assert_eq!(
+                    read_stream_frame(&mut reader).unwrap_err().kind(),
+                    io::ErrorKind::UnexpectedEof
+                );
+            }
+        }
     }
 
     #[test]
