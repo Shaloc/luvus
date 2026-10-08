@@ -1,5 +1,6 @@
 import { BridgeClient, BridgeError, LiveSession, type PaneSnapshot, type SessionSnapshot } from "@luvus/uhp-client";
 import { BrowserTickets, TICKET_KEY } from "./browser-tickets.js";
+import { BrowserAppearance } from "./appearance.js";
 import { button, element } from "./dom.js";
 import { accessProblem, pairingCredential, parsePairingInput, type SentCredential } from "./pairing.js";
 import { pairingQrDataUrl } from "./pairing-qr.js";
@@ -77,11 +78,17 @@ export class WebApp {
   #sent: SentCredential = { ticket: false, code: false };
   #pairError: string | undefined;
   readonly #tickets = new BrowserTickets();
+  readonly #appearance = new BrowserAppearance();
   #sentTicket: string | null = null;
   /** Redraws caused by live updates, as opposed to the person's own actions. */
   readonly #renders = new RenderScheduler(() => this.#renderNow());
 
   constructor(private readonly root: HTMLElement) {
+    this.#appearance.addEventListener("change", () => {
+      for (const control of this.root.querySelectorAll<HTMLButtonElement>(".appearance-toggle")) {
+        this.#updateAppearanceButton(control);
+      }
+    });
     const openPane = (pane: PaneSnapshot) => {
       const snapshot = this.#session.snapshot;
       if (snapshot) this.#openTerminal(snapshot, pane);
@@ -256,6 +263,7 @@ export class WebApp {
       element("div", { className: "pulse" }),
       element("h1", { text: "Connecting to Luvus" }),
       element("p", { text: "Authenticating and reconciling the live session." }),
+      this.#appearanceButton(),
     );
   }
 
@@ -290,6 +298,7 @@ export class WebApp {
       element("p", { text: problem.body }),
       form,
       this.#pairError ? element("p", { className: "pair-error", text: this.#pairError }) : undefined,
+      this.#appearanceButton(),
     );
   }
 
@@ -618,14 +627,29 @@ export class WebApp {
   }
 
   #sidebarFooter(): HTMLElement {
-    return element("nav", { className: "mission-dock", attrs: { "aria-label": "Devices and connection" } },
+    return element("nav", { className: "mission-dock", attrs: { "aria-label": "Devices, appearance and connection" } },
       missionNavButton("Devices", "devices", () => this.#openDevicePanel()),
+      this.#appearanceButton(),
       refreshButton(this.#sidebarControls.refresh),
       element("span", {
         className: `mission-nav-status ${this.#session.state}`,
         attrs: { role: "status", "aria-label": `Connection ${this.#session.state}`, title: this.#session.state },
       }, missionIcon("status")),
     );
+  }
+
+  #appearanceButton(): HTMLButtonElement {
+    const control = missionNavButton(this.#appearance.label, this.#appearance.preference, () => this.#appearance.cycle());
+    control.classList.add("appearance-toggle");
+    control.dataset.viewKey = "appearance";
+    this.#updateAppearanceButton(control);
+    return control;
+  }
+
+  #updateAppearanceButton(control: HTMLButtonElement): void {
+    control.title = this.#appearance.label;
+    control.setAttribute("aria-label", this.#appearance.label);
+    control.replaceChildren(missionIcon(this.#appearance.preference), element("span", { className: "mission-nav-label", text: this.#appearance.label }));
   }
 
   #updateConnectionStatus(): void {
@@ -831,7 +855,7 @@ function asBrowserSessions(value: unknown): BrowserSession[] {
   });
 }
 
-type MissionIconName = "overview" | "workspaces" | "devices" | "status" | "arrow";
+type MissionIconName = "overview" | "workspaces" | "devices" | "status" | "arrow" | "system" | "light" | "dark";
 type MissionNavIconName = MissionIconName | "luvus";
 
 function missionNavButton(label: string, icon: MissionNavIconName, onClick: () => void, active = false, disabled = false): HTMLButtonElement {
@@ -859,6 +883,9 @@ function missionIcon(name: MissionIconName): SVGSVGElement {
     devices: ["M8 2h8a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2Z", "M10 18h4"],
     status: ["M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z", "m8 12 2.5 2.5L16 9"],
     arrow: ["M5 12h14m-5-5 5 5-5 5"],
+    system: ["M3 4h18v13H3z", "M8 21h8m-4-4v4"],
+    light: ["M16 12a4 4 0 1 0-8 0 4 4 0 0 0 8 0Z", "M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5m11 11L19 19M5 19l1.5-1.5m11-11L19 5"],
+    dark: ["M20.5 14A9 9 0 0 1 10 3.5 9 9 0 1 0 20.5 14Z"],
   };
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("class", "mission-icon");

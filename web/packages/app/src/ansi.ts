@@ -15,11 +15,6 @@ interface State {
   strike: boolean;
 }
 
-const PALETTE = [
-  "#181922", "#ed8f9e", "#9ed68a", "#ead778", "#90b9f2", "#c6a0f6", "#7bdff2", "#d9d7e7",
-  "#676579", "#f3a7b4", "#b5e8a4", "#f1e38f", "#a9c9f7", "#d5b7fa", "#9ae8f5", "#f4f1ff",
-] as const;
-
 export function parseAnsi(input: string): AnsiRun[] {
   const runs: AnsiRun[] = [];
   const state = freshState();
@@ -56,7 +51,7 @@ function appendRun(runs: AnsiRun[], text: string, state: State): void {
 function cssStyle(state: State): Partial<CSSStyleDeclaration> | undefined {
   let foreground = state.foreground;
   let background = state.background;
-  if (state.reverse) [foreground, background] = [background ?? "#d9d7e7", foreground ?? "#111219"];
+  if (state.reverse) [foreground, background] = [background ?? "var(--terminal-bg)", foreground ?? "var(--text)"];
   const style: Partial<CSSStyleDeclaration> = {};
   if (foreground) style.color = foreground;
   if (background) style.backgroundColor = background;
@@ -113,7 +108,7 @@ function extendedColor(codes: number[], index: number): { value: string; consume
 
 function indexedColor(index: number): string {
   const value = Math.max(0, Math.min(255, index));
-  if (value < 16) return PALETTE[value]!;
+  if (value < 16) return `var(--ansi-${value})`;
   if (value < 232) {
     const offset = value - 16;
     const channel = (part: number) => part === 0 ? 0 : 55 + part * 40;

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { writeFile } from "node:fs/promises";
 import path from "node:path";
+import { checkBrowserAppearance } from "./check-browser-appearance.mjs";
 
 /** Exercise the actual embedded client, not a synthetic DOM or CSS fixture. */
 export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, screenshots, checkViewport = false }) {
@@ -217,6 +218,7 @@ export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, scre
   await cdp.call("Input.insertText", { text: "printf 'WEB_LAYOUT_%s\\n' ok" }, sessionId);
   await key("Enter", "Enter", 13);
   await until(() => run("document.querySelector('.terminal-content')?.textContent?.includes('WEB_LAYOUT_ok')"));
+  await checkBrowserAppearance({ cdp, sessionId, run, until, click, key, screenshot });
 
   await viewport(390, 844, true);
   await until(() => run("!!document.querySelector('#terminal-navigation > .terminal-sidebar')"));
@@ -228,6 +230,11 @@ export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, scre
   await key("Tab", "Tab", 9);
   assert.equal(await run("document.querySelector('#terminal-navigation').contains(document.activeElement)"), true, "drawer traps keyboard focus");
   await screenshot("terminal-mobile-drawer");
+  await click(".appearance-toggle");
+  assert.equal(await run("document.documentElement.dataset.theme"), "dark", "theme control is reachable in the mobile drawer");
+  await screenshot("terminal-mobile-drawer-dark");
+  await click(".appearance-toggle");
+  await click(".appearance-toggle");
   await key("Escape", "Escape", 27);
   assert.equal(await run("!document.querySelector('.terminal-header').inert && !document.querySelector('.terminal-main').inert"), true);
   await viewport(390, 480, true);
@@ -244,6 +251,7 @@ export async function checkBrowserLayout({ cdp, sessionId, evaluate, until, scre
   await viewport(1440, 900);
   await desktop("dashboard");
   await click('[data-view-key="pane-filter:false"]');
+  await screenshot("dashboard-light");
   console.log("browser layout passed: header-free desktop frame, aligned compact rails, both collapsed rails, compact action bar with default wrapping, live terminal input, mobile drawers, complementary breakpoint, and short viewport");
   if (checkViewport) console.log("browser viewport sizing passed: window, sidebar, and mobile viewport changes reach the real debug server");
 }

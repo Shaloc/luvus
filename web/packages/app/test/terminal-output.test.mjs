@@ -15,7 +15,7 @@ test("terminal cursor offsets count Unicode characters across ANSI runs", () => 
   assert.equal(plain(parts), "界🧭 input");
   assert.equal(beforeCursor(parts), "界🧭 ");
   assert.equal(parts.filter(({ kind }) => kind === "cursor").length, 1);
-  assert.equal(parts[0].style.color, "#9ed68a");
+  assert.equal(parts[0].style.color, "var(--ansi-2)");
 });
 
 test("terminal cursor padding is inserted only at the cursor", () => {
@@ -35,6 +35,22 @@ test("ANSI styles remain scoped to their original text without turning output in
   assert.equal(plain(parts), "plain working <script> done");
   assert.deepEqual(parts[1].style, { color: "rgb(224, 161, 84)", fontWeight: "700" });
   assert.equal(parts[2].style, undefined);
+});
+
+test("terminal theme adapts basic ANSI and inverted defaults while preserving explicit colors", () => {
+  const parts = terminalFrameParts("\x1b[7minverse\x1b[0;31mred\x1b[0;38;5;12mblue\x1b[0;38;5;196mfixed\x1b[0;38;2;10;20;30mrgb\x1b[0mplain");
+  assert.deepEqual(parts.map(({ style }) => style), [
+    { color: "var(--terminal-bg)", backgroundColor: "var(--text)" },
+    { color: "var(--ansi-1)" },
+    { color: "var(--ansi-12)" },
+    { color: "rgb(255, 0, 0)" },
+    { color: "rgb(10, 20, 30)" },
+    undefined,
+  ]);
+  assert.deepEqual(terminalFrameParts("\x1b[31;7mx\x1b[27my").map(({ style }) => style), [
+    { color: "var(--terminal-bg)", backgroundColor: "var(--ansi-1)" },
+    { color: "var(--ansi-1)" },
+  ]);
 });
 
 test("selection offsets follow retained text after leading output disappears", () => {

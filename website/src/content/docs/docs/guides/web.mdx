@@ -96,6 +96,22 @@ One bridge has one selected upstream session, so a session switch moves every
 browser device paired with that bridge. TUI and CLI clients keep their own
 attachments.
 
+## Choose a light or dark appearance
+
+Web follows your operating system's light/dark preference by default. Click the
+**Appearance** icon at the bottom of the workspace sidebar to cycle through
+**System → Light → Dark**. Its tooltip shows the current mode and the next choice.
+On a phone, open the navigation drawer to find the same control. It is also
+available on the pairing screen and works in read-only mode.
+
+Your choice is saved for this browser and bridge address and shared across its
+tabs. System mode updates when the operating system's appearance changes.
+Switching themes preserves the open terminal and applies to local and remote
+panes without changing their owner server's theme. Default terminal colors and
+the basic ANSI palette adapt; application-specified RGB and extended palette
+colors remain unchanged. An agent with its own fixed theme may also need its
+own light-mode setting.
+
 ## Control SSH workspaces from one browser
 
 In this fork, the selected session's merged SSH workspaces appear alongside

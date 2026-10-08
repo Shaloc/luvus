@@ -49,6 +49,13 @@ try {
   if (screenshots) console.log(`Layout screenshots: ${screenshots}`);
   const second = await page(pairing.origin);
   await ready(second);
+  assert.equal(await evaluate(second.sessionId, "document.documentElement.dataset.appearance"), "light", "new tabs load the saved appearance");
+  await evaluate(second.sessionId, "document.querySelector('.appearance-toggle').click()");
+  await until(() => evaluate(first.sessionId, "document.documentElement.dataset.theme === 'dark'"));
+  assert.match(await evaluate(first.sessionId, "document.querySelector('.appearance-toggle').title"), /Appearance: Dark/);
+  await cdp.call("Page.reload", {}, second.sessionId);
+  await ready(second);
+  assert.equal(await evaluate(second.sessionId, "document.documentElement.dataset.theme"), "dark", "refresh retains the saved theme");
   await evaluate(second.sessionId, "document.querySelector('[aria-label=Devices]').click()");
   await until(() => evaluate(second.sessionId, "document.querySelector('.device-copy')?.textContent?.startsWith('1 authorized')"));
   const extraTabs = [];
@@ -67,6 +74,7 @@ try {
   await launchBrowser();
   const restarted = await page(pairing.origin);
   await ready(restarted);
+  assert.equal(await evaluate(restarted.sessionId, "document.documentElement.dataset.appearance"), "dark", "browser restart retains appearance");
   const sibling = await page(pairing.origin);
   await ready(sibling);
   await foreground(restarted);
@@ -111,6 +119,7 @@ try {
   await evaluate(restarted.sessionId, "document.querySelector('.device-disconnect').click()");
   assert.equal(disconnectDialogs.length, 2);
   await until(() => evaluate(restarted.sessionId, "!!document.querySelector('.access-problem') && localStorage.getItem('luvus.web.ticket') === null"));
+  assert.equal(await evaluate(restarted.sessionId, "document.documentElement.dataset.theme"), "dark", "unpaired screen retains appearance without credentials");
   // Revocation must clear shared credentials without activating the sibling.
   await until(() => evaluate(sibling.sessionId, "localStorage.getItem('luvus.web.ticket') === null"));
   await foreground(sibling);
