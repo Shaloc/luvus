@@ -234,8 +234,17 @@ Choose **Settings → Layout → Workspace display** to switch live between:
 - **Tree**: local machine first, then SSH-alias groups. Each group keeps the
   existing pinned-workspace and nested-worktree ordering; workspace names do
   not repeat the hostname. Remote group dots reflect existing transport state:
-  green is connected, amber is connecting, and coral indicates a disconnected
-  projection. Only machines with workspaces in the current view are listed.
+  green is connected, amber is connecting or partially connected, and coral means
+  disconnected. Pooled-session health uses its shared live display and event
+  channel, rather than a stale error cached on an inactive workspace. Only machines with workspaces in the current view are listed.
+
+Right-click a remote machine heading (or press `a` while it is selected) for
+**Connection details**, **Error details**, and **Copy details**. Reports use the
+existing event watcher, shared display, and workspace state; opening them does
+not run SSH probes. They include session, owner generation, projection epoch,
+current errors and clearly marked cached errors. Press `r` to refresh the
+snapshot, `c` to copy, and Esc to close. Session-switcher rows use the same compact
+hostname badges, running/stopped dots, and a separate hover highlight.
 
 Click a machine heading to fold or unfold it. With WORKSPACES keyboard focus,
 use Up/Down to navigate, Enter/Space on a heading to toggle it, Left to collapse
@@ -418,7 +427,7 @@ by menus are excluded from the projected frame.
 ### Kitty graphics
 
 Stable fork releases include Kitty graphics from transport 11 onward. Current
-builds report `transport=16` with `luvus --version --remote-session-protocol`
+builds report `transport=18` with `luvus --version --remote-session-protocol`
 and separately negotiate physical cell dimensions for automatic split direction.
 Plain terminals can report cell dimensions without enabling Kitty graphics. Use Kitty 0.28 or newer on the display
 machine and matching graphics builds on remote owners. An older managed owner

@@ -432,6 +432,8 @@ where
                 r?;
             }
             Ok(ServerMessage::Notify(msg)) => crate::emit_notification(&msg),
+            // Only projections request these; ordinary clients receive rendered inboxes.
+            Ok(ServerMessage::Notification { .. }) => {}
             Ok(ServerMessage::Sound(signal)) => crate::emit_sound(signal),
             Ok(ServerMessage::ClipboardTracked { text, receipt }) => {
                 let sender = tx.clone();

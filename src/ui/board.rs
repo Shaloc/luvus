@@ -262,6 +262,7 @@ pub(super) fn render(
     });
 
     let task_block = super::dashboard_block(
+        f,
         format!("{} {:02}", cat.board_tasks.to_uppercase(), orch.tasks.len()),
         t,
         true,
@@ -1028,7 +1029,7 @@ fn draw_flow(
     if area.height < 3 || area.width < 12 {
         return Vec::new();
     }
-    let block = super::dashboard_block(cat.sec_flow.to_uppercase(), t, false);
+    let block = super::dashboard_block(f, cat.sec_flow.to_uppercase(), t, false);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
@@ -1540,6 +1541,7 @@ fn draw_leases(f: &mut RenderTarget, area: Rect, orch: &OrchState, cat: &Catalog
         return;
     }
     let block = super::dashboard_block(
+        f,
         format!("{} {:02}", cat.board_leases, orch.leases.len()),
         t,
         false,
@@ -1572,6 +1574,7 @@ fn draw_leases(f: &mut RenderTarget, area: Rect, orch: &OrchState, cat: &Catalog
 
 fn draw_summary(f: &mut RenderTarget, area: Rect, task: &Task, cat: &Catalog, t: &Theme) {
     let block = super::dashboard_block(
+        f,
         format!("{} · {}", cat.board_selected_task.to_uppercase(), task.id),
         t,
         false,
@@ -1691,7 +1694,7 @@ fn input_tail(value: &str, width: usize) -> String {
 
 /// Split text into explicit display-width rows so scrolling and the visible
 /// insertion cursor agree without relying on unstable widget measurements.
-fn wrap_display_lines(value: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_display_lines(value: &str, width: usize) -> Vec<String> {
     let mut rows = Vec::new();
     for logical in value.split('\n') {
         if logical.is_empty() {
@@ -1768,6 +1771,7 @@ pub(super) fn draw_form(
     f.render_widget(Clear, modal);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(modal);
@@ -2246,6 +2250,7 @@ pub(super) fn draw_start(
     f.render_widget(Clear, modal);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(modal);
@@ -2424,6 +2429,7 @@ pub(super) fn draw_detail(
     f.render_widget(Clear, modal);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(modal);
@@ -2604,6 +2610,7 @@ pub(super) fn draw_automation_detail(
     f.render_widget(Clear, modal);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(modal);

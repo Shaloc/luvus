@@ -370,6 +370,19 @@ pub struct BarNotification {
     pub dedupe_key: Option<String>,
 }
 
+/// Bounded, session-local history shared by core feedback and bar notifications.
+/// TTL only controls the bar preview; history lives until cleared or evicted.
+#[derive(Clone, Debug)]
+pub struct NotificationRecord {
+    pub id: u64,
+    pub text: String,
+    pub owner: Option<String>,
+    pub level: NotificationLevel,
+    pub time: std::time::SystemTime,
+    pub count: u32,
+    pub unread: bool,
+}
+
 pub struct NotificationPush {
     pub owner: Option<String>,
     pub text: String,
@@ -439,6 +452,9 @@ pub struct BarState {
     pub declarations: BTreeMap<String, BarDeclaration>,
     pub widgets: BTreeMap<String, BarWidget>,
     pub notifications: VecDeque<BarNotification>,
+    pub history: VecDeque<NotificationRecord>,
+    pub history_revision: u64,
+    pub pending_notifications: VecDeque<(String, NotificationLevel)>,
     pub hits: Vec<BarHit>,
     pub overflow_hits: Vec<OverflowHit>,
     pub overflow: Option<OverflowPopup>,
@@ -452,6 +468,9 @@ impl Default for BarState {
             declarations: BTreeMap::new(),
             widgets: BTreeMap::new(),
             notifications: VecDeque::new(),
+            history: VecDeque::new(),
+            history_revision: 0,
+            pending_notifications: VecDeque::new(),
             hits: Vec::new(),
             overflow_hits: Vec::new(),
             overflow: None,
@@ -481,6 +500,76 @@ impl Default for BarState {
 }
 
 impl BarState {
+    pub fn record_notification(
+        &mut self,
+        text: &str,
+        owner: Option<&str>,
+        level: NotificationLevel,
+    ) {
+        self.ingest_notification(text, owner, level, true);
+    }
+    pub fn ingest_notification(
+        &mut self,
+        text: &str,
+        owner: Option<&str>,
+        level: NotificationLevel,
+        relay: bool,
+    ) {
+        // Core messages can be multiline. Strip terminal controls and bound UTF-8
+        // storage without truncating a code point. External bar validation stays stricter.
+        let mut clean = String::new();
+        for c in text.chars().filter(|c| !c.is_control() || *c == '\n') {
+            if clean.len() + c.len_utf8() > 4096 {
+                break;
+            }
+            clean.push(c);
+        }
+        if clean.is_empty() {
+            return;
+        }
+        self.history_revision = self.history_revision.wrapping_add(1);
+        if relay {
+            self.pending_notifications.push_back((clean.clone(), level));
+            while self.pending_notifications.len() > MAX_NOTIFICATIONS {
+                self.pending_notifications.pop_front();
+            }
+        }
+        let time = std::time::SystemTime::now();
+        if let Some(last) = self.history.back_mut() {
+            if last.text == clean && last.owner.as_deref() == owner && last.level == level {
+                last.count = last.count.saturating_add(1);
+                last.time = time;
+                last.unread = true;
+                return;
+            }
+        }
+        let id = self.next_notification;
+        self.next_notification = self.next_notification.wrapping_add(1);
+        self.history.push_back(NotificationRecord {
+            id,
+            text: clean,
+            owner: owner.map(str::to_owned),
+            level,
+            time,
+            count: 1,
+            unread: true,
+        });
+        while self.history.len() > 100 {
+            self.history.pop_front();
+        }
+    }
+
+    pub fn clear_notification_history(&mut self) {
+        self.history.clear();
+        self.history_revision = self.history_revision.wrapping_add(1);
+    }
+    pub fn mark_notifications_read(&mut self) {
+        self.history_revision = self.history_revision.wrapping_add(1);
+        for record in &mut self.history {
+            record.unread = false;
+        }
+    }
+
     pub fn sync_modules(&mut self, modules: &crate::module::ModuleRegistry) {
         self.declarations
             .retain(|key, _| key == CORE_RUNTIME || key == CORE_FOCUSED_PANE);
@@ -578,6 +667,7 @@ impl BarState {
         now: Instant,
     ) -> Result<(), String> {
         request.validate()?;
+        self.record_notification(&request.text, request.owner.as_deref(), request.level);
         let NotificationPush {
             owner,
             text,

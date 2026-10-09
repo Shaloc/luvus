@@ -84,8 +84,11 @@ application-cursor pager), Luvus forwards those keys unchanged. `Shift+↑`,
 
 ## Copying
 
-Drag across a pane to select. Release requests a copy; the *Copied to Clipboard*
-toast appears only after a native clipboard helper confirms success. Luvus requests both your native OS clipboard (`pbcopy` / `wl-copy` /
+Drag across a pane to select. By default, release requests a copy. Turn off the
+pane header's **C** toggle to retain the selection without copying; use
+`Ctrl+Shift+C` to copy it explicitly. The choice belongs to that pane and survives
+restart/restore. The *Copied to Clipboard* feedback (toast or notification inbox)
+appears only after a native clipboard helper confirms success. Luvus requests both your native OS clipboard (`pbcopy` / `wl-copy` /
 `xclip` / `clip`) and OSC 52. The terminal must permit OSC 52 clipboard writes;
 that escape sequence does not acknowledge whether the clipboard changed.
 Soft-wrapped display rows copy as one logical line. Hard line breaks and any
@@ -94,7 +97,9 @@ leading indentation inside the selection remain unchanged.
 Many agents and other full-screen applications turn on terminal mouse
 reporting. Inside such a pane, a plain drag belongs to the application, so
 Luvus does not select or copy it. Hold `Shift` while dragging to select with
-Luvus instead. A right-click always opens the Luvus pane menu.
+Luvus instead. Right-click opens the Luvus pane menu by default. Enable the
+pane header's **R** toggle to send content right-clicks to a mouse-aware
+application; `Shift` + right-click still opens the menu.
 
 Clipboard helpers run on the **client machine**, including when attached over
 SSH. On Linux, the client uses `wl-copy` when `WAYLAND_DISPLAY` is set and

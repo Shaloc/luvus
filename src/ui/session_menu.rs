@@ -53,7 +53,9 @@ pub(crate) fn draw_session_menu(
             menu.rows
                 .iter()
                 .map(|row| {
-                    display_width(row.display_name()) + display_width(&session_state(app, row)) + 8
+                    display_width(row.display_name())
+                        + session_state(app, row, usize::MAX).width()
+                        + 8
                 })
                 .max()
                 .unwrap_or(64)
@@ -85,6 +87,7 @@ pub(crate) fn draw_session_menu(
     );
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .title(format!(" {} ", app.catalog.named_sessions.to_uppercase()))
         .border_style(Style::new().fg(theme.border_focus).bg(theme.surface0))
         .style(Style::new().bg(theme.surface0));
@@ -165,11 +168,13 @@ pub(crate) fn draw_session_menu(
     let available = content.bottom().saturating_sub(top + 1) as usize;
     f.render_widget(
         Paragraph::new(format!(
-            " r {} · a {} · {} [{}]",
+            " r {} · a {} · {} [{}] · ● {} / ○ {}",
             app.catalog.act_refresh,
             app.catalog.mobile_actions,
             app.catalog.session_merge,
-            if app.remote_merge_enabled { "✓" } else { " " }
+            if app.remote_merge_enabled { "✓" } else { " " },
+            app.catalog.session_running,
+            app.catalog.session_stopped
         ))
         .style(Style::new().fg(theme.overlay1)),
         Rect::new(
@@ -196,11 +201,12 @@ pub(crate) fn draw_session_menu(
         let hovered =
             app.session_menu.is_none() && app.hover.is_some_and(|(x, y)| contains(rect, x, y));
         let selected = index == cursor;
-        let hot = selected || hovered;
-        if hot {
+        if selected {
             f.render_widget(Block::new().style(Style::new().bg(theme.accent)), rect);
+        } else if hovered {
+            f.render_widget(Block::new().style(Style::new().bg(theme.surface1)), rect);
         }
-        draw_row(f, rect, app, index, selected, hot, theme);
+        draw_row(f, rect, app, index, selected, selected, theme);
         app.named_session_row_rects.push((index, rect));
     }
 }
@@ -447,7 +453,7 @@ fn draw_row(
     else {
         return;
     };
-    let state = session_state(app, row);
+    let state = session_state(app, row, usize::MAX);
     let dot = if row.remote.is_some() {
         "◆"
     } else if row.running {
@@ -458,7 +464,7 @@ fn draw_row(
     let state_width = if rect.height > 1 {
         0
     } else {
-        display_width(&state) + 2
+        state.width() + 2
     };
     // Even a many-host status must not erase the session's identity.
     let name_width = width
@@ -483,16 +489,9 @@ fn draw_row(
         ),
     ];
     if rect.height == 1 {
-        spans.push(Span::styled(
-            format!("  {state}"),
-            Style::new().fg(if hot {
-                theme.crust
-            } else if row.running {
-                theme.green
-            } else {
-                theme.overlay0
-            }),
-        ));
+        let used = spans.iter().map(Span::width).sum::<usize>();
+        spans.push(Span::raw("  "));
+        spans.extend(session_state(app, row, width.saturating_sub(used + 2)).spans);
     }
     let primary = Line::from(spans);
     f.render_widget(
@@ -501,98 +500,106 @@ fn draw_row(
     );
     if rect.height > 1 {
         f.render_widget(
-            Paragraph::new(Span::styled(
-                format!("    {state}"),
-                Style::new().fg(if hot {
-                    theme.crust
-                } else if row.running {
-                    theme.green
-                } else {
-                    theme.overlay0
-                }),
-            )),
+            Paragraph::new({
+                let mut line = session_state(app, row, width.saturating_sub(4));
+                line.spans.insert(0, Span::raw("    "));
+                line
+            }),
             Rect::new(rect.x, rect.y + 1, rect.width, 1),
         );
     }
 }
 
-fn session_state(app: &App, row: &crate::app::session_menu::NamedSessionRow) -> String {
+fn session_state(
+    app: &App,
+    row: &crate::app::session_menu::NamedSessionRow,
+    width: usize,
+) -> Line<'static> {
     let key = row.remote.as_ref().map_or_else(
         || format!("local/{}", row.name),
         |remote| remote.canonical_name(),
     );
     if let Some(action) = app.pending_named_session_actions.get(&key) {
-        return match action {
-            crate::app::session_menu::NamedSessionAction::Stop => {
-                app.catalog.session_stopping.to_string()
-            }
-            crate::app::session_menu::NamedSessionAction::Delete => {
-                app.catalog.session_deleting.to_string()
-            }
-        };
+        return Line::from(truncate(
+            match action {
+                crate::app::session_menu::NamedSessionAction::Stop => app.catalog.session_stopping,
+                crate::app::session_menu::NamedSessionAction::Delete => {
+                    app.catalog.session_deleting
+                }
+            },
+            width,
+        ));
     }
-    let mut state = if let Some(remote) = &row.remote {
-        let status = if app
+    let marker = |running: bool, error: bool| {
+        if error {
+            "?"
+        } else if running {
+            "●"
+        } else {
+            "○"
+        }
+    };
+    let mut badges = Vec::new();
+    let mut spans = Vec::new();
+    if let Some(remote) = &row.remote {
+        let error = app
             .remote_host_status
             .iter()
-            .any(|host| host.host == remote.host && host.error.is_some())
-        {
-            "?"
-        } else if row.running {
-            app.catalog.session_running
-        } else {
-            app.catalog.session_stopped
-        };
-        if row.current {
-            format!(
-                "{} · {} · {} · {}",
-                app.catalog.session_current, app.catalog.remote_session, remote.host, status
-            )
-        } else {
-            format!(
-                "{} · {} · {}",
-                app.catalog.remote_session, remote.host, status
-            )
-        }
-    } else if row.current {
-        format!(
-            "{} · {}",
-            app.catalog.session_current, app.catalog.session_running
-        )
-    } else if row.running {
-        app.catalog.session_running.to_string()
+            .any(|s| s.host == remote.host && s.error.is_some());
+        badges.push((
+            remote.host.as_str(),
+            format!("{} {}", marker(row.running, error), remote.host),
+        ));
     } else {
-        app.catalog.session_stopped.to_string()
-    };
+        spans.push(Span::raw(format!(
+            "{} {}",
+            app.catalog.session_local,
+            marker(row.running, false)
+        )));
+    }
+    if row.current {
+        spans.push(Span::raw(format!(" · {}", app.catalog.session_current)));
+    }
     if row.merged && row.remote.is_none() {
-        let mut first_host = true;
         for host in &app.remote_host_status {
             let session = host
                 .sessions
                 .iter()
                 .find(|session| session.name == row.display_name());
-            let cached_owner = app.named_session_menu.as_ref().is_some_and(|menu| {
+            let cached = app.named_session_menu.as_ref().is_some_and(|menu| {
                 menu.remote_targets
                     .iter()
                     .any(|target| target.host == host.host && target.session == row.display_name())
             });
-            if session.is_some() || (host.error.is_some() && cached_owner) {
-                if first_host {
-                    state = format!("{} · {}", app.catalog.session_local, state);
-                    first_host = false;
-                }
-                let status = if host.error.is_some() {
-                    "?"
-                } else if session.is_some_and(|session| session.running) {
-                    app.catalog.session_running
-                } else {
-                    app.catalog.session_stopped
-                };
-                state.push_str(&format!(" [{}: {}]", host.host, status));
+            if session.is_some() || host.error.is_some() && cached {
+                badges.push((
+                    host.host.as_str(),
+                    format!(
+                        "{} {}",
+                        marker(session.is_some_and(|s| s.running), host.error.is_some()),
+                        host.host
+                    ),
+                ));
             }
         }
     }
-    state
+    let mut remaining = width.saturating_sub(spans.iter().map(Span::width).sum());
+    for (i, (host, label)) in badges.iter().enumerate() {
+        let reserve = if i + 1 < badges.len() { 5 } else { 0 };
+        let needed = display_width(label) + 3;
+        if remaining < needed + reserve {
+            spans.push(Span::styled(
+                truncate(&format!(" +{}", badges.len() - i), remaining),
+                Style::new().fg(app.theme.overlay1),
+            ));
+            break;
+        }
+        spans.push(Span::raw(" "));
+        let badge = super::host_badge(host, label, needed - 1, app.config.layout.rounded_corners);
+        remaining = remaining.saturating_sub(needed);
+        spans.extend(badge);
+    }
+    Line::from(spans)
 }
 
 fn contains(rect: Rect, x: u16, y: u16) -> bool {
@@ -668,9 +675,12 @@ mod tests {
             app.named_session_menu.as_mut().unwrap().rows[1].running = running;
             for height in [1, 2] {
                 let text = rendered_row(&app, height);
-                assert!(text.contains("remote · build"), "{text}");
                 assert!(
-                    text.contains(if running { "running" } else { "stopped" }),
+                    text.contains("build") && !text.contains("remote ·"),
+                    "{text}"
+                );
+                assert!(
+                    text.contains(if running { "● build" } else { "○ build" }),
                     "{text}"
                 );
                 assert!(
@@ -686,7 +696,7 @@ mod tests {
         }];
         app.named_session_menu.as_mut().unwrap().rows[1].running = false;
         let text = rendered_row(&app, 1);
-        assert!(text.contains("remote · build · ?"));
+        assert!(text.contains("? build"));
         assert!(
             !text.contains("stopped"),
             "failed discovery is not proof that an owner stopped"
@@ -711,13 +721,13 @@ mod tests {
         for height in [1, 2] {
             let text = rendered_row(&app, height);
             assert!(
-                text.contains(&format!("{} · stopped", app.catalog.session_local)),
+                text.contains(&format!("{} ○", app.catalog.session_local)),
                 "{text}"
             );
-            assert!(text.contains("[build: running]"), "{text}");
+            assert!(text.contains("● build"), "{text}");
         }
         app.remote_host_status[0].sessions[0].running = false;
-        assert!(rendered_row(&app, 1).contains("[build: stopped]"));
+        assert!(rendered_row(&app, 1).contains("○ build"));
 
         // Discovery failures return no live inventory but retain cached targets.
         app.named_session_menu.as_mut().unwrap().remote_targets =
@@ -725,14 +735,14 @@ mod tests {
         app.remote_host_status[0].error = Some("offline".into());
         app.remote_host_status[0].sessions.clear();
         for height in [1, 2] {
-            assert!(rendered_row(&app, height).contains("[build: ?]"));
+            assert!(rendered_row(&app, height).contains("? build"));
         }
         app.named_session_menu
             .as_mut()
             .unwrap()
             .remote_targets
             .clear();
-        assert!(!rendered_row(&app, 1).contains("[build:"));
+        assert!(!rendered_row(&app, 1).contains("build"));
     }
 
     #[test]

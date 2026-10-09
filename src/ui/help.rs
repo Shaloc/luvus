@@ -59,6 +59,7 @@ pub(super) fn draw_help(f: &mut RenderTarget, area: Rect, app: &mut App, t: &The
     f.render_widget(Clear, modal);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(modal);

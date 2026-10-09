@@ -138,6 +138,9 @@ impl App {
         if let Some((_, exp)) = self.toast {
             consider(exp, true);
         }
+        if let Some(hover) = self.chrome_hover.filter(|h| !h.visible) {
+            consider(hover.ready_at, true);
+        }
         if let Some(flash) = self.search_flash.as_ref() {
             consider(flash.until, true);
         }

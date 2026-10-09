@@ -608,7 +608,9 @@ impl App {
     /// changes when the pane echoes (a separate `PtyData` event), so we don't waste
     /// a full render per keystroke.
     pub fn handle_event(&mut self, ev: AppEvent) -> bool {
-        self.with_focus_events(|app| app.handle_event_inner(ev))
+        let hide_hint = matches!(&ev, AppEvent::Key(key) if key.kind == KeyEventKind::Press)
+            && self.chrome_hover.take().is_some();
+        self.with_focus_events(|app| app.handle_event_inner(ev)) || hide_hint
     }
 
     fn handle_event_inner(&mut self, ev: AppEvent) -> bool {
@@ -1939,6 +1941,9 @@ impl App {
         use ratatui::crossterm::event::{MouseButton, MouseEventKind};
 
         let kind = m.kind;
+        if !matches!(kind, MouseEventKind::Moved) {
+            self.chrome_hover = None;
+        }
         // A pane can close while it owns a forwarded gesture. Stop targeting
         // the dead pane and remember its button so the eventual release cannot
         // fall through as an unmatched Luvus action.
@@ -2140,6 +2145,9 @@ impl App {
         let link_before = self.hover_link.clone();
 
         self.apply_mouse(m);
+        if matches!(kind, MouseEventKind::Moved) {
+            self.update_chrome_hover(Instant::now());
+        }
 
         if !matches!(kind, MouseEventKind::Moved) {
             return true;
@@ -2196,6 +2204,9 @@ impl App {
                         .map(|(rect, _)| *rect)
                         .find(|rect| hit(*rect))
                 });
+        }
+        if let Some(inspect) = &self.host_inspect {
+            return inspect.rects.iter().copied().find(|rect| hit(*rect));
         }
         if let Some(menu) = &self.tab_menu {
             return menu
@@ -2311,6 +2322,9 @@ impl App {
             .chain(self.bar.overflow_hits.iter().map(|hit| hit.rect))
             .find(|rect| hit(*rect))
         {
+            return Some(rect);
+        }
+        if let Some((rect, _)) = self.chrome_hint_at(at) {
             return Some(rect);
         }
 
@@ -2537,6 +2551,10 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+        if self.host_inspect.is_some() {
+            self.host_inspect_mouse(m);
             return;
         }
         // The running-command overlay owns the mouse while open.
@@ -2925,6 +2943,9 @@ impl App {
         // Ordinary Bar actions own their rendered rectangles, below all modal
         // and remote-owner guards. The open-popup guard above owns dismissal.
         let bar_press = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+        if self.notification_inbox_mouse(m) {
+            return;
+        }
         if bar_press && self.bar_click(m.column, m.row) {
             return;
         }
@@ -2933,14 +2954,41 @@ impl App {
         self.update_hover_divider(m.column, m.row);
         self.update_hover_sidebar(m.column, m.row);
         // Right-click a pane tab, WORKSPACES row, live/scheduled agent, ORCH
-        // row, file, dock row, or pane to open the matching context menu. A
-        // right-click is always Luvus's, even inside a mouse-aware application:
-        // most agents do nothing with it, so forwarding it would hide the menu.
+        // row, file, dock row, or pane to open the matching context menu.
+        // Pane content can opt into child right-click reporting. Chrome always
+        // keeps its menus; Shift also explicitly requests the Luvus menu.
         if let MouseEventKind::Down(MouseButton::Right) = m.kind {
+            if !m.modifiers.contains(KeyModifiers::SHIFT)
+                && self
+                    .pane_content_at(m.column, m.row)
+                    .is_some_and(|(id, _)| {
+                        self.panes
+                            .get(&id)
+                            .is_some_and(|p| p.mouse_options.right_click_to_app)
+                    })
+            {
+                // Respect the child's negotiated tracking mode. With reporting
+                // disabled the press does nothing, as in a native terminal.
+                self.begin_mouse_forward(&m, 2);
+                return;
+            }
             let (c, r) = (m.column, m.row);
             let hit =
                 |rect: Rect| c >= rect.x && c < rect.right() && r >= rect.y && r < rect.bottom();
-            if let Some((target, pane, _)) = self
+            if let Some((Some(host), _)) = self
+                .workspace_machine_rects
+                .iter()
+                .find(|(_, rect)| hit(*rect))
+            {
+                self.open_host_menu(host.clone(), c, r);
+            } else if let Some((ws, _)) = self.agent_group_rects.iter().find(|(_, rect)| hit(*rect))
+            {
+                self.open_agent_menu(
+                    AgentTarget::Workspace(self.workspaces[*ws].id.clone()),
+                    c,
+                    r,
+                );
+            } else if let Some((target, pane, _)) = self
                 .remote_agent_rects
                 .iter()
                 .find(|(_, _, rect)| hit(*rect))
@@ -2980,9 +3028,8 @@ impl App {
                 }
             } else if let Some((i, _)) = self.session_rects.iter().find(|(_, rect)| hit(*rect)) {
                 self.open_agent_menu(AgentTarget::Session(*i), c, r); // session → Resume/Close
-            } else if self.agents_active_only
-                && (hit(self.agents_area)
-                    || self.agents_filter_rects.iter().any(|(_, rect)| hit(*rect)))
+            } else if hit(self.agents_area)
+                || self.agents_filter_rects.iter().any(|(_, rect)| hit(*rect))
             {
                 self.open_agent_menu(AgentTarget::Dock, c, r);
             } else if let Some((row, _)) = self.diff_row_rects.iter().find(|(_, rect)| hit(*rect)) {
@@ -3274,10 +3321,16 @@ impl App {
                 // the (1-cell) selection. The highlight lingers briefly, while
                 // the success toast waits for native clipboard confirmation.
                 match self.selection_text() {
-                    Some(text) => {
+                    Some(text)
+                        if self
+                            .selection
+                            .as_ref()
+                            .is_some_and(|s| self.copy_on_select(s.pane)) =>
+                    {
                         self.pending_clipboard = Some(text);
                         self.schedule_copy_highlight_clear();
                     }
+                    Some(_) => self.selection_clear_at = None,
                     None => self.clear_selection(),
                 }
                 return;
@@ -3565,6 +3618,22 @@ impl App {
             self.pane_restart_confirm = Some(self.layout().focus);
             return;
         }
+        if let Some((id, right_click, _)) = self
+            .pane_mouse_rects
+            .iter()
+            .find(|(_, _, rect)| hit(*rect))
+            .copied()
+        {
+            if let Some(pane) = self.panes.get_mut(&id) {
+                if right_click {
+                    pane.mouse_options.right_click_to_app = !pane.mouse_options.right_click_to_app;
+                } else {
+                    pane.mouse_options.copy_on_select = !pane.mouse_options.copy_on_select;
+                }
+                self.session_dirty = true;
+            }
+            return;
+        }
         // The focused pane's ✕ button closes the active pane.
         if self.pane_close_rect.is_some_and(hit) {
             self.close_pane(self.layout().focus);
@@ -3604,6 +3673,11 @@ impl App {
             } else {
                 self.switch_tab(i);
             }
+            return;
+        }
+        if let Some((ws, _)) = self.agent_group_rects.iter().find(|(_, rect)| hit(*rect)) {
+            let ws = *ws;
+            self.toggle_agent_workspace(ws);
             return;
         }
         // The AGENTS All/Active filter toggle.
@@ -4674,9 +4748,17 @@ impl App {
                 dragging: false,
             });
         }
-        self.pending_clipboard = Some(text);
-        self.schedule_copy_highlight_clear();
+        if self.copy_on_select(pane) {
+            self.pending_clipboard = Some(text);
+            self.schedule_copy_highlight_clear();
+        }
         true
+    }
+
+    fn copy_on_select(&self, pane: PaneId) -> bool {
+        self.panes
+            .get(&pane)
+            .is_none_or(|p| p.mouse_options.copy_on_select)
     }
 
     /// Show a transient toast (e.g. "Copied") bottom-center for ~1.4s.
@@ -4851,7 +4933,11 @@ impl App {
     }
 
     pub fn show_toast(&mut self, text: impl Into<String>) {
-        self.toast = Some((text.into(), Instant::now() + COPY_HIGHLIGHT_DURATION));
+        let text = text.into();
+        self.bar
+            .record_notification(&text, None, crate::bar::NotificationLevel::Info);
+        self.toast = (!self.notifications_in_sidebar())
+            .then(|| (text, Instant::now() + COPY_HIGHLIGHT_DURATION));
     }
 
     fn schedule_copy_highlight_clear(&mut self) {
@@ -5067,6 +5153,8 @@ impl App {
     fn focused_pane_accepts_image_paste(&self) -> bool {
         self.mode == Mode::Normal
             && self.bar.overflow.is_none()
+            && self.host_inspect.is_none()
+            && !self.notification_inbox.open
             && self.cmd_inspect.is_none()
             && !self.help_open
             && !self.changelog_open
@@ -5329,6 +5417,14 @@ impl App {
         if self.bar.overflow.is_some() {
             return C::BarOverflow;
         }
+        if self.notification_inbox.open && self.settings.is_none() {
+            return C::NotificationInbox;
+        }
+        if let Some(inspect) = &self.host_inspect {
+            return C::HostInspect {
+                details: inspect.details.is_some(),
+            };
+        }
         if self.cmd_inspect.is_some() {
             return C::CommandInspect;
         }
@@ -5523,6 +5619,20 @@ impl App {
     }
 
     fn dispatch_key_press(&mut self, key: KeyEvent) -> bool {
+        if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+            && matches!(key.code, KeyCode::Char('c' | 'C'))
+            && crate::ui::chrome_uncovered(self)
+            && matches!(
+                self.ui_repeat_context(),
+                UiRepeatContext::Pane(_) | UiRepeatContext::Scroll { .. }
+            )
+        {
+            if let Some(text) = self.selection_text() {
+                self.pending_clipboard = Some(text);
+                self.schedule_copy_highlight_clear();
+                return true;
+            }
+        }
         if self.mode == Mode::PaneNavigate {
             return self.handle_pane_navigation_key(key);
         }
@@ -5571,6 +5681,14 @@ impl App {
             self.cancel_copy_mode();
         }
         self.cancel_orphaned_pane_search();
+        if self.notification_inbox.open && self.settings.is_none() {
+            self.notification_inbox_key(key);
+            return true;
+        }
+        if self.host_inspect.is_some() {
+            self.host_inspect_key(key);
+            return true;
+        }
         // The running-command overlay: scroll it, refresh it, or dismiss.
         if self.cmd_inspect.is_some() {
             match key.code {
@@ -9780,6 +9898,283 @@ mod link_click_tests {
             row: at.1,
             modifiers: mods,
         })
+    }
+
+    #[test]
+    fn pane_mouse_buttons_are_independent_and_survive_session_restore() {
+        let _env = crate::persist::test_env("pane-mouse-options");
+        let Fixture {
+            mut app,
+            mut term,
+            pane,
+            ..
+        } = fixture();
+        let sibling = app.split_pane(pane, Axis::Row, false).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buttons = app.pane_mouse_rects.clone();
+        assert_eq!(buttons.len(), 2);
+        for (id, _, rect) in buttons {
+            assert_eq!(id, pane);
+            app.handle_event(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                (rect.x, rect.y),
+                KeyModifiers::NONE,
+            ));
+        }
+        let options = app.panes[&pane].mouse_options;
+        assert!(options.right_click_to_app);
+        assert!(!options.copy_on_select);
+        assert_eq!(app.panes[&sibling].mouse_options, Default::default());
+        assert!(app.session_dirty);
+        assert!(app.selection.is_none());
+        assert!(app.mouse_grab.is_none());
+        let snapshot = crate::persist::snapshot(&app);
+        let value = serde_json::to_value(&snapshot).unwrap();
+        let (tx, _) = std::sync::mpsc::channel();
+        let restored =
+            App::from_snapshot(serde_json::from_value(value.clone()).unwrap(), tx).unwrap();
+        assert_eq!(
+            restored
+                .panes
+                .values()
+                .filter(|p| p.mouse_options == options)
+                .count(),
+            1
+        );
+        assert_eq!(
+            restored
+                .panes
+                .values()
+                .filter(|p| p.mouse_options == Default::default())
+                .count(),
+            1
+        );
+        // Old snapshots and future partial records both retain today's defaults.
+        let mut legacy = value["workspaces"][0]["tabs"][0]["panes"][0][1].clone();
+        legacy.as_object_mut().unwrap().remove("mouse_options");
+        let old: crate::persist::PaneSnap = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(old.mouse_options, Default::default());
+        legacy["mouse_options"] = serde_json::json!({"right_click_to_app": true});
+        let partial: crate::persist::PaneSnap = serde_json::from_value(legacy).unwrap();
+        assert!(partial.mouse_options.copy_on_select);
+        assert!(partial.mouse_options.right_click_to_app);
+    }
+
+    #[test]
+    fn pane_mouse_right_toggle_forwards_complete_gesture_and_shift_keeps_menu() {
+        let _env = crate::persist::test_env("pane-mouse-right");
+        let Fixture {
+            mut app,
+            pane,
+            off_link,
+            ..
+        } = fixture();
+        enable_mouse_tracking(&app, pane);
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .replace_input_sender_for_test(tx);
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.pane_menu.take().is_some());
+        assert!(rx.try_recv().is_err());
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .mouse_options
+            .right_click_to_app = true;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+        ] {
+            app.handle_event(mouse(kind, off_link, KeyModifiers::NONE));
+        }
+        assert!(app.pane_menu.is_none());
+        assert!(app.mouse_grab.is_none());
+        let bytes: Vec<_> = rx
+            .try_iter()
+            .map(|action| match action {
+                crate::terminal::pty::InputAction::Bytes(bytes) => bytes,
+                _ => panic!("unexpected non-mouse input"),
+            })
+            .collect();
+        assert_eq!(
+            bytes,
+            [
+                b"\x1b[<2;2;1M".to_vec(),
+                b"\x1b[<34;2;1M".to_vec(),
+                b"\x1b[<2;2;1m".to_vec()
+            ]
+        );
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            off_link,
+            KeyModifiers::SHIFT,
+        ));
+        assert!(app.pane_menu.take().is_some());
+        assert!(rx.try_recv().is_err());
+        app.panes[&pane]
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[?1002l\x1b[?1006l");
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            off_link,
+            KeyModifiers::NONE,
+        ));
+        assert!(app.pane_menu.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "no tracking means no synthesized input"
+        );
+        let header = app.pane_rects[0].1;
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Right),
+            (header.x + 4, header.y),
+            KeyModifiers::NONE,
+        ));
+        assert!(app.pane_menu.is_some(), "chrome keeps its context menu");
+    }
+
+    #[test]
+    fn pane_mouse_auto_copy_off_keeps_selection_and_explicit_copy() {
+        let _env = crate::persist::test_env("pane-mouse-copy");
+        let (mut app, _term, start) = fixture_showing("你好 hello\r\n  world", 0);
+        let pane = app.layout().focus;
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .mouse_options
+            .copy_on_select = false;
+        app.pending_clipboard = Some("old clipboard".into());
+        let end = (start.0 + 6, start.1 + 1);
+        for (kind, at) in [
+            (MouseEventKind::Down(MouseButton::Left), start),
+            (MouseEventKind::Drag(MouseButton::Left), end),
+            (MouseEventKind::Up(MouseButton::Left), end),
+        ] {
+            app.handle_event(mouse(kind, at, KeyModifiers::NONE));
+        }
+        assert_eq!(app.pending_clipboard.as_deref(), Some("old clipboard"));
+        assert_eq!(app.selection_text().as_deref(), Some("你好 hello\n  world"));
+        assert!(!app.tick_copy_highlight(Instant::now() + Duration::from_secs(10)));
+        let copy = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        app.help_open = true;
+        app.handle_event(AppEvent::Key(copy));
+        assert_eq!(
+            app.pending_clipboard.as_deref(),
+            Some("old clipboard"),
+            "modal owns keyboard"
+        );
+        app.help_open = false;
+        app.handle_event(AppEvent::Key(copy));
+        assert_eq!(
+            app.pending_clipboard.take().as_deref(),
+            Some("你好 hello\n  world")
+        );
+        assert!(app.selection_clear_at.is_some());
+        app.clear_selection();
+        let token = (start.0 + 6, start.1);
+        for _ in 0..2 {
+            app.handle_event(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                token,
+                KeyModifiers::NONE,
+            ));
+            app.handle_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                token,
+                KeyModifiers::NONE,
+            ));
+        }
+        assert_eq!(app.selection_text().as_deref(), Some("hello"));
+        assert!(
+            app.pending_clipboard.is_none(),
+            "double-click respects the same option"
+        );
+        assert!(app.selection_clear_at.is_none());
+        app.handle_event(AppEvent::PtyClipboard {
+            pane,
+            text: "child copy".into(),
+        });
+        assert_eq!(
+            app.pending_clipboard.take().as_deref(),
+            Some("child copy"),
+            "child OSC 52 is independent"
+        );
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .mouse_options
+            .copy_on_select = true;
+        assert!(app.copy_token_at(token.0, token.1));
+        assert_eq!(app.pending_clipboard.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn chrome_hover_is_delayed_read_only_and_dismissed_by_input() {
+        let _env = crate::persist::test_env("pane-mouse-hover");
+        let Fixture {
+            mut app,
+            mut term,
+            pane,
+            off_link,
+            ..
+        } = fixture();
+        let sibling = app.split_pane(pane, Axis::Row, false).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let title = app
+            .pane_title_rects
+            .iter()
+            .find(|(id, _)| *id == sibling)
+            .unwrap()
+            .1;
+        let at = (title.x, title.y);
+        assert!(app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE)));
+        let ready_at = app.chrome_hover.unwrap().ready_at;
+        assert!(!app.tick_chrome_hover(ready_at - Duration::from_millis(1)));
+        assert!(!app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE)));
+        assert_eq!(app.chrome_hover.unwrap().ready_at, ready_at);
+        assert!(app.tick_chrome_hover(ready_at));
+        assert!(
+            !app.tick_chrome_hover(ready_at + Duration::from_secs(1)),
+            "visible hint does not animate"
+        );
+        assert!(!crate::ui::retained_pty_eligible(&app));
+        assert_eq!(app.layout().focus, pane, "hover never changes focus");
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(app
+            .chrome_hint_at(Some(at))
+            .unwrap()
+            .1
+            .contains(&app.panes[&sibling].cwd.display().to_string()));
+        app.handle_event(mouse(MouseEventKind::Moved, off_link, KeyModifiers::NONE));
+        assert!(app.chrome_hover.is_none());
+        let ws = app.ws_rects[0].1;
+        assert!(app
+            .chrome_hint_at(Some((ws.x, ws.y)))
+            .unwrap()
+            .1
+            .contains(&app.ws().name));
+        app.help_open = true;
+        assert!(app.chrome_hint_at(Some((ws.x, ws.y))).is_none());
+        app.help_open = false;
+        app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+        app.tick_chrome_hover(app.chrome_hover.unwrap().ready_at);
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.chrome_hover.is_none());
     }
 
     /// The feature: `Ctrl`+click a URL in a pane and it goes to the client to be

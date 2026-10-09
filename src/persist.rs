@@ -92,6 +92,8 @@ fn new_tab_id() -> String {
 #[derive(Serialize, Deserialize)]
 pub struct PaneSnap {
     pub cwd: PathBuf,
+    #[serde(default)]
+    pub mouse_options: crate::terminal::pty::PaneMouseOptions,
     pub command: String,
     /// UHP terminal label, kept separate from the user-facing agent alias.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -909,6 +911,7 @@ fn snapshot_layout(
                         return Some((
                             id.0,
                             PaneSnap {
+                                mouse_options: Default::default(),
                                 cwd: PathBuf::new(),
                                 command: String::new(),
                                 backend_label: None,
@@ -970,6 +973,7 @@ fn snapshot_layout(
                             id.0,
                             PaneSnap {
                                 cwd: p.cwd.clone(),
+                                mouse_options: p.mouse_options,
                                 command: p.command.clone(),
                                 backend_label: app.backend_labels.get(&id).cloned(),
                                 name: app.agent_name_for(id).map(|s| s.to_string()),

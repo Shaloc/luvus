@@ -49,7 +49,7 @@ fn draw_automation_health(
         );
         return Vec::new();
     }
-    let block = deck_block("AUTOMATIONS", t, false);
+    let block = deck_block(f, "AUTOMATIONS", t, false);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
@@ -168,8 +168,13 @@ fn short_model(m: &str) -> Cow<'static, str> {
     }
 }
 
-fn deck_block(title: &str, t: &Theme, focus: bool) -> ratatui::widgets::Block<'static> {
-    super::dashboard_block(title, t, focus)
+fn deck_block(
+    f: &RenderTarget,
+    title: &str,
+    t: &Theme,
+    focus: bool,
+) -> ratatui::widgets::Block<'static> {
+    super::dashboard_block(f, title, t, focus)
 }
 
 fn pad_right(text: &str, width: usize) -> String {
@@ -340,7 +345,7 @@ fn draw_metric(
     if area.width < 4 || area.height < 3 {
         return;
     }
-    let block = deck_block(title, t, false);
+    let block = deck_block(f, title, t, false);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
@@ -688,7 +693,7 @@ fn draw_roster(
     cat: &Catalog,
     t: &Theme,
 ) -> RosterRender {
-    let block = deck_block("AGENT SESSIONS", t, true);
+    let block = deck_block(f, "AGENT SESSIONS", t, true);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
@@ -741,7 +746,7 @@ fn draw_roster(
 }
 
 fn draw_selected(f: &mut RenderTarget, area: Rect, row: Option<&MissionRowView>, t: &Theme) {
-    let block = deck_block("SELECTED AGENT", t, false);
+    let block = deck_block(f, "SELECTED AGENT", t, false);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let Some(row) = row else {
@@ -821,7 +826,7 @@ fn draw_selected(f: &mut RenderTarget, area: Rect, row: Option<&MissionRowView>,
 }
 
 fn draw_signal_matrix(f: &mut RenderTarget, area: Rect, rows: &[MissionRowView], t: &Theme) {
-    let block = deck_block("AGENT STATUS", t, false);
+    let block = deck_block(f, "AGENT STATUS", t, false);
     let inner = block.inner(area);
     f.render_widget(block, area);
     let states = [State::Working, State::Blocked, State::Done, State::Idle];
@@ -840,7 +845,7 @@ fn draw_signal_matrix(f: &mut RenderTarget, area: Rect, rows: &[MissionRowView],
 }
 
 fn draw_cost_chart(f: &mut RenderTarget, area: Rect, rows: &[MissionRowView], t: &Theme) {
-    let block = deck_block("COST BY MODEL", t, false);
+    let block = deck_block(f, "COST BY MODEL", t, false);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 {
@@ -1011,6 +1016,7 @@ pub(super) fn draw_detail(
     f.render_widget(Clear, modal);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(modal);
@@ -1091,6 +1097,7 @@ pub(super) fn draw_answer(f: &mut RenderTarget, area: Rect, text: &str, cat: &Ca
     f.render_widget(Clear, modal);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(modal);

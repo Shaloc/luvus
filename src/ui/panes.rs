@@ -3,30 +3,26 @@
 
 use super::*;
 
-/// Resolve one terminal pane title for both the lone-pane header and split-pane
-/// border renderers. The pane's explicit name wins; otherwise its stable
-/// lifetime ID remains visible and addressable. Path visibility is a separate
-/// presentation choice shared by both renderers.
+/// Resolve the same title for lone and split panes. Preserve an explicit Luvus
+/// name, then use the child terminal's OSC title (or adapter title), then cwd.
 fn terminal_pane_title(app: &App, id: PaneId, cwd: &Path, max_width: u16) -> String {
-    let identity = app
+    let title = app
         .agent_name_for(id)
         .map(ToOwned::to_owned)
-        .unwrap_or_else(|| format!("p{}", id.0));
+        .or_else(|| app.pane_title(id));
+    let Some(title) = title else {
+        return short_path(cwd, max_width);
+    };
     let max_width = max_width as usize;
     if !app.config.layout.pane_title_path {
-        return truncate(&identity, max_width);
+        return truncate(&title, max_width);
     }
-
-    const SEPARATOR: &str = " · ";
-    let identity_width = display_width(&identity);
-    let separator_width = display_width(SEPARATOR);
-    if identity_width.saturating_add(separator_width) >= max_width {
-        return truncate(&identity, max_width);
+    let used = display_width(&title).saturating_add(3);
+    if used >= max_width {
+        return truncate(&title, max_width);
     }
-
-    let path_width = max_width - identity_width - separator_width;
-    let path = short_path(cwd, path_width.min(u16::MAX as usize) as u16);
-    truncate(&format!("{identity}{SEPARATOR}{path}"), max_width)
+    let path = short_path(cwd, (max_width - used).min(u16::MAX as usize) as u16);
+    truncate(&format!("{title} · {path}"), max_width)
 }
 
 /// Draw the dot + pane identity (+ ✕ for the focused pane) as a title ON each
@@ -111,9 +107,22 @@ pub(super) fn draw_pane_titles(
         let bg = t.mantle;
         let inner_w = rect.width - 2; // inside the two corner cells
         let btn_w = title_buttons_w(focused, rect.width, !app.module_panes.contains_key(id));
-        let title_w = inner_w.saturating_sub(btn_w);
-        let label = terminal_pane_title(app, *id, &pane.cwd, title_w.saturating_sub(4));
-        let text_w = (3 + display_width(&label) as u16).min(title_w);
+        let mouse_w = app
+            .pane_mouse_rects
+            .iter()
+            .filter(|(pane, _, _)| pane == id)
+            .count() as u16
+            * 3;
+        let title_w = inner_w.saturating_sub(btn_w + mouse_w);
+        let label = terminal_pane_title(
+            app,
+            *id,
+            &pane.cwd,
+            title_w.saturating_sub(3 + u16::from(app.config.layout.rounded_corners)),
+        );
+        let text_w =
+            (3 + u16::from(app.config.layout.rounded_corners) + display_width(&label) as u16)
+                .min(title_w);
         let title = Line::from(vec![
             Span::styled(
                 format!(" {} ", st.dot()),
@@ -123,6 +132,11 @@ pub(super) fn draw_pane_titles(
         ]);
         let title_rect = Rect::new(rect.x + 1, rect.y, text_w, 1);
         f.render_widget(Paragraph::new(title), title_rect);
+        if app.config.layout.rounded_corners {
+            f.buffer_mut()
+                .set_style(title_rect, Style::new().bg(t.surface0));
+            f.pill_caps(title_rect, t.surface0, t.mantle);
+        }
         // Keep the title geometry so clicks focus the pane and never become an
         // accidental divider resize on a stacked layout.
         title_rects.push((*id, title_rect));
@@ -135,8 +149,38 @@ pub(super) fn draw_pane_titles(
             bg,
             t,
         );
+        draw_mouse_buttons(f, app, *id, bg, t);
     }
     title_rects
+}
+
+fn draw_mouse_buttons(f: &mut RenderTarget, app: &App, pane: PaneId, bg: Color, t: &Theme) {
+    let Some(options) = app.panes.get(&pane).map(|p| p.mouse_options) else {
+        return;
+    };
+    for (_, right_click, rect) in app.pane_mouse_rects.iter().filter(|(id, _, _)| *id == pane) {
+        let enabled = if *right_click {
+            options.right_click_to_app
+        } else {
+            options.copy_on_select
+        };
+        let text = match (*right_click, enabled) {
+            (true, true) => "R✓ ",
+            (true, false) => "R· ",
+            (false, true) => "C✓ ",
+            (false, false) => "C· ",
+        };
+        let mut style = Style::new()
+            .fg(if enabled { t.green } else { t.subtext0 })
+            .bg(bg);
+        if enabled {
+            style = style.bold();
+        }
+        if app.hover.is_some_and(|at| rect.contains(at.into())) {
+            style = style.reversed();
+        }
+        f.render_widget(Paragraph::new(Span::styled(text, style)), *rect);
+    }
 }
 
 /// Cells reserved on the right of a focused pane's title for its buttons: the ✕,
@@ -565,7 +609,9 @@ fn draw_one_pane(
         let header = Rect::new(area.x + pad, area.y, area.width.saturating_sub(2 * pad), 1);
         let hbg = if focused { t.surface1 } else { t.surface0 };
         let title_fg = if focused { t.accent } else { t.overlay1 };
-        f.render_widget(Block::new().style(Style::new().bg(hbg)), header);
+        if !app.config.layout.rounded_corners {
+            f.render_widget(Block::new().style(Style::new().bg(hbg)), header);
+        }
         // When this lone pane is a *zoomed* split (not just the only pane), show a
         // ⤡ restore button so a phone can un-zoom without a keyboard (docs/18).
         let show_restore = app.zoomed && header.width >= 8;
@@ -574,7 +620,14 @@ fn draw_one_pane(
         let path_budget = header
             .width
             .saturating_sub(if show_restore { 8 } else { 5 })
-            .saturating_sub(if restart { 3 } else { 0 });
+            .saturating_sub(if restart { 3 } else { 0 })
+            .saturating_sub(
+                app.pane_mouse_rects
+                    .iter()
+                    .filter(|(pane, _, _)| *pane == id)
+                    .count() as u16
+                    * 3,
+            );
         let title = Line::from(vec![
             Span::styled("▎", Style::new().fg(t.accent).bg(hbg)),
             Span::styled(
@@ -586,7 +639,21 @@ fn draw_one_pane(
                 Style::new().fg(title_fg).bg(hbg),
             ),
         ]);
-        f.render_widget(Paragraph::new(title), header);
+        let title_width = (title.width() as u16).saturating_add(1).min(
+            header
+                .width
+                .saturating_sub(if restart { 3 } else { 0 })
+                .saturating_sub(if show_restore { 3 } else { 0 }),
+        );
+        let title_rect = if app.config.layout.rounded_corners {
+            Rect::new(header.x, header.y, title_width, 1)
+        } else {
+            header
+        };
+        f.render_widget(Paragraph::new(title), title_rect);
+        if app.config.layout.rounded_corners {
+            f.pill_caps(title_rect, hbg, t.mantle);
+        }
         if restart {
             if let Some(rect) = super::pane_restart_rect(area, false, app.zoomed) {
                 f.render_widget(
@@ -608,6 +675,7 @@ fn draw_one_pane(
                 r,
             );
         }
+        draw_mouse_buttons(f, app, id, hbg, t);
     }
 
     // Content background = the dark pane background.
@@ -706,14 +774,14 @@ fn draw_one_pane(
                             },
                         )
                     }) {
-                        style = style.bg(t.sel_bg);
+                        style = style.patch(t.selection_style());
                     }
                     if copy.is_some_and(|copy| {
                         copy_top.is_some_and(|top| {
                             copy.contains(top.saturating_add(row as usize), col as usize)
                         })
                     }) {
-                        style = style.bg(t.sel_bg);
+                        style = style.patch(t.selection_style());
                     }
                     // The terminal's own cursor belongs to the child. During
                     // copy mode, draw Luvus's selection cursor instead.
@@ -784,7 +852,7 @@ fn draw_one_pane(
     };
     project_hover_file_hyperlink(context.rendered_hyperlinks, id, content, hover_link);
 
-    if let Some(region) = composer_region {
+    if let Some(region) = composer_region.filter(|_| app.config.theme != "none") {
         draw_codex_composer(
             f.buffer_mut(),
             content,
@@ -805,7 +873,7 @@ fn draw_one_pane(
             let buf = f.buffer_mut();
             for x in content.x..content.right() {
                 if let Some(c) = buf.cell_mut((x, y)) {
-                    c.set_bg(t.sel_bg);
+                    c.set_style(t.selection_style());
                 }
             }
         }
@@ -1159,6 +1227,146 @@ fn draw_codex_composer(
 mod tests {
     use super::*;
     use crate::terminal::vt::CodexComposerRegion;
+
+    #[test]
+    fn pane_titles_follow_osc_then_path_and_preserve_explicit_name() {
+        let _env = crate::persist::test_env("pane-display-title");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let id = app.layout().focus;
+        // Prompt-generated OSC titles must not race the controlled title
+        // updates below, including the empty-title directory fallback.
+        let (response_tx, _response_rx) = std::sync::mpsc::channel();
+        app.panes.get_mut(&id).unwrap().engine = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::terminal::vt::alacritty::AlacrittyEngine::new(
+                120,
+                40,
+                response_tx,
+                crate::config::SCROLLBACK_BYTES_DEFAULT,
+            ),
+        ));
+        let cwd = Path::new("/srv/project");
+        app.panes[&id]
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b]2;Build dashboard\x07");
+        assert_eq!(terminal_pane_title(&app, id, cwd, 60), "Build dashboard");
+        app.agent_names.insert("explicit".into(), id);
+        assert_eq!(terminal_pane_title(&app, id, cwd, 60), "explicit");
+        app.agent_names.clear();
+        app.config.layout.pane_title_path = true;
+        assert_eq!(
+            terminal_pane_title(&app, id, cwd, 60),
+            "Build dashboard · /srv/project"
+        );
+        app.panes[&id]
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b]2;\x07");
+        assert_eq!(terminal_pane_title(&app, id, cwd, 60), "/srv/project");
+        app.panes[&id]
+            .engine
+            .lock()
+            .unwrap()
+            .advance("\x1b]2;中文宽标题\x07".as_bytes());
+        assert!(display_width(&terminal_pane_title(&app, id, cwd, 5)) <= 5);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn none_theme_preserves_child_composer_colors_and_visible_selection() {
+        let _env = crate::persist::test_env("none-pane-composer");
+        crate::config::save(&crate::config::Config {
+            shell: "/bin/cat".into(),
+            ..Default::default()
+        });
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let id = app.layout().focus;
+        app.status.get_mut(&id).unwrap().agent = "codex".into();
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buffer = Buffer::empty(area);
+        crate::ui::render_into(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(p, _)| *p == id)
+            .unwrap()
+            .1;
+        {
+            let mut engine = app.panes[&id].engine.lock().unwrap();
+            engine.advance(
+                "\x1b[2J\x1b[2;1H› Write tests\x1b[5;1H\x1b[48;2;11;22;33mCHILD\x1b[0m\x1b[2;14H"
+                    .as_bytes(),
+            );
+            assert!(engine.codex_composer_region().is_some());
+        }
+        app.dispatch(
+            "config.patch",
+            &serde_json::json!({"patch": {"theme": "none", "layout": {"rounded_corners": true}}}),
+        )
+        .unwrap();
+        buffer.reset();
+        crate::ui::render_into(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        assert_eq!(buffer[(content.x + 20, content.y + 1)].bg, Color::Reset);
+        assert_eq!(
+            buffer[(content.x, content.y + 4)].bg,
+            Color::Rgb(11, 22, 33)
+        );
+        app.selection = Some(crate::app::Selection {
+            pane: id,
+            content,
+            anchor: (content.x, content.y + 1),
+            cursor: (content.x + 8, content.y + 1),
+            retained: None,
+            scrolled: false,
+            dragging: true,
+        });
+        buffer.reset();
+        crate::ui::render_into(&mut RenderTarget::new(&mut buffer, area), &mut app);
+        assert!(buffer[(content.x + 3, content.y + 1)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED));
+        assert!(!buffer[(content.x + 20, content.y + 1)]
+            .modifier
+            .contains(ratatui::style::Modifier::REVERSED));
+        assert_eq!(
+            buffer[(content.x, content.y + 4)].bg,
+            Color::Rgb(11, 22, 33)
+        );
+    }
+
+    #[test]
+    fn rounded_chrome_keeps_terminal_glyphs_and_click_geometry() {
+        let _env = crate::persist::test_env("rounded-pane-chrome");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let id = app.layout().focus;
+        app.split_pane(id, crate::layout::Axis::Col, false).unwrap();
+        app.panes[&id]
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b[2J\x1b[H\xe2\x94\x8cCHILD\xe2\x94\x90");
+        let area = Rect::new(0, 0, 120, 40);
+        let mut before = Buffer::empty(area);
+        crate::ui::render_into(&mut RenderTarget::new(&mut before, area), &mut app);
+        let tabs = app.tab_rects.clone();
+        let contents = app.pane_content_rects.clone();
+        app.config.layout.rounded_corners = true;
+        let mut after = Buffer::empty(area);
+        crate::ui::render_into(&mut RenderTarget::new(&mut after, area), &mut app);
+        let text: String = after.content.iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("╭") && text.contains("╰") && text.contains("◖"));
+        assert!(
+            text.contains("┌CHILD┐"),
+            "child output must remain unmodified"
+        );
+        assert_eq!(app.tab_rects, tabs);
+        assert_eq!(app.pane_content_rects, contents);
+    }
 
     #[test]
     fn remote_hyperlinks_crop_to_projection_and_keep_files_on_owner() {

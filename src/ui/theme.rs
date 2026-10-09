@@ -2,7 +2,7 @@
 //! stabilo/Valentino-Rossi green accent for active/selected elements.
 
 use crate::terminal::theme_probe::TerminalColors;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
 // ── Theme derivation from terminal colors ───────────────────────────────────
 
@@ -16,6 +16,15 @@ fn pal(c: [u8; 3]) -> Color {
 }
 
 impl Theme {
+    /// Text selection must remain visible when chrome has no background fill.
+    pub fn selection_style(&self) -> Style {
+        if self.sel_bg == Color::Reset {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().bg(self.sel_bg)
+        }
+    }
+
     /// The intentionally soft composer treatment used by Luvus's default
     /// Quattro Rally palette. Preserve its original low-contrast character.
     pub fn subtle_composer_surface(&self) -> Color {
@@ -54,6 +63,20 @@ impl Theme {
             mint: ansi(6),
             amber: ansi(3),
             coral: ansi(1),
+        }
+    }
+
+    /// No derived surface palette: keep default foreground/background and the
+    /// displaying terminal's ANSI accents, even after a successful color probe.
+    pub fn terminal_unstyled() -> Self {
+        Self {
+            surface1: Color::Reset,
+            sel_bg: Color::Reset,
+            subtext0: Color::Reset,
+            subtext1: Color::Reset,
+            overlay1: Color::Reset,
+            border_focus: Color::Indexed(2),
+            ..Self::terminal_native()
         }
     }
 
@@ -736,12 +759,16 @@ pub const THEMES: &[&str] = &[
     "mono",
     // Terminal is capability-derived rather than a bundled palette, and is
     // newest, so keep it after the built-in themes.
+    "none",
     "terminal",
 ];
 
-/// Map a stored theme name onto its current registry name. The Catppuccin
-/// palettes were originally registered as bare `latte`/`mocha`; a config written
-/// then must keep working rather than silently falling back to `noir`.
+/// Both virtual themes negotiate child colors with the displaying terminal.
+pub fn follows_terminal(name: &str) -> bool {
+    matches!(name, "terminal" | "none")
+}
+
+/// Map legacy palette names onto the current registry name.
 pub fn canonical(name: &str) -> &str {
     match name {
         "latte" => "catppuccin-latte",
@@ -762,6 +789,7 @@ pub fn by_name(name: &str) -> Theme {
     match name {
         // The client-supplied RGB palette is applied after startup. Until then,
         // use terminal-native Reset/ANSI colors rather than a bundled palette.
+        "none" => Theme::terminal_unstyled(),
         "terminal" => Theme::terminal_native(),
         "ocean" => Theme::ocean(),
         "homebrew" => Theme::homebrew(),
@@ -792,6 +820,7 @@ pub fn describe(name: &str) -> &'static str {
         return file.description.as_str();
     }
     match name {
+        "none" => "terminal defaults, no tinted surfaces",
         "terminal" => "inferred from your terminal",
         "ocean" => "deep cmd-blue, cyan accent",
         "homebrew" => "classic green-on-black",
@@ -903,7 +932,7 @@ mod tests {
         for &name in THEMES {
             assert!(!describe(name).is_empty(), "{name} needs a description");
             // Probe depends on runtime env — just verify it resolves without panic.
-            if name == "terminal" {
+            if follows_terminal(name) {
                 let _ = by_name(name);
                 continue;
             }

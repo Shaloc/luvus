@@ -6,7 +6,7 @@
 //! separates so it reads as draggable.
 
 use super::*;
-use ratatui::widgets::{BorderType, Borders};
+use ratatui::widgets::Borders;
 
 /// True if the hovered divider `d` runs along one of `rect`'s edges (so the
 /// panes it separates should highlight).
@@ -43,7 +43,7 @@ pub(super) fn render_pane_borders(
         let color = if focused { t.border_focus } else { t.border };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Plain)
+            .border_type(f.border_type())
             .border_style(Style::new().fg(color));
         f.render_widget(block, *rect);
     }

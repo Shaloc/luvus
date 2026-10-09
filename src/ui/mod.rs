@@ -30,6 +30,7 @@ pub struct RenderTarget<'a> {
     area: Rect,
     cursor: Option<(u16, u16)>,
     cursor_visible: bool,
+    rounded_corners: bool,
 }
 
 impl<'a> RenderTarget<'a> {
@@ -42,8 +43,31 @@ impl<'a> RenderTarget<'a> {
             area,
             cursor: None,
             cursor_visible: false,
+            rounded_corners: false,
         }
     }
+    pub(crate) fn border_type(&self) -> BorderType {
+        if self.rounded_corners {
+            BorderType::Rounded
+        } else {
+            BorderType::Plain
+        }
+    }
+
+    /// Shape only the two padding cells already reserved by a filled control;
+    /// geometry and click targets stay unchanged. Standard Unicode needs no
+    /// Powerline/Nerd Font installation.
+    pub(crate) fn pill_caps(&mut self, rect: Rect, fill: Color, background: Color) {
+        if !self.rounded_corners || fill == Color::Reset || rect.width < 3 || rect.height != 1 {
+            return;
+        }
+        for (x, glyph) in [(rect.x, "◖"), (rect.right() - 1, "◗")] {
+            if let Some(cell) = self.buf.cell_mut((x, rect.y)) {
+                cell.set_symbol(glyph).set_fg(fill).set_bg(background);
+            }
+        }
+    }
+
     pub fn area(&self) -> Rect {
         self.area
     }
@@ -81,6 +105,7 @@ mod help;
 mod menu;
 mod mission;
 mod mobile;
+mod notifications;
 mod panes;
 mod picker;
 mod preview;
@@ -105,6 +130,7 @@ pub fn render(f: &mut Frame, app: &mut App) {
             area,
             cursor: None,
             cursor_visible: false,
+            rounded_corners: false,
         };
         render_into(&mut target, app);
         (target.cursor, target.cursor_visible)
@@ -261,6 +287,13 @@ fn render_projection_preserving_state(
 
     // Geometry collections are write-only outputs of a render. Move the active
     // client's values aside instead of cloning them on every secondary frame.
+    let inbox_cache = std::mem::take(&mut app.notification_inbox.cached_lines);
+    let notification_inbox = app.notification_inbox.clone();
+    app.notification_inbox.cached_lines = inbox_cache;
+    let host_inspect_geometry = app
+        .host_inspect
+        .as_mut()
+        .map(|h| (std::mem::take(&mut h.rects), h.modal, h.max_scroll));
     let pane_rects = std::mem::take(&mut app.pane_rects);
     let pane_content_rects = std::mem::take(&mut app.pane_content_rects);
     let rendered_hyperlinks = std::mem::take(&mut app.rendered_hyperlinks);
@@ -271,6 +304,7 @@ fn render_projection_preserving_state(
     let workspace_machine_rects = std::mem::take(&mut app.workspace_machine_rects);
     let git_section_rects = std::mem::take(&mut app.git_section_rects);
     let agents_filter_rects = std::mem::take(&mut app.agents_filter_rects);
+    let agent_group_rects = std::mem::take(&mut app.agent_group_rects);
     let agents_elsewhere_rect = app.agents_elsewhere_rect;
     let agent_rects = std::mem::take(&mut app.agent_rects);
     let automation_rects = std::mem::take(&mut app.automation_rects);
@@ -364,6 +398,7 @@ fn render_projection_preserving_state(
     let workspaces_area = app.workspaces_area;
     let agents_area = app.agents_area;
     let pane_restart_rect = app.pane_restart_rect;
+    let pane_mouse_rects = app.pane_mouse_rects.clone();
     let pane_close_rect = app.pane_close_rect;
     let pane_zoom_rect = app.pane_zoom_rect;
     let tab_prev_rect = app.tab_prev_rect;
@@ -423,6 +458,18 @@ fn render_projection_preserving_state(
     app.changelog_scroll = changelog_scroll;
     app.file_tree.scroll = file_tree_scroll;
     app.menu_scroll = menu_scroll;
+    if let (Some(h), Some((rects, modal, max_scroll))) =
+        (app.host_inspect.as_mut(), host_inspect_geometry)
+    {
+        h.rects = rects;
+        h.modal = modal;
+        h.max_scroll = max_scroll;
+    }
+    let inbox_cache = std::mem::take(&mut app.notification_inbox.cached_lines);
+    let inbox_cache_key = app.notification_inbox.cache_key;
+    app.notification_inbox = notification_inbox;
+    app.notification_inbox.cached_lines = inbox_cache;
+    app.notification_inbox.cache_key = inbox_cache_key;
     app.pane_rects = pane_rects;
     let projected_content = std::mem::replace(&mut app.pane_content_rects, pane_content_rects);
     let projected_hyperlinks = std::mem::replace(&mut app.rendered_hyperlinks, rendered_hyperlinks);
@@ -433,6 +480,7 @@ fn render_projection_preserving_state(
     app.workspace_machine_rects = workspace_machine_rects;
     app.git_section_rects = git_section_rects;
     app.agents_filter_rects = agents_filter_rects;
+    app.agent_group_rects = agent_group_rects;
     app.agents_elsewhere_rect = agents_elsewhere_rect;
     app.agent_rects = agent_rects;
     app.automation_rects = automation_rects;
@@ -519,6 +567,7 @@ fn render_projection_preserving_state(
     app.workspaces_area = workspaces_area;
     app.agents_area = agents_area;
     app.pane_restart_rect = pane_restart_rect;
+    app.pane_mouse_rects = pane_mouse_rects;
     app.pane_close_rect = pane_close_rect;
     app.pane_zoom_rect = pane_zoom_rect;
     app.tab_prev_rect = tab_prev_rect;
@@ -553,12 +602,23 @@ fn render_projection_preserving_state(
 /// the ordinary full renderer. Conservative false negatives cost one full
 /// frame; a false positive could corrupt visible output.
 pub(crate) fn retained_pty_eligible(app: &App) -> bool {
-    app.mode == Mode::Normal
-        // The VT damage contract forces a full projection when title chrome
-        // changes. Enabling titles alone need not disable retained rendering.
+    chrome_uncovered(app)
+        && !app.chrome_hover.is_some_and(|h| h.visible)
         && app.selection.is_none()
         && app.copy_mode.is_none()
         && app.hover_link.is_none()
+        && !app.active_is_git()
+        && !app.active_is_orch()
+        && !app.active_is_mission()
+}
+
+pub(crate) use sidebar::rollup as workspace_state;
+
+/// Shared overlay boundary for retained terminal rendering and chrome hints.
+pub(crate) fn chrome_uncovered(app: &App) -> bool {
+    app.mode == Mode::Normal
+        // The VT damage contract forces a full projection when title chrome
+        // changes. Enabling titles alone need not disable retained rendering.
         && app.search_flash.is_none()
         && app.pane_search.is_none()
         && app.settings.is_none()
@@ -566,6 +626,8 @@ pub(crate) fn retained_pty_eligible(app: &App) -> bool {
         && app.picker.is_none()
         && !app.help_open
         && !app.changelog_open
+        && app.host_inspect.is_none()
+        && !app.notification_inbox.open
         && app.cmd_inspect.is_none()
         && app.worktree_prompt.is_none()
         && app.worktree_open.is_none()
@@ -594,9 +656,6 @@ pub(crate) fn retained_pty_eligible(app: &App) -> bool {
         && app.mission_answer.is_none()
         && app.bar.overflow.is_none()
         && app.toast.is_none()
-        && !app.active_is_git()
-        && !app.active_is_orch()
-        && !app.active_is_mission()
 }
 
 /// Apply owned VT damage to an already complete active-client projection.
@@ -611,7 +670,48 @@ pub(crate) fn patch_terminal_damage(
 }
 
 fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, workspace_only: bool) {
+    let notifications = if app.relay_notification_chrome || app.notifications_in_sidebar() {
+        Some(std::mem::take(&mut app.bar.notifications))
+    } else {
+        None
+    };
     render_into_mode_impl(f, app, resize_panes, workspace_only);
+    let area = f.area();
+    if let Some((rect, text)) = app.chrome_hint_at(app.hover) {
+        f.buffer_mut()
+            .set_style(rect.intersection(area), Style::new().underlined());
+        if app
+            .chrome_hover
+            .is_some_and(|h| h.rect == rect && h.visible)
+            && area.width > 2
+            && area.height > 0
+        {
+            let text = format!(
+                " {} ",
+                truncate(&text, area.width.saturating_sub(2) as usize)
+            );
+            let width = display_width(&text).min(area.width as usize) as u16;
+            let x = rect.x.min(area.right().saturating_sub(width));
+            let y = if rect.bottom() < area.bottom() {
+                rect.bottom()
+            } else {
+                rect.y.saturating_sub(1).max(area.y)
+            };
+            f.render_widget(
+                Paragraph::new(text).style(
+                    Style::new()
+                        .fg(app.theme.text)
+                        .bg(app.theme.base)
+                        .reversed(),
+                ),
+                Rect::new(x, y, width, 1),
+            );
+            app.rendered_hyperlinks.retain(|link| link.y != y);
+        }
+    }
+    if let Some(notifications) = notifications {
+        app.bar.notifications = notifications;
+    }
     // Evaluate while the projected workspace and overlays are still active.
     // Hover only changes styling; modal content must never inherit pane links.
     let hover = app.hover_link.take();
@@ -628,6 +728,7 @@ fn render_into_mode_impl(
     resize_panes: bool,
     workspace_only: bool,
 ) {
+    f.rounded_corners = app.config.layout.rounded_corners;
     let t = app.theme.clone();
     // The active i18n catalog (Copy `&'static`), passed to draw fns that don't
     // get the whole `App` (picker, git tab) so all chrome is localized (docs/21).
@@ -640,6 +741,8 @@ fn render_into_mode_impl(
     app.mission_row_rects.clear();
     app.mission_automation_rects.clear();
     app.automation_rects.clear();
+    app.agent_group_rects.clear();
+    app.pane_mouse_rects.clear();
     app.orch_hits.clear();
     app.rendered_hyperlinks.clear();
     // Cleared with the other per-frame hit geometry, above every early return:
@@ -650,6 +753,7 @@ fn render_into_mode_impl(
     // workspace rows must not remain clickable when the dock is not drawn.
     app.ws_rects.clear();
     app.workspace_machine_rects.clear();
+    app.notification_inbox.clear_geometry();
     app.workspaces_area = Rect::ZERO;
     app.agents_elsewhere_rect = None;
     // A remote frame supplies its own MENU. Neither the tab bar nor mobile
@@ -698,7 +802,27 @@ fn render_into_mode_impl(
             .as_ref()
             .map(|p| picker::draw_picker(f, area, p, app.compact, cat, &t))
             .unwrap_or_default();
-        if let Some((text, _)) = &app.toast {
+        if app.notifications_in_sidebar() || app.notification_inbox.open {
+            let height = if app.notification_inbox.open {
+                area.height
+            } else {
+                3.min(area.height)
+            };
+            notifications::draw(
+                f,
+                Rect::new(area.x, area.bottom() - height, area.width.min(48), height),
+                app,
+                &t,
+            );
+        }
+        if app.host_inspect.is_some() {
+            menu::draw_host_inspect(f, area, app, cat, &t);
+        }
+        if let Some((text, _)) = app
+            .toast
+            .as_ref()
+            .filter(|_| !app.relay_notification_chrome)
+        {
             draw_toast(f, area, text, &t);
         }
         return;
@@ -961,6 +1085,19 @@ fn render_into_mode_impl(
         None
     };
     app.pane_close_rect = focused_rect.and_then(|r| pane_close_rect(r, bordered));
+    if !app.compact && (bordered || lone_header) && app.panes.contains_key(&focus) {
+        if let Some((_, rect)) = rects.iter().find(|(id, _)| *id == focus) {
+            if let Some(buttons) = pane_mouse_buttons(
+                *rect,
+                bordered,
+                app.zoomed,
+                !app.module_panes.contains_key(&focus),
+            ) {
+                app.pane_mouse_rects
+                    .extend([(focus, true, buttons[0]), (focus, false, buttons[1])]);
+            }
+        }
+    }
     // Zoom button: the split-title ⤢ when bordered, else the lone-header ⤡ that
     // restores a *zoomed* single pane (so a phone can un-zoom).
     app.pane_zoom_rect = if bordered {
@@ -1103,6 +1240,19 @@ fn render_into_mode_impl(
         status::draw_owner_bar(f, status, app, &t);
     }
 
+    if app.notification_inbox.open && app.notification_inbox.rect.is_empty() {
+        notifications::draw(
+            f,
+            Rect::new(
+                area.x,
+                area.y + 1,
+                area.width.min(48),
+                area.height.saturating_sub(2),
+            ),
+            app,
+            &t,
+        );
+    }
     // Read-only overflow is attachment-local geometry over server-owned bar
     // content. Draw it above chrome and panes, below modal workflows.
     crate::bar::render::draw_overflow(f, area, &mut app.bar, &t);
@@ -1359,8 +1509,15 @@ fn render_into_mode_impl(
             menu::draw_file_menu(f, area, app, cat, &t);
         }
     }
+    if app.host_inspect.is_some() {
+        menu::draw_host_inspect(f, area, app, cat, &t);
+    }
     // A transient toast (e.g. "Copied") flashes on top of everything.
-    if let Some((text, _)) = &app.toast {
+    if let Some((text, _)) = app
+        .toast
+        .as_ref()
+        .filter(|_| !app.relay_notification_chrome)
+    {
         draw_toast(f, area, text, &t);
     }
 
@@ -1385,6 +1542,8 @@ fn render_into_mode_impl(
         || app.ws_rename.is_some()
         || app.pane_restart_confirm.is_some()
         || app.pane_rename.is_some()
+        || app.host_inspect.is_some()
+        || app.notification_inbox.open
         || app.ws_menu.is_some()
         || app.pane_menu.is_some()
         || app.agent_menu.is_some()
@@ -1470,7 +1629,7 @@ fn draw_commander(
     f.render_widget(Block::new().style(Style::new().bg(t.mantle)), rect);
     let title = truncate(&title, rect.width.saturating_sub(4) as usize);
     let block = Block::bordered()
-        .border_type(BorderType::Plain)
+        .border_type(f.border_type())
         .title(Span::styled(
             format!(" {title} "),
             Style::new().fg(t.accent).bg(t.mantle).bold(),
@@ -1602,7 +1761,7 @@ fn draw_commander_slash_preview(
     };
     f.render_widget(
         Block::bordered()
-            .border_type(BorderType::Plain)
+            .border_type(f.border_type())
             .title(Span::styled(
                 format!(" {} ", cat.commander_slash_title),
                 Style::new().fg(t.accent).bold(),
@@ -1696,7 +1855,7 @@ fn draw_commander_module_preview(
     };
     f.render_widget(
         Block::bordered()
-            .border_type(BorderType::Plain)
+            .border_type(f.border_type())
             .title(Span::styled(
                 format!(" {} ", cat.commander_slash_title),
                 Style::new().fg(t.accent).bold(),
@@ -2010,16 +2169,17 @@ pub(crate) fn display_width(s: &str) -> usize {
 /// border, title, and surface treatment in one place prevents full-tab views
 /// from drifting into separate visual systems.
 pub(super) fn dashboard_block(
+    f: &RenderTarget,
     title: impl Into<String>,
     t: &Theme,
     focus: bool,
 ) -> ratatui::widgets::Block<'static> {
-    use ratatui::widgets::{Block, BorderType, Borders};
+    use ratatui::widgets::{Block, Borders};
 
     let border = if focus { t.border_focus } else { t.surface1 };
     Block::new()
         .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(border).bg(t.mantle))
         .title(Span::styled(
             format!(" {} ", title.into()),
@@ -2113,6 +2273,7 @@ fn draw_toast(f: &mut RenderTarget, area: Rect, text: &str, t: &Theme) {
     f.render_widget(Clear, rect);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.accent).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(rect);
@@ -2175,6 +2336,27 @@ fn pane_restart_rect(area: Rect, bordered: bool, zoomed: bool) -> Option<Rect> {
             3,
             1,
         )
+    })
+}
+
+/// The two pane-local toggles precede the existing restart/zoom/close controls.
+/// Keep a minimum title budget; narrow panes retain the existing controls.
+fn pane_mouse_buttons(
+    area: Rect,
+    bordered: bool,
+    zoomed: bool,
+    restart: bool,
+) -> Option<[Rect; 2]> {
+    let pad = if bordered { 1 } else { lone_pad(area.width) };
+    let existing = if bordered {
+        6 + u16::from(restart) * 3
+    } else {
+        u16::from(zoomed) * 3 + u16::from(restart) * 3
+    };
+    let width = area.width.saturating_sub(pad * 2);
+    (area.height >= 2 && width >= existing + 6 + 8).then(|| {
+        let x = area.right() - pad - existing - 6;
+        [Rect::new(x, area.y, 3, 1), Rect::new(x + 3, area.y, 3, 1)]
     })
 }
 
@@ -2534,6 +2716,8 @@ mod bar_projection_tests {
         let mut buffer = Buffer::empty(desktop);
         render_into(&mut RenderTarget::new(&mut buffer, desktop), &mut app);
         let button = app.pane_restart_rect.expect("desktop restart");
+        let mouse_buttons = app.pane_mouse_rects.clone();
+        assert_eq!(mouse_buttons.len(), 2);
         let pane = app.layout().focus;
         let size = app.panes[&pane].size();
         app.pane_restart_confirm = Some(pane);
@@ -2543,6 +2727,7 @@ mod bar_projection_tests {
         let mut buffer = Buffer::empty(mobile);
         render_projection(&mut RenderTarget::new(&mut buffer, mobile), &mut app);
         assert_eq!(app.pane_restart_rect, Some(button));
+        assert_eq!(app.pane_mouse_rects, mouse_buttons);
         assert_eq!(app.modal_commit_rect, confirm);
         assert_eq!(app.panes[&pane].size(), size);
         assert_eq!(app.pane_restart_confirm, Some(pane));
@@ -3141,5 +3326,46 @@ mod commander_tests {
         assert!(row(strip.y + 2).contains("first output"));
         assert!(row(strip.y + 3).contains("latest output"));
         assert!(row(strip.bottom() - 2).contains("PgUp/PgDn"));
+    }
+}
+
+/// A stable host identity badge shared by agent and session navigation. State
+/// remains a separate glyph; host identity never borrows status colors.
+pub(super) fn host_badge(
+    host: &str,
+    label: &str,
+    width: usize,
+    rounded: bool,
+) -> Vec<Span<'static>> {
+    if width < 3 {
+        return Vec::new();
+    }
+    let colors = [
+        (65, 88, 131),
+        (56, 106, 83),
+        (119, 74, 110),
+        (116, 83, 42),
+        (56, 100, 116),
+        (96, 79, 139),
+        (128, 65, 69),
+        (75, 95, 65),
+    ];
+    let hash = host
+        .bytes()
+        .fold(0_u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+    let (r, g, b) = colors[hash as usize % colors.len()];
+    let bg = Color::Rgb(r, g, b);
+    let name = truncate(label, width.saturating_sub(2));
+    if rounded {
+        vec![
+            Span::styled("◖", Style::new().fg(bg)),
+            Span::styled(name, Style::new().fg(Color::White).bg(bg)),
+            Span::styled("◗", Style::new().fg(bg)),
+        ]
+    } else {
+        vec![Span::styled(
+            format!(" {name} "),
+            Style::new().fg(Color::White).bg(bg),
+        )]
     }
 }

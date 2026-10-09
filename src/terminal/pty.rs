@@ -135,6 +135,23 @@ impl PaneSize {
     }
 }
 
+/// Owner-local interaction preferences travel with the pane, not its tab or client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct PaneMouseOptions {
+    pub right_click_to_app: bool,
+    pub copy_on_select: bool,
+}
+
+impl Default for PaneMouseOptions {
+    fn default() -> Self {
+        Self {
+            right_click_to_app: false,
+            copy_on_select: true,
+        }
+    }
+}
+
 pub struct Pane {
     /// Stable application identity for operational lifecycle events. This is
     /// never derived from the child command or terminal contents.
@@ -144,6 +161,7 @@ pub struct Pane {
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     input_tx: InputSender,
     pub cwd: PathBuf,
+    pub mouse_options: PaneMouseOptions,
     pub command: String,
     /// The shell's pid, for reading its live working directory and process
     /// tree. 0 means a deferred spawn has not finished yet — callers must
@@ -592,6 +610,7 @@ impl Pane {
             terminal_runtime: Arc::new(Mutex::new(Some(terminal_runtime))),
             content_revision,
             observed_title_generation: AtomicU64::new(0),
+            mouse_options: PaneMouseOptions::default(),
             published_title: Mutex::new(None),
             #[cfg(windows)]
             history_maintenance_pending: AtomicBool::new(true),
@@ -802,6 +821,7 @@ impl Pane {
             terminal_runtime,
             content_revision,
             observed_title_generation: AtomicU64::new(0),
+            mouse_options: PaneMouseOptions::default(),
             published_title: Mutex::new(None),
             #[cfg(windows)]
             history_maintenance_pending: AtomicBool::new(true),

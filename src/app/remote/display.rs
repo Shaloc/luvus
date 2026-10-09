@@ -237,6 +237,7 @@ impl App {
             return false;
         }
         let pane = self.workspaces[index].tabs[0].layout.focus;
+        let terminal_colors = view.projection.display.terminal_colors;
         let workspace_id = view.target.workspace_id.clone();
         let key = RemoteSession {
             host: view.target.host.clone(),
@@ -315,6 +316,11 @@ impl App {
             _deadline: deadline,
         });
         if let Some(input) = &link.input {
+            if terminal_colors {
+                let _ = input.send(ClientMessage::TerminalColors(
+                    self.display_terminal_colors.clone(),
+                ));
+            }
             let result = input
                 .send(ClientMessage::CellPixels {
                     cell_width: pixels.0,
@@ -643,6 +649,61 @@ mod tests {
                 false,
             ),
         )
+    }
+
+    #[test]
+    fn remote_notifications_collect_background_owner_and_reject_stale_lifetime() {
+        let _env = crate::persist::test_env("remote-notification-source");
+        let (mut app, connection, _rx) = fixture();
+        app.config.notifications.display = crate::config::NotificationDisplay::Inbox;
+        app.active_ws = 0; // Local terminal foreground, remote display is idle.
+        let notice = |generation| super::super::RemoteEffect::Notice {
+            pane: connection,
+            generation,
+            text: "Remote task completed".into(),
+            level: crate::bar::NotificationLevel::Success,
+        };
+        app.apply_remote_effect(notice(0));
+        assert!(app.bar.history.is_empty());
+        app.apply_remote_effect(notice(1));
+        assert_eq!(app.bar.history.len(), 1);
+        assert_eq!(app.bar.history[0].owner.as_deref(), Some("dev-207 / api"));
+        assert!(app.toast.is_none());
+        assert!(
+            app.bar.pending_notifications.is_empty(),
+            "remote notices are not echoed onward"
+        );
+        assert_eq!(app.active_ws, 0);
+        app.remote_session_displays.clear();
+        app.apply_remote_effect(notice(1));
+        assert_eq!(app.bar.history.len(), 1);
+    }
+
+    #[test]
+    fn host_health_uses_pool_instead_of_inactive_stale_view_errors() {
+        use super::super::diagnostics::HostHealth;
+        let _env = crate::persist::test_env("host-pool-health");
+        let (mut app, _, _rx) = fixture();
+        let pane = app.workspaces[2].tabs[0].layout.focus;
+        let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+            panic!()
+        };
+        view.state = RemoteViewState::Disconnected;
+        view.error = Some("old display failed".into());
+        assert_eq!(app.remote_host_health()["dev-207"], HostHealth::Connected);
+        let report = app.host_diagnostics("dev-207", true);
+        assert!(report.contains("old display failed") && report.contains(app.catalog.host_cached));
+        app.remote_session_displays.clear();
+        assert_eq!(app.remote_host_health()["dev-207"], HostHealth::Partial);
+        for view in app.views.values_mut() {
+            if let ViewKind::Remote(view) = view {
+                view.state = RemoteViewState::Disconnected;
+            }
+        }
+        assert_eq!(
+            app.remote_host_health()["dev-207"],
+            HostHealth::Disconnected
+        );
     }
 
     #[test]

@@ -40,6 +40,7 @@ mod dispatch;
 mod file_jobs;
 pub(crate) mod files;
 mod git;
+pub(crate) mod hover;
 mod input;
 pub(crate) mod io_jobs;
 mod keys;
@@ -47,6 +48,7 @@ pub(crate) use keys::is_ctrl_chord;
 pub(crate) mod line_edit;
 mod mission;
 mod modules;
+mod notifications;
 mod pane_restart;
 mod persistence;
 mod picker;
@@ -1179,6 +1181,7 @@ impl PaneMenuItem {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum AgentTarget {
     Dock,
+    Workspace(String),
     Session(usize),
     Live(PaneId),
     Automation(String),
@@ -1205,6 +1208,9 @@ pub struct AgentMenu {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AgentMenuItem {
     ToggleWorkspaceGrouping,
+    ToggleStatusNames,
+    CollapseWorkspace,
+    ExpandWorkspace,
     ToggleStatus(State),
     AllStatuses,
     /// Toggle between all workspaces and the active workspace in the AGENTS dock.
@@ -1232,7 +1238,7 @@ impl AgentMenu {
     /// The built-in items for a given target, in render order.
     pub fn items_for(target: AgentTarget) -> Vec<AgentMenuItem> {
         match target {
-            AgentTarget::Dock => Vec::new(),
+            AgentTarget::Dock | AgentTarget::Workspace(_) => Vec::new(),
             AgentTarget::Automation(_) => vec![
                 AgentMenuItem::AutomationDetails,
                 AgentMenuItem::AutomationRun,
@@ -2269,6 +2275,7 @@ impl CopyMode {
 pub enum PopupId {
     Ws,
     WsQuick,
+    Host,
     Tab,
     TabSwap,
     Pane,
@@ -2557,6 +2564,8 @@ enum UiRepeatContext {
     Commander,
     BarOverflow,
     CommandInspect,
+    HostInspect { details: bool },
+    NotificationInbox,
     Help,
     Changelog,
     ModuleSetting,
@@ -2663,6 +2672,7 @@ pub struct App {
     pane_appearance: crate::terminal::appearance::PaneAppearance,
     /// Last foreground-client palette used to resolve the virtual Terminal theme.
     probed_appearance: Option<crate::terminal::appearance::PaneAppearance>,
+    pub(crate) display_terminal_colors: Option<crate::terminal::theme_probe::TerminalColors>,
     /// Built-in, installed, and virtual themes in Settings display order.
     /// Loaded from the shared home-level `themes/` directory; rendering reads
     /// this in-memory snapshot and never touches the filesystem.
@@ -2746,6 +2756,7 @@ pub struct App {
     /// snapshot of the pane's process tree, taken once when it opens. Click a
     /// pane's title to open it. `None` = closed.
     pub cmd_inspect: Option<CmdInspect>,
+    pub(crate) host_inspect: Option<remote::diagnostics::HostInspect>,
     /// Clickable pane-title strips, set by the renderer each frame.
     pub pane_title_rects: Vec<(PaneId, Rect)>,
     /// New-worktree branch-name prompt (docs/18 WT): `Some(buf)` ⇒ the modal is
@@ -3039,6 +3050,8 @@ pub struct App {
     pub dbl_click_release: bool,
     /// A transient toast (text, expiry) shown bottom-center — e.g. "Copied".
     pub toast: Option<(String, Instant)>,
+    pub(crate) notification_inbox: notifications::InboxUi,
+    pub(crate) relay_notification_chrome: bool,
     /// Downsample RGB → 256-color (for the local path on non-truecolor terms).
     pub downsample: bool,
     /// Throttle for refreshing pane working directories.
@@ -3158,6 +3171,9 @@ pub struct App {
     /// Presentation-only machine folds. None denotes this server's local workspaces.
     pub(crate) collapsed_workspace_machines: HashSet<Option<String>>,
     pub agent_cursor: usize,
+    /// Folds follow stable workspace identities, not shifting row indices.
+    pub(crate) collapsed_agent_workspaces: HashSet<String>,
+    pub(crate) agent_group_rects: Vec<(usize, Rect)>,
     /// The FILES dock (docs/38): the tree model, its scroll region, and the
     /// clickable rect per visible row (`(row index, rect)`), re-set each frame.
     pub file_tree: crate::files::FileTree,
@@ -3271,6 +3287,7 @@ pub struct App {
     pub last_active_ws_id_shown: Option<String>,
     /// Last mouse position, for hover affordances (the session delete ✕).
     pub hover: Option<(u16, u16)>,
+    pub(crate) chrome_hover: Option<hover::ChromeHover>,
     /// Scroll offsets for context-menu popups that do not fit (see
     /// [`MenuScroll`]), and the geometry a wheel event hit-tests against.
     pub menu_scroll: MenuScroll,
@@ -3348,6 +3365,7 @@ pub struct App {
     pub tab_next_rect: Option<Rect>,
     /// The focused pane's ✕ close button, for mouse hit-testing.
     pub pane_restart_rect: Option<Rect>,
+    pub(crate) pane_mouse_rects: Vec<(PaneId, bool, Rect)>,
     pub pane_restart_confirm: Option<PaneId>,
     pub pane_close_rect: Option<Rect>,
     /// The focused pane's ⤢ zoom/restore button (docs/18): a touch-reachable
@@ -3540,6 +3558,7 @@ impl App {
             theme,
             pane_appearance,
             probed_appearance: None,
+            display_terminal_colors: None,
             theme_registry,
             catalog,
             config,
@@ -3581,6 +3600,7 @@ impl App {
             changelog_scroll: 0,
             update_available: None,
             cmd_inspect: None,
+            host_inspect: None,
             pane_title_rects: Vec::new(),
             worktree_prompt: None,
             worktree_prompt_rect: None,
@@ -3701,6 +3721,8 @@ impl App {
             last_left_click: None,
             dbl_click_release: false,
             toast: None,
+            notification_inbox: notifications::InboxUi::default(),
+            relay_notification_chrome: false,
             downsample: false,
             last_cwd_at: Instant::now(),
             cwd_scan_inflight: false,
@@ -3759,6 +3781,8 @@ impl App {
             workspace_cursor: 0,
             collapsed_workspace_machines: HashSet::new(),
             agent_cursor: 0,
+            collapsed_agent_workspaces: HashSet::new(),
+            agent_group_rects: Vec::new(),
             // Rooted at nothing; the first detect tick re-roots it to the active
             // node (set_root is a no-op when already correct).
             file_tree: {
@@ -3818,6 +3842,7 @@ impl App {
             last_active_ws_shown: 0,
             last_active_ws_id_shown: None,
             hover: None,
+            chrome_hover: None,
             menu_scroll: MenuScroll::default(),
             app_tx,
             last_pane_area: Rect::ZERO,
@@ -3853,6 +3878,7 @@ impl App {
             tab_prev_rect: None,
             tab_next_rect: None,
             pane_restart_rect: None,
+            pane_mouse_rects: Vec::new(),
             pane_restart_confirm: None,
             pane_close_rect: None,
             pane_zoom_rect: None,
@@ -4122,7 +4148,7 @@ impl App {
                             pane_appearance,
                         )
                     });
-                    let (pane, module_rec) = match restored {
+                    let (mut pane, module_rec) = match restored {
                         Some((p, rec)) => (p, Some(rec)),
                         None => {
                             // Resolve a usable cwd before handing the shell to
@@ -4177,6 +4203,7 @@ impl App {
                         }
                     };
                     let direct_resume = resume_argv.is_some() && module_rec.is_none();
+                    pane.mouse_options = ps.mouse_options;
                     if let Some(rec) = module_rec {
                         module_panes.insert(id, rec);
                     }
@@ -4298,6 +4325,7 @@ impl App {
             theme,
             pane_appearance,
             probed_appearance: None,
+            display_terminal_colors: None,
             theme_registry,
             catalog,
             config,
@@ -4339,6 +4367,7 @@ impl App {
             changelog_scroll: 0,
             update_available: None,
             cmd_inspect: None,
+            host_inspect: None,
             pane_title_rects: Vec::new(),
             worktree_prompt: None,
             worktree_prompt_rect: None,
@@ -4459,6 +4488,8 @@ impl App {
             last_left_click: None,
             dbl_click_release: false,
             toast: None,
+            notification_inbox: notifications::InboxUi::default(),
+            relay_notification_chrome: false,
             downsample: false,
             last_cwd_at: Instant::now(),
             cwd_scan_inflight: false,
@@ -4517,6 +4548,8 @@ impl App {
             workspace_cursor: 0,
             collapsed_workspace_machines: HashSet::new(),
             agent_cursor: 0,
+            collapsed_agent_workspaces: HashSet::new(),
+            agent_group_rects: Vec::new(),
             // Rooted at nothing; the first detect tick re-roots it to the active
             // node (set_root is a no-op when already correct).
             file_tree: {
@@ -4576,6 +4609,7 @@ impl App {
             last_active_ws_shown: 0,
             last_active_ws_id_shown: None,
             hover: None,
+            chrome_hover: None,
             menu_scroll: MenuScroll::default(),
             app_tx,
             last_pane_area: Rect::ZERO,
@@ -4611,6 +4645,7 @@ impl App {
             tab_prev_rect: None,
             tab_next_rect: None,
             pane_restart_rect: None,
+            pane_mouse_rects: Vec::new(),
             pane_restart_confirm: None,
             pane_close_rect: None,
             pane_zoom_rect: None,
@@ -4659,10 +4694,37 @@ impl App {
 
     /// Apply colors reported by the terminal displaying the foreground client.
     pub fn apply_terminal_colors(&mut self, colors: &crate::terminal::theme_probe::TerminalColors) {
+        self.display_terminal_colors = Some(colors.clone());
         self.probed_appearance =
             Some(crate::terminal::appearance::PaneAppearance::from_terminal_colors(colors));
-        let derived = crate::ui::theme::Theme::from_terminal(colors);
-        self.set_effective_theme("terminal", derived);
+        let theme_id = self.config.theme.clone();
+        let derived = if theme_id == "none" {
+            crate::ui::theme::Theme::terminal_unstyled()
+        } else {
+            crate::ui::theme::Theme::from_terminal(colors)
+        };
+        self.set_effective_theme(&theme_id, derived);
+    }
+
+    /// Use the interactive display's negotiated appearance during pane creation.
+    /// Explicit theme changes inside the action keep their resulting appearance.
+    pub(crate) fn with_display_appearance<T>(
+        &mut self,
+        colors: Option<&crate::terminal::theme_probe::TerminalColors>,
+        action: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let previous = self.pane_appearance;
+        let temporary = colors
+            .filter(|_| crate::ui::theme::follows_terminal(&self.config.theme))
+            .map(crate::terminal::appearance::PaneAppearance::from_terminal_colors);
+        if let Some(appearance) = temporary {
+            self.pane_appearance = appearance;
+        }
+        let result = action(self);
+        if temporary == Some(self.pane_appearance) {
+            self.pane_appearance = previous;
+        }
+        result
     }
 
     /// Install one resolved UI theme and broadcast its pane appearance through
@@ -4768,27 +4830,73 @@ impl App {
         })
     }
 
-    /// One ordering rule for both mouse geometry and keyboard targets. Stable
-    /// workspace grouping preserves pins and deadline order within each group.
+    /// One ordering rule for both mouse geometry and keyboard targets. Reuse
+    /// the workspace tree (including owner boundaries and group pins), retaining
+    /// empty parent headings when a descendant has matching agents. Row order
+    /// within each workspace still preserves agent pins and deadlines.
     pub(crate) fn group_agent_dock_rows<T>(
         &self,
-        mut rows: Vec<(usize, T)>,
-        header: impl Fn(usize) -> T,
+        rows: Vec<(usize, T)>,
+        header: impl Fn(usize, bool) -> T,
     ) -> Vec<T> {
         if !self.agents_active_only || !self.config.agents_group_by_workspace {
             return rows.into_iter().map(|(_, row)| row).collect();
         }
-        rows.sort_by_key(|(workspace, _)| *workspace);
         let mut grouped = Vec::with_capacity(rows.len() + self.workspaces.len());
-        let mut previous = None;
+        let mut buckets: Vec<Vec<T>> = (0..self.workspaces.len()).map(|_| Vec::new()).collect();
         for (workspace, row) in rows {
-            if previous != Some(workspace) {
-                grouped.push(header(workspace));
-                previous = Some(workspace);
+            if let Some(bucket) = buckets.get_mut(workspace) {
+                bucket.push(row);
             }
-            grouped.push(row);
+        }
+        let order = self.workspace_display_order();
+        let mut start = 0;
+        while start < order.len() {
+            let end = (start + 1..order.len())
+                .find(|&i| !order[i].1)
+                .unwrap_or(order.len());
+            let group = &order[start..end];
+            if group.iter().any(|&(ws, _)| !buckets[ws].is_empty()) {
+                let parent = group[0].0;
+                grouped.push(header(parent, false));
+                if !self.agent_workspace_collapsed(parent) {
+                    grouped.append(&mut buckets[parent]);
+                    for &(child, _) in &group[1..] {
+                        if !buckets[child].is_empty() {
+                            grouped.push(header(child, true));
+                            if !self.agent_workspace_collapsed(child) {
+                                grouped.append(&mut buckets[child]);
+                            }
+                        }
+                    }
+                }
+            }
+            start = end;
         }
         grouped
+    }
+
+    pub(crate) fn agent_workspace_collapsed(&self, workspace: usize) -> bool {
+        self.workspaces
+            .get(workspace)
+            .is_some_and(|ws| self.collapsed_agent_workspaces.contains(&ws.id))
+    }
+
+    pub(crate) fn toggle_agent_workspace(&mut self, workspace: usize) {
+        let Some(ws) = self.workspaces.get(workspace) else {
+            return;
+        };
+        let id = ws.id.clone();
+        if !self.collapsed_agent_workspaces.remove(&id) {
+            self.collapsed_agent_workspaces.insert(id);
+        }
+        let rows = self.agent_dock_targets();
+        if let Some(index) = rows
+            .iter()
+            .position(|row| *row == AgentDockTarget::Workspace(workspace))
+        {
+            self.agent_cursor = index;
+        }
     }
 
     /// Apply the AGENTS scope projection without performing I/O. Mirrors
@@ -5022,7 +5130,7 @@ impl App {
                     Some((workspace, row))
                 })
                 .collect();
-            rows = self.group_agent_dock_rows(owned, AgentDockTarget::Workspace);
+            rows = self.group_agent_dock_rows(owned, |ws, _| AgentDockTarget::Workspace(ws));
         }
 
         if !self.agents_active_only {
@@ -5136,6 +5244,16 @@ impl App {
                 _ => {}
             },
             KeyCode::Char('a') => {
+                if let Some(WorkspaceSidebarRow::Machine(Some(host))) =
+                    order.get(self.workspace_cursor)
+                {
+                    self.open_host_menu(
+                        host.clone(),
+                        self.workspaces_area.x + 2,
+                        self.workspaces_area.y,
+                    );
+                    return true;
+                }
                 if let Some(&WorkspaceSidebarRow::Workspace(workspace, _)) =
                     order.get(self.workspace_cursor)
                 {
@@ -5163,7 +5281,12 @@ impl App {
     /// workspace scope; row activation matches the existing mouse behavior.
     pub fn handle_agents_key(&mut self, key: KeyEvent) -> bool {
         // Filters, scope, and the row menu act once per press.
-        if is_key_repeat(&key) && matches!(key.code, KeyCode::Char('a' | 'f' | 's')) {
+        if is_key_repeat(&key)
+            && matches!(
+                key.code,
+                KeyCode::Char('a' | 'f' | 's' | ' ') | KeyCode::Enter
+            )
+        {
             return true;
         }
         let mut rows = self.agent_dock_targets();
@@ -5194,10 +5317,49 @@ impl App {
                 self.agent_cursor = 0;
                 rows = self.agent_dock_targets();
             }
-            KeyCode::Enter => {
+            KeyCode::Left | KeyCode::Right => {
+                let workspace = rows[..rows.len().min(self.agent_cursor + 1)]
+                    .iter()
+                    .rev()
+                    .find_map(|row| {
+                        if let AgentDockTarget::Workspace(ws) = row {
+                            Some(*ws)
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(ws) = workspace {
+                    if (key.code == KeyCode::Left) != self.agent_workspace_collapsed(ws) {
+                        self.toggle_agent_workspace(ws);
+                        rows = self.agent_dock_targets();
+                    } else if key.code == KeyCode::Left {
+                        // A second Left on a folded worktree folds its parent,
+                        // even when that parent has no selectable agent row.
+                        let mut parent = None;
+                        for (index, child) in self.workspace_display_order() {
+                            if index == ws {
+                                if child {
+                                    if let Some(parent) = parent {
+                                        self.toggle_agent_workspace(parent);
+                                        rows = self.agent_dock_targets();
+                                    }
+                                }
+                                break;
+                            }
+                            if !child {
+                                parent = Some(index);
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(target) = rows.get(self.agent_cursor).cloned() {
-                    self.sidebar_focus = None;
+                    if !matches!(target, AgentDockTarget::Workspace(_)) {
+                        self.sidebar_focus = None;
+                    }
                     self.activate_agent_dock_target(target);
+                    rows = self.agent_dock_targets();
                 }
             }
             KeyCode::Char('a') => {
@@ -5222,18 +5384,18 @@ impl App {
         self.agent_cursor = self.agent_cursor.min(rows.len().saturating_sub(1));
         if matches!(
             rows.get(self.agent_cursor),
-            Some(AgentDockTarget::Workspace(_))
+            Some(AgentDockTarget::Workspace(ws)) if !self.agent_workspace_collapsed(*ws)
         ) {
             self.agent_cursor = if backwards {
                 (0..self.agent_cursor)
                     .rev()
-                    .find(|i| !matches!(rows[*i], AgentDockTarget::Workspace(_)))
+                    .find(|i| !matches!(rows[*i], AgentDockTarget::Workspace(ws) if !self.agent_workspace_collapsed(ws)))
             } else {
                 None
             }
             .or_else(|| {
                 (self.agent_cursor..rows.len())
-                    .find(|i| !matches!(rows[*i], AgentDockTarget::Workspace(_)))
+                    .find(|i| !matches!(rows[*i], AgentDockTarget::Workspace(ws) if !self.agent_workspace_collapsed(ws)))
             })
             .unwrap_or(0);
         }
@@ -5241,7 +5403,7 @@ impl App {
 
     fn activate_agent_dock_target(&mut self, target: AgentDockTarget) {
         match target {
-            AgentDockTarget::Workspace(_) => {}
+            AgentDockTarget::Workspace(workspace) => self.toggle_agent_workspace(workspace),
             AgentDockTarget::Live(pane) | AgentDockTarget::Elsewhere(pane) => {
                 self.focus_pane_global(pane)
             }
@@ -5268,9 +5430,9 @@ impl App {
 
     fn open_agent_dock_action(&mut self, target: AgentDockTarget) {
         match target {
-            AgentDockTarget::Workspace(_) => {
+            AgentDockTarget::Workspace(workspace) => {
                 self.open_agent_menu(
-                    AgentTarget::Dock,
+                    AgentTarget::Workspace(self.workspaces[workspace].id.clone()),
                     self.agents_area.x + 2,
                     self.agents_area.y,
                 );
@@ -7282,6 +7444,13 @@ impl App {
     /// declaring `contexts = ["agent"]`.
     pub fn agent_menu_items(&self, target: AgentTarget) -> Vec<AgentMenuItem> {
         let mut items = AgentMenu::items_for(target.clone());
+        if let AgentTarget::Workspace(id) = &target {
+            items.push(if self.collapsed_agent_workspaces.contains(id) {
+                AgentMenuItem::ExpandWorkspace
+            } else {
+                AgentMenuItem::CollapseWorkspace
+            });
+        }
         // A live agent can be pinned to the top of the AGENTS list, below its
         // Rename/Close actions (per-session, since pane ids are reallocated).
         if let AgentTarget::Live(id) = target {
@@ -7292,6 +7461,7 @@ impl App {
             });
         }
         items.push(AgentMenuItem::TogglePath);
+        items.push(AgentMenuItem::ToggleStatusNames);
         if let AgentTarget::RemoteLive { view, pane } = target {
             items.push(if self.remote_agent_is_pinned(view, pane) {
                 AgentMenuItem::Unpin
@@ -8462,6 +8632,7 @@ impl App {
         let module_actions = match &target {
             AgentTarget::Live(_) => self.module_menu_actions("agent"),
             AgentTarget::Dock
+            | AgentTarget::Workspace(_)
             | AgentTarget::Session(_)
             | AgentTarget::Automation(_)
             | AgentTarget::RemoteLive { .. }
@@ -8496,6 +8667,25 @@ impl App {
     /// actions remain distinct so a scheduled placeholder cannot mutate an
     /// unrelated live pane.
     pub fn agent_menu_action(&mut self, item: AgentMenuItem) {
+        match item {
+            AgentMenuItem::ToggleStatusNames => {
+                self.config.layout.agent_status_names = !self.config.layout.agent_status_names;
+                self.persist_config();
+                return;
+            }
+            AgentMenuItem::CollapseWorkspace | AgentMenuItem::ExpandWorkspace => {
+                if let Some(AgentTarget::Workspace(id)) =
+                    self.agent_menu.as_ref().map(|m| &m.target)
+                {
+                    if let Some(ws) = self.workspaces.iter().position(|ws| &ws.id == id) {
+                        self.toggle_agent_workspace(ws);
+                    }
+                }
+                self.agent_menu = None;
+                return;
+            }
+            _ => {}
+        }
         if matches!(
             item,
             AgentMenuItem::ToggleWorkspaceGrouping
@@ -8606,10 +8796,17 @@ impl App {
                 | AgentMenuItem::AutomationDelete,
                 AgentTarget::Session(_) | AgentTarget::Live(_),
             ) => {}
-            (AgentMenuItem::Divider, _) => {}
+            (
+                AgentMenuItem::Divider
+                | AgentMenuItem::ToggleStatusNames
+                | AgentMenuItem::CollapseWorkspace
+                | AgentMenuItem::ExpandWorkspace,
+                _,
+            ) => {}
             (
                 _,
                 AgentTarget::Dock
+                | AgentTarget::Workspace(_)
                 | AgentTarget::RemoteLive { .. }
                 | AgentTarget::RemoteSession { .. },
             )
@@ -8627,7 +8824,7 @@ impl App {
         let selectable: Vec<usize> = items
             .iter()
             .enumerate()
-            .filter_map(|(index, item)| (*item != AgentMenuItem::Divider).then_some(index))
+            .filter_map(|(index, item)| (!matches!(item, AgentMenuItem::Divider)).then_some(index))
             .collect();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.agent_menu = None,
@@ -19104,13 +19301,14 @@ fi
         let items = &app.agent_menu.as_ref().unwrap().items;
         assert_eq!(
             items.len(),
-            5,
-            "session menu has Resume + Close + path + divider + workspace scope"
+            6,
+            "session menu has Resume + Close + path + status names + divider + workspace scope"
         );
         assert_eq!(items[0].0, AgentMenuItem::Resume);
         assert_eq!(items[2].0, AgentMenuItem::TogglePath);
-        assert_eq!(items[3].0, AgentMenuItem::Divider);
-        assert_eq!(items[4].0, AgentMenuItem::ToggleWorkspaceScope);
+        assert_eq!(items[3].0, AgentMenuItem::ToggleStatusNames);
+        assert_eq!(items[4].0, AgentMenuItem::Divider);
+        assert_eq!(items[5].0, AgentMenuItem::ToggleWorkspaceScope);
         let rendered = |term: &Terminal<TestBackend>| {
             term.backend()
                 .buffer()
@@ -19123,7 +19321,11 @@ fi
 
         // The scope row describes the action that will be taken. Clicking it
         // persists the choice; reopening any AGENTS row offers the inverse.
-        let scope = items[4].1;
+        let scope = items
+            .iter()
+            .find(|(item, _)| *item == AgentMenuItem::ToggleWorkspaceScope)
+            .unwrap()
+            .1;
         app.handle_event(AppEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: scope.x + 1,

@@ -14,6 +14,7 @@ Use --agent-seen-only for native Done acknowledgement after remote owner restart
 Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
 Use --colors-only for child color queries and composed local/remote backgrounds (requires pyte).
+Use --appearance-only for pane mouse controls, None theme, notifications and host diagnostics (requires pyte).
 Use --reconnect-only for remote owner restart and automatic reconnection.
 Use --event-backpressure-only for event draining during a stalled topology snapshot.
 That mode uses a real VT decoder: uv run --with pyte==0.8.2 scripts/test-remote-sessions.py target/debug/luvus --reconnect-only
@@ -226,7 +227,8 @@ def main():
     graphics_only = "--graphics-only" in sys.argv[1:]
     theme_sync_only = "--theme-sync-only" in sys.argv[1:]
     colors_only = "--colors-only" in sys.argv[1:]
-    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only:
+    appearance_only = "--appearance-only" in sys.argv[1:]
+    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -236,7 +238,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -655,11 +657,19 @@ def main():
             clients.append((process, master))
             screen = bytearray()
             deadline = time.monotonic() + 4
+            answered_probe = False
             while time.monotonic() < deadline and (
                     b"luvus" not in screen.lower()
                     or ((theme_sync_only or graphics_only or colors_only) and not re.search(rb"\x1b\[\d+;\d+H", screen))):
                 if select.select([master], [], [], 0.1)[0]:
                     screen.extend(os.read(master, 65536))
+                    if appearance_only and not answered_probe and b"\x1b]10;?" in screen:
+                        # Real thin-client probe: simulate this light host terminal.
+                        reply = b"\x1b]10;rgb:38/3a/42\x07\x1b]11;rgb:fa/fa/fa\x07"
+                        for index in (1, 2, 3, 4, 6, 8):
+                            reply += f"\x1b]4;{index};rgb:60/70/80\x07".encode()
+                        os.write(master, reply)
+                        answered_probe = True
             assert process.poll() is None and b"luvus" in screen.lower(), screen[-1000:]
             assert b"\x1b[?1049h" in screen, "the fixture must observe the initial alternate-screen entry"
             if graphics_only:
@@ -667,7 +677,7 @@ def main():
             if colors_only:
                 color_output.clear()
                 color_output.extend(screen)
-            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only:
+            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -731,6 +741,132 @@ def main():
 
         def click(master, x, y, button=0):
             os.write(master, f"\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m".encode())
+
+        if appearance_only:
+            api("config.patch", {"patch": {"notifications": {"display": "inbox"},
+                "layout": {"rounded_corners": True, "workspace_display": "tree"}, "theme": "one-light"}})
+            process, master = start_client(["--session", "api"])
+            def screen_text():
+                drain(master, 0.12)
+                return "\n".join(client_terminals[master][0].display)
+            def row_for(label):
+                for y, line in enumerate(client_terminals[master][0].display):
+                    if label in line: return line.index(label) + 1, y + 1
+                raise AssertionError((label, screen_text()))
+
+            def mouse_options_case(remote):
+                label = "remote" if remote else "local"
+                pane = api("pane.list", remote=remote)["panes"][0]["pane"]
+                run("--session", "api", "pane", "run", str(pane),
+                    shlex.join([sys.executable, str(repo / "scripts/terminal-mouse-fixture.py"), label]), remote=remote)
+                report = root / ("mouse-" + label + ".json")
+                wait_for(lambda: report.exists() and "MOUSE_COPY_PROOF" in screen_text())
+                received = lambda: bytes.fromhex(json.loads(report.read_text())["received"])
+                assert not received()
+                assert "R·" in screen_text() and "C✓" in screen_text(), "new pane defaults"
+                x, y = row_for("R·")
+                click(master, x, y)
+                wait_for(lambda: "R✓" in screen_text())
+                x, y = row_for("MOUSE_COPY_PROOF")
+                click(master, x, y, button=2)
+                wait_for(lambda: received() == b"\x1b[<2;1;1M\x1b[<2;1;1m")
+                before = received()
+                click(master, x, y, button=6)  # Shift + right-click still opens the menu.
+                wait_for(lambda: "Split" in screen_text())
+                assert received() == before
+                os.write(master, b"\x1b")
+                drain(master)
+                x, y = row_for("C✓")
+                click(master, x, y)
+                wait_for(lambda: "C·" in screen_text())
+                clipboard = root / "clipboard-copy"
+                clipboard.write_bytes(b"OLD_CLIPBOARD")
+
+                def select_marker():
+                    x, y = row_for("MOUSE_COPY_PROOF")
+                    end = x + len("MOUSE_COPY_PROOF") - 1
+                    os.write(master, f"\x1b[<4;{x};{y}M\x1b[<36;{end};{y}M\x1b[<4;{end};{y}m".encode())
+                    drain(master)
+
+                select_marker()
+                assert clipboard.read_bytes() == b"OLD_CLIPBOARD", "auto-copy off"
+                assert received() == before, "selection is owned by Luvus"
+                os.write(master, b"\x1b[99;6u")  # Ctrl+Shift+C using the terminal key protocol.
+                wait_for(lambda: screen_text() and clipboard.read_bytes() == b"MOUSE_COPY_PROOF")
+                assert received() == before, "manual copy must not interrupt the child"
+                x, y = row_for("C·")
+                click(master, x, y)
+                wait_for(lambda: "C✓" in screen_text())
+                clipboard.write_bytes(b"OLD_CLIPBOARD")
+                select_marker()
+                wait_for(lambda: screen_text() and clipboard.read_bytes() == b"MOUSE_COPY_PROOF")
+                os.write(master, b"q")
+                drain(master)
+                print(f"PASS: {label} pane header toggles route right-clicks, preserve Shift menu, and control selection/manual clipboard copy", flush=True)
+
+            mouse_options_case(False)
+            run("session", "merge", "on")
+            wait_for(projected)
+            # Keep a LOCAL terminal active: remote notices must arrive even when
+            # no remote pane is selected. The remote owner retains default toasts.
+            wait_for(lambda: "Notification inbox" in screen_text())
+            run("--session", "api", "ui", "toast", "REMOTE_TOAST_PROOF", remote=True)
+            wait_for(lambda: "REMOTE_TOAST_PROOF" in screen_text())
+            header_x, header_y = row_for("Notification inbox")
+            terminal = client_terminals[master][0]
+            occurrences = [(y, line.index("REMOTE_TOAST_PROOF")) for y, line in enumerate(terminal.display)
+                           if "REMOTE_TOAST_PROOF" in line]
+            assert len(occurrences) == 1 and occurrences[0][1] < 45, occurrences
+            click(master, header_x, header_y)
+            wait_for(lambda: "fake-dev / api" in screen_text())
+            assert screen_text().count("REMOTE_TOAST_PROOF") == 1, screen_text()
+            os.write(master, b"\x1b")
+            drain(master)
+            workspace = next(w["workspace"] for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
+            api("workspace.focus", {"workspace": workspace})
+            drain(master, 1)
+            run("--session", "api", "ui", "toast", "REMOTE_ACTIVE_PROOF", remote=True)
+            wait_for(lambda: "REMOTE_ACTIVE_PROOF" in screen_text())
+            assert screen_text().count("REMOTE_ACTIVE_PROOF") == 1, screen_text()
+            assert all(line.index("REMOTE_ACTIVE_PROOF") < 45 for line in terminal.display if "REMOTE_ACTIVE_PROOF" in line)
+            api("ui.notification.push", {"text": "REMOTE_BAR_PROOF", "level": "error", "ttl_ms": 500}, remote=True)
+            wait_for(lambda: "REMOTE_BAR_PROOF" in screen_text())
+            header_x, header_y = row_for("Notification inbox")
+            click(master, header_x, header_y)
+            wait_for(lambda: "fake-dev / api" in screen_text())
+            drain(master, 1)
+            assert "REMOTE_BAR_PROOF" in screen_text(), "history expired with the bar TTL"
+            assert screen_text().count("REMOTE_BAR_PROOF") == 1, screen_text()
+            # Host details remain local, with no injected owner keystrokes.
+            os.write(master, b"\x1b")
+            drain(master)
+            x, y = row_for("fake-dev")
+            click(master, x, y, button=2)
+            wait_for(lambda: "Connection details" in screen_text())
+            x, y = row_for("Connection details")
+            click(master, x, y)
+            wait_for(lambda: "generation=" in screen_text())
+            os.write(master, b"\x1b")
+            drain(master)
+            mouse_options_case(True)
+            for remote in (False, True):
+                api("config.patch", {"patch": {"theme": "none"}}, remote=remote)
+            wait_for(lambda: screen_text() and terminal.buffer[10][80].bg == "default")
+            assert terminal.buffer[10][80].fg == "default", terminal.buffer[10][80]
+            remote_pane = api("pane.list", remote=True)["panes"][0]["pane"]
+            run("--session", "api", "pane", "run", str(remote_pane),
+                shlex.join([sys.executable, str(repo / "scripts/terminal-color-fixture.py"), "merged"]), remote=True)
+            report = root / "colors-merged.json"
+            wait_for(report.exists)
+            appearance = json.loads(report.read_text())
+            assert appearance["colors"] == {"10": [0x38, 0x3a, 0x42], "11": [0xfa, 0xfa, 0xfa]}, appearance
+            assert appearance["diff"] == [230, 255, 237], appearance
+            print("PASS: None forwards the real light terminal probe to remote child OSC 10/11 queries", flush=True)
+            os.write(master, b"q")
+            drain(master)
+            (root / "appearance-screen.txt").write_text(screen_text())
+            print("PASS: optional sidebar inbox collects inactive and active remote toasts/bar notices once, with source; history survives TTL; host details open on real thin client", flush=True)
+            return
 
         if colors_only:
             def color_case(label, master, remote):

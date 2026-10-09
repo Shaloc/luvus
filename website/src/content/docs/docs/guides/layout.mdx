@@ -23,12 +23,32 @@ like, and luvus tiles them automatically.
 | Zoom (fullscreen) a pane | n/a | `Ctrl+Space z` |
 | Close a pane | the `×` on its title, or right-click → **Close** | `Ctrl+Space x` |
 
-Right-click opens the pane menu anywhere in a pane, including one running a
+By default, right-click opens the pane menu anywhere in a pane, including one running a
 mouse-aware application such as an agent. Plain clicks and drags inside such an
 application go to it; hold `Shift` to select text with Luvus.
 
-Each split pane shows a title bar with a **status dot** and its working
-directory. The focused pane's frame is brighter.
+The focused terminal pane's header has two toggles alongside restart/zoom/close:
+
+- **R** sends right-clicks in the pane content to the application when enabled.
+  It respects the application's mouse-reporting mode; `Shift` + right-click
+  always opens Luvus's menu. Header and sidebar menus are unaffected.
+- **C** copies Luvus text selections on left-button release or double-click.
+  It is enabled by default. When disabled, the selection remains highlighted;
+  press `Ctrl+Shift+C` to copy it explicitly. An application's own selection
+  and OSC 52 clipboard writes are independent of this option.
+
+A check mark means enabled. Each pane remembers its own choices across session
+restore and pane restart, including remote panes (update the owning server).
+Very narrow headers hide these controls; widen or zoom the pane to access them.
+Hover over a control for its label, or over a workspace, agent, or pane title
+for its full name, status, and directory. Hints appear after a short pause and
+do not change focus.
+
+Each pane title shows a **status dot** and its explicit pane name, otherwise the
+agent/application's OSC 0/2 title, otherwise its working directory. The optional
+path setting appends the directory when a title exists. The focused pane's frame
+is brighter. **Settings → Layout → Rounded corners** switches Luvus borders and
+tab/title caps to rounded Unicode shapes; child terminal glyphs are unchanged.
 
 **New Pane** splits the right-clicked pane along its longer physical side,
 using the terminal's cell dimensions to choose side by side or top / bottom.
@@ -253,7 +273,8 @@ Unicode character counts; wide glyphs such as CJK and many emoji consume two.
 
 ## Selecting text
 
-Drag across any pane to select, and releasing **auto-copies** to your clipboard. Full
+Drag across a pane to select; releasing **auto-copies** by default. Disable its
+**C** header toggle to keep the selection until you copy with `Ctrl+Shift+C`. Full
 details, plus scrollback, are in [Scrollback & Copy](/docs/guides/scrollback/).
 
 ## Pasting clipboard images

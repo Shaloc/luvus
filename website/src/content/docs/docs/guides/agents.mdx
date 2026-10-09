@@ -65,8 +65,18 @@ Input**, **Idle**, **Done**). Multiple checked states are combined with OR.
 empty list. The menu stays open while selecting states (Space or Enter also
 toggles the selected checkbox). These preferences persist, apply equally to
 local and registered remote agents, and leave **All** history unchanged.
-Groups follow workspace order; pins stay first within their workspace. Keyboard
-navigation skips group headings. Scheduled placeholders use Idle, starting or
+Groups follow the workspace tree: linked worktrees nest below their main checkout,
+with the same repository, remote host/session boundaries and workspace pin order
+as WORKSPACES. Agent pins stay first within their workspace. Parents without matching
+agents remain visible when a child has matches, including in this-workspace scope.
+Keyboard navigation skips expanded group headings. Click a heading to collapse or
+expand its entire subtree; Left folds the current group, and a second Left on a
+folded worktree folds its parent. Right, Enter or Space expands a selected folded
+group. Folds are temporary and follow stable workspace identity; child folds survive
+folding and reopening their parent. A remote hostname appears once as a colored badge
+on the root group heading, without repeating it on nested worktrees or agents.
+**Show Status Names** in the right-click menu defaults
+to on; turning it off leaves the colored status dot. Scheduled placeholders use Idle, starting or
 restoring ones use Working, and those needing a rebind use Waiting for Input.
 
 When **Show agent session title** is on, the second line of each agent row

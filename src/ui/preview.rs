@@ -94,7 +94,7 @@ pub(super) fn draw(
             for x in body.x..body.right() {
                 if selection.contains(x, y) {
                     if let Some(cell) = buffer.cell_mut((x, y)) {
-                        cell.set_bg(theme.sel_bg);
+                        cell.set_style(theme.selection_style());
                     }
                 }
             }

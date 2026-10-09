@@ -263,7 +263,7 @@ impl ThemeRegistry {
     fn builtins() -> Self {
         let mut entries = Vec::new();
         for id in theme::THEMES {
-            let virtual_theme = *id == "terminal";
+            let virtual_theme = theme::follows_terminal(id);
             let bundled = super::builtin_file(id);
             entries.push(ThemeEntry {
                 id: (*id).to_string(),

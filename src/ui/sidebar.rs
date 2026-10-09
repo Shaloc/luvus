@@ -18,7 +18,7 @@ fn attention(s: State) -> u8 {
 }
 
 /// Most urgent pane state across a whole workspace.
-fn rollup(app: &App, ws_index: usize) -> State {
+pub(crate) fn rollup(app: &App, ws_index: usize) -> State {
     let mut best = State::Idle;
     if let Some(ws) = app.workspaces.get(ws_index) {
         if let Some(view) = app.remote_workspace_view(ws_index) {
@@ -72,7 +72,7 @@ enum AgentDockRow {
     Local(PaneId, usize),
     Remote(usize, usize),
     Scheduled(usize),
-    Workspace(usize),
+    Workspace(usize, bool),
 }
 
 /// Rows of sidebar chrome above the dock stack: the brand/menu row plus one
@@ -284,6 +284,19 @@ fn draw_sidebar_mode(
         body_w,
         area.bottom().saturating_sub(body_top),
     );
+    let inbox_side = if app.sidebars.left.visible {
+        Side::Left
+    } else {
+        Side::Right
+    };
+    let body = if !workspace_only
+        && side == inbox_side
+        && (app.notifications_in_sidebar() || app.notification_inbox.open)
+    {
+        super::notifications::sidebar(f, body, app, t)
+    } else {
+        body
+    };
     let (docks, weights): (Vec<_>, Vec<_>) = app
         .sidebars
         .get(side)
@@ -477,7 +490,7 @@ fn draw_workspaces_dock(
     app: &mut App,
     t: &Theme,
 ) -> WorkspaceHits {
-    use crate::app::remote::RemoteViewState;
+    use crate::app::remote::diagnostics::HostHealth;
     use crate::app::workspace_sidebar::{last_scroll, visible_end, WorkspaceSidebarRow};
     let cat = app.catalog;
     let cx = area.x + 2;
@@ -558,22 +571,14 @@ fn draw_workspaces_dock(
     let nscroll = app.workspaces_scroll;
     let ncap = visible_end(&order, nscroll, nrows as usize, paths_visible).saturating_sub(nscroll);
     // Read existing transport evidence once, never probe hosts from rendering.
-    let mut machine_states = std::collections::HashMap::new();
-    if tree {
-        for view in app.views.values() {
-            if let crate::app::ViewKind::Remote(view) = view {
-                let state = machine_states
-                    .entry(view.target.host.as_str())
-                    .or_insert(RemoteViewState::Connecting);
-                if view.state == RemoteViewState::Disconnected
-                    || *state != RemoteViewState::Disconnected
-                        && view.state == RemoteViewState::Ready
-                {
-                    *state = view.state;
-                }
-            }
-        }
-    }
+    let machine_states = if tree {
+        app.remote_host_health()
+            .into_iter()
+            .map(|(host, health)| (host.to_string(), health))
+            .collect::<std::collections::HashMap<_, _>>()
+    } else {
+        Default::default()
+    };
     let mut y = nlist_top;
     for (vi, row) in order.into_iter().skip(nscroll).take(ncap).enumerate() {
         let selected = keyboard_focused && nscroll + vi == app.workspace_cursor;
@@ -581,8 +586,8 @@ fn draw_workspaces_dock(
             let collapsed = app.collapsed_workspace_machines.contains(&host);
             let label = host.as_deref().unwrap_or(cat.session_local);
             let color = match host.as_deref().and_then(|host| machine_states.get(host)) {
-                Some(RemoteViewState::Ready) => t.green,
-                Some(RemoteViewState::Disconnected) => t.coral,
+                Some(HostHealth::Connected) => t.green,
+                Some(HostHealth::Disconnected) => t.coral,
                 _ => t.amber,
             };
             let name = crate::ui::truncate(label, (cw as usize).saturating_sub(4));
@@ -760,6 +765,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 Style::new().fg(t.overlay1).bg(t.surface1)
             };
             f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+            f.pill_caps(rect, style.bg.unwrap_or(t.base), t.base);
             app.agents_filter_rects.push((val, rect));
             x = x.saturating_add(w);
         }
@@ -770,6 +776,8 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let alist_top = aheader + DOCK_HEADER_ROWS;
     let arows = area.bottom().saturating_sub(alist_top);
     let paths_visible = app.config.layout.agent_paths;
+    let grouped = active_only && app.config.agents_group_by_workspace;
+    let status_names = app.config.layout.agent_status_names;
     let row_stride = dock_row_stride(paths_visible);
     app.agents_area = Rect::new(area.x, alist_top, area.width, arows);
 
@@ -874,12 +882,8 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             }
             scheduled.push((
                 row.id.clone(),
-                if paths_visible {
-                    row.agent.clone()
-                } else {
-                    format!("[{}] {}", view.target.host, row.agent)
-                },
-                format!("[{}] {}", view.target.host, workspace.name),
+                row.agent.clone(),
+                workspace.name.clone(),
                 row.deadline,
                 row.starting,
                 row.target_state,
@@ -950,7 +954,9 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let keyboard_focused = app.sidebar_focus == Some(SidebarListFocus::Agents);
     let keyboard_total = atotal + usize::from(has_elsewhere);
     app.agent_cursor = app.agent_cursor.min(keyboard_total.saturating_sub(1));
-    if matches!(live.get(app.agent_cursor), Some(AgentDockRow::Workspace(_))) {
+    while matches!(live.get(app.agent_cursor), Some(AgentDockRow::Workspace(ws, _)) if !app.agent_workspace_collapsed(*ws))
+        && app.agent_cursor + 1 < keyboard_total
+    {
         app.agent_cursor = (app.agent_cursor + 1).min(keyboard_total.saturating_sub(1));
     }
     app.agents_elsewhere_rect = None;
@@ -979,29 +985,68 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             )),
         );
     } else {
+        // A scroll can begin inside a worktree, below its group heading.
+        let mut group_child = live[..ascroll.min(live.len())]
+            .iter()
+            .rev()
+            .find_map(|row| match row {
+                AgentDockRow::Workspace(_, child) => Some(*child),
+                _ => None,
+            })
+            .unwrap_or(false);
         for (vi, k) in (ascroll..atotal).take(acap).enumerate() {
             let y = alist_top + vi as u16 * row_stride;
             let selected = keyboard_focused && app.agent_cursor == k;
-            if let Some(AgentDockRow::Workspace(wi)) = live.get(k) {
+            if selected {
+                f.buffer_mut().set_style(
+                    Rect::new(area.x, y, area.width.saturating_sub(1), row_stride),
+                    Style::new().bg(t.surface1),
+                );
+            }
+            if let Some(AgentDockRow::Workspace(wi, child)) = live.get(k) {
+                group_child = *child;
                 let ws = &app.workspaces[*wi];
-                let label = if let Some(remote) = &ws.remote {
-                    format!("[{}] {}", remote.host, ws.name)
-                } else {
-                    ws.name.clone()
-                };
+                let folded = app.agent_workspace_collapsed(*wi);
+                let prefix = vec![Span::styled(
+                    match (child, folded) {
+                        (true, true) => "  ▸ ",
+                        (true, false) => "  ▾ ",
+                        (false, true) => "▸ ",
+                        (false, false) => "▾ ",
+                    },
+                    Style::new().fg(t.subtext0),
+                )];
                 line_at(
                     f,
                     y,
-                    Line::from(Span::styled(
-                        crate::ui::truncate(&label, cw as usize),
-                        Style::new().fg(t.subtext0).bold(),
-                    )),
+                    agent_label_line(
+                        prefix,
+                        ws.remote
+                            .as_ref()
+                            .filter(|_| !child)
+                            .map(|remote| remote.host.as_str()),
+                        &ws.name,
+                        Style::new()
+                            .fg(if selected { t.accent } else { t.subtext0 })
+                            .bold(),
+                        cw as usize,
+                        app.config.layout.rounded_corners,
+                    ),
                 );
+                app.agent_group_rects
+                    .push((*wi, Rect::new(area.x, y, area.width, row_stride)));
                 continue;
             }
+            let indent = if !grouped {
+                ""
+            } else if group_child {
+                "    "
+            } else {
+                "  "
+            };
             if let Some(row @ (AgentDockRow::Local(..) | AgentDockRow::Remote(..))) = live.get(k) {
                 let rect = Rect::new(area.x, y, area.width, row_stride);
-                let (st, agent, focused, meta) = match row {
+                let (st, agent, focused, meta, host) = match row {
                     AgentDockRow::Local(id, wi) => {
                         let wsname = &app.workspaces[*wi].name;
                         agent_rects.push((*id, rect));
@@ -1025,6 +1070,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                                 .unwrap_or_default(),
                             *id == focus,
                             meta,
+                            None,
                         )
                     }
                     AgentDockRow::Remote(workspace_index, agent_index) => {
@@ -1035,32 +1081,39 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         let focused = app.workspaces[app.active_ws].remote.as_ref() == Some(target)
                             && agent.focused;
                         let meta = format!(
-                            "  [{}] {wsname} · ={}",
-                            target.host,
+                            "  {wsname} · ={}",
                             agent.name.as_deref().unwrap_or(&agent.pane)
                         );
-                        let name = if paths_visible {
-                            agent.agent.clone()
-                        } else {
-                            format!("[{}] {}", target.host, agent.agent)
-                        };
+                        let name = agent.agent.clone();
                         let meta = if app.config.layout.agent_title {
                             agent
                                 .title
                                 .as_ref()
-                                .map(|title| format!("  [{}] {title}", target.host))
+                                .map(|title| format!("  {title}"))
                                 .unwrap_or(meta)
                         } else {
                             meta
                         };
-                        let presentation = (agent.state, name, focused, meta);
+                        let presentation = (
+                            agent.state,
+                            name,
+                            focused,
+                            meta,
+                            (!grouped).then(|| target.host.clone()),
+                        );
                         let hit = (target.clone(), agent.pane.clone(), rect);
                         app.remote_agent_rects.push(hit);
                         presentation
                     }
                     _ => unreachable!(),
                 };
-                let name_style = if focused {
+                if focused && !selected {
+                    f.buffer_mut().set_style(
+                        Rect::new(area.x, y, area.width.saturating_sub(1), row_stride),
+                        Style::new().bg(t.sel_bg),
+                    );
+                }
+                let name_style = if focused || selected {
                     Style::new().fg(t.accent).bold()
                 } else {
                     Style::new().fg(t.subtext1)
@@ -1068,35 +1121,36 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 // Working stays visually prominent without scheduling animation
                 // frames while the agent is busy.
                 let dot = st.dot();
-                let label = format!(" {}  ", st.label());
-                let prefix_w = crate::ui::display_width(dot) + crate::ui::display_width(&label);
-                let agent = crate::ui::truncate(&agent, (cw as usize).saturating_sub(prefix_w));
+                let label = if status_names {
+                    format!(" {}  ", st.label())
+                } else {
+                    " ".into()
+                };
                 line_at(
                     f,
                     y,
-                    Line::from(vec![
-                        Span::styled(dot, Style::new().fg(st.color(t))),
-                        Span::styled(label, Style::new().fg(st.color(t))),
-                        Span::styled(agent, name_style),
-                    ]),
+                    agent_label_line(
+                        vec![
+                            Span::raw(indent),
+                            Span::styled(dot, Style::new().fg(st.color(t))),
+                            Span::styled(label, Style::new().fg(st.color(t))),
+                        ],
+                        host.as_deref(),
+                        &agent,
+                        name_style,
+                        cw as usize,
+                        app.config.layout.rounded_corners,
+                    ),
                 );
                 if paths_visible {
                     line_at(
                         f,
                         y + 1,
                         Line::from(Span::styled(
-                            crate::ui::truncate(&meta, cw as usize),
+                            crate::ui::truncate(&format!("{indent}{meta}"), cw as usize),
                             Style::new().fg(if focused { t.subtext0 } else { t.overlay0 }),
                         )),
                     );
-                }
-                if focused {
-                    let buf = f.buffer_mut();
-                    for row in y..y + row_stride {
-                        for x in area.x..area.right().saturating_sub(1) {
-                            buf[(x, row)].set_bg(t.sel_bg);
-                        }
-                    }
                 }
             } else if let Some((
                 automation,
@@ -1106,7 +1160,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 starting,
                 target_state,
                 owner,
-                _,
+                workspace_index,
             )) = live.get(k).and_then(|row| match row {
                 AgentDockRow::Scheduled(i) => scheduled.get(*i),
                 _ => None,
@@ -1128,19 +1182,34 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     _ if *starting => (cat.automation_starting, t.accent),
                     _ => (cat.automation_scheduled, t.accent),
                 };
-                let label = format!(" {status}  ");
-                let prefix_w = 1 + crate::ui::display_width(&label);
+                let label = if status_names {
+                    format!(" {status}  ")
+                } else {
+                    " ".into()
+                };
+                let host = (!grouped)
+                    .then(|| {
+                        app.workspaces[*workspace_index]
+                            .remote
+                            .as_ref()
+                            .map(|remote| remote.host.as_str())
+                    })
+                    .flatten();
                 line_at(
                     f,
                     y,
-                    Line::from(vec![
-                        Span::styled("◷", Style::new().fg(status_color)),
-                        Span::styled(label, Style::new().fg(status_color)),
-                        Span::styled(
-                            crate::ui::truncate(agent, (cw as usize).saturating_sub(prefix_w)),
-                            Style::new().fg(t.subtext1).bold(),
-                        ),
-                    ]),
+                    agent_label_line(
+                        vec![
+                            Span::raw(indent),
+                            Span::styled("◷", Style::new().fg(status_color)),
+                            Span::styled(label, Style::new().fg(status_color)),
+                        ],
+                        host,
+                        agent,
+                        Style::new().fg(t.subtext1).bold(),
+                        cw as usize,
+                        app.config.layout.rounded_corners,
+                    ),
                 );
                 if paths_visible {
                     line_at(
@@ -1148,7 +1217,10 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         y + 1,
                         Line::from(Span::styled(
                             crate::ui::truncate(
-                                &format!("  {workspace} · UTC {}", super::format_utc(*deadline)),
+                                &format!(
+                                    "{indent}  {workspace} · UTC {}",
+                                    super::format_utc(*deadline)
+                                ),
                                 cw as usize,
                             ),
                             Style::new().fg(t.overlay0),
@@ -1159,18 +1231,14 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 // A resumable session discovered on disk — click to reopen.
                 let visible_index = k - live.len();
                 let row = Rect::new(area.x, y, area.width, row_stride);
-                let (agent, proj) = if visible_index >= resumable_total {
+                let (agent, proj, host) = if visible_index >= resumable_total {
                     let (view, session, host) = &remote_history[visible_index - resumable_total];
                     app.remote_history_rects.push((*view, session.key, row));
                     let project = std::path::Path::new(&session.cwd)
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("project");
-                    let agent = if paths_visible {
-                        session.agent.clone()
-                    } else {
-                        format!("[{host}] {}", session.agent)
-                    };
+                    let agent = session.agent.clone();
                     let title = app
                         .config
                         .layout
@@ -1178,7 +1246,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         .then_some(session.title.as_deref())
                         .flatten()
                         .unwrap_or(project);
-                    (agent, format!("[{host}] {title}"))
+                    (agent, title.to_string(), Some(host.clone()))
                 } else {
                     let si = if scoped {
                         resumable_scoped[visible_index]
@@ -1204,20 +1272,25 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                                     .unwrap_or("project")
                             })
                             .to_string(),
+                        None,
                     )
                 };
                 let meta = format!("  {proj}");
-                let label = " resume  ";
-                let prefix_w = 1 + crate::ui::display_width(label);
-                let name = crate::ui::truncate(&agent, (cw as usize).saturating_sub(prefix_w));
+                let label = if status_names { " resume  " } else { " " };
                 line_at(
                     f,
                     y,
-                    Line::from(vec![
-                        Span::styled("○", Style::new().fg(t.overlay1)),
-                        Span::styled(label, Style::new().fg(t.overlay1)),
-                        Span::styled(name, Style::new().fg(t.subtext0)),
-                    ]),
+                    agent_label_line(
+                        vec![
+                            Span::styled("○", Style::new().fg(t.overlay1)),
+                            Span::styled(label, Style::new().fg(t.overlay1)),
+                        ],
+                        host.as_deref(),
+                        &agent,
+                        Style::new().fg(t.subtext0),
+                        cw as usize,
+                        app.config.layout.rounded_corners,
+                    ),
                 );
                 if paths_visible {
                     line_at(
@@ -1231,12 +1304,6 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 }
                 // Removing / reopening a session is on the row's right-click menu
                 // (docs/28) — no per-row ✕ button.
-            }
-            if selected {
-                f.buffer_mut().set_style(
-                    Rect::new(area.x, y, area.width.saturating_sub(1), row_stride),
-                    Style::new().fg(t.accent).bg(t.surface1),
-                );
             }
         }
         draw_scrollbar(
@@ -2543,4 +2610,26 @@ mod dock_tone_tests {
             "the ellipsis takes the colour of a span that was drawn, not the dropped one"
         );
     }
+}
+
+/// The label budgets badge and text together so long aliases cannot cover the
+/// scrollbar. Host colors are deterministic, independent of workspace order.
+fn agent_label_line(
+    mut prefix: Vec<Span<'static>>,
+    host: Option<&str>,
+    label: &str,
+    style: Style,
+    width: usize,
+    rounded: bool,
+) -> Line<'static> {
+    let used: usize = prefix.iter().map(Span::width).sum();
+    let mut remaining = width.saturating_sub(used);
+    if let Some(host) = host.filter(|_| remaining > 4) {
+        let badge = host_badge(host, host, (remaining / 2).max(3), rounded);
+        remaining = remaining.saturating_sub(badge.iter().map(Span::width).sum::<usize>() + 1);
+        prefix.extend(badge);
+        prefix.push(Span::raw(" "));
+    }
+    prefix.push(Span::styled(truncate(label, remaining), style));
+    Line::from(prefix)
 }

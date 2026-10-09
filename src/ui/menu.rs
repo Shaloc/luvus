@@ -71,7 +71,7 @@ fn render_popup(
     let w = if mobile {
         area.width.max(1)
     } else {
-        (label_w + 3).clamp(12, area.width.max(1))
+        (label_w + 3).max(12).min(area.width.max(1))
     };
     let h = ((rows.len() as u16).saturating_mul(row_height) + 2).min(area.height.max(1));
     let x = if mobile {
@@ -89,6 +89,7 @@ fn render_popup(
     f.render_widget(Clear, popup);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(popup);
@@ -546,6 +547,7 @@ pub(super) fn draw_agent_menu(
             text: {
                 let label = agent_label(*it, cat, &extras, scoped, app.config.layout.agent_paths);
                 let checked = match it {
+                    AgentMenuItem::ToggleStatusNames => Some(app.config.layout.agent_status_names),
                     AgentMenuItem::ToggleWorkspaceGrouping => {
                         Some(app.config.agents_group_by_workspace)
                     }
@@ -593,6 +595,9 @@ fn agent_label(
 ) -> String {
     match it {
         AgentMenuItem::ToggleWorkspaceGrouping => cat.menu_group_workspaces.into(),
+        AgentMenuItem::ToggleStatusNames => cat.menu_status_names.into(),
+        AgentMenuItem::CollapseWorkspace => cat.menu_collapse_workspace.into(),
+        AgentMenuItem::ExpandWorkspace => cat.menu_expand_workspace.into(),
         AgentMenuItem::AllStatuses => cat.menu_all_statuses.into(),
         AgentMenuItem::ToggleStatus(state) => {
             use crate::ui::theme::State;
@@ -1433,5 +1438,94 @@ mod tests {
             theme.accent,
             "the keyboard-selected Start row is highlighted"
         );
+    }
+}
+
+/// Reuse the ordinary context menu and wrapped diagnostic text renderer.
+pub(super) fn draw_host_inspect(
+    f: &mut RenderTarget,
+    area: Rect,
+    app: &mut App,
+    cat: &Catalog,
+    t: &Theme,
+) {
+    let Some(inspect) = app.host_inspect.as_ref() else {
+        return;
+    };
+    if let Some(report) = &inspect.details {
+        help::dim_backdrop(f, area, t);
+        let modal = help::centered_rect(
+            area,
+            area.width.saturating_sub(4).min(110),
+            area.height.saturating_sub(2).min(32),
+        );
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(f.border_type())
+            .title(if inspect.errors_only {
+                cat.host_errors
+            } else {
+                cat.host_details
+            })
+            .style(Style::new().fg(t.text).bg(t.surface0))
+            .border_style(Style::new().fg(t.border_focus));
+        let inner = block.inner(modal);
+        f.render_widget(Clear, modal);
+        f.render_widget(block, modal);
+        let body = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(2),
+        );
+        let lines: Vec<_> = report
+            .lines()
+            .flat_map(|line| super::board::wrap_display_lines(line, body.width as usize))
+            .collect();
+        let max_scroll = lines.len().saturating_sub(body.height as usize);
+        let scroll = inspect.scroll.min(max_scroll);
+        let text: Vec<_> = lines
+            .into_iter()
+            .skip(scroll)
+            .take(body.height as usize)
+            .map(Line::from)
+            .collect();
+        f.render_widget(Paragraph::new(text), body);
+        if inner.height > 0 {
+            f.render_widget(
+                Paragraph::new(cat.host_detail_hint).style(Style::new().fg(t.overlay1)),
+                Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+            );
+        }
+        if let Some(inspect) = app.host_inspect.as_mut() {
+            inspect.modal = Some(modal);
+            inspect.max_scroll = max_scroll;
+        }
+    } else {
+        let rows: Vec<_> = [cat.host_details, cat.host_errors, cat.host_copy]
+            .into_iter()
+            .map(|text| MenuRow {
+                text: text.into(),
+                divider: false,
+                destructive: false,
+            })
+            .collect();
+        let rects = render_popup(
+            f,
+            area,
+            inspect.anchor,
+            &rows,
+            t,
+            PopupCtx {
+                hover: app.hover,
+                selected: Some(inspect.selected),
+                mobile: app.compact,
+                id: PopupId::Host,
+                scroll: &mut app.menu_scroll,
+            },
+        );
+        if let Some(inspect) = app.host_inspect.as_mut() {
+            inspect.rects = rects;
+        }
     }
 }

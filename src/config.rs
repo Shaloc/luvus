@@ -338,10 +338,13 @@ pub struct LayoutConfig {
     pub row_gap: u16,
     #[serde(default = "yes")]
     pub show_titles: bool,
-    /// Show a pane's live cwd after its explicit name or `p<ID>` fallback in the
+    /// Append a pane's live cwd after its explicit name or terminal title in the
     /// title. This applies equally to lone-pane headers and split-pane borders.
     #[serde(default)]
     pub pane_title_path: bool,
+    /// Round Luvus-owned frames and filled title/tab controls.
+    #[serde(default)]
+    pub rounded_corners: bool,
     /// In the AGENTS sidebar, show each agent's session title in place of the
     /// `wsname · =<id>` meta line (live) or the project folder (resumable).
     /// OSC title wins when the agent set one; otherwise a module-provided title
@@ -365,6 +368,9 @@ pub struct LayoutConfig {
     /// default; the row context menu can hide it for a denser one-row list.
     #[serde(default = "yes")]
     pub agent_paths: bool,
+    /// Keep state dots while optionally hiding their text labels.
+    #[serde(default = "yes")]
+    pub agent_status_names: bool,
     /// Resume a session into its own workspace (else a new tab in the current one).
     #[serde(default = "yes", alias = "resume_in_new_node")]
     pub resume_in_new_workspace: bool,
@@ -539,6 +545,9 @@ impl SidebarsConfig {
 /// completion cue remains the default style for backward compatibility.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NotifyConfig {
+    /// Ordinary UI feedback: legacy floating toast or a quiet sidebar inbox.
+    #[serde(default)]
+    pub display: NotificationDisplay,
     /// The synthesized cue family used by both notification events.
     #[serde(default = "default_sound_style")]
     pub sound_style: String,
@@ -553,11 +562,20 @@ pub struct NotifyConfig {
 impl Default for NotifyConfig {
     fn default() -> Self {
         Self {
+            display: NotificationDisplay::default(),
             sound_style: default_sound_style(),
             sound_on_done: false,
             sound_on_blocked: false,
         }
     }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationDisplay {
+    #[default]
+    Toast,
+    Inbox,
 }
 
 fn default_sound_style() -> String {
@@ -642,11 +660,13 @@ impl Default for LayoutConfig {
             row_gap: 0,
             show_titles: true,
             pane_title_path: false,
+            rounded_corners: false,
             agent_title: false,
             workspace_paths: true,
             workspace_display: WorkspaceDisplay::Flat,
             auto_workspace_rehome: false,
             agent_paths: true,
+            agent_status_names: true,
             resume_in_new_workspace: true,
             new_pane_to_workspace_root: false,
             file_open: default_file_open(),
@@ -1008,6 +1028,22 @@ fn apply_delta(target: &mut Value, delta: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_preferences_migrate_and_roundtrip() {
+        let mut config: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(config.notifications.display, NotificationDisplay::Toast);
+        config.notifications.display = NotificationDisplay::Inbox;
+        assert!(config.layout.agent_status_names);
+        assert!(!config.layout.rounded_corners);
+        config.layout.agent_status_names = false;
+        config.layout.rounded_corners = true;
+        let restored: Config =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert_eq!(restored.notifications.display, NotificationDisplay::Inbox);
+        assert!(!restored.layout.agent_status_names);
+        assert!(restored.layout.rounded_corners);
+    }
 
     #[test]
     fn auto_workspace_rehome_defaults_off_and_roundtrips() {

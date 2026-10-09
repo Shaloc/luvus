@@ -17,7 +17,9 @@ pub fn local_cell_pixels() -> (u16, u16) {
     crate::platform::terminal_cell_pixels().unwrap_or((0, 0))
 }
 
-pub const PROTOCOL_VERSION: u32 = 16;
+// 17 belongs to the incompatible released v0.14.1 wire layout.
+// Keep rejecting it; fork notification delivery starts at 18.
+pub const PROTOCOL_VERSION: u32 = 18;
 pub const PROJECTION_PROTOCOL_VERSION: u32 = 10;
 pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 
@@ -33,6 +35,7 @@ pub fn supports_version(version: u32) -> bool {
             | 13
             | 14
             | 15
+            | 16
             | PROTOCOL_VERSION
     )
 }
@@ -236,6 +239,12 @@ pub enum ServerMessage {
     ScopedClipboard {
         origin: Option<u64>,
         text: String,
+    },
+    /// Transport 18: ordinary feedback is delivered separately from owner
+    /// chrome to one elected display connection and its local inbox.
+    Notification {
+        text: String,
+        level: crate::bar::NotificationLevel,
     },
 }
 
@@ -465,8 +474,8 @@ pub const PROJECTION_CAPABILITY: &str = "projection.v1";
 pub const SESSION_DISPLAY_CAPABILITY: &str = "session_display.v1";
 
 pub fn remote_display_capabilities() -> serde_json::Value {
-    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, 14, 15, PROTOCOL_VERSION],
-        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1", "hyperlinks.v1", "scoped_frames.v1", "scoped_clipboard.v1"]})
+    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, 14, 15, 16, PROTOCOL_VERSION],
+        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1", "hyperlinks.v1", "scoped_frames.v1", "scoped_clipboard.v1", "notifications.v1", "terminal_colors.v1"]})
 }
 
 #[derive(Clone, PartialEq)]
@@ -1581,6 +1590,8 @@ mod tests {
         assert!(supports_version(15));
         assert!(supports_version(16));
         assert!(!supports_version(17));
+        assert!(supports_version(18));
+        assert!(!supports_version(19));
     }
 
     #[test]

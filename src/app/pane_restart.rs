@@ -14,6 +14,7 @@ impl App {
             .get(&id)
             .ok_or("only terminal panes can restart")?;
         let cwd = pane.cwd.clone();
+        let mouse_options = pane.mouse_options;
         let (cols, rows) = pane.size();
         let session = self
             .status
@@ -53,7 +54,7 @@ impl App {
         self.close_pane(id);
 
         let shell = crate::platform::resolve_shell(&self.config.shell);
-        let pane = Pane::spawn_resume_deferred(
+        let mut pane = Pane::spawn_resume_deferred(
             replacement,
             cols,
             rows,
@@ -66,6 +67,7 @@ impl App {
             self.workspace_cell_pixels(workspace),
         );
         let mut status = PaneStatus::new(pane.command.clone());
+        pane.mouse_options = mouse_options;
         if resume.is_some() {
             status.agent = session.as_ref().unwrap().agent.clone();
             status.agent_session = session;
@@ -127,6 +129,10 @@ mod tests {
         let mut app = App::new(120, 40, tx).unwrap();
         let old = app.layout().focus;
         let sibling = app.split_pane(old, Axis::Row, false).unwrap();
+        app.panes.get_mut(&old).unwrap().mouse_options = crate::terminal::pty::PaneMouseOptions {
+            right_click_to_app: true,
+            copy_on_select: false,
+        };
         let sibling_engine = app.panes[&sibling].engine.clone();
         let cwd = app.panes[&old].cwd.clone();
         app.agent_names.insert("kept-name".into(), old);
@@ -173,6 +179,9 @@ mod tests {
         assert_eq!(app.layout().pane_rect(area, new), Some(before));
         assert_eq!(app.layout().len(), 2);
         assert_eq!(app.panes[&new].cwd, cwd);
+        assert!(app.panes[&new].mouse_options.right_click_to_app);
+        assert!(!app.panes[&new].mouse_options.copy_on_select);
+        assert_eq!(app.panes[&sibling].mouse_options, Default::default());
         assert_eq!(app.agent_names["kept-name"], new);
         assert!(app.pinned_agents.contains(&new));
         assert!(app.panes[&new].engine.lock().is_ok());

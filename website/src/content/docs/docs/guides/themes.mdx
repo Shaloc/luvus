@@ -237,3 +237,22 @@ own UI after changing themes or upgrading from incomplete query support.
 DEC private mode 2031 is supported: `CSI ? 996 n` queries the current scheme,
 `CSI ? 2031 h/l` subscribes, DECRQM reports set or reset, and a theme change
 sends `CSI ? 997;1n` (dark) or `CSI ? 997;2n` (light) to subscribed panes.
+
+## Follow the terminal without tinted surfaces
+
+Choose **None** (`none`) in **Settings → Theme**, or run `luvus theme use none`.
+It reuses the terminal theme's probe and child appearance negotiation, while
+keeping the default foreground/background (`Reset`) and terminal ANSI colors.
+It does not derive tinted background surfaces, so terminal transparency remains
+visible. It also disables Luvus's added Codex composer fill. Child applications
+keep their own explicit colors, including a light input background drawn by the
+agent itself. Colored status controls and hostname badges
+remain distinct; selected navigation rows use accent text rather than gray bars.
+
+The existing **Terminal** theme remains available when you prefer derived surface
+colors. Both modes use the displaying terminal's color probe for child light/dark
+and default-color queries. Remote theme synchronization uses the same existing
+owner route. Transport 18 also carries the displaying terminal's colors to the
+active remote workspace, so a remote child can answer OSC 10/11 with the correct
+light or dark defaults. Passive displays cannot overwrite that workspace's
+appearance. Install the updated build on both sides before selecting `none`.

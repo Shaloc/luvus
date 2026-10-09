@@ -1735,15 +1735,16 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     // local session that never resizes would split on the fallback aspect.
     let (cell_width_px, cell_height_px) = ipc::protocol::local_cell_pixels();
     app.set_client_cell_pixels(cell_width_px, cell_height_px);
-    let pending = if app.config.theme == "terminal" {
-        let probe = terminal::theme_probe::probe();
+    // Cache the bounded startup probe even for a static theme, so switching
+    // to None later can immediately answer child color queries correctly.
+    let probe = terminal::theme_probe::probe();
+    app.display_terminal_colors = probe.colors.clone();
+    if crate::ui::theme::follows_terminal(&app.config.theme) {
         if let Some(colors) = probe.colors.as_ref() {
             app.apply_terminal_colors(colors);
         }
-        probe.pending
-    } else {
-        Vec::new()
-    };
+    }
+    let pending = probe.pending;
     // Match the client path: query colors before enabling input protocols, so
     // any interleaved bytes are ordinary keys that can be replayed losslessly.
     let _ = execute!(
@@ -1815,6 +1816,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
             thread::sleep(Duration::from_millis(16) - since);
         }
         app.detect_tick(Instant::now());
+        app.bar.pending_notifications.clear();
         for msg in app.pending_notify.drain(..) {
             emit_notification(&msg);
         }
@@ -1857,6 +1859,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         }
         app.tick_toast(Instant::now());
         app.tick_copy_highlight(Instant::now());
+        app.tick_chrome_hover(Instant::now());
         app.tick_search_flash(Instant::now());
         app.tick_bar_notifications(Instant::now());
         // A forced redraw (resize / regained focus) wipes the terminal so the next
@@ -2770,13 +2773,24 @@ mod tests {
     /// An unnamed pane remains identifiable, while disabling pane titles also
     /// reclaims the lone header row for terminal content.
     #[test]
-    fn unnamed_lone_pane_title_uses_id_and_honors_visibility() {
+    fn unnamed_lone_pane_title_uses_path_and_honors_visibility() {
         let _env = crate::persist::test_env("unnamed-lone-pane-title");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
-        thread::sleep(Duration::from_millis(120));
         let pane = app.layout().focus;
-        let fallback = format!("p{}", pane.0);
+        // A live shell can set an OSC title in its prompt, legitimately taking
+        // precedence over cwd. Keep this no-title fixture independent of it.
+        let (response_tx, _response_rx) = mpsc::channel();
+        app.panes.get_mut(&pane).unwrap().engine = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::terminal::vt::alacritty::AlacrittyEngine::new(
+                80,
+                24,
+                response_tx,
+                crate::config::SCROLLBACK_BYTES_DEFAULT,
+            ),
+        ));
+        let fallback = "/pane-title-fallback".to_string();
+        app.panes.get_mut(&pane).unwrap().cwd = std::path::PathBuf::from(&fallback);
         app.config.layout.pane_title_path = false;
 
         let render = |app: &mut App| -> String {
@@ -2797,10 +2811,7 @@ mod tests {
             .iter()
             .find_map(|(id, rect)| (*id == pane).then_some(rect.height))
             .expect("focused pane content geometry");
-        assert!(
-            shown.contains(&fallback),
-            "unnamed pane shows its stable ID"
-        );
+        assert!(shown.contains(&fallback), "unnamed pane shows its path");
 
         app.config.layout.show_titles = false;
         let hidden = render(&mut app);

@@ -98,6 +98,7 @@ pub enum LayoutRow {
     MobileWidth,
     PaneTitles,
     PaneTitlePath,
+    RoundedCorners,
     ResumeWs,
     DiffLayout,
     DiffWrap,
@@ -136,6 +137,8 @@ pub enum GeneralRow {
     NewPaneToWorkspaceRoot,
     /// Show each agent's live session title in the AGENTS sidebar.
     AgentTitle,
+    NotificationDisplay,
+    NotificationInbox,
     SoundStyle,
     SoundDone,
     SoundBlocked,
@@ -169,6 +172,8 @@ impl App {
             GeneralRow::ResumeFlags,
             GeneralRow::NewPaneToWorkspaceRoot,
             GeneralRow::AgentTitle,
+            GeneralRow::NotificationDisplay,
+            GeneralRow::NotificationInbox,
             GeneralRow::SoundStyle,
             GeneralRow::SoundDone,
             GeneralRow::SoundBlocked,
@@ -199,6 +204,7 @@ impl App {
             LayoutRow::MobileWidth,
             LayoutRow::PaneTitles,
             LayoutRow::PaneTitlePath,
+            LayoutRow::RoundedCorners,
             LayoutRow::ResumeWs,
         ];
         #[cfg(windows)]
@@ -614,6 +620,7 @@ impl App {
                     self.general_rows().get(i),
                     Some(GeneralRow::FileOpen)
                         | Some(GeneralRow::FileClick)
+                        | Some(GeneralRow::NotificationDisplay)
                         | Some(GeneralRow::SoundStyle)
                 ),
                 // Number/enum module settings likewise only move via `‹ ›`.
@@ -909,6 +916,10 @@ impl App {
             // Enter/click: Test rows ring their cue, everything else steps.
             SettingsTab::General => match self.general_rows().get(cursor).copied() {
                 Some(GeneralRow::ClipboardHelper) => self.request_clipboard_helper(true),
+                Some(GeneralRow::NotificationInbox) => {
+                    self.settings = None;
+                    self.open_notification_inbox();
+                }
                 Some(GeneralRow::TestDoneSound) => self.test_sound(crate::sound::SoundCue::Done),
                 Some(GeneralRow::TestBlockedSound) => {
                     self.test_sound(crate::sound::SoundCue::Blocked)
@@ -1297,6 +1308,11 @@ impl App {
         self.theme_selection_revision = self.theme_selection_revision.wrapping_add(1);
         let theme_id = self.config.theme.clone();
         self.set_effective_theme(&theme_id, selected);
+        if theme::follows_terminal(&theme_id) {
+            if let Some(colors) = self.display_terminal_colors.clone() {
+                self.apply_terminal_colors(&colors);
+            }
+        }
         self.changelog_rows = None;
         self.persist_config_patch(&serde_json::json!({"theme": theme_id}));
         true
@@ -1308,7 +1324,7 @@ impl App {
     pub(crate) fn replace_theme_registry(&mut self, registry: crate::theme::ThemeRegistry) -> bool {
         let selected_exists = registry.get(&self.config.theme).is_some();
         self.theme_registry = registry;
-        if self.config.theme != "terminal" {
+        if !theme::follows_terminal(&self.config.theme) {
             let selected = self.theme_registry.theme_or_default(&self.config.theme);
             let theme_id = self.config.theme.clone();
             self.set_effective_theme(&theme_id, selected);
@@ -1393,6 +1409,10 @@ impl App {
             }
             LayoutRow::PaneTitles => {
                 self.config.layout.show_titles = !self.config.layout.show_titles;
+                self.persist_config();
+            }
+            LayoutRow::RoundedCorners => {
+                self.config.layout.rounded_corners = !self.config.layout.rounded_corners;
                 self.persist_config();
             }
             LayoutRow::PaneTitlePath => {
@@ -1705,6 +1725,18 @@ impl App {
                 self.config.layout.agent_title = !self.config.layout.agent_title;
                 self.persist_config();
             }
+            Some(GeneralRow::NotificationDisplay) => {
+                use crate::config::NotificationDisplay;
+                self.config.notifications.display = if self.notifications_in_sidebar() {
+                    NotificationDisplay::Toast
+                } else {
+                    NotificationDisplay::Inbox
+                };
+                self.toast = None;
+                self.notification_inbox.open = false;
+                self.persist_config();
+            }
+            Some(GeneralRow::NotificationInbox) => {}
             Some(GeneralRow::SoundStyle) => self.cycle_sound_style(delta),
             Some(GeneralRow::SoundDone) => {
                 self.config.notifications.sound_on_done = !self.config.notifications.sound_on_done;
@@ -2600,7 +2632,7 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 15);
+        assert_eq!(app.settings_rows(SettingsTab::General), 17);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
         assert_eq!(

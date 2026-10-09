@@ -622,6 +622,7 @@ fn draw_notes_for_anchor(
         f.render_widget(
             Block::new()
                 .borders(Borders::ALL)
+                .border_type(f.border_type())
                 .title(Span::styled(
                     super::truncate(&title, width.saturating_sub(2) as usize),
                     Style::new()
@@ -689,6 +690,7 @@ fn draw_note_composer(f: &mut RenderTarget, area: Rect, y: u16, view: &DiffView,
     f.render_widget(
         Block::new()
             .borders(Borders::ALL)
+            .border_type(f.border_type())
             .title(Span::styled(
                 super::truncate(&title, width.saturating_sub(2) as usize),
                 Style::new().fg(t.accent).bold(),
@@ -785,6 +787,7 @@ fn draw_agent_picker(f: &mut RenderTarget, area: Rect, picker: &DiffAgentPicker,
     f.render_widget(
         Block::new()
             .borders(Borders::ALL)
+            .border_type(f.border_type())
             .title(" Send review notes ")
             .style(Style::new().fg(t.border_focus).bg(t.mantle)),
         rect,

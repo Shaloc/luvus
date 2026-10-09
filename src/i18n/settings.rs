@@ -36,6 +36,14 @@ pub const KEY_REFERENCE_KEYS: &[&[&str]] = &[
 ];
 
 pub struct Catalog {
+    pub notify_display: &'static str,
+    pub notify_toast: &'static str,
+    pub notify_inbox: &'static str,
+    pub notify_open: &'static str,
+    pub notify_empty: &'static str,
+    pub notify_hint: &'static str,
+
+    pub rounded_corners: &'static str,
     pub language_sync_done: &'static str,
     pub language_sync_failed: &'static str,
     pub remote_auto_install: &'static str,
@@ -128,6 +136,13 @@ pub struct Catalog {
 }
 
 pub static EN: Catalog = Catalog {
+    notify_display: "Notification display",
+    notify_toast: "Floating toast",
+    notify_inbox: "Notification inbox",
+    notify_open: "Open history",
+    notify_empty: "No notifications",
+    notify_hint: "r Read · x Clear · c Copy · Esc Close",
+    rounded_corners: "Rounded corners",
     language_sync_done: "Language synchronized: {hosts}",
     language_sync_failed: "Language sync failed: {error}",
     remote_auto_install: "Offer Luvus installation when selecting a host",
@@ -304,6 +319,13 @@ pub static EN: Catalog = Catalog {
 };
 
 pub static ES: Catalog = Catalog {
+    notify_display: "Mostrar notificaciones",
+    notify_toast: "Aviso flotante",
+    notify_inbox: "Bandeja de notificaciones",
+    notify_open: "Abrir historial",
+    notify_empty: "Sin notificaciones",
+    notify_hint: "r Leer · x Borrar · c Copiar · Esc Cerrar",
+    rounded_corners: "Esquinas redondeadas",
     language_sync_done: "Idioma sincronizado: {hosts}",
     language_sync_failed: "Error al sincronizar el idioma: {error}",
     remote_auto_install: "Ofrecer instalar Luvus al seleccionar un host",
@@ -349,6 +371,13 @@ pub static ES: Catalog = Catalog {
 };
 
 pub static PT: Catalog = Catalog {
+    notify_display: "Exibir notificações",
+    notify_toast: "Aviso flutuante",
+    notify_inbox: "Caixa de notificações",
+    notify_open: "Abrir histórico",
+    notify_empty: "Sem notificações",
+    notify_hint: "r Ler · x Limpar · c Copiar · Esc Fechar",
+    rounded_corners: "Cantos arredondados",
     language_sync_done: "Idioma sincronizado: {hosts}",
     language_sync_failed: "Falha ao sincronizar o idioma: {error}",
     remote_auto_install: "Oferecer instalação do Luvus ao selecionar um host",
@@ -392,6 +421,13 @@ pub static PT: Catalog = Catalog {
 };
 
 pub static FR: Catalog = Catalog {
+    notify_display: "Affichage des notifications",
+    notify_toast: "Notification flottante",
+    notify_inbox: "Boîte de notifications",
+    notify_open: "Ouvrir l’historique",
+    notify_empty: "Aucune notification",
+    notify_hint: "r Lu · x Effacer · c Copier · Esc Fermer",
+    rounded_corners: "Coins arrondis",
     language_sync_done: "Langue synchronisée : {hosts}",
     language_sync_failed: "Échec de la synchronisation de la langue : {error}",
     remote_auto_install: "Proposer Luvus à la sélection d’un hôte",
@@ -435,6 +471,13 @@ pub static FR: Catalog = Catalog {
 };
 
 pub static DE: Catalog = Catalog {
+    notify_display: "Benachrichtigungsanzeige",
+    notify_toast: "Schwebender Hinweis",
+    notify_inbox: "Benachrichtigungsfach",
+    notify_open: "Verlauf öffnen",
+    notify_empty: "Keine Benachrichtigungen",
+    notify_hint: "r Gelesen · x Leeren · c Kopieren · Esc Schließen",
+    rounded_corners: "Abgerundete Ecken",
     language_sync_done: "Sprache synchronisiert: {hosts}",
     language_sync_failed: "Sprachsynchronisierung fehlgeschlagen: {error}",
     remote_auto_install: "Luvus-Installation bei Host-Auswahl anbieten",
@@ -478,6 +521,13 @@ pub static DE: Catalog = Catalog {
 };
 
 pub static ID: Catalog = Catalog {
+    notify_display: "Tampilan notifikasi",
+    notify_toast: "Notifikasi mengambang",
+    notify_inbox: "Kotak notifikasi",
+    notify_open: "Buka riwayat",
+    notify_empty: "Tidak ada notifikasi",
+    notify_hint: "r Dibaca · x Hapus · c Salin · Esc Tutup",
+    rounded_corners: "Sudut membulat",
     language_sync_done: "Bahasa disinkronkan: {hosts}",
     language_sync_failed: "Sinkronisasi bahasa gagal: {error}",
     remote_auto_install: "Tawarkan instalasi Luvus saat memilih host",
@@ -651,6 +701,13 @@ pub static ID: Catalog = Catalog {
 };
 
 pub static ZH: Catalog = Catalog {
+    notify_display: "通知显示方式",
+    notify_toast: "浮动提示",
+    notify_inbox: "侧栏通知盒",
+    notify_open: "查看通知历史",
+    notify_empty: "暂无通知",
+    notify_hint: "r 已读 · x 清空 · c 复制 · Esc 关闭",
+    rounded_corners: "圆角模式",
     language_sync_done: "语言已同步：{hosts}",
     language_sync_failed: "语言同步失败：{error}",
     remote_auto_install: "选择主机时提示安装 Luvus",
@@ -821,6 +878,13 @@ pub static ZH: Catalog = Catalog {
 };
 
 pub static JA: Catalog = Catalog {
+    notify_display: "通知の表示方式",
+    notify_toast: "フローティング通知",
+    notify_inbox: "通知ボックス",
+    notify_open: "履歴を開く",
+    notify_empty: "通知はありません",
+    notify_hint: "r 既読 · x 消去 · c コピー · Esc 閉じる",
+    rounded_corners: "角を丸くする",
     language_sync_done: "言語を同期しました：{hosts}",
     language_sync_failed: "言語の同期に失敗しました：{error}",
     remote_auto_install: "ホスト選択時に Luvus のインストールを提案",
@@ -1000,6 +1064,13 @@ pub static JA: Catalog = Catalog {
 };
 
 pub static KO: Catalog = Catalog {
+    notify_display: "알림 표시 방식",
+    notify_toast: "플로팅 알림",
+    notify_inbox: "알림함",
+    notify_open: "기록 열기",
+    notify_empty: "알림 없음",
+    notify_hint: "r 읽음 · x 지우기 · c 복사 · Esc 닫기",
+    rounded_corners: "둥근 모서리",
     language_sync_done: "언어 동기화 완료: {hosts}",
     language_sync_failed: "언어 동기화 실패: {error}",
     remote_auto_install: "호스트 선택 시 Luvus 설치 제안",

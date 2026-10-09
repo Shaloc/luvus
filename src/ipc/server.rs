@@ -457,7 +457,7 @@ pub fn run() -> Result<()> {
     app.reconcile_automations();
     shutdown::install(tx.clone());
 
-    let mut terminal_theme_enabled = app.config.theme == "terminal";
+    let mut terminal_theme_enabled = crate::ui::theme::follows_terminal(&app.config.theme);
     let terminal_theme = Arc::new(AtomicBool::new(terminal_theme_enabled));
     api::start_server(api_listener, tx.clone(), events);
     start_client_listener(client_listener, tx.clone(), terminal_theme.clone());
@@ -600,7 +600,7 @@ pub fn run() -> Result<()> {
             );
             record_event_render_request(source, changed, &mut render_request);
         }
-        let enabled = app.config.theme == "terminal";
+        let enabled = crate::ui::theme::follows_terminal(&app.config.theme);
         if enabled != terminal_theme_enabled {
             terminal_theme_enabled = enabled;
             terminal_theme.store(enabled, Ordering::Relaxed);
@@ -682,6 +682,12 @@ pub fn run() -> Result<()> {
         if app.tick_automations(crate::automation::unix_now()) {
             render_request.record(RenderCause::Detection);
         }
+        for (text, level) in app.bar.pending_notifications.drain(..) {
+            broadcast_projection_notification(
+                &mut clients,
+                ServerMessage::Notification { text, level },
+            );
+        }
         for msg in app.pending_notify.drain(..) {
             broadcast(&mut clients, ServerMessage::Notify(msg));
         }
@@ -730,6 +736,9 @@ pub fn run() -> Result<()> {
             render_request.record(RenderCause::Metadata);
         }
         if app.tick_copy_highlight(Instant::now()) {
+            render_request.record(RenderCause::Metadata);
+        }
+        if app.tick_chrome_hover(Instant::now()) {
             render_request.record(RenderCause::Metadata);
         }
         // Likewise for an expired search-jump flash (docs/63).
@@ -1137,6 +1146,15 @@ fn apply(
                 client.force_full = true;
                 return client.surface_active();
             }
+            if let ClientInput::TerminalColors(colors) = input {
+                let Some(client) = clients.get_mut(&id) else {
+                    return false;
+                };
+                client.terminal_colors = colors;
+                client.force_full = true;
+                // Metadata does not activate a hidden projection or claim PTY ownership.
+                return client.surface_active();
+            }
             if let ClientInput::Graphics {
                 cell_width,
                 cell_height,
@@ -1260,6 +1278,7 @@ fn apply(
                     ClientInput::InputSourceClosed { .. }
                     | ClientInput::ClipboardHelperOrigin(_)
                     | ClientInput::CellPixels { .. }
+                    | ClientInput::TerminalColors(_)
                     | ClientInput::Graphics { .. }
                     | ClientInput::Resize(..)
                     | ClientInput::ProjectionInterest { .. }
@@ -1273,13 +1292,15 @@ fn apply(
                 // another client's earlier request cannot be consumed here.
                 let previous_switch = app.pending_session_switch.take();
                 let previous_detach = std::mem::take(&mut app.detach_requested);
-                let changed = app.with_preserved_workspace_sidebar(|app| {
-                    app.handle_client_event_with_surface(
-                        id,
-                        relay_origin.flatten(),
-                        client.version >= 16,
-                        event,
-                    )
+                let changed = app.with_display_appearance(client.terminal_colors.as_ref(), |app| {
+                    app.with_preserved_workspace_sidebar(|app| {
+                        app.handle_client_event_with_surface(
+                            id,
+                            relay_origin.flatten(),
+                            client.version >= 16,
+                            event,
+                        )
+                    })
                 });
                 if let Some(text) = app
                     .commander
@@ -1405,6 +1426,7 @@ fn apply(
                 ClientInput::Command(command) => AppEvent::ClientCommand(command),
                 ClientInput::InputSourceClosed { .. }
                 | ClientInput::CellPixels { .. }
+                | ClientInput::TerminalColors(_)
                 | ClientInput::Graphics { .. }
                 | ClientInput::ClipboardHelperOrigin(_)
                 | ClientInput::Resize(..)
@@ -1592,6 +1614,14 @@ fn dispatch_clipboard(
     });
 }
 
+fn broadcast_projection_notification(clients: &mut Clients, msg: ServerMessage) {
+    clients.retain(|_, client| {
+        client.version < 18
+            || client.projection.is_none()
+            || client.send_control(msg.clone()).is_ok()
+    });
+}
+
 fn broadcast(clients: &mut Clients, msg: ServerMessage) {
     clients.retain(|_, client| client.send_control(msg.clone()).is_ok());
 }
@@ -1626,14 +1656,14 @@ fn workspace_size_owner(
 }
 
 fn apply_foreground_theme(app: &mut App, clients: &Clients, foreground: Option<u64>) {
-    if app.config.theme != "terminal" {
-        return;
-    }
-    if let Some(colors) = foreground
+    let colors = foreground
         .and_then(|id| clients.get(&id))
-        .and_then(|client| client.terminal_colors.as_ref())
-    {
-        app.apply_terminal_colors(colors);
+        .and_then(|client| client.terminal_colors.as_ref());
+    app.display_terminal_colors = colors.cloned();
+    if crate::ui::theme::follows_terminal(&app.config.theme) {
+        if let Some(colors) = colors {
+            app.apply_terminal_colors(colors);
+        }
     }
 }
 
@@ -1967,7 +1997,8 @@ fn render_client(
     client_id: Option<u64>,
 ) -> RenderClientOutcome {
     let origin = client.render_origin;
-    app.with_input_source(client_id, origin, |app| {
+    let previous_chrome = app.relay_notification_chrome;
+    let outcome = app.with_input_source(client_id, origin, |app| {
         if !client.surface_active() {
             return RenderClientOutcome::default();
         }
@@ -1988,6 +2019,7 @@ fn render_client(
             && !client.behind
             && client.last_frame.is_some();
         let patched = if may_patch {
+            app.relay_notification_chrome = client.version >= 18 && client.projection.is_some();
             let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
             ui::patch_terminal_damage(
                 &mut target,
@@ -2021,6 +2053,13 @@ fn render_client(
                         for (id, pane) in &app.panes {
                             if tab.layout.contains(*id) {
                                 pane.set_cell_pixels(client.layout_cell_pixels());
+                                if crate::ui::theme::follows_terminal(&app.config.theme) {
+                                    if let Some(colors) = client.terminal_colors.as_ref() {
+                                        if let Ok(mut engine) = pane.engine.lock() {
+                                            engine.set_appearance(crate::terminal::appearance::PaneAppearance::from_terminal_colors(colors));
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2036,6 +2075,7 @@ fn render_client(
             }
             FULL_TERMINAL_PROJECTIONS.fetch_add(1, Ordering::Relaxed);
             client.render_buf.reset();
+            app.relay_notification_chrome = client.version >= 18 && client.projection.is_some();
             let mut target = ui::RenderTarget::new(&mut client.render_buf, area);
             target.graphics_enabled = client.graphics.is_some();
             if let Some(workspace_id) = client.workspace_id.as_deref() {
@@ -2066,6 +2106,7 @@ fn render_client(
                 client.retained_hyperlinks = projection.hyperlinks;
                 client.retained_ready = true;
             }
+            app.relay_notification_chrome = false;
             let cursor = (target.cursor(), target.cursor_visible());
             graphics = std::mem::take(&mut target.graphics);
             cursor
@@ -2231,11 +2272,13 @@ fn render_client(
             let mut public_buffer = Buffer::empty(area);
             let mut target = ui::RenderTarget::new(&mut public_buffer, area);
             target.graphics_enabled = client.graphics.is_some();
+            app.relay_notification_chrome = client.version >= 18 && client.projection.is_some();
             let projection = if let Some(workspace_id) = client.workspace_id.as_deref() {
                 ui::render_workspace_projection(&mut target, app, workspace_id)
             } else {
                 ui::render_projection(&mut target, app)
             };
+            app.relay_notification_chrome = false;
             let public_cursor = (target.cursor(), target.cursor_visible());
             let public_graphics = std::mem::take(&mut target.graphics);
             let mut frame =
@@ -2282,7 +2325,9 @@ fn render_client(
                 disconnected: true,
             },
         }
-    })
+    });
+    app.relay_notification_chrome = previous_chrome;
+    outcome
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2423,8 +2468,9 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
         return;
     }
 
-    let probe_terminal =
-        !managed_projection && workspace_id.is_none() && terminal_theme.load(Ordering::Relaxed);
+    let probe_terminal = !managed_projection
+        && workspace_id.is_none()
+        && (version >= 18 || terminal_theme.load(Ordering::Relaxed));
     if protocol::write_message(&mut writer, &ServerMessage::Ready { probe_terminal }).is_err() {
         return;
     }
@@ -2735,6 +2781,17 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             Ok(ClientMessage::ClipboardSucceeded { receipt }) if tracks_clipboard => {
                 if app_tx
                     .send(AppEvent::ClientClipboardSucceeded { id, receipt })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ClientMessage::TerminalColors(colors)) if version >= 18 && managed_projection => {
+                if app_tx
+                    .send(AppEvent::ClientInput {
+                        id,
+                        input: ClientInput::TerminalColors(colors),
+                    })
                     .is_err()
                 {
                     break;
@@ -4236,6 +4293,146 @@ mod tests {
             assert!(fixture.clients.contains_key(&2));
             assert!(!fixture.clients[&2].private_frame_active);
             assert!(fixture.app.panes[&pane].size().1 > private_size.1);
+        }
+
+        #[test]
+        fn projection_terminal_colors_follow_owner_without_passive_focus_or_palette_changes() {
+            use crate::ipc::server::ProjectionSubscription;
+            use crate::terminal::{
+                appearance::PaneAppearance, pty::InputAction, theme_probe::TerminalColors, vt,
+            };
+            let _env = crate::persist::test_env("projection-terminal-colors");
+            let mut fixture = Fixture::new();
+            fixture.api(
+                "config.patch",
+                serde_json::json!({"patch": {"theme": "none"}}),
+            );
+            let colors = |fg, bg| TerminalColors {
+                fg,
+                bg,
+                palette: [[0; 3]; 16],
+            };
+            let dark = colors([220; 3], [20; 3]);
+            let light = colors([40; 3], [240; 3]);
+            fixture.clients.get_mut(&1).unwrap().terminal_colors = Some(dark);
+            fixture.clients.get_mut(&2).unwrap().projection = Some(ProjectionSubscription {
+                active: true,
+                epoch: 1,
+                ..Default::default()
+            });
+            let target = fixture.target_pane();
+            let mut receivers = Vec::new();
+            for pane in [fixture.foreground_pane, target] {
+                let (tx, rx) = mpsc::channel();
+                fixture.app.panes.get_mut(&pane).unwrap().engine = vt::create_engine(
+                    vt::VtEngineKind::default(),
+                    80,
+                    24,
+                    tx,
+                    65536,
+                    PaneAppearance::default(),
+                );
+                receivers.push(rx);
+            }
+            let activity = fixture.clients[&2].last_activity;
+            fixture.input(2, ClientInput::TerminalColors(Some(light.clone())));
+            assert_eq!(fixture.clients[&2].last_activity, activity);
+            fixture.render();
+            let read_bg = |app: &App, pane, rx: &mpsc::Receiver<InputAction>| {
+                rx.try_iter().for_each(drop);
+                app.panes[&pane]
+                    .engine
+                    .lock()
+                    .unwrap()
+                    .advance(b"\x1b]11;?\x07");
+                let InputAction::Bytes(bytes) = rx.try_recv().unwrap() else {
+                    panic!()
+                };
+                String::from_utf8(bytes).unwrap()
+            };
+            assert!(
+                read_bg(&fixture.app, fixture.foreground_pane, &receivers[0])
+                    .contains("1414/1414/1414")
+            );
+            assert!(read_bg(&fixture.app, target, &receivers[1]).contains("f0f0/f0f0/f0f0"));
+            let (mut passive, passive_rx) = projection_client(fixture.workspace_id.clone(), 0);
+            passive.projection = Some(ProjectionSubscription {
+                active: true,
+                epoch: 1,
+                ..Default::default()
+            });
+            fixture.clients.insert(3, passive);
+            fixture._client_receivers.push(passive_rx);
+            fixture.input(
+                3,
+                ClientInput::TerminalColors(Some(colors([250; 3], [5; 3]))),
+            );
+            fixture.render();
+            assert!(read_bg(&fixture.app, target, &receivers[1]).contains("f0f0/f0f0/f0f0"));
+            assert_eq!(fixture.foreground, Some(1));
+            assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
+            fixture
+                .clients
+                .get_mut(&2)
+                .unwrap()
+                .projection
+                .as_mut()
+                .unwrap()
+                .active = false;
+            fixture.input(2, ClientInput::TerminalColors(Some(light)));
+            assert!(!fixture.clients[&2].surface_active());
+        }
+
+        #[test]
+        fn projection_notifications_negotiate_delivery_and_suppress_only_new_owner_chrome() {
+            let _env = crate::persist::test_env("projection-notification-delivery");
+            let mut fixture = Fixture::new();
+            fixture.clients.get_mut(&2).unwrap().projection = Some(Default::default());
+            fixture.input(
+                2,
+                ClientInput::ProjectionInterest {
+                    epoch: 1,
+                    active: true,
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            for version in [16, 18] {
+                fixture.clients.get_mut(&2).unwrap().version = version;
+                fixture.app.show_toast("NOTIFICATION-PROOF");
+                fixture.render();
+                let text = |id| {
+                    fixture.clients[&id]
+                        .last_frame
+                        .as_ref()
+                        .unwrap()
+                        .cells
+                        .iter()
+                        .map(|cell| cell.symbol.as_str())
+                        .collect::<String>()
+                };
+                assert!(
+                    text(1).contains("NOTIFICATION-PROOF"),
+                    "ordinary local client keeps toast"
+                );
+                assert_eq!(text(2).contains("NOTIFICATION-PROOF"), version < 18);
+                assert!(!fixture.app.relay_notification_chrome);
+                for rx in &fixture._client_receivers {
+                    rx.try_iter().for_each(drop);
+                }
+                crate::ipc::server::broadcast_projection_notification(
+                    &mut fixture.clients,
+                    ServerMessage::Notification {
+                        text: "NOTIFICATION-PROOF".into(),
+                        level: crate::bar::NotificationLevel::Info,
+                    },
+                );
+                assert!(fixture._client_receivers[0].try_recv().is_err());
+                assert_eq!(
+                    fixture._client_receivers[1].try_recv().is_ok(),
+                    version >= 18
+                );
+            }
         }
 
         #[test]

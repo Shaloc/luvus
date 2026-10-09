@@ -266,8 +266,10 @@ impl App {
                 "automation.run_failed",
                 json!({"run_id": run_id, "automation_id": run.automation_id, "code": "no_session"}),
             );
-            self.pending_notify
-                .push(format!("Automation {} could not start", run.automation_id));
+            self.queue_desktop_notification(format!(
+                "Automation {} could not start",
+                run.automation_id
+            ));
             return true;
         }
 
@@ -285,8 +287,10 @@ impl App {
                     "automation.run_failed",
                     json!({"run_id": run_id, "automation_id": run.automation_id, "code": code}),
                 );
-                self.pending_notify
-                    .push(format!("Automation {} could not start", run.automation_id));
+                self.queue_desktop_notification(format!(
+                    "Automation {} could not start",
+                    run.automation_id
+                ));
                 return true;
             }
         };
@@ -385,8 +389,10 @@ impl App {
                     "automation.run_failed",
                     json!({"automation_id": run.automation_id, "run_id": run_id, "task_id": task_id, "code": code}),
                 );
-                self.pending_notify
-                    .push(format!("Automation {} failed to start", run.automation_id));
+                self.queue_desktop_notification(format!(
+                    "Automation {} failed to start",
+                    run.automation_id
+                ));
             }
         }
         true
@@ -416,8 +422,10 @@ impl App {
             json!({"automation_id": run.automation_id, "run_id": run_id,
                 "task_id": run.task_id, "code": "git_error", "message": message}),
         );
-        self.pending_notify
-            .push(format!("Automation {} failed to start", run.automation_id));
+        self.queue_desktop_notification(format!(
+            "Automation {} failed to start",
+            run.automation_id
+        ));
     }
 
     pub(crate) fn validate_active_agent_target(
@@ -1247,7 +1255,7 @@ impl App {
                 },
             }),
         );
-        self.pending_notify.push(format!(
+        self.queue_desktop_notification(format!(
             "Automation {}: {}",
             run.automation_id,
             match status {
@@ -1472,7 +1480,7 @@ impl App {
             json!({"automation_id": automation_id, "run_id": run_id, "task_id": task_id, "status": status}),
         );
         if terminal {
-            self.pending_notify.push(format!(
+            self.queue_desktop_notification(format!(
                 "Automation {automation_id}: {}",
                 match status {
                     RunStatus::Succeeded => "done",

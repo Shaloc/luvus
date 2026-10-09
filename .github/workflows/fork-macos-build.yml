@@ -92,6 +92,11 @@ jobs:
           cmp skills/luvus/SKILL.md "$RUNNER_TEMP/luvus-skill.md"
           python3 scripts/test-fork-installer.py "target/$TARGET/release/luvus"
           echo "name=$package" >> "$GITHUB_OUTPUT"
+      - name: Isolated pane controls, native appearance and notification smoke
+        run: |
+          python3 -m venv target/ui-appearance-test-env
+          target/ui-appearance-test-env/bin/pip install pyte==0.8.2
+          target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --appearance-only
       - name: Isolated local and remote Kitty transport smoke
         run: |
           # Same checkout binary, private homes and fake SSH only; no real hosts.

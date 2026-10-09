@@ -223,7 +223,13 @@ pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
             Style::new().fg(t.crust).bg(t.accent).bold()
         } else {
             // Inactive tab: same as the pane background.
-            Style::new().fg(t.subtext0).bg(t.mantle)
+            Style::new()
+                .fg(t.subtext0)
+                .bg(if app.config.layout.rounded_corners {
+                    t.surface0
+                } else {
+                    t.mantle
+                })
         };
         // Paint the whole tab first: the label widget covers all but the reserved
         // `✕` columns, which stay the tab's own colour on an inactive tab.
@@ -241,6 +247,7 @@ pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
             );
             close_rects.push((i, close));
         }
+        f.pill_caps(rect, style.bg.unwrap_or(t.mantle), t.mantle);
         tab_rects.push((i, rect));
         x += w + GAP;
     }
@@ -268,6 +275,7 @@ pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
             )),
             rect,
         );
+        f.pill_caps(rect, t.surface0, t.mantle);
         tab_rects.push((n, rect));
     }
     (tab_rects, close_rects, prev_rect, next_rect)

@@ -98,6 +98,7 @@ pub(super) fn draw_settings(
     f.render_widget(Clear, modal);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(modal);
@@ -782,6 +783,18 @@ fn draw_content(
                             t,
                         ));
                     }
+                    LayoutRow::RoundedCorners => {
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.settings.rounded_corners,
+                            toggle(l.rounded_corners, t),
+                            t,
+                        ));
+                    }
                     LayoutRow::PaneTitlePath => {
                         ctls.push(ctl_row(
                             f,
@@ -1131,6 +1144,40 @@ fn draw_content(
                         cursor,
                         cat.set_agent_title,
                         toggle(app.config.layout.agent_title, t),
+                        t,
+                    )),
+                    GeneralRow::NotificationDisplay => {
+                        let value = if app.notifications_in_sidebar() {
+                            cat.settings.notify_inbox
+                        } else {
+                            cat.settings.notify_toast
+                        };
+                        ctls.push((
+                            i,
+                            slider_row(
+                                f,
+                                area,
+                                y,
+                                i,
+                                cursor == i,
+                                cat.settings.notify_display,
+                                value.to_string(),
+                                t,
+                                &mut arrows,
+                            ),
+                        ));
+                    }
+                    GeneralRow::NotificationInbox => ctls.push(ctl_row(
+                        f,
+                        area,
+                        y,
+                        i,
+                        cursor,
+                        cat.settings.notify_inbox,
+                        Line::from(Span::styled(
+                            cat.settings.notify_open,
+                            Style::new().fg(t.accent),
+                        )),
                         t,
                     )),
                     GeneralRow::SoundStyle => {
@@ -1653,6 +1700,7 @@ pub(super) fn draw_module_setting_prompt(f: &mut RenderTarget, area: Rect, app: 
     f.render_widget(Clear, rect);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(rect);

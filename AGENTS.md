@@ -117,6 +117,9 @@ boundaries are:
   without changing legacy frames, graphics, or workspace identity checks.
   Transport 16 adds clipboard receipts and origin-scoped Commander frames and
   copies; shared display channels must retain their source and owner fences.
+  Transport 18 adds session notification delivery and active-display terminal
+  colors; transport 17 is reserved for an incompatible historical upstream wire
+  layout and must remain rejected. Passive displays must not change child colors.
 - `src/ipc/api.rs` and `src/ipc/transport.rs`: bounded local API handling plus
   Unix-socket and Windows-named-pipe transport.
 - `src/ui/`: Ratatui rendering, panes, sidebars, docks, tab bar, settings,

@@ -1920,9 +1920,10 @@ mod tests {
         app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(
             app.agent_menu.as_ref().and_then(|menu| menu.selected),
-            Some(4),
+            Some(5),
             "keyboard navigation skips the divider"
         );
     }

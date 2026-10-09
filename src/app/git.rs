@@ -138,7 +138,9 @@ impl App {
                         if let Some(ab) = badge {
                             self.workspaces[wi].git_ahead_behind = Some(ab);
                         }
-                        self.pending_notify.extend(alerts);
+                        for alert in alerts {
+                            self.queue_desktop_notification(alert);
+                        }
                         return;
                     }
                 }

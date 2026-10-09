@@ -614,6 +614,285 @@ mod tests {
     }
 
     #[test]
+    fn agent_presentation_badges_status_names_and_folds_keep_owner_routes() {
+        use crate::app::{AgentDockTarget, SidebarListFocus};
+        use crate::event::AppEvent;
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("agent-presentation");
+        let mut app = remote_ui_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.app_tx = tx;
+        let (view, input, _) = add_remote_workspace(&mut app);
+        remote_view(&mut app, view).agents = vec![agent(7, false)];
+        app.set_agents_filter(true);
+        app.config.layout.agent_paths = false;
+        app.config.agents_group_by_workspace = true;
+        let text = render(&mut app);
+        let header = app.agent_group_rects[0].1;
+        let agent_rect = app.remote_agent_rects[0].2;
+        let buffer = render_buffer(&mut app);
+        let line = |y| {
+            (app.agents_area.x..app.agents_area.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(line(header.y).contains("dev-207"));
+        assert!(!line(header.y).contains("[dev-207]"));
+        assert!(!line(agent_rect.y).contains("dev-207"));
+        assert!(line(agent_rect.y).contains("blocked"), "{text}");
+        let hint = app
+            .chrome_hint_at(Some((agent_rect.x, agent_rect.y)))
+            .unwrap()
+            .1;
+        assert!(hint.contains("dev-207"), "{hint}");
+        assert!(hint.contains(app.catalog.menu_agent_states[1]), "{hint}");
+        app.open_agent_menu(AgentTarget::Dock, 2, 2);
+        app.agent_menu_action(AgentMenuItem::ToggleStatusNames);
+        app.flush_config_for_test(&rx);
+        assert!(!crate::config::load().layout.agent_status_names);
+        app.agent_menu = None;
+        let buffer = render_buffer(&mut app);
+        let line: String = (agent_rect.x..agent_rect.right())
+            .map(|x| buffer[(x, agent_rect.y)].symbol())
+            .collect();
+        assert!(!line.contains("blocked") && line.contains(crate::ui::theme::State::Blocked.dot()));
+        assert!(input.try_recv().is_err());
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: header.x + 2,
+            row: header.y,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(app.agent_workspace_collapsed(1));
+        assert_eq!(
+            app.agent_dock_targets(),
+            vec![AgentDockTarget::Workspace(1)]
+        );
+        render(&mut app);
+        assert!(app.remote_agent_rects.is_empty());
+        app.sidebar_focus = Some(SidebarListFocus::Agents);
+        app.handle_agents_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(!app.agent_workspace_collapsed(1));
+        assert_eq!(app.agent_cursor, 1);
+        app.handle_agents_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.agent_workspace_collapsed(1));
+        assert_eq!(app.agent_cursor, 0);
+        // Identity survives local indices shifting, without folding another owner.
+        app.workspaces.swap(0, 1);
+        assert!(app.agent_workspace_collapsed(0));
+        assert!(!app.agent_workspace_collapsed(1));
+        app.toggle_agent_workspace(0);
+        app.handle_agents_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.handle_agents_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(input.try_recv().unwrap(), ClientMessage::Command(cmd) if cmd == "remote_agent_focus 7")
+        );
+        assert_eq!(app.active_ws, 0);
+    }
+
+    #[test]
+    fn agent_worktree_groups_keep_context_filter_folds_and_owner_routes() {
+        use crate::app::{AgentDockTarget, PaneStatus, SidebarListFocus};
+        use crate::event::AppEvent;
+        use crate::ui::theme::State;
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("agent-worktree-hierarchy");
+        let mut app = remote_ui_app();
+        let local = app.workspaces[0].tabs[0].layout.focus;
+        app.status.insert(local, PaneStatus::new("codex".into()));
+        app.status.get_mut(&local).unwrap().state = State::Working;
+        // Discovery can open a linked worktree before its main checkout.
+        let (child, input, _) = add_remote_workspace(&mut app);
+        let (parent, parent_input, _) = add_remote_workspace(&mut app);
+        for (ws, pane, name, linked) in [(1, child, "feature", true), (2, parent, "api", false)] {
+            app.workspaces[ws].id = format!("projection-{name}");
+            app.workspaces[ws].name = name.into();
+            app.workspaces[ws].remote.as_mut().unwrap().workspace_id = name.into();
+            remote_view(&mut app, pane).target.workspace_id = name.into();
+            app.workspaces[ws].worktree = Some(crate::git::WorktreeMembership {
+                common_dir: "/srv/api/.git".into(),
+                directory_identity: None,
+                linked,
+            });
+        }
+        remote_view(&mut app, child).agents = vec![agent(7, false), agent(8, true)];
+        app.agents_active_only = true;
+        app.config.agents_group_by_workspace = true;
+        app.config.agents_status_filter.working = false;
+        let expected = vec![
+            AgentDockTarget::Workspace(2),
+            AgentDockTarget::Workspace(1),
+            AgentDockTarget::RemoteLive {
+                view: child,
+                pane: "8".into(),
+            },
+            AgentDockTarget::RemoteLive {
+                view: child,
+                pane: "7".into(),
+            },
+        ];
+        assert_eq!(app.agent_dock_targets(), expected);
+        for paths in [false, true] {
+            app.config.layout.agent_paths = paths;
+            app.agent_cursor = 0;
+            app.sidebar_focus = Some(SidebarListFocus::Agents);
+            let buffer = render_buffer(&mut app);
+            assert_eq!(app.agent_cursor, 2, "skip consecutive expanded headings");
+            assert_eq!(
+                app.agent_group_rects
+                    .iter()
+                    .map(|r| r.0)
+                    .collect::<Vec<_>>(),
+                vec![2, 1]
+            );
+            let line = |rect: Rect| {
+                (rect.x..rect.right())
+                    .map(|x| buffer[(x, rect.y)].symbol())
+                    .collect::<String>()
+            };
+            let root_line = line(app.agent_group_rects[0].1);
+            let child_line = line(app.agent_group_rects[1].1);
+            let agent_line = line(app.remote_agent_rects[0].2);
+            assert!(root_line.contains("dev-207") && root_line.contains("api"));
+            assert!(child_line.contains("feature") && !child_line.contains("dev-207"));
+            assert!(!agent_line.contains("dev-207"));
+            let column =
+                |line: &str, glyph: &str| line.chars().position(|c| glyph.starts_with(c)).unwrap();
+            assert_eq!(column(&child_line, "▾"), column(&root_line, "▾") + 2);
+            assert_eq!(
+                column(&agent_line, State::Blocked.dot()),
+                column(&root_line, "▾") + 4
+            );
+            assert_eq!(app.remote_agent_rects[0].1, "8", "pin order within child");
+            let header = app.agent_group_rects[0].1;
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: header.x + 2,
+                row: header.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert_eq!(
+                app.agent_dock_targets(),
+                vec![AgentDockTarget::Workspace(2)]
+            );
+            render(&mut app);
+            assert!(app.remote_agent_rects.is_empty());
+            app.sidebar_focus = Some(SidebarListFocus::Agents);
+            app.handle_agents_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+            assert_eq!(app.agent_dock_targets(), expected);
+            assert_eq!(app.agent_cursor, 2);
+        }
+        app.handle_agents_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.agent_workspace_collapsed(1));
+        app.handle_agents_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.agent_workspace_collapsed(2));
+        app.handle_agents_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.agent_cursor, 1, "child retains its own fold");
+        app.handle_agents_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.agent_cursor, 2);
+        app.handle_agents_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(input.try_recv().unwrap(), ClientMessage::Command(cmd) if cmd == "remote_agent_focus 8")
+        );
+        assert!(
+            parent_input.try_recv().is_err(),
+            "context headings do not control the parent owner"
+        );
+        assert_eq!(app.active_ws, 1);
+        app.agents_this_workspace = true;
+        assert_eq!(
+            app.agent_dock_targets(),
+            expected,
+            "scope retains parent context"
+        );
+        app.config.agents_status_filter.blocked = false;
+        assert!(
+            app.agent_dock_targets().is_empty(),
+            "no empty tree when no agents match"
+        );
+    }
+
+    #[test]
+    fn agent_worktree_groups_share_workspace_pins_and_owner_boundaries() {
+        let _env = crate::persist::test_env("agent-worktree-owners");
+        let mut app = remote_ui_app();
+        let mut receivers = Vec::new();
+        for _ in 0..4 {
+            receivers.push(add_remote_workspace(&mut app).1);
+        }
+        // Identical filesystem paths across hosts/sessions must never nest.
+        for (i, ws) in app.workspaces.iter_mut().enumerate() {
+            ws.id = format!("ws-{i}");
+            ws.worktree = Some(crate::git::WorktreeMembership {
+                common_dir: "/srv/api/.git".into(),
+                directory_identity: None,
+                linked: i >= 2,
+            });
+        }
+        app.workspaces[3].remote.as_mut().unwrap().host = "dev-63".into();
+        app.workspaces[4].remote.as_mut().unwrap().session = "other".into();
+        app.agents_active_only = true;
+        app.config.agents_group_by_workspace = true;
+        let rows = |app: &App| {
+            app.group_agent_dock_rows(
+                vec![
+                    (3, "r3".to_owned()),
+                    (2, "r2".into()),
+                    (0, "r0".into()),
+                    (4, "r4".into()),
+                ],
+                |ws, child| format!("h{ws}:{child}"),
+            )
+        };
+        assert_eq!(
+            rows(&app),
+            vec!["h0:false", "r0", "h1:false", "h2:true", "r2", "h3:false", "r3", "h4:false", "r4"]
+        );
+        app.workspaces[2].pinned = true;
+        assert_eq!(
+            rows(&app),
+            vec!["h1:false", "h2:true", "r2", "h0:false", "r0", "h3:false", "r3", "h4:false", "r4"]
+        );
+        app.toggle_agent_workspace(1);
+        assert_eq!(
+            rows(&app),
+            vec!["h1:false", "h0:false", "r0", "h3:false", "r3", "h4:false", "r4"]
+        );
+        // If the parent is no longer part of that repository, the orphan is a
+        // root exactly as in WORKSPACES, unaffected by the former parent fold.
+        app.workspaces[1].worktree = None;
+        assert_eq!(
+            rows(&app),
+            vec!["h2:false", "r2", "h0:false", "r0", "h3:false", "r3", "h4:false", "r4"]
+        );
+        app.config.agents_group_by_workspace = false;
+        assert_eq!(rows(&app), vec!["r3", "r2", "r0", "r4"]);
+        app.config.agents_group_by_workspace = true;
+        app.agents_active_only = false;
+        assert_eq!(rows(&app), vec!["r3", "r2", "r0", "r4"]);
+        assert!(receivers.iter().all(|rx| rx.try_recv().is_err()));
+    }
+
+    #[test]
+    fn passive_agent_projection_keeps_group_hit_rectangles() {
+        let _env = crate::persist::test_env("agent-group-passive");
+        let mut app = remote_ui_app();
+        let (view, _input, _) = add_remote_workspace(&mut app);
+        remote_view(&mut app, view).agents = vec![agent(7, false)];
+        app.set_agents_filter(true);
+        app.config.agents_group_by_workspace = true;
+        render(&mut app);
+        let rects = app.agent_group_rects.clone();
+        let area = Rect::new(0, 0, 90, 20);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        crate::ui::render_projection(
+            &mut crate::ui::RenderTarget::new(&mut buffer, area),
+            &mut app,
+        );
+        assert_eq!(app.agent_group_rects, rects);
+    }
+
+    #[test]
     fn active_grouping_multiselect_matches_remote_mouse_and_keyboard_rows() {
         use crate::app::{AgentDockTarget, PaneStatus, SidebarListFocus};
         use crate::event::AppEvent;

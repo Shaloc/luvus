@@ -440,7 +440,7 @@ pub(super) fn draw_file_view(
             for x in body.x..body.right() {
                 if file_selection_contains(sel, x, y, text_x) {
                     if let Some(cell) = buf.cell_mut((x, y)) {
-                        cell.set_bg(t.sel_bg);
+                        cell.set_style(t.selection_style());
                     }
                 }
             }
@@ -837,6 +837,7 @@ pub(super) fn draw_named_delete_confirm(
     f.render_widget(Clear, modal);
     let block = Block::new()
         .borders(Borders::ALL)
+        .border_type(f.border_type())
         .border_style(Style::new().fg(t.coral).bg(t.surface0))
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(modal);
