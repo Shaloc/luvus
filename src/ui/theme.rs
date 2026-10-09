@@ -16,6 +16,60 @@ fn pal(c: [u8; 3]) -> Color {
 }
 
 impl Theme {
+    /// Resolve only chrome surfaces against the displaying terminal. Main pane
+    /// foreground/background remain Reset in None mode; child colors are untouched.
+    pub(crate) fn chrome(&self, colors: Option<&TerminalColors>) -> Self {
+        let mut theme = self.clone();
+        if self.crust == Color::Reset {
+            theme.crust = colors.map_or(Color::Indexed(0), |c| blend_rgb(c.bg, c.fg, 0.07));
+        }
+        if self.surface0 == Color::Reset {
+            theme.surface0 = colors.map_or(Color::Indexed(8), |c| blend_rgb(c.bg, c.fg, 0.12));
+        }
+        if self.surface1 == Color::Reset {
+            theme.surface1 = colors.map_or(Color::Indexed(8), |c| blend_rgb(c.bg, c.fg, 0.19));
+        }
+        if let (Color::Indexed(index), Some(c)) = (self.accent, colors) {
+            if let Some(rgb) = c.palette.get(index as usize) {
+                theme.accent = pal(*rgb);
+            }
+        }
+        theme
+    }
+
+    /// Filled controls need their own foreground, not the canvas background:
+    /// Reset would use dark terminal text even on a saturated dark accent.
+    pub(crate) fn on_color(&self, background: Color) -> Color {
+        let rgb = match background {
+            Color::Rgb(r, g, b) => [r, g, b],
+            Color::Indexed(i) => {
+                crate::terminal::appearance::query_color(Color::Indexed(i), [0; 3])
+                    .unwrap_or([0; 3])
+            }
+            Color::White => [255; 3],
+            Color::Gray => [192; 3],
+            Color::Yellow => [255, 255, 0],
+            Color::LightGreen => [0, 255, 0],
+            Color::LightCyan => [0, 255, 255],
+            Color::Reset => return self.text,
+            _ => [0; 3],
+        };
+        let linear = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = 0.2126 * linear(rgb[0]) + 0.7152 * linear(rgb[1]) + 0.0722 * linear(rgb[2]);
+        if luminance > 0.179 {
+            Color::Rgb(0, 0, 0)
+        } else {
+            Color::Rgb(255, 255, 255)
+        }
+    }
+
     /// Text selection must remain visible when chrome has no background fill.
     pub fn selection_style(&self) -> Style {
         if self.sel_bg == Color::Reset {

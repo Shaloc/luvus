@@ -670,7 +670,7 @@ pub(crate) fn patch_terminal_damage(
 }
 
 fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, workspace_only: bool) {
-    let notifications = if app.relay_notification_chrome || app.notifications_in_sidebar() {
+    let notifications = if app.relay_notification_chrome || app.notifications_in_inbox() {
         Some(std::mem::take(&mut app.bar.notifications))
     } else {
         None
@@ -678,8 +678,41 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
     render_into_mode_impl(f, app, resize_panes, workspace_only);
     let area = f.area();
     if let Some((rect, text)) = app.chrome_hint_at(app.hover) {
-        f.buffer_mut()
-            .set_style(rect.intersection(area), Style::new().underlined());
+        let t = app.theme.chrome(app.display_terminal_colors.as_ref());
+        // Preserve selected rows and filled badges; hover only raises the
+        // surrounding neutral surface, so owner focus remains distinguishable.
+        let hover_area = rect.intersection(area);
+        let pane_title = app.pane_title_rects.iter().any(|(_, title)| *title == rect)
+            || app
+                .pane_mouse_rects
+                .iter()
+                .any(|(_, _, button)| *button == rect)
+            || [
+                app.pane_close_rect,
+                app.pane_zoom_rect,
+                app.pane_restart_rect,
+            ]
+            .contains(&Some(rect));
+        for y in hover_area.y..hover_area.bottom() {
+            for x in hover_area.x..hover_area.right() {
+                if let Some(cell) = f.buffer_mut().cell_mut((x, y)) {
+                    if pane_title {
+                        if !matches!(cell.symbol(), " " | "◖" | "◗") {
+                            cell.set_style(Style::new().underlined());
+                        }
+                        continue;
+                    }
+                    if cell.bg == t.sel_bg && t.sel_bg != Color::Reset {
+                        continue;
+                    }
+                    if cell.bg == t.base || cell.bg == t.mantle || cell.bg == Color::Reset {
+                        cell.set_bg(t.surface0);
+                    } else if cell.bg == t.surface0 {
+                        cell.set_bg(t.surface1);
+                    }
+                }
+            }
+        }
         if app
             .chrome_hover
             .is_some_and(|h| h.rect == rect && h.visible)
@@ -698,12 +731,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
                 rect.y.saturating_sub(1).max(area.y)
             };
             f.render_widget(
-                Paragraph::new(text).style(
-                    Style::new()
-                        .fg(app.theme.text)
-                        .bg(app.theme.base)
-                        .reversed(),
-                ),
+                Paragraph::new(text).style(Style::new().fg(t.on_color(t.surface1)).bg(t.surface1)),
                 Rect::new(x, y, width, 1),
             );
             app.rendered_hyperlinks.retain(|link| link.y != y);
@@ -729,7 +757,7 @@ fn render_into_mode_impl(
     workspace_only: bool,
 ) {
     f.rounded_corners = app.config.layout.rounded_corners;
-    let t = app.theme.clone();
+    let t = app.theme.chrome(app.display_terminal_colors.as_ref());
     // The active i18n catalog (Copy `&'static`), passed to draw fns that don't
     // get the whole `App` (picker, git tab) so all chrome is localized (docs/21).
     let cat = app.catalog;
@@ -802,18 +830,14 @@ fn render_into_mode_impl(
             .as_ref()
             .map(|p| picker::draw_picker(f, area, p, app.compact, cat, &t))
             .unwrap_or_default();
-        if app.notifications_in_sidebar() || app.notification_inbox.open {
-            let height = if app.notification_inbox.open {
-                area.height
-            } else {
-                3.min(area.height)
-            };
-            notifications::draw(
+        if !workspace_only {
+            status::draw_status(
                 f,
-                Rect::new(area.x, area.bottom() - height, area.width.min(48), height),
+                Rect::new(area.x, area.bottom() - 1, area.width, 1),
                 app,
                 &t,
             );
+            notifications::popup(f, area, app, &t);
         }
         if app.host_inspect.is_some() {
             menu::draw_host_inspect(f, area, app, cat, &t);
@@ -842,11 +866,12 @@ fn render_into_mode_impl(
                 && app.config.bars.region_for(key, widget.region)
                     == Some(crate::bar::BarRegion::BottomRight)
         });
-    let status_h = if app.compact || (workspace_only && !owner_bar) {
-        0
-    } else {
-        1
-    };
+    let status_h =
+        if (app.compact && !app.notifications_in_inbox()) || (workspace_only && !owner_bar) {
+            0
+        } else {
+            1
+        };
     let [main, status] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(status_h)]).areas(area);
     // Stored so an in-flight sidebar-edge drag can map a cursor column to a width
@@ -1183,7 +1208,7 @@ fn render_into_mode_impl(
         if resize_panes {
             app.ensure_preview_layouts(&preview_rects);
         }
-        let cursor = panes::draw_panes(f, &rects, bordered, lone_header, app, &t);
+        let cursor = panes::draw_panes(f, &rects, bordered, lone_header, app, &t, &mut title_rects);
         // Draw all pane borders in one overlay pass (manual cell-by-cell), then
         // the dot+path+close titles ON each top border row.
         if bordered {
@@ -1240,18 +1265,8 @@ fn render_into_mode_impl(
         status::draw_owner_bar(f, status, app, &t);
     }
 
-    if app.notification_inbox.open && app.notification_inbox.rect.is_empty() {
-        notifications::draw(
-            f,
-            Rect::new(
-                area.x,
-                area.y + 1,
-                area.width.min(48),
-                area.height.saturating_sub(2),
-            ),
-            app,
-            &t,
-        );
+    if !workspace_only {
+        notifications::popup(f, area, app, &t);
     }
     // Read-only overflow is attachment-local geometry over server-owned bar
     // content. Draw it above chrome and panes, below modal workflows.
@@ -2468,7 +2483,7 @@ mod path_tests {
         render_into(&mut target, &mut app);
         let before = app.dispatch("ui.bar.list", &serde_json::json!({})).unwrap();
         let cached = app.bar.widgets[crate::bar::CORE_FOCUSED_PANE].clone();
-        assert!(before.to_string().contains(&format!("pane {}", local.0)));
+        assert!(before.to_string().contains(&format!("p{}", local.0)));
         render_workspace_projection(&mut target, &mut app, &destination);
         assert_eq!(app.active_ws, 0);
         assert_eq!(app.bar.widgets[crate::bar::CORE_FOCUSED_PANE], cached);
@@ -3336,6 +3351,7 @@ pub(super) fn host_badge(
     label: &str,
     width: usize,
     rounded: bool,
+    t: &Theme,
 ) -> Vec<Span<'static>> {
     if width < 3 {
         return Vec::new();
@@ -3355,17 +3371,18 @@ pub(super) fn host_badge(
         .fold(0_u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
     let (r, g, b) = colors[hash as usize % colors.len()];
     let bg = Color::Rgb(r, g, b);
+    let fg = t.on_color(bg);
     let name = truncate(label, width.saturating_sub(2));
     if rounded {
         vec![
             Span::styled("◖", Style::new().fg(bg)),
-            Span::styled(name, Style::new().fg(Color::White).bg(bg)),
+            Span::styled(name, Style::new().fg(fg).bg(bg)),
             Span::styled("◗", Style::new().fg(bg)),
         ]
     } else {
         vec![Span::styled(
             format!(" {name} "),
-            Style::new().fg(Color::White).bg(bg),
+            Style::new().fg(fg).bg(bg),
         )]
     }
 }

@@ -90,7 +90,8 @@ impl App {
                 return Some((
                     *rect,
                     format!(
-                        "{} / {} · {} · {} · {}",
+                        "p{} · {} / {} · {} · {} · {}",
+                        pane,
                         target.host,
                         target.session,
                         agent
@@ -115,7 +116,8 @@ impl App {
             Some((
                 rect,
                 format!(
-                    "{} · {} · {}",
+                    "p{} · {} · {} · {}",
+                    id.0,
                     title,
                     self.state_hint(status.map_or(State::Unknown, |s| s.state)),
                     pane.cwd.display()
@@ -158,18 +160,6 @@ impl App {
                         session.cwd
                     ),
                 ));
-            }
-        }
-        // The unbordered single pane has a header but no split-title hit entry.
-        for &(pane, rect) in &self.pane_rects {
-            if rect.y == at.1
-                && hit(rect)
-                && self
-                    .pane_content_rects
-                    .iter()
-                    .any(|(id, content)| *id == pane && content.y > rect.y)
-            {
-                return pane_hint(pane, Rect::new(rect.x, rect.y, rect.width, 1));
             }
         }
         None

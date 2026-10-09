@@ -71,7 +71,7 @@ fn render_popup(
     let w = if mobile {
         area.width.max(1)
     } else {
-        (label_w + 3).max(12).min(area.width.max(1))
+        (label_w + 4).max(12).min(area.width.max(1))
     };
     let h = ((rows.len() as u16).saturating_mul(row_height) + 2).min(area.height.max(1));
     let x = if mobile {
@@ -86,14 +86,38 @@ fn render_popup(
     };
     let popup = Rect::new(x, y, w, h);
 
+    // Rounded outlines need the surrounding surface in their outer corner
+    // cells; filling those cells with the menu color makes a square silhouette.
+    let corners = [
+        (popup.x, popup.y),
+        (popup.right() - 1, popup.y),
+        (popup.x, popup.bottom() - 1),
+        (popup.right() - 1, popup.bottom() - 1),
+    ]
+    .map(|at| (at, f.buffer_mut().cell(at).map(|cell| cell.bg)));
     f.render_widget(Clear, popup);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
-        .border_style(Style::new().fg(t.border_focus).bg(t.surface0))
+        .border_style(
+            Style::new()
+                .fg(if f.rounded_corners {
+                    t.overlay0
+                } else {
+                    t.border_focus
+                })
+                .bg(t.surface0),
+        )
         .style(Style::new().bg(t.surface0));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
+    if f.rounded_corners {
+        for (at, bg) in corners {
+            if let (Some(cell), Some(bg)) = (f.buffer_mut().cell_mut(at), bg) {
+                cell.set_bg(bg);
+            }
+        }
+    }
 
     // How many rows fit, and how far the list can therefore be scrolled.
     let per_screen = (inner.height / row_height) as usize;
@@ -137,7 +161,7 @@ fn render_popup(
         }
         let hot = selected.map_or_else(|| row_is_hovered(row, hover), |index| index == i);
         let fg = if hot {
-            t.crust
+            t.on_color(t.accent)
         } else if r.destructive {
             t.coral // the one destructive action
         } else {
@@ -146,11 +170,14 @@ fn render_popup(
         let bg = if hot { t.accent } else { t.surface0 };
         f.render_widget(
             Paragraph::new(Span::styled(
-                format!(" {}", r.text),
+                format!(" {} ", r.text),
                 Style::new().fg(fg).bg(bg),
             )),
             text_row,
         );
+        if hot {
+            f.pill_caps(text_row, bg, t.surface0);
+        }
         rects[i] = row;
     }
 
@@ -986,6 +1013,47 @@ mod label_case_tests {
     const MINOR: [&str; 12] = [
         "a", "an", "the", "to", "in", "on", "of", "for", "and", "or", "with", "as",
     ];
+
+    #[test]
+    fn rounded_popup_preserves_outer_corners_and_rounds_the_selected_row() {
+        let area = Rect::new(0, 0, 50, 20);
+        let mut buffer = Buffer::empty(area);
+        let mut target = RenderTarget::new(&mut buffer, area);
+        target.rounded_corners = true;
+        let theme = Theme::noir();
+        let canvas = Color::Rgb(245, 245, 245);
+        target.buffer_mut().set_style(area, Style::new().bg(canvas));
+        let mut scroll = MenuScroll::default();
+        let rows = [MenuRow {
+            text: "Create pane".into(),
+            divider: false,
+            destructive: false,
+        }];
+        let hits = render_popup(
+            &mut target,
+            area,
+            (4, 5),
+            &rows,
+            &theme,
+            PopupCtx {
+                hover: None,
+                selected: Some(0),
+                mobile: false,
+                id: PopupId::Pane,
+                scroll: &mut scroll,
+            },
+        );
+        assert_eq!(buffer[(4, 5)].symbol(), "╭");
+        assert_eq!(buffer[(4, 5)].bg, canvas);
+        let row = hits[0];
+        assert_eq!(buffer[(row.x, row.y)].symbol(), "◖");
+        assert_eq!(buffer[(row.right() - 1, row.y)].symbol(), "◗");
+        assert_eq!(buffer[(row.x + 1, row.y)].fg, theme.on_color(theme.accent));
+        let text: String = (row.x..row.right())
+            .map(|x| buffer[(x, row.y)].symbol())
+            .collect();
+        assert!(text.contains("Create pane"), "{text}");
+    }
 
     #[test]
     fn mobile_menu_hover_covers_the_full_touch_row() {

@@ -136,7 +136,7 @@ pub(super) fn draw_settings(
                 let rect = Rect::new(inner.x + index as u16 * width, inner.bottom() - 1, width, 1);
                 let selected = (index == 0) == ui.remote_install_confirm;
                 let style = if selected {
-                    Style::new().fg(t.crust).bg(t.accent).bold()
+                    Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
                 } else {
                     Style::new().fg(t.text)
                 };
@@ -196,7 +196,7 @@ pub(super) fn draw_settings(
             f.render_widget(
                 Paragraph::new(Span::styled(
                     truncate(&label, rect.width as usize),
-                    Style::new().fg(t.crust).bg(t.accent).bold(),
+                    Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold(),
                 ))
                 .alignment(Alignment::Center),
                 rect,
@@ -235,7 +235,7 @@ pub(super) fn draw_settings(
                 1,
             );
             let style = if st == tab {
-                Style::new().fg(t.crust).bg(t.accent).bold()
+                Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
             } else {
                 Style::new().fg(t.subtext0)
             };
@@ -277,7 +277,7 @@ pub(super) fn draw_settings(
                 break;
             }
             let style = if st == tab {
-                Style::new().fg(t.crust).bg(t.accent).bold()
+                Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
             } else {
                 Style::new().fg(t.subtext0)
             };
@@ -1147,7 +1147,7 @@ fn draw_content(
                         t,
                     )),
                     GeneralRow::NotificationDisplay => {
-                        let value = if app.notifications_in_sidebar() {
+                        let value = if app.notifications_in_inbox() {
                             cat.settings.notify_inbox
                         } else {
                             cat.settings.notify_toast
@@ -1854,7 +1854,7 @@ fn dock_row(
         ),
         (format!(" {} ", cat.side_off), 2, side.is_none()),
     ];
-    let on = Style::new().fg(t.crust).bg(t.accent).bold();
+    let on = Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold();
     let off = Style::new().fg(t.subtext0).bg(t.surface1);
     let total: u16 = btns
         .iter()
@@ -1933,7 +1933,7 @@ fn bar_row(
         let width = display_width(&label) as u16;
         let rect = Rect::new(x, y, width, 1);
         let style = if active {
-            Style::new().fg(t.crust).bg(t.accent).bold()
+            Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
         } else {
             Style::new().fg(t.subtext0).bg(t.surface1)
         };

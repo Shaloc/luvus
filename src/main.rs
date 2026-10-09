@@ -2687,7 +2687,10 @@ mod tests {
         assert!(text.contains("WORKSPACES"), "workspaces header missing");
         assert!(text.contains("AGENTS"), "agents header missing");
         assert!(text.contains("tab"), "tab status missing");
-        assert!(text.contains("NORMAL"), "status mode missing");
+        assert!(
+            !text.contains("NORMAL"),
+            "ordinary status mode is intentionally hidden"
+        );
     }
 
     /// Naming a pane (via `pane name` / `agent name`) uses the same visible title
@@ -2828,13 +2831,10 @@ mod tests {
         );
     }
 
-    /// Clicking the bottom-right version number opens the changelog modal, which shows
-    /// the embedded release notes; esc closes it.
+    /// Changelog remains available through the menu after removing the status version.
     #[test]
-    fn clicking_version_opens_the_changelog() {
-        use ratatui::crossterm::event::{
-            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-        };
+    fn changelog_remains_available_without_status_version() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let _env = crate::persist::test_env("changelog-click");
         let (tx, _rx) = mpsc::channel::<AppEvent>();
         let mut app = App::new(80, 24, tx).expect("spawn pane");
@@ -2852,21 +2852,10 @@ mod tests {
                 .collect()
         };
 
-        // The version number is a click target in the bottom status line.
         render(&mut app);
-        let vr = app.version_rect.expect("version number is clickable");
-        assert_eq!(vr.y, h - 1, "version belongs to the bottom status line");
-        assert_eq!(vr.right() + 1, w, "version keeps one right padding cell");
-        app.handle_event(AppEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: vr.x + 1,
-            row: vr.y,
-            modifiers: KeyModifiers::NONE,
-        }));
-        assert!(
-            app.changelog_open,
-            "clicking the version opened the changelog"
-        );
+        assert!(app.version_rect.is_none());
+        app.open_changelog();
+        assert!(app.changelog_open);
 
         let text = render(&mut app);
         assert!(text.contains("Changelog"), "modal title shows");

@@ -475,6 +475,9 @@ def valid_agent_session_title(container):
 
 def valid_snapshot_alias_rows(result):
     """Validate alias projection while preserving unknown additive row fields."""
+    bindings = result.get("prefix_bindings", {})
+    if not isinstance(bindings, dict) or not all(isinstance(key, str) for key in bindings.values()):
+        return False
     workspaces = result.get("workspaces")
     if not isinstance(workspaces, list):
         return False

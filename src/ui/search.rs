@@ -71,7 +71,7 @@ pub(super) fn draw_search(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
             break;
         }
         let style = if search.scope == scope {
-            Style::new().fg(t.crust).bg(t.accent).bold()
+            Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
         } else {
             Style::new().fg(t.subtext0)
         };

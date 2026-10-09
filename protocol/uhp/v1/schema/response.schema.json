@@ -411,6 +411,11 @@
         "workspaces"
       ],
       "properties": {
+        "prefix_bindings": {
+          "type": "object",
+          "description": "Optional display hints: command IDs to effective prefix keys; empty strings mean unbound.",
+          "additionalProperties": { "type": "string" }
+        },
         "protocol": {
           "const": {
             "name": "luvus-uhp",

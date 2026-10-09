@@ -271,9 +271,6 @@ impl BarConfig {
             Some(crate::bar::BarRegion::TopRight)
         } else if self.bottom_right.iter().any(|candidate| candidate == key) {
             Some(crate::bar::BarRegion::BottomRight)
-        } else if key == crate::bar::CORE_FOCUSED_PANE {
-            // This built-in is opt-in even for an existing serialized BarConfig.
-            None
         } else {
             Some(fallback)
         }
@@ -545,7 +542,7 @@ impl SidebarsConfig {
 /// completion cue remains the default style for backward compatibility.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct NotifyConfig {
-    /// Ordinary UI feedback: legacy floating toast or a quiet sidebar inbox.
+    /// Ordinary UI feedback: legacy floating toast or a quiet bottom-bar inbox.
     #[serde(default)]
     pub display: NotificationDisplay,
     /// The synthesized cue family used by both notification events.

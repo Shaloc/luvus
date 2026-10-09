@@ -216,6 +216,7 @@ impl App {
             "server_generation":self.backend_server_generation,
             "event_sequence":crate::ipc::api::current_sequence(&self.events),
             "remote_display":crate::ipc::protocol::remote_display_capabilities(),
+            "prefix_bindings":Cmd::ALL.iter().map(|cmd| (cmd.id(), self.key_for(*cmd))).collect::<std::collections::BTreeMap<_, _>>(),
             "workspaces":workspaces,
         })
     }
@@ -250,9 +251,14 @@ impl App {
             .and_then(Value::as_object)
             .is_some_and(|patch| {
                 !patch.is_empty()
-                    && patch
-                        .keys()
-                        .all(|key| matches!(key.as_str(), "theme" | "language"))
+                    && patch.keys().all(|key| {
+                        matches!(key.as_str(), "theme" | "language")
+                            || key == "layout"
+                                && patch["layout"].as_object().is_some_and(|layout| {
+                                    !layout.is_empty()
+                                        && layout.keys().all(|k| k == "rounded_corners")
+                                })
+                    })
             })
         {
             // A remote preference change must not reset scroll/layout, rediscover
@@ -263,6 +269,9 @@ impl App {
             }
             if patch.get("language").is_some() {
                 self.apply_language_locally(&next.language);
+            }
+            if patch.get("layout").is_some() {
+                self.apply_rounded_corners_locally(next.layout.rounded_corners);
             }
             self.emit_event("config.changed", json!({}));
             return Ok(());
@@ -296,6 +305,9 @@ impl App {
             self.config.layout.workspace_display != next.layout.workspace_display;
         let discard_pane_screens =
             self.config.session.persist_pane_screen && !next.session.persist_pane_screen;
+        if self.config.layout.rounded_corners != next.layout.rounded_corners {
+            self.remote_rounded_sync.revision = self.remote_rounded_sync.revision.wrapping_add(1);
+        }
         self.config = next;
         if discard_pane_screens {
             self.session_dirty = true;

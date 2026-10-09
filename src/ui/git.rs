@@ -1013,7 +1013,7 @@ fn draw_header(
     for (s, label) in labels {
         let w = label.chars().count() as u16;
         let style = if s == g.section {
-            Style::new().fg(t.crust).bg(t.accent).bold()
+            Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
         } else {
             Style::new().fg(t.subtext0)
         };

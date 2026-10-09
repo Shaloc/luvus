@@ -537,6 +537,10 @@ resynchronization rules.
 `uhp.capabilities` negotiates the app-level automation surface and its
 limits. `session.snapshot` returns every workspace, tab, terminal pane, native
 view, stable terminal identity, root process, and agent state in one response.
+The optional `prefix_bindings` object maps command IDs to the owner's displayed
+prefix keys (an empty value means unbound). It lets merged displays show remote
+shortcuts without using their local keymap for owner actions. Older owners may
+omit this field; consumers must tolerate absent and future command IDs.
 Merged remote workspace rows also include their SSH Host alias in `host`; local
 workspace rows use `host:null`. In this fork a merged workspace may also include
 `remote: {host, session, workspace_id, server_generation, connected, tabs}`.

@@ -15,7 +15,7 @@ and Luvus owns their placement, validation, theming, width, and rendering.
 | Placement | Location | Space Luvus always protects |
 |---|---|---|
 | **Top** | To the right of the tabs | Active tab, tab arrows, new-tab button, and sidebar controls |
-| **Bottom** | In the middle of the status row | Prefix/key hint on the left and the clickable version on the right |
+| **Bottom** | At the right of the status row | Active mode guidance and notification previews |
 | **Off** | Hidden | The declaration and saved preference remain available |
 
 For managed remote workspaces, **Top** uses a display-side navigation row above
@@ -24,17 +24,22 @@ its PTY accordingly, so local widgets never cover remote tabs or input cells.
 **Bottom** continues to use the existing status row.
 
 The built-in **Runtime status** widget starts at the bottom and shows a compact
-summary such as `NORMAL · 1 pane · tab 2/4`. It can be moved or hidden like a
+summary such as `tab 2/4 · 1 pane`. It can be moved or hidden like a
 module widget, but its content is managed by Luvus.
 
-The optional **Current tab / pane** widget (`core:focused-pane`) starts **Off**.
-Select **Bottom** in Settings to see, for example,
-`tab 2 · pane 27 · ● qodercli working`. The tab position is 1-based and the
+The **Current tab / pane** widget (`core:focused-pane`) starts at the **Bottom**.
+It keeps the focused pane ID and agent status visible, for example,
+`p27 · ● qodercli working`. The runtime widget supplies the tab position; the
 pane ID is the owner's opaque identifier. Local, remote and merged workspaces
 use their actual focused pane; shells and native views omit the agent label.
 Disconnected or not-yet-aligned remote metadata is hidden. In narrow rows it
-uses compact labels such as `t2 p27`, then the standard overflow if needed.
-Mode-specific key guidance retains priority over bottom widgets.
+uses compact labels such as `p27`, then the standard overflow if needed.
+Mode-specific key guidance retains priority over bottom widgets. Ordinary mode
+hides the version and shortcut legend; press your prefix (normally Ctrl+B) to
+show shortcuts, including in remote workspaces. Remote command hints use the
+owner snapshot's effective bindings; display-owned actions use local bindings.
+Older owners without binding metadata still show the prefix and fixed help/navigation hints.
+Changelog and version information remain available in Menu.
 
 ```sh
 luvus bar move --id core:focused-pane --region bottom-right
@@ -152,7 +157,7 @@ Top and Bottom can each use at most **100 terminal columns**, but the available
 width may be smaller for the current client:
 
 - Top yields space to tabs and their navigation controls.
-- Bottom yields space to the prefix hint and version control.
+- Bottom yields space to active mode guidance and notification previews.
 - Wide characters, including many emoji and CJK glyphs, consume two columns.
 - When full content does not fit, Luvus tries `compact_content`.
 - Lower-priority widgets compact or move into the read-only `… +N` overflow

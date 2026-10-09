@@ -10,6 +10,8 @@ pub(crate) struct InboxUi {
     pub scroll: usize,
     pub selected: Option<u64>,
     pub rect: Rect,
+    pub trigger: Rect,
+    pub close: Rect,
     pub header: Rect,
     pub clear: Rect,
     pub max_scroll: usize,
@@ -20,6 +22,8 @@ pub(crate) struct InboxUi {
 impl InboxUi {
     pub fn clear_geometry(&mut self) {
         self.rect = Rect::ZERO;
+        self.trigger = Rect::ZERO;
+        self.close = Rect::ZERO;
         self.header = Rect::ZERO;
         self.clear = Rect::ZERO;
         self.rows.clear();
@@ -31,7 +35,7 @@ impl App {
             .record_notification(&message, None, crate::bar::NotificationLevel::Info);
         self.pending_notify.push(message);
     }
-    pub(crate) fn notifications_in_sidebar(&self) -> bool {
+    pub(crate) fn notifications_in_inbox(&self) -> bool {
         self.config.notifications.display == crate::config::NotificationDisplay::Inbox
     }
     pub(crate) fn open_notification_inbox(&mut self) {
@@ -39,8 +43,6 @@ impl App {
         self.notification_inbox.scroll = 0;
         self.notification_inbox.selected = self.bar.history.back().map(|item| item.id);
         self.bar.mark_notifications_read();
-        // Reveal the existing sidebar without changing the user's saved layout.
-        self.sidebars.left.visible = true;
     }
     pub(crate) fn notification_inbox_key(&mut self, key: KeyEvent) {
         match key.code {
@@ -104,15 +106,29 @@ impl App {
                 && mouse.row >= r.y
                 && mouse.row < r.bottom()
         };
+        if hit(self.notification_inbox.trigger) {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                if self.notification_inbox.open {
+                    self.notification_inbox.open = false;
+                } else {
+                    self.open_notification_inbox();
+                }
+            }
+            return true;
+        }
+        if !self.notification_inbox.open {
+            return false;
+        }
         if !hit(self.notification_inbox.rect) {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.notification_inbox.open = false;
             }
-            return false;
+            // Dismiss without clicking the terminal or workspace underneath.
+            return true;
         }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if hit(self.notification_inbox.header) {
+                if hit(self.notification_inbox.close) || hit(self.notification_inbox.header) {
                     if self.notification_inbox.open {
                         self.notification_inbox.open = false;
                     } else {
@@ -194,6 +210,51 @@ mod tests {
     }
 
     #[test]
+    fn chrome_uses_readable_theme_surfaces_without_repainting_none_canvas() {
+        use ratatui::style::{Color, Modifier};
+        let _env = crate::persist::test_env("chrome-surfaces");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(140, 40, tx).unwrap();
+        app.config.layout.rounded_corners = true;
+        app.apply_theme_locally("none");
+        let area = Rect::new(0, 0, 140, 40);
+        let draw = |app: &mut App| {
+            let mut b = ratatui::buffer::Buffer::empty(area);
+            crate::ui::render_into(&mut crate::ui::RenderTarget::new(&mut b, area), app);
+            b
+        };
+        for (fg, bg) in [([30, 40, 50], [245; 3]), ([230; 3], [20; 3])] {
+            let mut colors = crate::terminal::theme_probe::TerminalColors {
+                fg,
+                bg,
+                palette: crate::terminal::theme_probe::default_ansi_palette(fg, bg),
+            };
+            colors.palette[4] = [40, 75, 180];
+            app.apply_terminal_colors(&colors);
+            let theme = app.theme.chrome(Some(&colors));
+            let b = draw(&mut app);
+            assert_eq!(b[(80, 12)].bg, Color::Reset);
+            assert_eq!(b[(70, 39)].bg, theme.crust);
+            assert_ne!(theme.crust, Color::Reset);
+            let menu = app.settings_icon_rect.unwrap();
+            assert_eq!(b[(menu.x, menu.y)].symbol(), "◖");
+            assert_eq!(b[(menu.right() - 1, menu.y)].symbol(), "◗");
+            app.hover = Some((menu.x + 1, menu.y));
+            let b = draw(&mut app);
+            assert_eq!(b[(menu.x + 1, menu.y)].bg, theme.accent);
+            assert_eq!(b[(menu.x + 1, menu.y)].fg, Color::Rgb(255, 255, 255));
+            let row = app.ws_rects[0].1;
+            app.hover = Some((row.x + 2, row.y));
+            let b = draw(&mut app);
+            assert_eq!(b[(row.x + 2, row.y)].bg, theme.surface0);
+            assert!(!b[(row.x + 2, row.y)]
+                .modifier
+                .contains(Modifier::UNDERLINED));
+            app.hover = None;
+        }
+    }
+
+    #[test]
     fn notification_history_survives_ttl_coalesces_and_stays_bounded() {
         let mut bar = BarState::default();
         let now = Instant::now();
@@ -262,8 +323,12 @@ mod tests {
         };
         draw(&mut app);
         let panes = app.pane_content_rects.clone();
-        let header = app.notification_inbox.header;
+        let header = app.notification_inbox.trigger;
         assert!(!header.is_empty());
+        assert_eq!(header.y, area.bottom() - 1);
+        assert!(app.notification_inbox.rect.is_empty());
+        let agents = app.agents_area;
+        let workspaces = app.workspaces_area;
         app.handle_event(AppEvent::Mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: header.x + 1,
@@ -273,6 +338,11 @@ mod tests {
         assert!(app.notification_inbox.open);
         draw(&mut app);
         assert_eq!(app.pane_content_rects, panes);
+        assert_eq!(app.agents_area, agents);
+        assert_eq!(app.workspaces_area, workspaces);
+        assert_eq!(app.notification_inbox.rect.bottom(), header.y);
+        assert!(app.notification_inbox.rect.width > agents.width);
+        let trigger = app.notification_inbox.trigger;
         assert!(app.bar.history.iter().all(|r| !r.unread));
         let geometry = app.notification_inbox.rows.clone();
         let other = Rect::new(0, 0, 68, 18);
@@ -282,6 +352,7 @@ mod tests {
             &mut app,
         );
         assert_eq!(app.notification_inbox.rows, geometry);
+        assert_eq!(app.notification_inbox.trigger, trigger);
         app.handle_event(AppEvent::Key(KeyEvent::new(
             KeyCode::Char('c'),
             KeyModifiers::NONE,
@@ -294,6 +365,17 @@ mod tests {
             KeyModifiers::NONE,
         )));
         assert!(!app.notification_inbox.open);
+        app.open_notification_inbox();
+        draw(&mut app);
+        let focus = app.layout().focus;
+        app.handle_event(AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 139,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert!(!app.notification_inbox.open);
+        assert_eq!(app.layout().focus, focus);
         // Collapsed and narrow render paths remain bounded, including no workspace.
         app.workspaces.clear();
         let small = Rect::new(0, 0, 24, 6);

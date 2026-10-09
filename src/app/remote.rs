@@ -197,6 +197,9 @@ pub struct RemoteWorkspaceRuntime {
     pub server_generation: String,
     pub connected: bool,
     pub tabs: Vec<Value>,
+    /// Bounded display hints from the owner snapshot, shared across workspaces.
+    #[serde(skip)]
+    pub prefix_bindings: Option<Arc<std::collections::HashMap<String, String>>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1729,7 +1732,7 @@ impl App {
                     // must not echo a single notification back around a cycle.
                     self.bar
                         .ingest_notification(&text, Some(&source), level, false);
-                    if !self.notifications_in_sidebar() {
+                    if !self.notifications_in_inbox() {
                         self.toast = Some((
                             format!(
                                 "{source}: {}",
@@ -2444,7 +2447,7 @@ impl App {
     }
 }
 
-fn outer_command(command: Cmd) -> bool {
+pub(crate) fn outer_command(command: Cmd) -> bool {
     matches!(
         command,
         Cmd::NewWorkspace
@@ -2511,6 +2514,20 @@ pub(super) fn parse_remote_snapshot(
         .and_then(|result| result.get("event_sequence"))
         .and_then(Value::as_u64)
         .ok_or_else(|| "remote snapshot did not contain an event sequence".to_string())?;
+    let prefix_bindings = response["result"]["prefix_bindings"]
+        .as_object()
+        .map(|bindings| {
+            Arc::new(
+                Cmd::ALL
+                    .iter()
+                    .filter_map(|cmd| {
+                        let key = bindings.get(cmd.id())?.as_str()?;
+                        (key.len() <= 64 && !key.chars().any(char::is_control))
+                            .then(|| (cmd.id().to_owned(), key.to_owned()))
+                    })
+                    .collect(),
+            )
+        });
     let workspaces = workspaces
         .iter()
         // A remote host may itself have merge configured. Federation is only
@@ -2525,6 +2542,7 @@ pub(super) fn parse_remote_snapshot(
                         server_generation: generation.to_string(),
                         connected: true,
                         tabs: workspace["tabs"].as_array().cloned().unwrap_or_default(),
+                        prefix_bindings: prefix_bindings.clone(),
                     }),
                 focused_pane: parse_focused_pane_metadata(workspace),
                 agents: parse_remote_agents(workspace),
@@ -5331,6 +5349,79 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn remote_prefix_status_uses_owner_bindings_and_restores_agent_status() {
+        let _env = crate::persist::test_env("remote-prefix-status");
+        let mut app = remote_ui_app();
+        let mut owner = remote_ui_app();
+        app.prefix = super::super::keys::PrefixSpec::parse("ctrl+b").unwrap();
+        owner
+            .config
+            .keybindings
+            .insert(Cmd::ClosePane.id().into(), "K".into());
+        owner
+            .config
+            .keybindings
+            .insert(Cmd::NewTab.id().into(), "T".into());
+        let mut response =
+            json!({"result":owner.dispatch("session.snapshot", &json!({})).unwrap()});
+        response["result"]["prefix_bindings"]["untrusted"] = json!("ignored");
+        let parsed = parse_remote_snapshot(&response, RemoteBinaryLocation::Path).unwrap();
+        let runtime = parsed.workspaces[0].runtime.clone().unwrap();
+        assert!(!runtime
+            .prefix_bindings
+            .as_ref()
+            .unwrap()
+            .contains_key("untrusted"));
+        let (pane, receiver, _) = add_remote_workspace(&mut app);
+        let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+            unreachable!()
+        };
+        view.runtime = Some(runtime);
+        view.focused_pane = Some(crate::bar::FocusedPaneMetadata {
+            tab: 2,
+            pane: "77".into(),
+            agent: Some(("codex".into(), crate::ui::theme::State::Working)),
+        });
+        app.handle_event(AppEvent::Key(app.prefix.key_event()));
+        let b = remote_ui_buffer(&mut app, (240, 30));
+        let row: String = (0..240).map(|x| b[(x, 29)].symbol()).collect();
+        assert!(
+            row.contains("Ctrl+B") && row.contains("K close") && row.contains("T new tab"),
+            "{row}"
+        );
+        assert!(
+            !row.contains("codex working"),
+            "prefix guidance temporarily owns the bar"
+        );
+        app.handle_event(AppEvent::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        )));
+        assert!(matches!(
+            receiver.try_recv().unwrap(),
+            ClientMessage::PrefixKey(_)
+        ));
+        let b = remote_ui_buffer(&mut app, (240, 30));
+        let row: String = (0..240).map(|x| b[(x, 29)].symbol()).collect();
+        assert!(
+            row.contains("p77") && row.contains("codex working"),
+            "{row}"
+        );
+        assert!(!row.contains("Ctrl+B"), "{row}");
+        response["result"]
+            .as_object_mut()
+            .unwrap()
+            .remove("prefix_bindings");
+        let legacy = parse_remote_snapshot(&response, RemoteBinaryLocation::Path).unwrap();
+        assert!(legacy.workspaces[0]
+            .runtime
+            .as_ref()
+            .unwrap()
+            .prefix_bindings
+            .is_none());
     }
 
     #[test]

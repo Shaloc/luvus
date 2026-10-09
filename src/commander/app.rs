@@ -67,6 +67,7 @@ impl App {
 
     fn commander_overlays_clear(&self) -> bool {
         self.bar.overflow.is_none()
+            && !self.notification_inbox.open
             && self.cmd_inspect.is_none()
             && !self.help_open
             && !self.changelog_open

@@ -1,5 +1,5 @@
 //! The bottom status line. Fixed guidance owns the left edge, Luvus Bar owns
-//! the flexible middle, and the clickable version stays fixed at the right.
+//! the right edge, leaving the middle for the quiet notification preview.
 
 use super::*;
 use crate::app::SidebarListFocus;
@@ -42,80 +42,70 @@ pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
     f.render_widget(Block::new().style(Style::new().bg(t.crust)), area);
     app.version_rect = None;
 
-    let version_text = concat!("v", env!("CARGO_PKG_VERSION"));
-    let dot = if app.update_available.is_some() {
-        " ●"
+    let inbox = app.notifications_in_inbox() && !app.bar.history.is_empty();
+    let guidance_budget = if inbox && app.mode == Mode::Normal {
+        area.width.saturating_sub((area.width / 2).min(40))
     } else {
-        ""
+        area.width
     };
-    let click_w = display_width(version_text).saturating_add(display_width(dot)) as u16;
-    let version = if click_w < area.width {
-        let rect = Rect::new(area.right().saturating_sub(click_w + 1), area.y, click_w, 1);
-        app.version_rect = Some(rect);
-        let hovered = app
-            .hover
-            .is_some_and(|(x, y)| rect.contains(Position::new(x, y)));
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled(
-                    version_text,
-                    Style::new().fg(if hovered { t.accent } else { t.subtext1 }),
-                ),
-                Span::styled(dot, Style::new().fg(t.accent).bold()),
-                Span::raw(" "),
-            ])),
-            Rect::new(rect.x, area.y, click_w + 1, 1),
-        );
-        Some(rect)
-    } else {
-        None
-    };
-
-    let left_limit = version.map_or(area.right(), |rect| rect.x);
-    let (left, show_bar) = fixed_guidance(app, t, left_limit.saturating_sub(area.x));
-    let left_width = left.width() as u16;
-    f.render_widget(
-        Paragraph::new(left),
-        Rect::new(area.x, area.y, left_limit.saturating_sub(area.x), 1),
-    );
-
-    let Some(version) = version else { return };
+    let (left, show_bar) = fixed_guidance(app, t, guidance_budget);
+    let left_width = (left.width() as u16).min(area.width);
+    let mut x = area.x;
+    let caps: Vec<_> = left
+        .spans
+        .iter()
+        .map(|span| {
+            let rect = Rect::new(x, area.y, span.width() as u16, 1);
+            x = rect.right();
+            (rect, span.style.bg)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(left), area);
+    for (rect, fill) in caps {
+        if let Some(fill) = fill.filter(|_| rect.right() <= area.right()) {
+            f.pill_caps(rect, fill, t.crust);
+        }
+    }
     if !show_bar {
         return;
     }
-    const GAP: u16 = 5;
-    let separator_x = version.x.saturating_sub(GAP);
-    let start = area.x.saturating_add(left_width);
-    let budget = separator_x
-        .saturating_sub(start)
-        .min(crate::bar::MAX_BAR_REGION_WIDTH);
-    if budget == 0 {
-        return;
-    }
-    let (hits, overflow, visible) = {
+    let available = area.width.saturating_sub(left_width + 1);
+    // Reserve useful preview space before composing optional status widgets.
+    // The remaining cells go back to the preview when the widgets are short.
+    let preview_min = if inbox { available.min(28) } else { 0 };
+    let (hits, overflow, bar_width) = {
         let candidates =
             app.bar
                 .widgets_for(crate::bar::BarRegion::BottomRight, &app.config.bars, false);
+        let budget = available
+            .saturating_sub(preview_min)
+            .min(crate::bar::MAX_BAR_REGION_WIDTH);
         let layout = crate::bar::compose(&candidates, budget, crate::bar::MAX_BAR_WIDGET_WIDTH);
-        let visible = !layout.is_empty();
         let (hits, overflow) = crate::bar::render::draw_region(
             f,
-            Rect::new(separator_x.saturating_sub(budget), area.y, budget, 1),
+            Rect::new(area.right().saturating_sub(budget + 1), area.y, budget, 1),
             crate::bar::BarRegion::BottomRight,
             &candidates,
             &layout,
             t,
         );
-        (hits, overflow, visible)
+        (hits, overflow, layout.width)
     };
     app.bar.hits.extend(hits);
     if let Some(overflow) = overflow {
         app.bar.overflow_hits.push(overflow);
     }
-    if visible {
-        f.render_widget(
-            Paragraph::new(Span::styled("  ·  ", Style::new().fg(t.overlay0))),
-            Rect::new(separator_x, area.y, GAP, 1),
+    if inbox {
+        super::notifications::preview(
+            f,
+            Rect::new(
+                area.x + left_width,
+                area.y,
+                available.saturating_sub(bar_width + 1),
+                1,
+            ),
+            app,
+            t,
         );
     }
 }
@@ -271,31 +261,27 @@ fn fixed_guidance(app: &App, t: &Theme, budget: u16) -> (Line<'static>, bool) {
         return (Line::from(left), false);
     }
 
-    let key = |command: crate::app::Cmd| app.key_for(command);
-    let prefix = app.prefix.label();
-    if let Some(owner) = app
-        .workspaces
-        .get(app.active_ws)
-        .and_then(|workspace| workspace.remote.as_ref())
-    {
-        left.push(mode_label(cat.remote_session, t));
-        left.push(Span::raw("  "));
-        let chord = if app.mode == Mode::Prefix {
-            "?".to_string()
-        } else {
-            format!("{prefix} ?")
-        };
-        left.extend(hint(&chord, cat.all_shortcuts, t));
-        left.push(Span::styled(
-            format!("{} / {}", owner.host, owner.session),
-            Style::new().fg(t.accent),
-        ));
-        return (Line::from(left), true);
-    }
+    let key = |command: crate::app::Cmd| {
+        if let Some(view) = app.remote_workspace_view(app.active_ws) {
+            if !crate::app::remote::outer_command(command) {
+                return view
+                    .runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.prefix_bindings.as_ref())
+                    .and_then(|bindings| bindings.get(command.id()))
+                    .cloned()
+                    .unwrap_or_default();
+            }
+        }
+        app.key_for(command)
+    };
     if app.mode == Mode::Prefix {
-        left.push(mode_label(cat.mode_prefix, t));
+        left.push(mode_label(
+            &format!("{} {}", app.prefix.label(), cat.mode_prefix),
+            t,
+        ));
         left.push(Span::raw("  "));
-        left.extend(hint("?", cat.all_keys, t));
+        left.extend(hint("?", cat.all_shortcuts, t));
         left.extend(hint("←↓↑→", cat.pane, t));
         left.extend(compound_hint(
             &[
@@ -320,16 +306,23 @@ fn fixed_guidance(app: &App, t: &Theme, budget: u16) -> (Line<'static>, bool) {
         return (Line::from(left), false);
     }
 
-    left.push(Span::styled(
-        format!(" {prefix} "),
-        Style::new().fg(t.crust).bg(t.accent).bold(),
-    ));
-    left.push(Span::styled(
-        format!("  {}", cat.prefix),
-        Style::new().fg(t.subtext0),
-    ));
-    left.push(Span::styled("  ·  ", Style::new().fg(t.overlay0)));
-    left.extend(hint(&format!("{prefix} ?"), cat.all_shortcuts, t));
+    if let Some(owner) = app
+        .workspaces
+        .get(app.active_ws)
+        .and_then(|workspace| workspace.remote.as_ref())
+    {
+        left.push(mode_label(cat.remote_session, t));
+        left.push(Span::raw("  "));
+        left.push(Span::styled(
+            truncate(
+                &format!("{} / {}", owner.host, owner.session),
+                usize::from(budget).saturating_sub(left.iter().map(Span::width).sum()),
+            ),
+            Style::new().fg(t.accent),
+        ));
+        return (Line::from(left), true);
+    }
+
     (Line::from(left), true)
 }
 
@@ -375,7 +368,7 @@ fn local_search_guidance<M>(
 fn mode_label(label: &str, t: &Theme) -> Span<'static> {
     Span::styled(
         format!(" {label} "),
-        Style::new().fg(t.crust).bg(t.accent).bold(),
+        Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold(),
     )
 }
 
@@ -451,14 +444,17 @@ mod tests {
                 .draw(|frame| crate::ui::render(frame, &mut app))
                 .unwrap();
             let status = row(&terminal, 29);
-            assert!(
-                status.contains("remote") && status.contains("dev-207 / api"),
+            assert_eq!(
+                status.contains("dev-207 / api"),
+                mode == Mode::Normal,
                 "{status}"
             );
-            assert!(status.contains('?'), "{status}");
-            if mode == Mode::Normal {
-                assert!(status.contains(&app.prefix.label()), "{status}");
-            }
+            assert_eq!(status.contains('?'), mode == Mode::Prefix, "{status}");
+            assert_eq!(
+                status.contains(&app.prefix.label()),
+                mode == Mode::Prefix,
+                "{status}"
+            );
         }
         app.active_ws = 0;
         app.mode = Mode::Normal;
@@ -469,38 +465,32 @@ mod tests {
     }
 
     #[test]
-    fn default_guidance_and_fixed_version_keep_the_existing_edges() {
+    fn normal_status_is_compact_and_shortcuts_only_appear_after_prefix() {
         let _env = crate::persist::test_env("bar-status-default");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(120, 30, tx).unwrap();
+        app.config.layout.rounded_corners = true;
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-
         terminal
             .draw(|frame| crate::ui::render(frame, &mut app))
             .unwrap();
-
         let status = row(&terminal, 29);
-        let prefix = app.prefix.label();
-        let guidance = format!(
-            "  {prefix}   {}  ·  {prefix} ? {}",
-            app.catalog.prefix, app.catalog.all_shortcuts
-        );
-        assert!(
-            status.starts_with(&guidance),
-            "unexpected guidance prefix: {status:?}"
-        );
-        assert!(
-            status
-                .trim_end()
-                .ends_with(concat!("v", env!("CARGO_PKG_VERSION"))),
-            "unexpected version suffix: {status:?}"
-        );
-        let version = app.version_rect.expect("version stays clickable");
-        assert_eq!(version.right(), 119);
+        assert!(!status.contains(&app.prefix.label()));
+        assert!(!status.contains(env!("CARGO_PKG_VERSION")));
+        assert!(app.version_rect.is_none());
+        assert!(status.trim().len() < 35, "{status}");
+        app.mode = Mode::Prefix;
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let status = row(&terminal, 29);
+        assert!(status.contains(&app.prefix.label()), "{status}");
+        assert!(status.contains('?'));
+        assert!(status.contains('◖') && status.contains('◗'), "{status}");
     }
 
     #[test]
-    fn external_bottom_widgets_and_long_mode_hints_never_cover_version() {
+    fn external_bottom_widgets_yield_to_prefix_guidance() {
         let _env = crate::persist::test_env("bar-status-fixed-lanes");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
@@ -521,14 +511,14 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::render(frame, &mut app))
             .unwrap();
-        let version = app.version_rect.expect("version stays visible");
-        assert!(app.bar.hits.iter().all(|hit| hit.rect.right() <= version.x));
+        assert!(app.bar.hits.iter().any(|hit| hit.key.owner == "example"));
+        assert!(app.bar.hits.iter().all(|hit| hit.rect.right() < 80));
 
         app.mode = Mode::Prefix;
         terminal
             .draw(|frame| crate::ui::render(frame, &mut app))
             .unwrap();
-        assert_eq!(app.version_rect, Some(version));
+        assert!(app.version_rect.is_none());
         assert!(
             app.bar.hits.is_empty(),
             "mode guidance temporarily owns the middle lane"
@@ -690,7 +680,11 @@ mod tests {
             );
             assert_eq!(
                 line.spans[1].content.as_ref(),
-                format!(" {expected} "),
+                if mode == Mode::Prefix {
+                    format!(" {} {expected} ", app.prefix.label())
+                } else {
+                    format!(" {expected} ")
+                },
                 "{mode:?} must own the leading mode label"
             );
         }
@@ -788,7 +782,7 @@ mod tests {
             .insert(pane, crate::app::ViewKind::Diff(Box::new(view)));
 
         let line = fixed_guidance(&app, &theme, 120).0;
-        assert_ne!(line.spans[1].content.as_ref(), " SEARCH ");
+        assert!(line.spans.iter().all(|span| span.content != " SEARCH "));
         assert!(
             line.spans
                 .iter()
@@ -804,7 +798,7 @@ mod tests {
         app.views
             .insert(pane, crate::app::ViewKind::Preview(preview));
         let line = fixed_guidance(&app, &theme, 120).0;
-        assert_ne!(line.spans[1].content.as_ref(), " SEARCH ");
+        assert!(line.spans.iter().all(|span| span.content != " SEARCH "));
         assert!(
             line.spans
                 .iter()
@@ -1015,6 +1009,7 @@ mod tests {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(200, 24, tx).unwrap();
         app.config.bars.place(crate::bar::CORE_RUNTIME, None);
+        app.config.bars.place(crate::bar::CORE_FOCUSED_PANE, None);
         let mut segment =
             crate::bar::BarSegment::text("x".repeat(100), crate::bar::BarTone::Accent);
         segment.action = Some("details".into());
@@ -1036,12 +1031,12 @@ mod tests {
 
         let hit = app.bar.hits.first().expect("bottom widget is visible");
         assert_eq!(hit.rect.width, crate::bar::MAX_BAR_REGION_WIDTH);
-        let version = app.version_rect.expect("version remains fixed");
-        assert_eq!(hit.rect.right() + 5, version.x);
+        assert_eq!(hit.rect.right(), area.right() - 1);
+        assert!(app.version_rect.is_none());
     }
 
     #[test]
-    fn focused_pane_metadata_renders_with_version_and_narrow_overflow() {
+    fn focused_pane_metadata_renders_compactly_with_narrow_overflow() {
         let _env = crate::persist::test_env("bar-status-focused-pane");
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut app = App::new(200, 24, tx).unwrap();
@@ -1062,17 +1057,17 @@ mod tests {
             draw_status(&mut target, area, &mut app, &theme);
             let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
             assert!(
-                text.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
+                !text.contains(concat!("v", env!("CARGO_PKG_VERSION"))),
                 "{width}: {text}"
             );
             if width == 200 {
-                assert!(text.contains(&format!("pane {}", pane.0)), "{text}");
+                assert!(text.contains(&format!("p{}", pane.0)), "{text}");
                 assert!(text.contains("qodercli working"), "{text}");
             }
         }
     }
     /// Copy mode's guidance is clipped, never wrapped, so a row wider than the
-    /// space left of the version chip loses its tail silently. Cancel and copy are
+    /// available status row loses its tail silently. Cancel and copy are
     /// how you leave the mode with or without the selection, so they have to
     /// survive every catalog at the widest count the mode can hold. English alone
     /// proves nothing here: it is the shortest of the eight, and the row only fits
@@ -1095,7 +1090,7 @@ mod tests {
             .draw(|frame| crate::ui::render(frame, &mut app))
             .unwrap();
         // The real budget, taken from the rendered layout rather than restated.
-        let budget = app.version_rect.expect("version stays visible").x;
+        let budget = terminal.backend().buffer().area.width;
         let t = app.theme.clone();
 
         for code in crate::i18n::LANGS {

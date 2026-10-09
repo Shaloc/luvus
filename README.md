@@ -100,6 +100,10 @@ verifies SHA-256, and installs to `~/.local/bin`. GitHub CLI and sudo are not
 required. An existing binary is backed up before replacement. Running sessions
 are left untouched.
 
+Downloads, extraction and version checks all use a private `.luvus-update.*`
+directory inside the installation directory, without using `/tmp` or `TMPDIR`.
+Temporary files are removed after installation; the previous binary backup is kept.
+
 Set `LUVUS_INSTALL_DIR` to replace a binary installed elsewhere. For an update,
 check `command -v luvus` first so an older copy does not take precedence on `PATH`.
 

@@ -224,7 +224,10 @@ fn draw_header(
             Span::styled(" ◉ ", Style::new().fg(signal.1).bold()),
             Span::styled(cat.mc_title, Style::new().fg(t.text).bold()),
             Span::raw("  "),
-            Span::styled(" BETA ", Style::new().fg(t.crust).bg(t.accent).bold()),
+            Span::styled(
+                " BETA ",
+                Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold(),
+            ),
             Span::styled(
                 match scope {
                     MissionScope::Workspace => "  //  CURRENT WORKSPACE",

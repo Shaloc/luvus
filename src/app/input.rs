@@ -2598,6 +2598,10 @@ impl App {
             }
             return;
         }
+        if self.notification_inbox.open {
+            self.notification_inbox_mouse(m);
+            return;
+        }
         // ORCH overlays own the mouse. Visible controls act through the same
         // board methods as keyboard input; clicks elsewhere never fall through
         // to the dashboard behind the modal.
@@ -2896,6 +2900,9 @@ impl App {
         if self.compact && self.ws().remote.is_none() && m.row < self.last_pane_area.y {
             return;
         }
+        if self.notification_inbox_mouse(m) {
+            return;
+        }
         // Clear outer list focus before forwarding a remote press; forwarding
         // returns early and must not leave invisible keyboard capture behind.
         if matches!(m.kind, MouseEventKind::Down(_)) {
@@ -2943,9 +2950,6 @@ impl App {
         // Ordinary Bar actions own their rendered rectangles, below all modal
         // and remote-owner guards. The open-popup guard above owns dismissal.
         let bar_press = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
-        if self.notification_inbox_mouse(m) {
-            return;
-        }
         if bar_press && self.bar_click(m.column, m.row) {
             return;
         }
@@ -3327,7 +3331,7 @@ impl App {
                             .as_ref()
                             .is_some_and(|s| self.copy_on_select(s.pane)) =>
                     {
-                        self.pending_clipboard = Some(text);
+                        self.queue_selection_copy(text);
                         self.schedule_copy_highlight_clear();
                     }
                     Some(_) => self.selection_clear_at = None,
@@ -4368,7 +4372,7 @@ impl App {
             .and_then(|pane| pane.retained_selection_text(copy.ordered()))
             .and_then(finish_selected_text);
         if let Some(text) = text {
-            self.pending_clipboard = Some(text);
+            self.queue_selection_copy(text);
         }
         // A selection copy returns to a live terminal, so the next key is
         // immediately visible where the child expects it.
@@ -4749,10 +4753,17 @@ impl App {
             });
         }
         if self.copy_on_select(pane) {
-            self.pending_clipboard = Some(text);
+            self.queue_selection_copy(text);
             self.schedule_copy_highlight_clear();
         }
         true
+    }
+
+    /// A selection gets feedback even on SSH displays where OSC 52 cannot
+    /// confirm acceptance. "Copied" remains reserved for a native receipt.
+    fn queue_selection_copy(&mut self, text: String) {
+        self.pending_clipboard = Some(text);
+        self.show_toast(self.catalog.copy_requested);
     }
 
     fn copy_on_select(&self, pane: PaneId) -> bool {
@@ -4936,7 +4947,7 @@ impl App {
         let text = text.into();
         self.bar
             .record_notification(&text, None, crate::bar::NotificationLevel::Info);
-        self.toast = (!self.notifications_in_sidebar())
+        self.toast = (!self.notifications_in_inbox())
             .then(|| (text, Instant::now() + COPY_HIGHLIGHT_DURATION));
     }
 
@@ -5628,7 +5639,7 @@ impl App {
             )
         {
             if let Some(text) = self.selection_text() {
-                self.pending_clipboard = Some(text);
+                self.queue_selection_copy(text);
                 self.schedule_copy_highlight_clear();
                 return true;
             }
@@ -10063,6 +10074,10 @@ mod link_click_tests {
         }
         assert_eq!(app.pending_clipboard.as_deref(), Some("old clipboard"));
         assert_eq!(app.selection_text().as_deref(), Some("你好 hello\n  world"));
+        assert!(
+            app.bar.history.is_empty(),
+            "disabled auto-copy emits no notice"
+        );
         assert!(!app.tick_copy_highlight(Instant::now() + Duration::from_secs(10)));
         let copy = KeyEvent::new(
             KeyCode::Char('C'),
@@ -10118,6 +10133,80 @@ mod link_click_tests {
             .copy_on_select = true;
         assert!(app.copy_token_at(token.0, token.1));
         assert_eq!(app.pending_clipboard.as_deref(), Some("hello"));
+        assert_eq!(
+            app.bar.history.back().unwrap().text,
+            app.catalog.copy_requested
+        );
+        assert!(!app
+            .bar
+            .history
+            .iter()
+            .any(|notice| notice.text == app.catalog.copied));
+    }
+
+    #[test]
+    fn rounded_pane_title_hover_preserves_background_and_controls_have_both_caps() {
+        use ratatui::style::Modifier;
+        let _env = crate::persist::test_env("rounded-pane-hover");
+        let Fixture {
+            mut app,
+            mut term,
+            pane,
+            ..
+        } = fixture();
+        app.config.layout.rounded_corners = true;
+        for split in [false, true] {
+            if split {
+                app.split_pane(pane, Axis::Row, false).unwrap();
+            }
+            app.hover = None;
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let focused = app.layout().focus;
+            let title = app
+                .pane_title_rects
+                .iter()
+                .find(|(id, _)| *id == focused)
+                .unwrap()
+                .1;
+            let before = term.backend().buffer().clone();
+            let at = (
+                (title.x..title.right())
+                    .find(|x| !matches!(before[(*x, title.y)].symbol(), " " | "◖" | "◗"))
+                    .unwrap(),
+                title.y,
+            );
+            let control = app.pane_mouse_rects[0].2;
+            let right = app
+                .pane_close_rect
+                .or(app.pane_zoom_rect)
+                .or(app.pane_restart_rect)
+                .unwrap();
+            assert_eq!(before[(control.x, control.y)].symbol(), "◖");
+            assert_eq!(before[(right.right() - 1, right.y)].symbol(), "◗");
+            app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+            app.tick_chrome_hover(app.chrome_hover.unwrap().ready_at);
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let after = term.backend().buffer();
+            for x in title.x..title.right() {
+                assert_eq!(after[(x, title.y)].bg, before[(x, title.y)].bg);
+            }
+            assert!(after[at].modifier.contains(Modifier::UNDERLINED));
+            assert!(app
+                .chrome_hint_at(Some(at))
+                .unwrap()
+                .1
+                .starts_with(&format!("p{} · ", focused.0)));
+            app.handle_event(mouse(
+                MouseEventKind::Moved,
+                (control.x, control.y),
+                KeyModifiers::NONE,
+            ));
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            assert_eq!(
+                term.backend().buffer()[(control.x, control.y)].bg,
+                before[(control.x, control.y)].bg
+            );
+        }
     }
 
     #[test]

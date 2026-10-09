@@ -595,7 +595,13 @@ fn session_state(
             break;
         }
         spans.push(Span::raw(" "));
-        let badge = super::host_badge(host, label, needed - 1, app.config.layout.rounded_corners);
+        let badge = super::host_badge(
+            host,
+            label,
+            needed - 1,
+            app.config.layout.rounded_corners,
+            &app.theme.chrome(app.display_terminal_colors.as_ref()),
+        );
         remaining = remaining.saturating_sub(needed);
         spans.extend(badge);
     }

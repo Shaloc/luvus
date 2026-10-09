@@ -27,11 +27,12 @@ running local server, also sends that theme ID to every running session on
 the currently connected, selected SSH hosts. It updates their live palettes
 and saved theme without restarting servers. Other settings are preserved.
 This affects other clients viewing those remote owners too.
-Language selection in Settings follows the same scope in an independent queue;
-theme synchronization does not change the selected language.
+Language selection and **Layout → Rounded corners** follow the same scope in
+independent queues. Each changes only its own preference; inbound patches never
+rebroadcast or reset the remote layout.
 
 Synchronization is asynchronous; rapid previews coalesce to the latest
-selection. Local selection succeeds independently; a toast reports remote
+selection. Local selection succeeds independently; ordinary UI feedback reports remote
 success or failure. Offline and deselected hosts are excluded, stopped owners
 are never started, and connecting or reconnecting alone does not overwrite
 the remote theme. Select the theme again to retry a failed host.
@@ -243,11 +244,13 @@ sends `CSI ? 997;1n` (dark) or `CSI ? 997;2n` (light) to subscribed panes.
 Choose **None** (`none`) in **Settings → Theme**, or run `luvus theme use none`.
 It reuses the terminal theme's probe and child appearance negotiation, while
 keeping the default foreground/background (`Reset`) and terminal ANSI colors.
-It does not derive tinted background surfaces, so terminal transparency remains
-visible. It also disables Luvus's added Codex composer fill. Child applications
+Main pane and sidebar backgrounds stay at the terminal default, preserving
+transparency. The bottom status bar uses a subtle neutral background derived
+from the terminal probe; buttons and sidebar hover highlights use neutral
+chrome surfaces. Host badges retain their stable per-host colors. Filled controls choose contrasting light or dark text. It also disables Luvus's added Codex composer fill. Child applications
 keep their own explicit colors, including a light input background drawn by the
 agent itself. Colored status controls and hostname badges
-remain distinct; selected navigation rows use accent text rather than gray bars.
+remain distinct; selected navigation rows keep their accent text.
 
 The existing **Terminal** theme remains available when you prefer derived surface
 colors. Both modes use the displaying terminal's color probe for child light/dark

@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import subprocess
 import shlex
+import shutil
 import select
 import sys
 import tarfile
@@ -240,8 +241,10 @@ def host_admission_smoke(repo, root, binary, env):
 def main():
     repo = Path(__file__).resolve().parent.parent
     root = Path(tempfile.mkdtemp(prefix="installer-smoke-", dir=repo / "target"))
-    for directory in ("bin", "downloads", "install", "tmp", "state"):
+    for directory in ("bin", "downloads", "install with spaces", "tmp", "state", "home"):
         (root / directory).mkdir()
+    blocked_tmp = root / "tmp" / "blocked"
+    blocked_tmp.write_text("temporary storage is unavailable")
     payload = b'#!/bin/sh\n[ "$*" = "--version --remote-session-protocol" ] || exit 90\nprintf "luvus 1.0.99 remote-session=2 transport=${FIXTURE_TRANSPORT:-13}\\n"\n'
     if len(sys.argv) > 1:
         binary = Path(sys.argv[1]).resolve()
@@ -258,6 +261,14 @@ def main():
         archive.with_suffix(".gz.sha256").write_text(f"{digest}  {archive.name}\n")
     helpers = {
         "uname": '#!/bin/sh\ncase "$1" in -s) echo "$FIXTURE_OS" ;; -m) echo "$FIXTURE_ARCH" ;; *) exit 99 ;; esac\n',
+        "mktemp": f'''#!/bin/sh
+install_dir="${{LUVUS_INSTALL_DIR:-$HOME/.local/bin}}"
+[ "$#" = 2 ] && [ "$1" = -d ] && [ "$2" = "$install_dir/.luvus-update.XXXXXX" ] || {{
+  echo "installer temporary files must stay inside the installation directory" >&2
+  exit 95
+}}
+exec {shlex.quote(shutil.which("mktemp"))} "$@"
+''',
         "curl": '''#!/bin/sh
 printf '%s\\n' "$*" >> "$FIXTURE_ROOT/requests"
 destination=""
@@ -288,18 +299,26 @@ esac
         path.write_text(source)
         path.chmod(0o755)
     env = {k: v for k, v in os.environ.items() if not k.startswith("LUVUS_")}
-    env.update(PATH=f"{root}/bin:{env['PATH']}", LUVUS_INSTALL_DIR=str(root / "install"),
-               LUVUS_HOME=str(root / "state"), TMPDIR=str(root / "tmp"),
+    install_dir = root / "install with spaces"
+    env.update(PATH=f"{root}/bin:{env['PATH']}", LUVUS_INSTALL_DIR=str(install_dir),
+               HOME=str(root / "home"), LUVUS_HOME=str(root / "state"), TMPDIR=str(blocked_tmp),
                FIXTURE_ROOT=str(root), FIXTURE_OS="Linux", FIXTURE_ARCH="x86_64")
-    installed = root / "install/luvus"
+    installed = install_dir / "luvus"
 
     def run(ok=True, **extra):
         result = subprocess.run(["sh", str(repo / "install.sh")], env=dict(env, **extra),
                                 text=True, capture_output=True, timeout=30)
         assert (result.returncode == 0) == ok, result.stdout + result.stderr
-        assert not list((root / "tmp").iterdir()), "download fixture leaked"
+        assert list((root / "tmp").iterdir()) == [blocked_tmp], "installer touched temporary storage"
+        assert blocked_tmp.read_text() == "temporary storage is unavailable"
+        for directory in (install_dir, root / "home/.local/bin"):
+            for stage in directory.glob(".luvus-update.*"):
+                assert [p.name for p in stage.iterdir()] == ["luvus.previous"], "staging files leaked"
         return result.stdout + result.stderr
 
+    assert "No servers were restarted" in run(LUVUS_INSTALL_DIR="")
+    assert (root / "home/.local/bin/luvus").read_bytes() == payload
+    assert not list((root / "home/.local/bin").glob(".luvus-update.*"))
     installed.write_bytes(b"old binary")
     old_inode = installed.stat().st_ino
     assert "No servers were restarted" in run()
@@ -321,7 +340,7 @@ esac
         assert re.fullmatch(r"target=\S+ profile=\S+", lines[3]), detailed
         assert sorted((root / "state").rglob("*")) == before, "version query started or changed a server"
         print("PASS: detailed build identity, -V alias, single-line SSH probe, no server side effects")
-    assert any(p.read_bytes() == b"old binary" for p in (root / "install").glob(".luvus-update.*/luvus.previous"))
+    assert any(p.read_bytes() == b"old binary" for p in install_dir.glob(".luvus-update.*/luvus.previous"))
     assert "installed" in run(LUVUS_VERSION="fork-1.0.99-0123456").lower()
     assert installed.read_bytes() == payload
     assert "installed" in run(FIXTURE_API_FAILURE="1").lower()

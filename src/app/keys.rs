@@ -1706,11 +1706,8 @@ mod tests {
                 .join("")
         };
 
-        // Normal mode shows the live prefix chord (default Ctrl+Space).
-        assert!(
-            screen(&mut app).contains("Ctrl+Space"),
-            "default prefix shown"
-        );
+        // Ordinary mode leaves room for notification previews.
+        assert!(!screen(&mut app).contains("Ctrl+Space"));
 
         // Enter prefix mode: the hint bar includes the search key `/`.
         app.handle_event(crate::event::AppEvent::Key(KeyEvent::new(
@@ -1723,12 +1720,14 @@ mod tests {
             "prefix hint bar shows the `/` search key"
         );
 
-        // Back in normal mode, after switching to Ctrl+b the readout reflects it.
+        // Custom prefix hints likewise appear only after entering prefix mode.
         app.handle_event(crate::event::AppEvent::Key(KeyEvent::new(
             KeyCode::Esc,
             KeyModifiers::NONE,
         )));
         assert!(app.set_prefix("ctrl+b"));
+        assert!(!screen(&mut app).contains("Ctrl+B"));
+        app.handle_event(crate::event::AppEvent::Key(app.prefix.key_event()));
         assert!(
             screen(&mut app).contains("Ctrl+B"),
             "status bar reflects the custom prefix"

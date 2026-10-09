@@ -60,17 +60,32 @@ asset="$BIN-$target.tar.gz"
 url="https://github.com/$REPO/releases/download/$tag/$asset"
 printf 'Installing %s %s (%s)...\n' "$BIN" "$tag" "$target"
 
-# ── download + extract ──
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/luvus-download.XXXXXX")
-stage=""
+# ── choose an install dir and private staging directory ──
+if [ -n "${LUVUS_INSTALL_DIR:-}" ]; then
+  dir="$LUVUS_INSTALL_DIR"
+else
+  dir="$HOME/.local/bin"
+fi
+mkdir -p "$dir"
+[ -w "$dir" ] || err "cannot write to $dir (set LUVUS_INSTALL_DIR to a writable dir)"
+[ ! -L "$dir/$BIN" ] || err "refusing to replace a symlink: $dir/$BIN"
+if [ -e "$dir/$BIN" ]; then
+  [ -f "$dir/$BIN" ] || err "not a regular file: $dir/$BIN"
+fi
+# Keep downloads, extraction and execution on the installation filesystem.
+# Do not use TMPDIR: corporate policies may forbid temporary executable files.
+stage=$(mktemp -d "$dir/.luvus-update.XXXXXX")
+tmp="$stage/download"
 cleanup() {
-  # These paths are private directories created by mktemp, never user input.
+  # Only remove this private staging content; keep any previous binary backup.
   rm -rf "$tmp"
-  if [ -n "$stage" ] && [ -f "$stage/$BIN.new" ]; then
-    rm -f "$stage/$BIN.new"
-  fi
+  rm -f "$stage/$BIN.new"
+  rmdir "$stage" 2>/dev/null || :
 }
 trap cleanup EXIT
+mkdir "$tmp"
+
+# ── download + extract ──
 $DLO "$tmp/$asset" "$url" || err "download failed: $url"
 $DLO "$tmp/$asset.sha256" "$url.sha256" || err "checksum download failed"
 # Verify only this archive, not arbitrary filenames from the checksum file.
@@ -87,24 +102,8 @@ member=$(tar -tzf "$tmp/$asset" | awk '/^luvus-[a-zA-Z0-9._-]+\/luvus$/ {print}'
 [ -n "$member" ] || err "archive did not contain '$BIN'"
 case "$member" in *'
 '*) err "archive contains multiple binaries" ;; esac
-tar -xOzf "$tmp/$asset" "$member" > "$tmp/$BIN" || err "extract failed"
-[ -s "$tmp/$BIN" ] || err "archive contained an empty binary"
-chmod 755 "$tmp/$BIN"
-
-# ── choose an install dir on PATH ──
-if [ -n "${LUVUS_INSTALL_DIR:-}" ]; then
-  dir="$LUVUS_INSTALL_DIR"
-else
-  dir="$HOME/.local/bin"
-fi
-mkdir -p "$dir"
-[ -w "$dir" ] || err "cannot write to $dir (set LUVUS_INSTALL_DIR to a writable dir)"
-[ ! -L "$dir/$BIN" ] || err "refusing to replace a symlink: $dir/$BIN"
-if [ -e "$dir/$BIN" ]; then
-  [ -f "$dir/$BIN" ] || err "not a regular file: $dir/$BIN"
-fi
-stage=$(mktemp -d "$dir/.luvus-update.XXXXXX")
-cp "$tmp/$BIN" "$stage/$BIN.new"
+tar -xOzf "$tmp/$asset" "$member" > "$stage/$BIN.new" || err "extract failed"
+[ -s "$stage/$BIN.new" ] || err "archive contained an empty binary"
 chmod 755 "$stage/$BIN.new"
 version=$("$stage/$BIN.new" --version --remote-session-protocol) || err "downloaded binary cannot run"
 printf '%s\n' "$version"

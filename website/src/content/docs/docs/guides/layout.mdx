@@ -41,14 +41,22 @@ A check mark means enabled. Each pane remembers its own choices across session
 restore and pane restart, including remote panes (update the owning server).
 Very narrow headers hide these controls; widen or zoom the pane to access them.
 Hover over a control for its label, or over a workspace, agent, or pane title
-for its full name, status, and directory. Hints appear after a short pause and
-do not change focus.
+for its full name, status, and directory. Pane hints start with the owner pane ID
+(`p15`), even when the title/path is long. Title hover uses an underline and keeps
+its existing background; sidebar hover uses a background highlight. Hints appear
+after a short pause and do not change focus.
+
+Selection copies immediately show **Copy requested**, including over SSH with
+OSC 52. **Copied** appears only after a native clipboard success receipt; an
+OSC 52 request alone cannot prove acceptance by the terminal. Both notices follow
+the configured toast/inbox presentation.
 
 Each pane title shows a **status dot** and its explicit pane name, otherwise the
 agent/application's OSC 0/2 title, otherwise its working directory. The optional
 path setting appends the directory when a title exists. The focused pane's frame
 is brighter. **Settings → Layout → Rounded corners** switches Luvus borders and
-tab/title caps to rounded Unicode shapes; child terminal glyphs are unchanged.
+tab/title, pane-control, and Menu caps to rounded Unicode shapes; child terminal glyphs are unchanged.
+This setting also synchronizes to running sessions on connected, selected SSH hosts.
 
 **New Pane** splits the right-clicked pane along its longer physical side,
 using the terminal's cell dimensions to choose side by side or top / bottom.
@@ -246,19 +254,18 @@ that agent without clearing the scope. See [Working with Agents](/docs/guides/ag
 
 Luvus Bar lets built-ins and modules use the otherwise flexible space beside
 the tabs and in the middle of the bottom status row. It never adds a row or
-changes pane/PTY dimensions. Tabs, sidebar toggles, the left prefix guidance,
-and the clickable version always keep priority.
+changes pane/PTY dimensions. Tabs, sidebar toggles, and mode-specific guidance always keep priority.
 
 Arrange declared widgets in **Settings → Layout → Luvus Bar**:
 
 - **Top** places a compact widget beside the tabs.
-- **Bottom** places it between the fixed shortcut hint and version.
+- **Bottom** places it at the right of the status bar, beside notification previews.
 - **Off** hides it without deleting module state or its placement declaration.
 
 The declaration rows stay in a stable order while you change placement, so the
 selected widget does not jump under the pointer.
 
-The built-in **Runtime status** widget shows `NORMAL · 1 pane · tab 2/4` in
+The built-in **Runtime status** widget shows `tab 2/4 · 1 pane` in
 Bottom by default and can be moved or hidden. At narrow widths, widgets use
 their compact content and then move into a read-only `… +N` overflow popup;
 they never overlap navigation. See the dedicated [Luvus Bar guide](/docs/guides/bar/)
@@ -266,7 +273,7 @@ for installation, placement, CLI control, module publishing, and troubleshooting
 
 Both Top and Bottom are capped at 100 display columns. They may be narrower when
 the viewport has less room: Top reserves the active tab, scroll arrows, and
-new-tab button, while Bottom reserves the fixed shortcut guidance and version.
+new-tab button, while Bottom reserves active mode guidance and notification previews.
 Extra tabs enter their existing scroll window. A single widget may use all 100
 columns when its region has room. These are terminal columns rather than
 Unicode character counts; wide glyphs such as CJK and many emoji consume two.

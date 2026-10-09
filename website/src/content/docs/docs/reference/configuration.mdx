@@ -32,7 +32,7 @@ cleanly across versions because unknown fields get defaults.
 | `allow_nested` | allow opening an interactive Luvus client from a Luvus pane; defaults to `false` because nested clients compete for terminal input |
 | `layout.scrollback_bytes` | approximate memory budget per pane's retained history; defaults to `10485760` (10 MiB). The legacy `layout.scrollback` line count is read for compatibility. (See [Scrollback](/docs/guides/scrollback/).) |
 | `layout.mobile_width` | inclusive viewport width for automatic mobile presentation; defaults to `64`, and `0` disables it. The legacy `layout.compact_width` key is accepted and migrated. (See [Mobile Sessions](/docs/guides/mobile/).) |
-| `layout.rounded_corners` | optional rounded box borders and tab/title caps; defaults to `false`. Uses standard Unicode glyphs, without changing terminal output or hit targets. |
+| `layout.rounded_corners` | optional rounded box borders and tab/title caps; defaults to `false`. Uses standard Unicode glyphs, without changing terminal output or hit targets. Local Settings changes also synchronize to running sessions on connected, selected SSH hosts. |
 | `layout.agent_status_names` | show the state name beside agent dots; defaults to `true`. Toggle **Show Status Names** in the agent context menu. |
 | `layout.show_titles` | show pane identities in lone-pane headers and split-pane borders |
 | `layout.pane_title_path` | append each terminal's live working directory to its explicit pane name or OSC 0/2 title; without a title, show the directory alone |
@@ -50,7 +50,7 @@ cleanly across versions because unknown fields get defaults.
 | `layout.diff_marker_style` | changed-line indicator: `symbols` (default), `bars`, or `both` |
 | `layout.diff_color_mode` | changed-line palette: `theme` (default) follows the active theme, while `standard` uses fixed red and green review colors |
 | `layout.diff_live_refresh` | refresh visible diff views when the shared FILES status scan changes |
-| `notifications.display` | `toast` (default) keeps floating feedback; `inbox` collects feedback in the sidebar. Select **Settings → General → Notification display**. **Notification inbox → Open history** also opens history when sidebars are hidden. |
+| `notifications.display` | `toast` (default) keeps floating feedback; `inbox` shows a bottom-bar message preview that opens a floating history panel. Select **Settings → General → Notification display**. **Notification inbox → Open history** also opens history when sidebars are hidden. |
 | `notifications.sound_style` | notification cue family: `retro` (default), `soft`, or `pulse` |
 | `notifications.sound_on_done` | play the selected done cue after an agent finishes; defaults to `false` |
 | `notifications.sound_on_blocked` | play the selected blocked cue when an agent needs attention; defaults to `false` |
@@ -64,7 +64,7 @@ cleanly across versions because unknown fields get defaults.
 | `keybindings` | command id → key, overriding the defaults |
 | `direct_keybindings` | opt-in command id → modified semantic chord handled without the prefix. It is empty by default; configured chords are intercepted instead of reaching the focused pane (see [Keybindings](/docs/reference/keybindings/#opt-in-direct-shortcuts)). |
 | `worktree.provider` | worktree backend: `git` (default, backward-compatible) or the canonical id of an enabled module declaring `[worktree_provider]`. Configuration cannot supply executable or argv. Creation applies to CLI/API, TUI, and ORCH task worktrees. A module's optional `remove_command` handles explicit API/TUI removal; otherwise removal falls back to Git. Internal rollback and task merge remain Git-backed. |
-| `bars.top_right` / `bars.bottom_right` / `bars.off` | canonical widget ids (`module:id`) in each Luvus Bar placement. `core:runtime-status` defaults to Bottom. `core:focused-pane` (current tab, pane ID, agent type and state) defaults to Off. Live content and notifications are never persisted. |
+| `bars.top_right` / `bars.bottom_right` / `bars.off` | canonical widget ids (`module:id`) in each Luvus Bar placement. `core:runtime-status` defaults to Bottom. `core:focused-pane` (pane ID, agent type and state) defaults to Bottom; an explicit Off setting is still respected. Live content and notifications are never persisted. |
 
 ## Environment variables
 
@@ -79,10 +79,12 @@ cleanly across versions because unknown fields get defaults.
 
 ### Notification history
 
-The optional sidebar inbox collects UI toasts, structured `ui.notification.push`
-messages and desktop-alert messages in one session-local history. Collapsed, it
-shows unread / total counts and the latest message; click to expand within the
-sidebar. New messages never open it or move terminal focus. Scroll with the
+The optional bottom-bar inbox collects UI toasts, structured `ui.notification.push`
+messages and desktop-alert messages in one session-local history. When there are
+messages, the bottom status bar shows the unread count and latest message preview.
+Click the preview to open a bordered floating panel above the bar; click outside,
+the close button, or press Esc to dismiss. It does not occupy a sidebar dock or
+resize panes. New messages never open it or move terminal focus. Scroll with the
 wheel, arrows, Page Up/Down or Home/End; click an entry then `c` to copy it,
 `r` marks all read, `x` or `×` clears history, and Esc closes it. Opening marks
 existing entries read; notifications arriving while open remain unread.
@@ -90,9 +92,9 @@ existing entries read; notifications arriving while open remain unread.
 History retains at most 100 entries of 4 KiB each, coalesces consecutive identical
 messages from the same source, and survives the notification bar's TTL. It is
 not written to disk and disappears when the server stops. Blocking confirmations
-remain confirmations. With both sidebars hidden, reopen a sidebar or use Settings
-→ General → Notification inbox; compact layouts show history only when explicitly
-opened. Read state belongs to the session, so attached clients share it.
+remain confirmations. The bottom preview remains available with both sidebars
+hidden, including compact layouts. Settings → General → Notification inbox also
+opens history, even when toast presentation is selected. Read state belongs to the session, so attached clients share it.
 
 Registered remote owners supporting transport 18 forward ordinary notifications
 to the display's inbox, including while their workspaces are inactive. The source

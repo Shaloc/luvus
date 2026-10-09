@@ -62,7 +62,7 @@ pub(super) fn draw_switcher(f: &mut RenderTarget, area: Rect, app: &mut App, t: 
         }
         let active = scope == app.switcher_scope;
         let style = if active {
-            Style::new().fg(t.crust).bg(t.accent).bold()
+            Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
         } else {
             Style::new().fg(t.subtext0)
         };

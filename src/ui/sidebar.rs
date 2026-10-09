@@ -284,19 +284,6 @@ fn draw_sidebar_mode(
         body_w,
         area.bottom().saturating_sub(body_top),
     );
-    let inbox_side = if app.sidebars.left.visible {
-        Side::Left
-    } else {
-        Side::Right
-    };
-    let body = if !workspace_only
-        && side == inbox_side
-        && (app.notifications_in_sidebar() || app.notification_inbox.open)
-    {
-        super::notifications::sidebar(f, body, app, t)
-    } else {
-        body
-    };
     let (docks, weights): (Vec<_>, Vec<_>) = app
         .sidebars
         .get(side)
@@ -373,7 +360,7 @@ fn draw_left_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let toggle = Rect::new(area.x, area.y, 3.min(area.width), 1);
     app.sidebar_toggle_rect = Some(toggle);
     let chev_style = if over(toggle) {
-        Style::new().fg(t.crust).bg(t.accent).bold()
+        Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
     } else {
         Style::new().fg(t.accent).bg(t.surface0).bold()
     };
@@ -395,7 +382,7 @@ fn draw_left_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
 
     // Menu drawn after the wordmark so the pill always sits on top.
     let (fg, bg) = if over(menu) {
-        (t.crust, t.accent)
+        (t.on_color(t.accent), t.accent)
     } else {
         (t.accent, t.surface1)
     };
@@ -403,6 +390,7 @@ fn draw_left_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         Paragraph::new(Span::styled(menu_label, Style::new().fg(fg).bg(bg).bold())),
         menu,
     );
+    f.pill_caps(menu, bg, t.base);
     app.settings_icon_rect = Some(menu);
 }
 
@@ -419,7 +407,7 @@ fn draw_right_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme)
     let toggle = Rect::new(area.right().saturating_sub(3), area.y, 3.min(area.width), 1);
     app.right_sidebar_toggle_rect = Some(toggle);
     let style = if over(toggle) {
-        Style::new().fg(t.crust).bg(t.accent).bold()
+        Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
     } else {
         Style::new().fg(t.accent).bg(t.surface0).bold()
     };
@@ -436,7 +424,7 @@ fn draw_right_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme)
         let menu = Rect::new(chrome_left, area.y, w.min(area.width), 1);
         if menu.right() <= toggle.x {
             let (fg, bg) = if over(menu) {
-                (t.crust, t.accent)
+                (t.on_color(t.accent), t.accent)
             } else {
                 (t.accent, t.surface1)
             };
@@ -444,6 +432,7 @@ fn draw_right_chrome(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme)
                 Paragraph::new(Span::styled(label, Style::new().fg(fg).bg(bg).bold())),
                 menu,
             );
+            f.pill_caps(menu, bg, t.base);
             app.settings_icon_rect = Some(menu);
             draw_named_session_button(f, area.y, menu.right().saturating_add(1), toggle.x, app, t);
         }
@@ -474,7 +463,7 @@ fn draw_named_session_button(
         column >= rect.x && column < rect.right() && row >= rect.y && row < rect.bottom()
     });
     let style = if app.server_mode && (app.named_session_menu.is_some() || hovered) {
-        Style::new().fg(t.crust).bg(t.accent).bold()
+        Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
     } else {
         Style::new().fg(t.text).bold()
     };
@@ -760,7 +749,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             let w = crate::ui::display_width(label) as u16;
             let rect = Rect::new(x, aheader, w, 1);
             let style = if active_only == val {
-                Style::new().fg(t.crust).bg(t.accent).bold()
+                Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
             } else {
                 Style::new().fg(t.overlay1).bg(t.surface1)
             };
@@ -1031,6 +1020,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                             .bold(),
                         cw as usize,
                         app.config.layout.rounded_corners,
+                        t,
                     ),
                 );
                 app.agent_group_rects
@@ -1140,6 +1130,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         name_style,
                         cw as usize,
                         app.config.layout.rounded_corners,
+                        t,
                     ),
                 );
                 if paths_visible {
@@ -1209,6 +1200,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         Style::new().fg(t.subtext1).bold(),
                         cw as usize,
                         app.config.layout.rounded_corners,
+                        t,
                     ),
                 );
                 if paths_visible {
@@ -1290,6 +1282,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         Style::new().fg(t.subtext0),
                         cw as usize,
                         app.config.layout.rounded_corners,
+                        t,
                     ),
                 );
                 if paths_visible {
@@ -1966,7 +1959,10 @@ mod tests {
         for st in [State::Idle, State::Blocked, State::Working, State::Done] {
             app.status.get_mut(&id).unwrap().state = st;
             term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-            let cols = label_columns(&term, st.label());
+            let cols: Vec<_> = label_columns(&term, st.label())
+                .into_iter()
+                .filter(|column| *column < app.agent_rects[0].1.right())
+                .collect();
             assert!(!cols.is_empty(), "the {st:?} row should be drawn");
             columns.extend(cols);
         }
@@ -2613,7 +2609,7 @@ mod dock_tone_tests {
 }
 
 /// The label budgets badge and text together so long aliases cannot cover the
-/// scrollbar. Host colors are deterministic, independent of workspace order.
+/// scrollbar. Host badge colors are stable by host name, independent of workspace order.
 fn agent_label_line(
     mut prefix: Vec<Span<'static>>,
     host: Option<&str>,
@@ -2621,11 +2617,12 @@ fn agent_label_line(
     style: Style,
     width: usize,
     rounded: bool,
+    t: &Theme,
 ) -> Line<'static> {
     let used: usize = prefix.iter().map(Span::width).sum();
     let mut remaining = width.saturating_sub(used);
     if let Some(host) = host.filter(|_| remaining > 4) {
-        let badge = host_badge(host, host, (remaining / 2).max(3), rounded);
+        let badge = host_badge(host, host, (remaining / 2).max(3), rounded, t);
         remaining = remaining.saturating_sub(badge.iter().map(Span::width).sum::<usize>() + 1);
         prefix.extend(badge);
         prefix.push(Span::raw(" "));

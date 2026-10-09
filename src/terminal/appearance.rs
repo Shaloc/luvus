@@ -108,7 +108,7 @@ fn luminance(rgb: [u8; 3]) -> f32 {
         + 0.0722 * (rgb[2] as f32 / 255.0)
 }
 
-fn query_color(color: Color, default: [u8; 3]) -> Option<[u8; 3]> {
+pub(crate) fn query_color(color: Color, default: [u8; 3]) -> Option<[u8; 3]> {
     match color {
         Color::Reset => Some(default),
         Color::Rgb(r, g, b) => Some([r, g, b]),

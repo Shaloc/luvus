@@ -1347,6 +1347,12 @@ impl App {
         self.persist_config_patch(&serde_json::json!({"language": code}));
     }
 
+    pub(in crate::app) fn apply_rounded_corners_locally(&mut self, rounded: bool) {
+        self.config.layout.rounded_corners = rounded;
+        self.remote_rounded_sync.revision = self.remote_rounded_sync.revision.wrapping_add(1);
+        self.persist_config_patch(&serde_json::json!({"layout": {"rounded_corners": rounded}}));
+    }
+
     /// Layout tab ‹ ›/click on a row's control (docs/29). Width sliders step by
     /// `delta`; toggles flip; a `Dock` row's `[Left]`/`[Right]` buttons (which map
     /// to `delta < 0` / `delta > 0`) place the dock on that side.
@@ -1412,8 +1418,8 @@ impl App {
                 self.persist_config();
             }
             LayoutRow::RoundedCorners => {
-                self.config.layout.rounded_corners = !self.config.layout.rounded_corners;
-                self.persist_config();
+                self.apply_rounded_corners_locally(!self.config.layout.rounded_corners);
+                self.sync_rounded_corners_to_connected_hosts();
             }
             LayoutRow::PaneTitlePath => {
                 self.config.layout.pane_title_path = !self.config.layout.pane_title_path;
@@ -1727,7 +1733,7 @@ impl App {
             }
             Some(GeneralRow::NotificationDisplay) => {
                 use crate::config::NotificationDisplay;
-                self.config.notifications.display = if self.notifications_in_sidebar() {
+                self.config.notifications.display = if self.notifications_in_inbox() {
                     NotificationDisplay::Toast
                 } else {
                     NotificationDisplay::Inbox

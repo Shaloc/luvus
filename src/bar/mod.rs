@@ -886,31 +886,25 @@ impl crate::app::App {
         let runtime = BarWidget::new(
             BarWidgetKey::new("core", "runtime-status"),
             BarRegion::BottomRight,
-            vec![
-                BarSegment::text(self.catalog.mode_normal, BarTone::Muted),
-                BarSegment::separator(),
-                BarSegment::text(
-                    format!(
-                        "{panes} {}",
-                        if panes == 1 {
-                            self.catalog.pane
-                        } else {
-                            self.catalog.panes
-                        }
-                    ),
-                    BarTone::Normal,
+            vec![BarSegment::text(
+                format!(
+                    "{} {}/{} · {} {}",
+                    self.catalog.act_tab,
+                    active_tab + 1,
+                    tab_count,
+                    panes,
+                    if panes == 1 {
+                        self.catalog.pane
+                    } else {
+                        self.catalog.panes
+                    }
                 ),
-                BarSegment::separator(),
-                BarSegment::text(
-                    format!("{} {}/{}", self.catalog.act_tab, active_tab + 1, tab_count),
-                    BarTone::Normal,
-                ),
-            ],
-            vec![
-                BarSegment::text(format!("{panes}p"), BarTone::Normal),
-                BarSegment::separator(),
-                BarSegment::text(format!("{}/{}", active_tab + 1, tab_count), BarTone::Normal),
-            ],
+                BarTone::Normal,
+            )],
+            vec![BarSegment::text(
+                format!("{}/{} · {panes}p", active_tab + 1, tab_count),
+                BarTone::Normal,
+            )],
             100,
         )
         .expect("core runtime widget is bounded");
@@ -1001,21 +995,11 @@ impl crate::app::App {
             self.bar.remove_widget(CORE_FOCUSED_PANE);
             return;
         };
-        let mut content = vec![
-            BarSegment::text(
-                format!("{} {}", self.catalog.act_tab, metadata.tab),
-                BarTone::Normal,
-            ),
-            BarSegment::separator(),
-            BarSegment::text(
-                format!("{} {}", self.catalog.pane, metadata.pane),
-                BarTone::Normal,
-            ),
-        ];
-        let mut compact = vec![BarSegment::text(
-            format!("t{} p{}", metadata.tab, metadata.pane),
+        let mut content = vec![BarSegment::text(
+            format!("p{}", metadata.pane),
             BarTone::Normal,
         )];
+        let mut compact = content.clone();
         if let Some((agent, state)) = metadata.agent {
             let segment = BarSegment {
                 kind: BarSegmentKind::State {
@@ -1350,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn focused_pane_widget_is_opt_in_and_tracks_actual_local_focus() {
+    fn focused_pane_widget_defaults_on_tracks_focus_and_respects_explicit_off() {
         use crate::ui::theme::State;
         let _env = crate::persist::test_env("focused-pane-bar");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -1360,10 +1344,10 @@ mod tests {
             config
                 .bars
                 .region_for(CORE_FOCUSED_PANE, BarRegion::BottomRight),
-            None
+            Some(BarRegion::BottomRight)
         );
         app.refresh_core_bar_widgets();
-        assert!(!app.bar.widgets.contains_key(CORE_FOCUSED_PANE));
+        assert!(app.bar.widgets.contains_key(CORE_FOCUSED_PANE));
         assert!(app.bar.declaration(CORE_FOCUSED_PANE).is_some());
         assert!(app
             .bar
@@ -1380,9 +1364,9 @@ mod tests {
         status.state = State::Working;
         app.refresh_core_bar_widgets();
         let text = mobile_segment_text(&app.bar.widgets[CORE_FOCUSED_PANE].content);
-        assert!(text.contains(&format!("pane {}", pane.0)), "{text}");
+        assert!(text.contains(&format!("p{}", pane.0)), "{text}");
         assert!(
-            text.contains("tab 1") && text.contains("codex working"),
+            !text.contains("tab 1") && text.contains("codex working"),
             "{text}"
         );
         let created = app.dispatch("tab.new", &serde_json::json!({})).unwrap();
@@ -1436,8 +1420,8 @@ mod tests {
         app.refresh_core_bar_widgets();
         let text = mobile_segment_text(&app.bar.widgets[CORE_FOCUSED_PANE].content);
         assert!(
-            text.contains("tab 3")
-                && text.contains("pane owner-27")
+            !text.contains("tab 3")
+                && text.contains("powner-27")
                 && text.contains("qodercli blocked"),
             "{text}"
         );

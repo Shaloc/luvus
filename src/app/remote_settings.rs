@@ -10,7 +10,7 @@ use super::{io_jobs::IoJobs, App};
 use crate::session::remote::{self, ConnectionScope, HostStatus, RemoteSession};
 
 struct PreferenceRequest {
-    value: String,
+    value: serde_json::Value,
     revision: u64,
     hosts: Vec<String>,
 }
@@ -19,13 +19,15 @@ struct PreferenceRequest {
 enum Preference {
     Theme,
     Language,
+    RoundedCorners,
 }
 
 impl Preference {
-    fn key(self) -> &'static str {
+    fn patch(self, value: &serde_json::Value) -> serde_json::Value {
         match self {
-            Self::Theme => "theme",
-            Self::Language => "language",
+            Self::Theme => serde_json::json!({"theme": value}),
+            Self::Language => serde_json::json!({"language": value}),
+            Self::RoundedCorners => serde_json::json!({"layout": {"rounded_corners": value}}),
         }
     }
 
@@ -33,6 +35,7 @@ impl Preference {
         match self {
             Self::Theme => &app.remote_theme_sync,
             Self::Language => &app.remote_language_sync,
+            Self::RoundedCorners => &app.remote_rounded_sync,
         }
     }
 
@@ -40,13 +43,15 @@ impl Preference {
         match self {
             Self::Theme => &mut app.remote_theme_sync,
             Self::Language => &mut app.remote_language_sync,
+            Self::RoundedCorners => &mut app.remote_rounded_sync,
         }
     }
 
-    fn value(self, app: &App) -> &str {
+    fn value(self, app: &App) -> serde_json::Value {
         match self {
-            Self::Theme => &app.config.theme,
-            Self::Language => &app.config.language,
+            Self::Theme => app.config.theme.clone().into(),
+            Self::Language => app.config.language.clone().into(),
+            Self::RoundedCorners => app.config.layout.rounded_corners.into(),
         }
     }
 
@@ -54,6 +59,7 @@ impl Preference {
         match self {
             Self::Theme => app.theme_selection_revision,
             Self::Language => app.remote_language_sync.revision,
+            Self::RoundedCorners => app.remote_rounded_sync.revision,
         }
     }
 
@@ -61,6 +67,7 @@ impl Preference {
         match self {
             Self::Theme => app.catalog.settings.theme_sync_done,
             Self::Language => app.catalog.settings.language_sync_done,
+            Self::RoundedCorners => app.catalog.settings.rounded_sync_done,
         }
     }
 
@@ -68,6 +75,7 @@ impl Preference {
         match self {
             Self::Theme => app.catalog.settings.theme_sync_failed,
             Self::Language => app.catalog.settings.language_sync_failed,
+            Self::RoundedCorners => app.catalog.settings.rounded_sync_failed,
         }
     }
 }
@@ -108,7 +116,7 @@ fn connected_hosts(selected: &[String], statuses: &[HostStatus]) -> Vec<String> 
 fn sync_host_preference(
     host: &str,
     preference: Preference,
-    value: &str,
+    value: &serde_json::Value,
     scope: &Arc<ConnectionScope>,
 ) -> Result<(), String> {
     if !scope.wait_for_retry(Duration::ZERO) {
@@ -129,7 +137,7 @@ fn sync_host_preference(
             let response = remote::request_control_in_scope(
                 &target,
                 "config.patch",
-                serde_json::json!({"patch": {(preference.key()): value}}),
+                serde_json::json!({"patch": preference.patch(value)}),
                 Duration::from_secs(3),
                 1024 * 1024,
                 Arc::clone(scope),
@@ -157,6 +165,10 @@ fn sync_host_preference(
 }
 
 impl App {
+    pub(super) fn sync_rounded_corners_to_connected_hosts(&mut self) {
+        self.sync_preference_to_connected_hosts(Preference::RoundedCorners);
+    }
+
     pub(super) fn sync_theme_to_connected_hosts(&mut self) {
         self.sync_preference_to_connected_hosts(Preference::Theme);
     }
@@ -167,7 +179,7 @@ impl App {
 
     fn sync_preference_to_connected_hosts(&mut self, preference: Preference) {
         let request = PreferenceRequest {
-            value: preference.value(self).to_string(),
+            value: preference.value(self),
             revision: preference.revision(self),
             hosts: connected_hosts(&self.config.remote_hosts, &self.remote_host_status),
         };
@@ -176,7 +188,11 @@ impl App {
     }
 
     pub(super) fn cancel_unselected_preference_sync(&mut self) {
-        for state in [&mut self.remote_theme_sync, &mut self.remote_language_sync] {
+        for state in [
+            &mut self.remote_theme_sync,
+            &mut self.remote_language_sync,
+            &mut self.remote_rounded_sync,
+        ] {
             state.scopes.retain(|host, scope| {
                 if self.config.remote_hosts.contains(host) {
                     true
@@ -302,6 +318,50 @@ mod tests {
             }],
             error: error.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn rounded_sync_coalesces_bool_patches_without_rebroadcast_or_layout_reset() {
+        let _env = persist::test_env("rounded-sync");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.config.remote_hosts = vec!["active".into()];
+        app.remote_host_status = vec![status("active", true, None)];
+        app.remote_rounded_sync.inflight = true;
+        for value in [true, false, true] {
+            app.apply_rounded_corners_locally(value);
+            app.sync_rounded_corners_to_connected_hosts();
+        }
+        let request = app.remote_rounded_sync.pending.take().unwrap();
+        assert_eq!(request.value, serde_json::json!(true));
+        assert_eq!(request.hosts, ["active"]);
+        assert_eq!(request.revision, app.remote_rounded_sync.revision);
+        assert_eq!(
+            Preference::RoundedCorners.patch(&request.value),
+            serde_json::json!({"layout":{"rounded_corners":true}})
+        );
+        app.file_tree.scroll = 17;
+        let generation = app.remote_registry_generation;
+        let mut expected = serde_json::to_value(&app.config).unwrap();
+        expected["layout"]["rounded_corners"] = false.into();
+        app.dispatch(
+            "config.patch",
+            &serde_json::json!({"patch":{"layout":{"rounded_corners":false}}}),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&app.config).unwrap(), expected);
+        assert_eq!(app.remote_registry_generation, generation);
+        assert_eq!(app.file_tree.scroll, 17);
+        assert!(app.remote_rounded_sync.pending.is_none());
+        assert!(app
+            .dispatch(
+                "config.patch",
+                &serde_json::json!({"patch":{"layout":{"rounded_corners":"true"}}})
+            )
+            .is_err());
+        assert_eq!(serde_json::to_value(&app.config).unwrap(), expected);
+        app.flush_config_for_test(&rx);
+        assert!(!crate::config::load().layout.rounded_corners);
     }
 
     #[test]

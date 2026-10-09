@@ -121,6 +121,22 @@ Pick whichever channel you prefer:
   </TabItem>
 </Tabs>
 
+## Shaloc fork installer
+
+For this fork's macOS ARM64 and Linux x86_64 musl releases, use:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shaloc/luvus/main/install.sh | sh
+```
+
+The fork installer uses `~/.local/bin` by default, or `LUVUS_INSTALL_DIR` when
+set. Downloads, extraction and binary validation stay in a private
+`.luvus-update.*` directory inside that installation directory; `/tmp` and
+`TMPDIR` are not used. It checks SHA-256 before executing the candidate,
+preserves a backup of the previous binary, and replaces it by a same-filesystem
+rename. Temporary files are cleaned up on success or failure, retaining any
+backup. Existing servers are not restarted.
+
 ## Check your setup
 
 ```sh

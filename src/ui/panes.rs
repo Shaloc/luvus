@@ -150,6 +150,9 @@ pub(super) fn draw_pane_titles(
             t,
         );
         draw_mouse_buttons(f, app, *id, bg, t);
+        if focused {
+            round_title_controls(f, app, t);
+        }
     }
     title_rects
 }
@@ -165,10 +168,10 @@ fn draw_mouse_buttons(f: &mut RenderTarget, app: &App, pane: PaneId, bg: Color, 
             options.copy_on_select
         };
         let text = match (*right_click, enabled) {
-            (true, true) => "R✓ ",
-            (true, false) => "R· ",
-            (false, true) => "C✓ ",
-            (false, false) => "C· ",
+            (true, true) => " R✓",
+            (true, false) => " R·",
+            (false, true) => " C✓",
+            (false, false) => " C·",
         };
         let mut style = Style::new()
             .fg(if enabled { t.green } else { t.subtext0 })
@@ -177,10 +180,32 @@ fn draw_mouse_buttons(f: &mut RenderTarget, app: &App, pane: PaneId, bg: Color, 
             style = style.bold();
         }
         if app.hover.is_some_and(|at| rect.contains(at.into())) {
-            style = style.reversed();
+            style = style.underlined();
         }
         f.render_widget(Paragraph::new(Span::styled(text, style)), *rect);
     }
+}
+
+/// The existing hit targets already reserve padding at both ends of the strip.
+/// Share their geometry so rounded caps cannot eat labels or move click targets.
+fn round_title_controls(f: &mut RenderTarget, app: &App, t: &Theme) {
+    if !app.config.layout.rounded_corners {
+        return;
+    }
+    let controls = app.pane_mouse_rects.iter().map(|(_, _, r)| *r).chain(
+        [
+            app.pane_restart_rect,
+            app.pane_zoom_rect,
+            app.pane_close_rect,
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    let Some(rect) = controls.reduce(|a, b| a.union(b)) else {
+        return;
+    };
+    f.buffer_mut().set_style(rect, Style::new().bg(t.surface0));
+    f.pill_caps(rect, t.surface0, t.mantle);
 }
 
 /// Cells reserved on the right of a focused pane's title for its buttons: the ✕,
@@ -252,6 +277,7 @@ struct PaneRenderContext<'a> {
     diff_note_rects: &'a mut Vec<(PaneId, String, Rect)>,
     preview_link_rects: &'a mut Vec<(PaneId, String, Rect)>,
     rendered_hyperlinks: &'a mut Vec<crate::app::RenderedHyperlink>,
+    title_rects: &'a mut Vec<(PaneId, Rect)>,
 }
 
 const MAX_RENDERED_HYPERLINKS: usize = 256;
@@ -391,6 +417,7 @@ pub(super) fn draw_panes(
     lone_header: bool,
     app: &mut App,
     t: &Theme,
+    title_rects: &mut Vec<(PaneId, Rect)>,
 ) -> Option<(u16, u16, bool)> {
     let focus = app.layout().focus;
     let mut cursor = None;
@@ -406,6 +433,7 @@ pub(super) fn draw_panes(
             diff_note_rects: &mut diff_note_rects,
             preview_link_rects: &mut preview_link_rects,
             rendered_hyperlinks: &mut rendered_hyperlinks,
+            title_rects,
         };
         for (id, rect) in rects {
             if let Some(c) = draw_one_pane(f, *rect, *id, *id == focus, bordered, &mut context, t) {
@@ -645,11 +673,8 @@ fn draw_one_pane(
                 .saturating_sub(if restart { 3 } else { 0 })
                 .saturating_sub(if show_restore { 3 } else { 0 }),
         );
-        let title_rect = if app.config.layout.rounded_corners {
-            Rect::new(header.x, header.y, title_width, 1)
-        } else {
-            header
-        };
+        let title_rect = Rect::new(header.x, header.y, title_width, 1);
+        context.title_rects.push((id, title_rect));
         f.render_widget(Paragraph::new(title), title_rect);
         if app.config.layout.rounded_corners {
             f.pill_caps(title_rect, hbg, t.mantle);
@@ -676,6 +701,9 @@ fn draw_one_pane(
             );
         }
         draw_mouse_buttons(f, app, id, hbg, t);
+        if focused {
+            round_title_controls(f, app, t);
+        }
     }
 
     // Content background = the dark pane background.
@@ -890,7 +918,7 @@ fn draw_one_pane(
             f.render_widget(
                 Paragraph::new(Line::from(Span::styled(
                     label,
-                    Style::new().fg(t.crust).bg(t.accent),
+                    Style::new().fg(t.on_color(t.accent)).bg(t.accent),
                 ))),
                 badge,
             );

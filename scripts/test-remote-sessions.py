@@ -748,7 +748,9 @@ def main():
             process, master = start_client(["--session", "api"])
             def screen_text():
                 drain(master, 0.12)
-                return "\n".join(client_terminals[master][0].display)
+                text = "\n".join(client_terminals[master][0].display)
+                (root / "appearance-screen.txt").write_text(text)
+                return text
             def row_for(label):
                 for y, line in enumerate(client_terminals[master][0].display):
                     if label in line: return line.index(label) + 1, y + 1
@@ -800,25 +802,40 @@ def main():
                 clipboard.write_bytes(b"OLD_CLIPBOARD")
                 select_marker()
                 wait_for(lambda: screen_text() and clipboard.read_bytes() == b"MOUSE_COPY_PROOF")
+                wait_for(lambda: screen_text() and any(label in client_terminals[master][0].display[-1]
+                                                      for label in ("Copied", "Copy requested")))
+                bottom = client_terminals[master][0].display[-1]
+                preview_label = "Copied" if "Copied" in bottom else "Copy requested"
+                click(master, bottom.index(preview_label) + 1, len(client_terminals[master][0].display))
+                wait_for(lambda: "Copy requested" in screen_text())
+                os.write(master, b"\x1b")
+                drain(master)
                 os.write(master, b"q")
                 drain(master)
                 print(f"PASS: {label} pane header toggles route right-clicks, preserve Shift menu, and control selection/manual clipboard copy", flush=True)
 
             mouse_options_case(False)
+            remote_log = root / "remote-state/sessions/api/logs/server.log"
+            def display_attachments():
+                return sum(json.loads(line).get("event") == "client.attach" for line in remote_log.read_text().splitlines())
+            before_attach = display_attachments()
             run("session", "merge", "on")
             wait_for(projected)
+            # Topology appears before its notification display subscribes. Wait
+            # for that existing channel, then send each notice exactly once.
+            wait_for(lambda: screen_text() and display_attachments() > before_attach)
             # Keep a LOCAL terminal active: remote notices must arrive even when
             # no remote pane is selected. The remote owner retains default toasts.
-            wait_for(lambda: "Notification inbox" in screen_text())
             run("--session", "api", "ui", "toast", "REMOTE_TOAST_PROOF", remote=True)
             wait_for(lambda: "REMOTE_TOAST_PROOF" in screen_text())
-            header_x, header_y = row_for("Notification inbox")
+            header_x, header_y = row_for("REMOTE_TOAST_PROOF")
             terminal = client_terminals[master][0]
             occurrences = [(y, line.index("REMOTE_TOAST_PROOF")) for y, line in enumerate(terminal.display)
                            if "REMOTE_TOAST_PROOF" in line]
-            assert len(occurrences) == 1 and occurrences[0][1] < 45, occurrences
+            assert len(occurrences) == 1 and occurrences[0][0] == len(terminal.display) - 1, occurrences
             click(master, header_x, header_y)
             wait_for(lambda: "fake-dev / api" in screen_text())
+            (root / "notification-popup-screen.txt").write_text(screen_text())
             assert screen_text().count("REMOTE_TOAST_PROOF") == 1, screen_text()
             os.write(master, b"\x1b")
             drain(master)
@@ -828,10 +845,10 @@ def main():
             run("--session", "api", "ui", "toast", "REMOTE_ACTIVE_PROOF", remote=True)
             wait_for(lambda: "REMOTE_ACTIVE_PROOF" in screen_text())
             assert screen_text().count("REMOTE_ACTIVE_PROOF") == 1, screen_text()
-            assert all(line.index("REMOTE_ACTIVE_PROOF") < 45 for line in terminal.display if "REMOTE_ACTIVE_PROOF" in line)
+            assert "REMOTE_ACTIVE_PROOF" in terminal.display[-1], screen_text()
             api("ui.notification.push", {"text": "REMOTE_BAR_PROOF", "level": "error", "ttl_ms": 500}, remote=True)
             wait_for(lambda: "REMOTE_BAR_PROOF" in screen_text())
-            header_x, header_y = row_for("Notification inbox")
+            header_x, header_y = row_for("REMOTE_BAR_PROOF")
             click(master, header_x, header_y)
             wait_for(lambda: "fake-dev / api" in screen_text())
             drain(master, 1)
@@ -849,6 +866,14 @@ def main():
             os.write(master, b"\x1b")
             drain(master)
             mouse_options_case(True)
+            os.write(master, b"\x02")
+            wait_for(lambda: screen_text() and "Ctrl+B" in terminal.display[-1] and "split" in terminal.display[-1])
+            os.write(master, b"\x1b")
+            wait_for(lambda: screen_text() and "Ctrl+B" not in terminal.display[-1])
+            remote_focus = next(p["pane"] for p in api("pane.list", remote=True)["panes"] if p["focused"])
+            api("agent.report", {"pane": remote_focus, "source": "smoke/status", "agent": "codex", "status": "working", "ttl_s": 120}, remote=True)
+            wait_for(lambda: screen_text() and "codex working" in terminal.display[-1] and f"p{remote_focus}" in terminal.display[-1])
+            print("PASS: merged remote prefix hints and focused owner pane/agent status are visible by default", flush=True)
             for remote in (False, True):
                 api("config.patch", {"patch": {"theme": "none"}}, remote=remote)
             wait_for(lambda: screen_text() and terminal.buffer[10][80].bg == "default")
@@ -865,7 +890,7 @@ def main():
             os.write(master, b"q")
             drain(master)
             (root / "appearance-screen.txt").write_text(screen_text())
-            print("PASS: optional sidebar inbox collects inactive and active remote toasts/bar notices once, with source; history survives TTL; host details open on real thin client", flush=True)
+            print("PASS: bottom preview and floating inbox collect inactive and active remote toasts/bar notices once, with source; history survives TTL; host details open on real thin client", flush=True)
             return
 
         if colors_only:
@@ -1310,6 +1335,22 @@ def main():
             os.write(master, b"\x1b")
             drain(master)
             print("PASS: merged remote Settings language follows local selection on all running owners", flush=True)
+
+            os.write(master, b"\x02=")
+            settings_screen = drain(master)
+            click(master, *position(settings_screen + repaint(master), "Layout"))
+            layout_screen = drain(master)
+            click(master, *position(layout_screen + repaint(master), "Rounded corners"))
+            # Clicking this toggle row selects and activates it.
+            wait_for(lambda: all(api("config.get", remote=True, session=name)["config"]["layout"]["rounded_corners"]
+                                for name in owners))
+            assert api("config.get")["config"]["layout"]["rounded_corners"]
+            os.write(master, b"\r")
+            wait_for(lambda: all(not api("config.get", remote=True, session=name)["config"]["layout"]["rounded_corners"]
+                                for name in owners))
+            os.write(master, b"\x1b")
+            drain(master)
+            print("PASS: Layout rounded corners synchronizes both directions to running owners without restart", flush=True)
 
             # Selecting another local theme must not inherit any remote config.
             run("--session", "api", "theme", "use", "one-dark")

@@ -36,3 +36,4 @@
 {"id":"session-report-valid-2","result":{"type":"session_match","pane":null,"matches":0,"server_generation":"boot-a"}}
 {"id":"session-report-valid-3","result":{"type":"session_match","pane":"7","matches":1,"server_generation":"boot-a"}}
 {"id":"session-report-valid-4","result":{"type":"session_match","pane":null,"matches":2,"server_generation":"boot-a"}}
+{"id":"snapshot-prefix-bindings","result":{"type":"session_snapshot","protocol":{"name":"luvus-uhp","major":1,"minor":0},"session":"default","server_generation":"example-generation","event_sequence":1,"workspaces":[],"prefix_bindings":{"close_pane":"K","new_tab":"","future-command":"F"}}}

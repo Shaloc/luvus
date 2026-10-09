@@ -33,7 +33,7 @@ pub(super) fn draw_sidebar_reopen(
             .hover
             .is_some_and(|(c, rr)| c >= r.x && c < r.right() && rr == r.y);
         let style = if hov {
-            Style::new().fg(t.crust).bg(t.accent).bold()
+            Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
         } else {
             Style::new().fg(t.accent).bg(t.surface0).bold()
         };
@@ -53,7 +53,7 @@ pub(super) fn draw_sidebar_reopen(
             .hover
             .is_some_and(|(c, rr)| c >= r.x && c < r.right() && rr == r.y);
         let style = if hov {
-            Style::new().fg(t.crust).bg(t.accent).bold()
+            Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
         } else {
             Style::new().fg(t.accent).bg(t.surface0).bold()
         };
@@ -220,7 +220,7 @@ pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
         let label = center(&truncate(&labels[i], text_w.saturating_sub(2)), text_w);
         let rect = Rect::new(x, area.y, w, 1);
         let style = if i == active {
-            Style::new().fg(t.crust).bg(t.accent).bold()
+            Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
         } else {
             // Inactive tab: same as the pane background.
             Style::new()
@@ -242,7 +242,10 @@ pub(super) fn draw_tabbar(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
             // The active tab keeps its `✕` close button in the reserved columns.
             let close = Rect::new(x + w - CLOSE, area.y, CLOSE, 1);
             f.render_widget(
-                Paragraph::new(Span::styled("✕ ", Style::new().fg(t.crust).bg(t.accent))),
+                Paragraph::new(Span::styled(
+                    "✕ ",
+                    Style::new().fg(t.on_color(t.accent)).bg(t.accent),
+                )),
                 close,
             );
             close_rects.push((i, close));

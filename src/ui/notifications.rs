@@ -1,4 +1,4 @@
-//! Quiet sidebar notification history; only explicit opening expands it.
+//! Bottom-bar notification preview and an explicitly opened floating history.
 use super::{theme::Theme, RenderTarget};
 use crate::{app::App, bar::NotificationLevel};
 use ratatui::{
@@ -8,25 +8,86 @@ use ratatui::{
     widgets::{Block, Paragraph},
 };
 
-/// Reserve a footer in the chosen existing sidebar. Expanded history occupies
-/// only its dock body, keeping the terminal and its PTY size untouched.
-pub(super) fn sidebar(f: &mut RenderTarget, body: Rect, app: &mut App, t: &Theme) -> Rect {
-    if body.width < 3 || body.height == 0 {
-        return body;
+/// Bottom-bar preview uses the same bounded history as the floating inbox.
+pub(super) fn preview(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
+    if area.width < 4 || area.height == 0 {
+        return;
     }
-    let height = if app.notification_inbox.open {
-        body.height
-    } else {
-        body.height.min(3)
+    let Some(latest) = app.bar.history.back() else {
+        return;
     };
-    let area = Rect::new(
-        body.x,
-        body.bottom() - height,
-        body.width.saturating_sub(1),
-        height,
+    let unread = app.bar.history.iter().filter(|item| item.unread).count();
+    let text = if app.notification_inbox.open {
+        format!(
+            " ▾ {} {unread}/{} ",
+            app.catalog.settings.notify_inbox,
+            app.bar.history.len()
+        )
+    } else {
+        format!(" ● {unread} {}", latest.text.lines().next().unwrap_or(""))
+    };
+    let text = super::truncate(&text, area.width as usize);
+    let rect = Rect::new(area.x, area.y, super::display_width(&text) as u16, 1);
+    app.notification_inbox.trigger = rect;
+    let hovered = app.hover.is_some_and(|p| rect.contains(p.into()));
+    let background = if hovered || app.notification_inbox.open {
+        t.surface1
+    } else {
+        t.crust
+    };
+    f.render_widget(
+        Paragraph::new(text).style(
+            Style::new()
+                .fg(if hovered {
+                    t.on_color(background)
+                } else {
+                    level_color(latest.level, t)
+                })
+                .bg(background),
+        ),
+        rect,
     );
-    draw(f, area, app, t);
-    Rect::new(body.x, body.y, body.width, body.height - height)
+}
+
+/// The inbox is a client overlay above the status line, never a sidebar dock.
+pub(super) fn popup(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
+    if !app.notification_inbox.open || area.width < 8 || area.height < 4 {
+        return;
+    }
+    let anchor = app.notification_inbox.trigger;
+    let bottom = if anchor.is_empty() {
+        area.bottom().saturating_sub(1)
+    } else {
+        anchor.y
+    };
+    let height = bottom.saturating_sub(area.y).min(18);
+    if height < 3 {
+        return;
+    }
+    let width = area.width.saturating_sub(2).min(90);
+    let x = if anchor.is_empty() {
+        area.x + (area.width - width) / 2
+    } else {
+        anchor
+            .x
+            .min(area.right().saturating_sub(width + 1))
+            .max(area.x)
+    };
+    let popup = Rect::new(x, bottom - height, width, height);
+    let border = Block::bordered()
+        .border_type(f.border_type())
+        .border_style(Style::new().fg(t.border_focus))
+        .style(Style::new().fg(t.text).bg(t.base));
+    let inner = border.inner(popup);
+    f.render_widget(ratatui::widgets::Clear, popup);
+    f.render_widget(border, popup);
+    draw(f, inner, app, t);
+    app.notification_inbox.rect = popup;
+    app.notification_inbox.close = Rect::new(popup.right() - 4, popup.y, 3, 1);
+    f.render_widget(
+        Paragraph::new(" × ").style(Style::new().fg(t.text).bg(t.base)),
+        app.notification_inbox.close,
+    );
 }
 fn level_color(level: NotificationLevel, t: &Theme) -> ratatui::style::Color {
     match level {
@@ -36,7 +97,7 @@ fn level_color(level: NotificationLevel, t: &Theme) -> ratatui::style::Color {
         NotificationLevel::Error => t.coral,
     }
 }
-pub(super) fn draw(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
+fn draw(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
     if area.width < 3 || area.height == 0 {
         return;
     }
@@ -69,20 +130,6 @@ pub(super) fn draw(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
         area.width,
         area.height.saturating_sub(1),
     );
-    if !open {
-        let text = app
-            .bar
-            .history
-            .back()
-            .map(|item| item.text.lines().next().unwrap_or(""))
-            .unwrap_or(cat.notify_empty);
-        f.render_widget(
-            Paragraph::new(super::truncate(text, body.width as usize))
-                .style(Style::new().fg(t.subtext0)),
-            body,
-        );
-        return;
-    }
     let body = Rect::new(body.x, body.y, body.width, body.height.saturating_sub(1));
     let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     app.notification_inbox.clear = Rect::new(
@@ -139,7 +186,7 @@ pub(super) fn draw(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
                     String::new()
                 }
             );
-            // Keep host/session legible in a narrow sidebar: it gets its own
+            // Keep host/session legible in a narrow popup: it gets its own
             // line instead of losing its suffix after the timestamp.
             if super::display_width(&label) > body.width as usize {
                 let (stamp, source) = label.split_at(label.find('Z').unwrap() + 1);

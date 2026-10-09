@@ -49,7 +49,7 @@ the session count or connection error. Opening the session switcher, or pressing
 `r` there, refreshes the list, including sessions created independently on the
 remote host. There is no idle polling and no connection to unselected hosts.
 
-Local **Settings → Theme** and **Settings → Language** changes synchronize
+Local **Settings → Theme**, **Settings → Language**, and **Layout → Rounded corners** changes synchronize
 the selected value to all running
 sessions on connected selected hosts, including when the focused workspace is
 remote. No other configuration is copied, and received patches do not fan out
@@ -142,14 +142,15 @@ the display client's. Global session navigation and local Settings/Agents stay
 local. Pressing the prefix twice sends the owner's configured prefix once.
 The bottom status bar identifies the active remote host and actual session.
 
-To also show the current tab position, pane ID, and agent type/state, select
-**Settings → Layout → Luvus Bar → Current tab / pane → Bottom**. It defaults
-to Off and uses the focused owner's metadata in local, direct remote, and
+The current pane ID and agent type/state are shown by default in
+**Settings → Layout → Luvus Bar → Current tab / pane → Bottom**. This uses the focused owner's metadata in local, direct remote, and
 merge layouts. Tab positions are 1-based; pane IDs are the owner's opaque IDs,
 not the local projection's ID. Shells and native views have no agent label.
 Metadata is hidden while disconnected or while topology and displayed focus
 do not agree. Mode-specific key guidance takes precedence on the status line;
-narrow rows use compact labels (`t2 p27`) or the normal bar overflow.
+narrow rows use compact labels (`p27`) or the normal bar overflow. Pressing
+Ctrl+B (or your configured prefix) replaces this row with shortcut guidance;
+owner actions use bindings advertised by the remote snapshot.
 
 The existing CLI/UHP bar placement commands control the same preference on
 the display server:
