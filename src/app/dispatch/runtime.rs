@@ -147,6 +147,9 @@ impl App {
         if let Some(exp) = self.bar.notifications.iter().map(|n| n.expires_at).min() {
             consider(exp, true);
         }
+        if let Some(exp) = self.bar.notification_preview_until {
+            consider(exp, true);
+        }
         if let Some(exp) = self
             .pending_pty_exits
             .values()

@@ -4701,11 +4701,7 @@ impl App {
         self.probed_appearance =
             Some(crate::terminal::appearance::PaneAppearance::from_terminal_colors(colors));
         let theme_id = self.config.theme.clone();
-        let derived = if theme_id == "none" {
-            crate::ui::theme::Theme::terminal_unstyled()
-        } else {
-            crate::ui::theme::Theme::from_terminal(colors)
-        };
+        let derived = crate::ui::theme::Theme::for_terminal(&theme_id, Some(colors));
         self.set_effective_theme(&theme_id, derived);
     }
 

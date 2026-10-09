@@ -29,9 +29,9 @@ pub struct ProbeResult {
 /// Query only the palette entries used by `Theme::from_terminal`.
 #[cfg(unix)]
 const PALETTE_QUERIES: [u8; 6] = [1, 2, 3, 4, 6, 8];
-/// Unsupported terminals must not add a visible pause to attachment.
+/// A bounded startup wait also covers replies crossing an SSH round trip.
 #[cfg(unix)]
-const PROBE_TIMEOUT_MS: u64 = 50;
+const PROBE_TIMEOUT_MS: u64 = 250;
 
 /// Query the terminal. The caller must already have enabled raw mode.
 #[cfg(unix)]
@@ -99,6 +99,7 @@ pub fn probe() -> ProbeResult {
 fn fd_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> bool {
     use std::time::{Duration, Instant};
 
+    #[cfg(not(target_os = "macos"))]
     let mut poll_fd = libc::pollfd {
         fd,
         events: libc::POLLIN,
@@ -108,11 +109,46 @@ fn fd_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> bool {
         (timeout_ms >= 0).then(|| Instant::now() + Duration::from_millis(timeout_ms as u64));
     let mut remaining = timeout_ms;
     loop {
+        // Darwin terminal descriptors need select for reliable readiness;
+        // poll can return without waiting for a delayed terminal reply.
+        #[cfg(target_os = "macos")]
+        let result = {
+            if fd < 0 || fd as usize >= libc::FD_SETSIZE {
+                return false;
+            }
+            // SAFETY: fd is checked against fd_set's bounds; both structures
+            // live through select and the descriptor remains borrowed.
+            unsafe {
+                let mut reads: libc::fd_set = std::mem::zeroed();
+                libc::FD_SET(fd, &mut reads);
+                let mut timeout = libc::timeval {
+                    tv_sec: (remaining.max(0) / 1000).into(),
+                    tv_usec: (remaining.max(0) % 1000) * 1000,
+                };
+                libc::select(
+                    fd + 1,
+                    &mut reads,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    if remaining < 0 {
+                        std::ptr::null_mut()
+                    } else {
+                        &mut timeout
+                    },
+                )
+            }
+        };
         // SAFETY: `poll_fd` contains only the borrowed descriptor supplied by
         // the caller. The timeout is bounded by the probe's existing deadline.
+        #[cfg(not(target_os = "macos"))]
         let result = unsafe { libc::poll(&mut poll_fd, 1, remaining) };
         if result > 0 {
-            return poll_fd.revents & libc::POLLIN != 0;
+            #[cfg(target_os = "macos")]
+            return true;
+            #[cfg(not(target_os = "macos"))]
+            {
+                return poll_fd.revents & libc::POLLIN != 0;
+            }
         }
         if result == 0 {
             return false;
@@ -128,7 +164,10 @@ fn fd_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> bool {
             return false;
         }
         remaining = remaining_duration.as_millis().clamp(1, i32::MAX as u128) as i32;
-        poll_fd.revents = 0;
+        #[cfg(not(target_os = "macos"))]
+        {
+            poll_fd.revents = 0;
+        }
     }
 }
 
@@ -462,6 +501,55 @@ fn xterm_modifiers(value: u16) -> KeyModifiers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_waits_for_a_delayed_reply_on_a_raw_pty() {
+        use std::io::{Read, Write};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::time::Duration;
+
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: openpty initializes two fresh descriptors; File owns each
+        // successful result, including on a later assertion failure.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let (mut master, mut slave) = unsafe {
+            (
+                std::fs::File::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+            )
+        };
+        // SAFETY: termios is initialized by tcgetattr for this live PTY.
+        unsafe {
+            let mut mode: libc::termios = std::mem::zeroed();
+            assert_eq!(libc::tcgetattr(slave.as_raw_fd(), &mut mode), 0);
+            libc::cfmakeraw(&mut mode);
+            assert_eq!(libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &mode), 0);
+        }
+        assert!(!fd_readable(slave.as_raw_fd(), 0));
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            master.write_all(b"reply").unwrap();
+            master // Keep the peer alive through the readiness check.
+        });
+        assert!(fd_readable(slave.as_raw_fd(), 1000));
+        let _master = writer.join().unwrap();
+        let mut bytes = [0; 5];
+        slave.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"reply");
+        assert!(!fd_readable(slave.as_raw_fd(), 0));
+    }
 
     #[test]
     fn parses_st_and_bel_color_replies() {

@@ -61,13 +61,24 @@ impl PaneAppearance {
         declared: ThemeAppearance,
         probed: Option<Self>,
     ) -> Self {
-        let foreground = query_color(
+        let resolve = |color, reported: Option<[u8; 3]>, fallback| {
+            if matches!(declared, ThemeAppearance::Terminal) && color == Color::Reset {
+                // The terminal's default is unknown until its probe succeeds.
+                // Reporting the bundled dark palette misleads light-mode apps.
+                reported
+            } else {
+                query_color(color, reported.unwrap_or(fallback))
+            }
+        };
+        let foreground = resolve(
             foreground_color,
-            probed.and_then(|p| p.foreground).unwrap_or(DEFAULT_FG),
+            probed.and_then(|p| p.foreground),
+            DEFAULT_FG,
         );
-        let background = query_color(
+        let background = resolve(
             background_color,
-            probed.and_then(|p| p.background).unwrap_or(DEFAULT_BG),
+            probed.and_then(|p| p.background),
+            DEFAULT_BG,
         );
         let scheme = match declared {
             ThemeAppearance::Dark => ColorScheme::Dark,
@@ -183,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_reset_uses_probe_then_fallback() {
+    fn terminal_reset_uses_probe_and_does_not_invent_default_colors() {
         let probed = PaneAppearance {
             foreground: Some([0x28, 0x28, 0x28]),
             background: Some([0xf2, 0xe5, 0xbc]),
@@ -200,7 +211,11 @@ mod tests {
         );
         assert_eq!(
             PaneAppearance::resolve(Color::Reset, Color::Reset, ThemeAppearance::Terminal, None),
-            PaneAppearance::default()
+            PaneAppearance {
+                foreground: None,
+                background: None,
+                scheme: ColorScheme::Dark
+            }
         );
     }
 }

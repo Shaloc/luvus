@@ -454,6 +454,7 @@ pub struct BarState {
     pub notifications: VecDeque<BarNotification>,
     pub history: VecDeque<NotificationRecord>,
     pub history_revision: u64,
+    pub notification_preview_until: Option<Instant>,
     pub pending_notifications: VecDeque<(String, NotificationLevel)>,
     pub hits: Vec<BarHit>,
     pub overflow_hits: Vec<OverflowHit>,
@@ -470,6 +471,7 @@ impl Default for BarState {
             notifications: VecDeque::new(),
             history: VecDeque::new(),
             history_revision: 0,
+            notification_preview_until: None,
             pending_notifications: VecDeque::new(),
             hits: Vec::new(),
             overflow_hits: Vec::new(),
@@ -527,6 +529,7 @@ impl BarState {
         if clean.is_empty() {
             return;
         }
+        self.notification_preview_until = Some(Instant::now() + Duration::from_secs(5));
         self.history_revision = self.history_revision.wrapping_add(1);
         if relay {
             self.pending_notifications.push_back((clean.clone(), level));
@@ -561,6 +564,7 @@ impl BarState {
 
     pub fn clear_notification_history(&mut self) {
         self.history.clear();
+        self.notification_preview_until = None;
         self.history_revision = self.history_revision.wrapping_add(1);
     }
     pub fn mark_notifications_read(&mut self) {
@@ -668,6 +672,8 @@ impl BarState {
     ) -> Result<(), String> {
         request.validate()?;
         self.record_notification(&request.text, request.owner.as_deref(), request.level);
+        self.notification_preview_until =
+            Some(now + Duration::from_millis(request.ttl_ms.clamp(MIN_TTL_MS, MAX_TTL_MS)));
         let NotificationPush {
             owner,
             text,
@@ -733,7 +739,13 @@ impl BarState {
         let before = self.notifications.len();
         self.notifications
             .retain(|notification| notification.expires_at > now);
-        let changed = before != self.notifications.len();
+        let preview_expired = self
+            .notification_preview_until
+            .is_some_and(|until| until <= now);
+        if preview_expired {
+            self.notification_preview_until = None;
+        }
+        let changed = before != self.notifications.len() || preview_expired;
         if changed {
             self.clear_geometry();
         }

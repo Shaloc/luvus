@@ -281,6 +281,7 @@ impl App {
         let Some(inspect) = &mut self.host_inspect else {
             return;
         };
+        self.hover = None;
         let details = inspect.details.is_some();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.host_inspect = None,
@@ -326,6 +327,11 @@ impl App {
         };
         let pos = (mouse.column, mouse.row).into();
         match mouse.kind {
+            MouseEventKind::Moved if inspect.details.is_none() => {
+                if let Some(selected) = inspect.rects.iter().position(|r| r.contains(pos)) {
+                    inspect.selected = selected;
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) if inspect.details.is_none() => {
                 if let Some(action) = inspect.rects.iter().position(|r| r.contains(pos)) {
                     self.host_inspect_action(action);
@@ -356,6 +362,7 @@ mod tests {
         let mut app = remote_ui_app();
         let (view, input, _) = add_remote_workspace(&mut app);
         app.config.layout.workspace_display = crate::config::WorkspaceDisplay::Tree;
+        app.config.layout.rounded_corners = true;
         let ViewKind::Remote(v) = app.views.get_mut(&view).unwrap() else {
             panic!()
         };
@@ -380,7 +387,43 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert_eq!(app.host_inspect.as_ref().unwrap().host, "dev-207");
-        app.host_inspect_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        crate::ui::render_into(
+            &mut crate::ui::RenderTarget::new(&mut buffer, area),
+            &mut app,
+        );
+        let rows = app.host_inspect.as_ref().unwrap().rects.clone();
+        let motion = |row: Rect| {
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: row.x + 1,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        for (selected, row) in rows.iter().copied().enumerate() {
+            assert!(app.handle_event(motion(row)), "entering a row must repaint");
+            assert_eq!(app.host_inspect.as_ref().unwrap().selected, selected);
+            crate::ui::render_into(
+                &mut crate::ui::RenderTarget::new(&mut buffer, area),
+                &mut app,
+            );
+            for x in row.x + 1..row.right() - 1 {
+                assert_eq!(buffer[(x, row.y)].bg, app.theme.accent);
+            }
+            assert!(!app.handle_event(motion(row)), "same row is unchanged");
+        }
+        app.host_inspect_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.host_inspect.as_ref().unwrap().selected, 1);
+        assert!(
+            app.handle_event(motion(rows[2])),
+            "mouse resumes after keyboard selection"
+        );
+        assert_eq!(app.host_inspect.as_ref().unwrap().selected, 2);
+        assert!(app.handle_event(motion(rows[1])));
+        assert!(
+            input.try_recv().is_err(),
+            "hover must not send remote input"
+        );
         app.host_inspect_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         crate::ui::render_into(
             &mut crate::ui::RenderTarget::new(&mut buffer, area),

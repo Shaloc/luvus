@@ -693,7 +693,12 @@ mod tests {
         let result = run_with_input(
             &dir,
             &[shell.into(), "-c".into(), script.into()],
-            &[("BG_PID_FILE".into(), pid_file.display().to_string())],
+            &[
+                ("BG_PID_FILE".into(), pid_file.display().to_string()),
+                // Other fixtures temporarily replace the process-wide PATH.
+                // These POSIX shell scripts need only standard system tools.
+                ("PATH".into(), "/usr/bin:/bin".into()),
+            ],
             Some(input),
             None,
             None,

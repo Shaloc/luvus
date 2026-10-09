@@ -305,6 +305,68 @@ mod tests {
     }
 
     #[test]
+    fn inbox_preview_expires_without_losing_history_or_closing_the_popup() {
+        let _env = crate::persist::test_env("inbox-preview-expiry");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(140, 40, tx).unwrap();
+        app.config.notifications.display = crate::config::NotificationDisplay::Inbox;
+        let area = Rect::new(0, 0, 140, 40);
+        let draw = |app: &mut App| {
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            crate::ui::render_into(&mut crate::ui::RenderTarget::new(&mut buffer, area), app);
+            (0..area.width)
+                .map(|x| buffer[(x, area.bottom() - 1)].symbol())
+                .collect::<String>()
+        };
+        for remote in [false, true] {
+            if remote {
+                app.bar.ingest_notification(
+                    "REMOTE_PREVIEW",
+                    Some("host / session"),
+                    NotificationLevel::Info,
+                    false,
+                );
+            } else {
+                app.show_toast("LOCAL_PREVIEW");
+            }
+            let label = if remote {
+                "REMOTE_PREVIEW"
+            } else {
+                "LOCAL_PREVIEW"
+            };
+            let until = app.bar.notification_preview_until.unwrap();
+            assert!(draw(&mut app).contains(label));
+            assert!(!app.tick_bar_notifications(until - Duration::from_millis(1)));
+            assert!(app.tick_bar_notifications(until));
+            assert!(!draw(&mut app).contains(label));
+            assert!(app.notification_inbox.trigger.width < 10);
+            assert!(app.bar.history.back().unwrap().unread);
+            let trigger = app.notification_inbox.trigger;
+            assert!(app.notification_inbox_mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: trigger.x + 1,
+                row: trigger.y,
+                modifiers: KeyModifiers::NONE,
+            }));
+            assert!(app.notification_inbox.open);
+            assert_eq!(app.bar.history.back().unwrap().text, label);
+            assert!(!app.tick_bar_notifications(until + Duration::from_secs(30)));
+            assert!(app.notification_inbox.open);
+            app.notification_inbox.open = false;
+        }
+        app.show_toast("REPEAT_PREVIEW");
+        let until = app.bar.notification_preview_until.unwrap();
+        app.tick_bar_notifications(until);
+        app.show_toast("REPEAT_PREVIEW");
+        assert_eq!(app.bar.history.back().unwrap().count, 2);
+        assert!(draw(&mut app).contains("REPEAT_PREVIEW"));
+        app.bar.clear_notification_history();
+        assert!(app.bar.notification_preview_until.is_none());
+        draw(&mut app);
+        assert!(app.notification_inbox.trigger.is_empty());
+    }
+
+    #[test]
     fn notification_inbox_is_optional_quiet_and_passive_geometry_safe() {
         let _env = crate::persist::test_env("notification-inbox");
         let (tx, _rx) = std::sync::mpsc::channel();

@@ -86,38 +86,14 @@ fn render_popup(
     };
     let popup = Rect::new(x, y, w, h);
 
-    // Rounded outlines need the surrounding surface in their outer corner
-    // cells; filling those cells with the menu color makes a square silhouette.
-    let corners = [
-        (popup.x, popup.y),
-        (popup.right() - 1, popup.y),
-        (popup.x, popup.bottom() - 1),
-        (popup.right() - 1, popup.bottom() - 1),
-    ]
-    .map(|at| (at, f.buffer_mut().cell(at).map(|cell| cell.bg)));
     f.render_widget(Clear, popup);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
-        .border_style(
-            Style::new()
-                .fg(if f.rounded_corners {
-                    t.overlay0
-                } else {
-                    t.border_focus
-                })
-                .bg(t.surface0),
-        )
-        .style(Style::new().bg(t.surface0));
+        .border_style(Style::new().fg(t.border_focus).bg(t.base))
+        .style(Style::new().fg(t.text).bg(t.base));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    if f.rounded_corners {
-        for (at, bg) in corners {
-            if let (Some(cell), Some(bg)) = (f.buffer_mut().cell_mut(at), bg) {
-                cell.set_bg(bg);
-            }
-        }
-    }
 
     // How many rows fit, and how far the list can therefore be scrolled.
     let per_screen = (inner.height / row_height) as usize;
@@ -150,10 +126,7 @@ fn render_popup(
             // A thin, non-interactive separator across the inner width.
             let line = "─".repeat(inner.width as usize);
             f.render_widget(
-                Paragraph::new(Span::styled(
-                    line,
-                    Style::new().fg(t.surface1).bg(t.surface0),
-                )),
+                Paragraph::new(Span::styled(line, Style::new().fg(t.border).bg(t.base))),
                 text_row,
             );
             rects[i] = row;
@@ -167,16 +140,17 @@ fn render_popup(
         } else {
             t.text
         };
-        let bg = if hot { t.accent } else { t.surface0 };
+        let bg = if hot { t.accent } else { t.base };
+        let style = Style::new().fg(fg).bg(bg);
+        // Fill the complete row, including padding beyond a short label.
+        // Rounded caps alone would leave a disconnected highlight at the right.
+        f.render_widget(Block::new().style(style), row);
         f.render_widget(
-            Paragraph::new(Span::styled(
-                format!(" {} ", r.text),
-                Style::new().fg(fg).bg(bg),
-            )),
+            Paragraph::new(format!(" {} ", r.text)).style(style),
             text_row,
         );
         if hot {
-            f.pill_caps(text_row, bg, t.surface0);
+            f.pill_caps(text_row, bg, t.base);
         }
         rects[i] = row;
     }
@@ -185,7 +159,7 @@ fn render_popup(
     // one. The marker sits in the border, which costs no row.
     if popup.width >= 3 {
         let marker_x = popup.right().saturating_sub(2);
-        let style = Style::new().fg(t.accent).bg(t.surface0);
+        let style = Style::new().fg(t.accent).bg(t.base);
         if offset > 0 {
             f.render_widget(
                 Paragraph::new(Span::styled("\u{25b2}", style)),
@@ -1015,7 +989,7 @@ mod label_case_tests {
     ];
 
     #[test]
-    fn rounded_popup_preserves_outer_corners_and_rounds_the_selected_row() {
+    fn rounded_popup_has_a_continuous_background_and_full_width_highlight() {
         let area = Rect::new(0, 0, 50, 20);
         let mut buffer = Buffer::empty(area);
         let mut target = RenderTarget::new(&mut buffer, area);
@@ -1024,11 +998,18 @@ mod label_case_tests {
         let canvas = Color::Rgb(245, 245, 245);
         target.buffer_mut().set_style(area, Style::new().bg(canvas));
         let mut scroll = MenuScroll::default();
-        let rows = [MenuRow {
-            text: "Create pane".into(),
-            divider: false,
-            destructive: false,
-        }];
+        let rows = [
+            MenuRow {
+                text: "Split".into(),
+                divider: false,
+                destructive: false,
+            },
+            MenuRow {
+                text: "Run command in pane".into(),
+                divider: false,
+                destructive: false,
+            },
+        ];
         let hits = render_popup(
             &mut target,
             area,
@@ -1044,15 +1025,23 @@ mod label_case_tests {
             },
         );
         assert_eq!(buffer[(4, 5)].symbol(), "╭");
-        assert_eq!(buffer[(4, 5)].bg, canvas);
+        assert_eq!(buffer[(4, 5)].bg, theme.base);
         let row = hits[0];
+        for x in [row.x - 1, row.right()] {
+            for y in [row.y - 1, hits[1].bottom()] {
+                assert_eq!(buffer[(x, y)].bg, theme.base, "menu corner {x},{y}");
+            }
+        }
         assert_eq!(buffer[(row.x, row.y)].symbol(), "◖");
         assert_eq!(buffer[(row.right() - 1, row.y)].symbol(), "◗");
+        for x in row.x + 1..row.right() - 1 {
+            assert_eq!(buffer[(x, row.y)].bg, theme.accent, "highlight gap at {x}");
+        }
         assert_eq!(buffer[(row.x + 1, row.y)].fg, theme.on_color(theme.accent));
         let text: String = (row.x..row.right())
             .map(|x| buffer[(x, row.y)].symbol())
             .collect();
-        assert!(text.contains("Create pane"), "{text}");
+        assert!(text.contains("Split"), "{text}");
     }
 
     #[test]

@@ -82,7 +82,10 @@ cleanly across versions because unknown fields get defaults.
 The optional bottom-bar inbox collects UI toasts, structured `ui.notification.push`
 messages and desktop-alert messages in one session-local history. When there are
 messages, the bottom status bar shows the unread count and latest message preview.
-Click the preview to open a bordered floating panel above the bar; click outside,
+Ordinary local and remote previews collapse after five seconds to a small unread
+count; history is retained. Locally pushed structured notifications honor their
+requested TTL. Click the preview or collapsed count to open a bordered floating
+panel above the bar; click outside,
 the close button, or press Esc to dismiss. It does not occupy a sidebar dock or
 resize panes. New messages never open it or move terminal focus. Scroll with the
 wheel, arrows, Page Up/Down or Home/End; click an entry then `c` to copy it,

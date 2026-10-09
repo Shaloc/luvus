@@ -16,18 +16,28 @@ fn pal(c: [u8; 3]) -> Color {
 }
 
 impl Theme {
+    /// Derive only UI colors; applying this palette must not mutate other
+    /// clients' themes or the appearance owned by a live pane.
+    pub(crate) fn for_terminal(name: &str, colors: Option<&TerminalColors>) -> Self {
+        if name == "none" {
+            Self::terminal_unstyled()
+        } else {
+            colors.map_or_else(Self::terminal_native, Self::from_terminal)
+        }
+    }
+
     /// Resolve only chrome surfaces against the displaying terminal. Main pane
     /// foreground/background remain Reset in None mode; child colors are untouched.
     pub(crate) fn chrome(&self, colors: Option<&TerminalColors>) -> Self {
         let mut theme = self.clone();
         if self.crust == Color::Reset {
-            theme.crust = colors.map_or(Color::Indexed(0), |c| blend_rgb(c.bg, c.fg, 0.07));
+            theme.crust = colors.map_or(Color::Reset, |c| blend_rgb(c.bg, c.fg, 0.07));
         }
         if self.surface0 == Color::Reset {
-            theme.surface0 = colors.map_or(Color::Indexed(8), |c| blend_rgb(c.bg, c.fg, 0.12));
+            theme.surface0 = colors.map_or(Color::Reset, |c| blend_rgb(c.bg, c.fg, 0.12));
         }
         if self.surface1 == Color::Reset {
-            theme.surface1 = colors.map_or(Color::Indexed(8), |c| blend_rgb(c.bg, c.fg, 0.19));
+            theme.surface1 = colors.map_or(Color::Reset, |c| blend_rgb(c.bg, c.fg, 0.19));
         }
         if let (Color::Indexed(index), Some(c)) = (self.accent, colors) {
             if let Some(rgb) = c.palette.get(index as usize) {
@@ -1049,6 +1059,20 @@ mod tests {
             assert_eq!(theme.surface0, Color::Reset);
             assert_eq!(theme.text, pal(colors.fg));
             assert_eq!(theme.accent, pal(colors.palette[4]));
+        }
+    }
+
+    #[test]
+    fn none_chrome_does_not_guess_dark_surfaces_without_a_probe() {
+        let theme = Theme::terminal_unstyled().chrome(None);
+        for color in [
+            theme.base,
+            theme.mantle,
+            theme.crust,
+            theme.surface0,
+            theme.surface1,
+        ] {
+            assert_eq!(color, Color::Reset);
         }
     }
 

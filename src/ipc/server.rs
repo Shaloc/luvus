@@ -1998,6 +1998,23 @@ fn render_client(
 ) -> RenderClientOutcome {
     let origin = client.render_origin;
     let previous_chrome = app.relay_notification_chrome;
+    // Each projection is painted for its own displaying terminal. The owner's
+    // foreground client may have a different palette (or no color probe).
+    // Keep this scoped to rendering: only the size owner below changes PTYs.
+    let previous_colors = std::mem::replace(
+        &mut app.display_terminal_colors,
+        client.terminal_colors.clone(),
+    );
+    let previous_theme = crate::ui::theme::follows_terminal(&app.config.theme).then(|| {
+        let mut theme = crate::ui::theme::Theme::for_terminal(
+            &app.config.theme,
+            client.terminal_colors.as_ref(),
+        );
+        if app.downsample {
+            theme = theme.to_256();
+        }
+        std::mem::replace(&mut app.theme, theme)
+    });
     let outcome = app.with_input_source(client_id, origin, |app| {
         if !client.surface_active() {
             return RenderClientOutcome::default();
@@ -2327,6 +2344,10 @@ fn render_client(
         }
     });
     app.relay_notification_chrome = previous_chrome;
+    app.display_terminal_colors = previous_colors;
+    if let Some(theme) = previous_theme {
+        app.theme = theme;
+    }
     outcome
 }
 
@@ -4293,6 +4314,57 @@ mod tests {
             assert!(fixture.clients.contains_key(&2));
             assert!(!fixture.clients[&2].private_frame_active);
             assert!(fixture.app.panes[&pane].size().1 > private_size.1);
+        }
+
+        #[test]
+        fn projection_chrome_uses_its_display_palette_without_changing_the_owner() {
+            use crate::terminal::theme_probe::{default_ansi_palette, TerminalColors};
+            let _env = crate::persist::test_env("projection-chrome-palette");
+            let mut fixture = Fixture::new();
+            let colors = |fg, bg| TerminalColors {
+                fg,
+                bg,
+                palette: default_ansi_palette(fg, bg),
+            };
+            let dark = colors([230; 3], [20; 3]);
+            let light = colors([40; 3], [245; 3]);
+            fixture.clients.get_mut(&1).unwrap().terminal_colors = Some(dark.clone());
+            fixture.clients.get_mut(&2).unwrap().terminal_colors = Some(light.clone());
+            for name in ["none", "terminal"] {
+                fixture.api(
+                    "config.patch",
+                    serde_json::json!({"patch": {
+                        "theme": name, "layout": {"rounded_corners": true}
+                    }}),
+                );
+                fixture.app.apply_terminal_colors(&dark);
+                let original_theme = fixture.app.theme.clone();
+                fixture.render();
+                let light_theme = if name == "none" {
+                    crate::ui::theme::Theme::terminal_unstyled()
+                } else {
+                    crate::ui::theme::Theme::from_terminal(&light)
+                }
+                .chrome(Some(&light));
+                let frame = &fixture.clients[&2].render_buf;
+                assert!(
+                    frame
+                        .content
+                        .iter()
+                        .any(|cell| cell.bg == light_theme.surface0),
+                    "{name}: remote header must use the display's light surface"
+                );
+                assert!(
+                    !frame
+                        .content
+                        .iter()
+                        .any(|cell| cell.bg == original_theme.chrome(Some(&dark)).surface0),
+                    "{name}: remote header inherited the owner's dark surface"
+                );
+                assert_eq!(fixture.app.theme, original_theme);
+                assert_eq!(fixture.app.display_terminal_colors, Some(dark.clone()));
+                assert_eq!(fixture.foreground, Some(1));
+            }
         }
 
         #[test]

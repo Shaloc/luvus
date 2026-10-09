@@ -247,7 +247,10 @@ keeping the default foreground/background (`Reset`) and terminal ANSI colors.
 Main pane and sidebar backgrounds stay at the terminal default, preserving
 transparency. The bottom status bar uses a subtle neutral background derived
 from the terminal probe; buttons and sidebar hover highlights use neutral
-chrome surfaces. Host badges retain their stable per-host colors. Filled controls choose contrasting light or dark text. It also disables Luvus's added Codex composer fill. Child applications
+chrome surfaces. Without a successful color probe, these surfaces stay at the
+terminal default instead of assuming a dark ANSI background. Context menus use
+the main background with a continuous border and full-row selection highlight.
+Host badges retain their stable per-host colors. Filled controls choose contrasting light or dark text. It also disables Luvus's added Codex composer fill. Child applications
 keep their own explicit colors, including a light input background drawn by the
 agent itself. Colored status controls and hostname badges
 remain distinct; selected navigation rows keep their accent text.
@@ -256,6 +259,6 @@ The existing **Terminal** theme remains available when you prefer derived surfac
 colors. Both modes use the displaying terminal's color probe for child light/dark
 and default-color queries. Remote theme synchronization uses the same existing
 owner route. Transport 18 also carries the displaying terminal's colors to the
-active remote workspace, so a remote child can answer OSC 10/11 with the correct
+active remote workspace for both its UI chrome and child appearance, so a remote child can answer OSC 10/11 with the correct
 light or dark defaults. Passive displays cannot overwrite that workspace's
 appearance. Install the updated build on both sides before selecting `none`.

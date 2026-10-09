@@ -284,7 +284,7 @@ def main():
                LUVUS_SMOKE_ROOT=str(root), LUVUS_SMOKE_BINARY=str(binary),
                LUVUS_SMOKE_REMOTE_BINARY=str(remote_binary), DISPLAY=":smoke")
     env.pop("WAYLAND_DISPLAY", None)
-    if colors_only:
+    if colors_only or appearance_only:
         env["COLORTERM"] = "truecolor"
         # Tool runners commonly export NO_COLOR. This private display must
         # actually emit SGR colors for end-to-end color assertions.
@@ -665,6 +665,10 @@ def main():
                     screen.extend(os.read(master, 65536))
                     if appearance_only and not answered_probe and b"\x1b]10;?" in screen:
                         # Real thin-client probe: simulate this light host terminal.
+                        # A client reached through SSH can receive OSC replies
+                        # after the old 50ms startup window. Keep the real input
+                        # path under test instead of injecting colors via API.
+                        time.sleep(0.12)
                         reply = b"\x1b]10;rgb:38/3a/42\x07\x1b]11;rgb:fa/fa/fa\x07"
                         for index in (1, 2, 3, 4, 6, 8):
                             reply += f"\x1b]4;{index};rgb:60/70/80\x07".encode()
@@ -764,7 +768,7 @@ def main():
                 report = root / ("mouse-" + label + ".json")
                 wait_for(lambda: report.exists() and "MOUSE_COPY_PROOF" in screen_text())
                 received = lambda: bytes.fromhex(json.loads(report.read_text())["received"])
-                assert not received()
+                assert not received(), (label, "unexpected child input", repr(received()))
                 assert "R·" in screen_text() and "C✓" in screen_text(), "new pane defaults"
                 x, y = row_for("R·")
                 click(master, x, y)
@@ -846,6 +850,15 @@ def main():
             wait_for(lambda: "REMOTE_ACTIVE_PROOF" in screen_text())
             assert screen_text().count("REMOTE_ACTIVE_PROOF") == 1, screen_text()
             assert "REMOTE_ACTIVE_PROOF" in terminal.display[-1], screen_text()
+            # A quiet remote notification must retire its preview on a deadline,
+            # with no keys or new PTY output needed to trigger the redraw.
+            wait_for(lambda: "REMOTE_ACTIVE_PROOF" not in screen_text())
+            bottom = terminal.display[-1]
+            assert "●" in bottom, bottom
+            click(master, bottom.index("●") + 1, len(terminal.display))
+            wait_for(lambda: "REMOTE_ACTIVE_PROOF" in screen_text())
+            os.write(master, b"\x1b")
+            drain(master)
             api("ui.notification.push", {"text": "REMOTE_BAR_PROOF", "level": "error", "ttl_ms": 500}, remote=True)
             wait_for(lambda: "REMOTE_BAR_PROOF" in screen_text())
             header_x, header_y = row_for("REMOTE_BAR_PROOF")
@@ -861,6 +874,13 @@ def main():
             click(master, x, y, button=2)
             wait_for(lambda: "Connection details" in screen_text())
             x, y = row_for("Connection details")
+            selected_bg = terminal.buffer[y - 1][x - 1].bg
+            error_x, error_y = row_for("Error details")
+            os.write(master, f"\x1b[<35;{error_x};{error_y}M".encode())
+            wait_for(lambda: screen_text() and terminal.buffer[error_y - 1][error_x - 1].bg == selected_bg
+                     and terminal.buffer[y - 1][x - 1].bg != selected_bg)
+            os.write(master, f"\x1b[<35;{x};{y}M".encode())
+            wait_for(lambda: screen_text() and terminal.buffer[y - 1][x - 1].bg == selected_bg)
             click(master, x, y)
             wait_for(lambda: "generation=" in screen_text())
             os.write(master, b"\x1b")
@@ -875,9 +895,16 @@ def main():
             wait_for(lambda: screen_text() and "codex working" in terminal.display[-1] and f"p{remote_focus}" in terminal.display[-1])
             print("PASS: merged remote prefix hints and focused owner pane/agent status are visible by default", flush=True)
             for remote in (False, True):
-                api("config.patch", {"patch": {"theme": "none"}}, remote=remote)
+                api("config.patch", {"patch": {"theme": "none", "layout": {"rounded_corners": True}}}, remote=remote)
             wait_for(lambda: screen_text() and terminal.buffer[10][80].bg == "default")
             assert terminal.buffer[10][80].fg == "default", terminal.buffer[10][80]
+            def light_remote_chrome():
+                screen_text()
+                colors = {cell.bg for y in range(3) for cell in terminal.buffer[y].values()}
+                (root / "remote-chrome-colors.json").write_text(json.dumps(sorted(colors)))
+                return "e2e2e3" in colors
+            wait_for(light_remote_chrome)
+            print("PASS: remote None chrome uses the same light display palette as local chrome", flush=True)
             remote_pane = api("pane.list", remote=True)["panes"][0]["pane"]
             run("--session", "api", "pane", "run", str(remote_pane),
                 shlex.join([sys.executable, str(repo / "scripts/terminal-color-fixture.py"), "merged"]), remote=True)
@@ -888,6 +915,16 @@ def main():
             assert appearance["diff"] == [230, 255, 237], appearance
             print("PASS: None forwards the real light terminal probe to remote child OSC 10/11 queries", flush=True)
             os.write(master, b"q")
+            drain(master)
+            click(master, 80, 10, button=6)
+            wait_for(lambda: "Split" in screen_text())
+            x, y = row_for("Split")
+            os.write(master, f"\x1b[<35;{x};{y}M".encode())
+            drain(master)
+            (root / "none-menu-cells.json").write_text(json.dumps([
+                [terminal.buffer[y][x]._asdict() for x in range(terminal.columns)]
+                for y in range(terminal.lines)]))
+            os.write(master, b"\x1b")
             drain(master)
             (root / "appearance-screen.txt").write_text(screen_text())
             print("PASS: bottom preview and floating inbox collect inactive and active remote toasts/bar notices once, with source; history survives TTL; host details open on real thin client", flush=True)
@@ -2755,9 +2792,9 @@ def main():
                 directory = state if name == "default" else state / "sessions" / name
                 assert directory.resolve().is_relative_to(state), name
                 run("--session", name, "remote-server-command", "stop", remote=remote, okay=False)
-        # Graphics checkpoints are replayed in real Kitty after owner teardown.
+        # Graphics and appearance checkpoints can be inspected after teardown.
         # Other successful fixtures are disposable; failures retain evidence.
-        if sys.exc_info()[0] is None and not graphics_only and not ssh_admission_only:
+        if sys.exc_info()[0] is None and not graphics_only and not appearance_only and not ssh_admission_only:
             assert_isolated(env)
             assert_isolated(remote_env)
             shutil.rmtree(root)

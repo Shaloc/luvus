@@ -10159,9 +10159,13 @@ mod link_click_tests {
             if split {
                 app.split_pane(pane, Axis::Row, false).unwrap();
             }
+            let focused = app.layout().focus;
+            // Shell startup can change the OSC title between these two frames.
+            // Keep the label geometry fixed while checking hover styling.
+            app.agent_names
+                .insert(format!("hover-fixture-{}", focused.0), focused);
             app.hover = None;
             term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-            let focused = app.layout().focus;
             let title = app
                 .pane_title_rects
                 .iter()

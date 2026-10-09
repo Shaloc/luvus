@@ -23,8 +23,10 @@ pub(super) fn preview(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme
             app.catalog.settings.notify_inbox,
             app.bar.history.len()
         )
-    } else {
+    } else if app.bar.notification_preview_until.is_some() {
         format!(" ● {unread} {}", latest.text.lines().next().unwrap_or(""))
+    } else {
+        format!(" ● {unread} ")
     };
     let text = super::truncate(&text, area.width as usize);
     let rect = Rect::new(area.x, area.y, super::display_width(&text) as u16, 1);

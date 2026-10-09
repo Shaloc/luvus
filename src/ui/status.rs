@@ -43,8 +43,15 @@ pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
     app.version_rect = None;
 
     let inbox = app.notifications_in_inbox() && !app.bar.history.is_empty();
+    let preview_reserve =
+        if app.notification_inbox.open || app.bar.notification_preview_until.is_some() {
+            40
+        } else {
+            8
+        };
     let guidance_budget = if inbox && app.mode == Mode::Normal {
-        area.width.saturating_sub((area.width / 2).min(40))
+        area.width
+            .saturating_sub((area.width / 2).min(preview_reserve))
     } else {
         area.width
     };
@@ -72,7 +79,11 @@ pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
     let available = area.width.saturating_sub(left_width + 1);
     // Reserve useful preview space before composing optional status widgets.
     // The remaining cells go back to the preview when the widgets are short.
-    let preview_min = if inbox { available.min(28) } else { 0 };
+    let preview_min = if inbox {
+        available.min(preview_reserve.min(28))
+    } else {
+        0
+    };
     let (hits, overflow, bar_width) = {
         let candidates =
             app.bar
