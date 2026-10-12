@@ -26,7 +26,7 @@ def ssh_helper():
     assert root.parent == repo / "target" and root.name.startswith("installer-smoke-")
     args = sys.argv[2:]
     while args and args[0].startswith("-"):
-        args = args[2:] if args[0] == "-o" else args[1:]
+        args = args[2:] if args[0] in ("-o", "-S") else args[1:]
     host, *command = args
     assert host in ("fixture", "denied"), host
     with (root / "ssh-calls").open("a") as log:
