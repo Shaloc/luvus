@@ -11,7 +11,7 @@
 
 use super::*;
 use crate::changelog::{classify, Block as CBlock, Seg, CHANGELOG};
-use ratatui::widgets::{Borders, Clear};
+use ratatui::widgets::Borders;
 
 /// How many releases the modal shows. The rest are a click away on the website:
 /// every shipped release is still embedded in the binary, this is purely how many
@@ -36,7 +36,7 @@ pub(super) fn draw_changelog(f: &mut RenderTarget, area: Rect, app: &mut App, t:
         centered_rect(area, w, h)
     };
     app.changelog_modal_rect = Some(modal);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())

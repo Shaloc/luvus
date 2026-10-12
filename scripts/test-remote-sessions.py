@@ -81,7 +81,8 @@ def ssh_substitute():
     binary = Path(os.environ.get("LUVUS_SMOKE_REMOTE_BINARY", os.environ["LUVUS_SMOKE_BINARY"])).resolve()
     assert binary.is_relative_to(Path(__file__).resolve().parent.parent / "target") and binary.is_file(), binary
     real_config = os.environ.get("LUVUS_TEST_SSH_POOL_CONFIG")
-    if real_config and "remote-client-bridge" in command:
+    if real_config and ("remote-client-bridge" in command or "--version" in command
+                        or "remote-session-list" in command):
         config = Path(real_config).resolve()
         assert config.parent.parent == Path(__file__).resolve().parent.parent / "target"
         assert config.parent.name.startswith("ssh-pool-real-")
@@ -197,13 +198,15 @@ def ssh_substitute():
 def real_ssh_bridge():
     root = fixture_root()
     args = shlex.split(os.environ["SSH_ORIGINAL_COMMAND"])
-    assert args == ["luvus", "--session", "api", "remote-client-bridge", "--existing"], args
+    display = args == ["luvus", "--session", "api", "remote-client-bridge", "--existing"]
+    assert display or args in (["luvus", "--version", "--remote-session-protocol"],
+                              ["luvus", "--session", "default", "remote-session-list"]), args
     import fcntl
     with (root / "ssh-admission.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         path = root / "ssh-admission.json"
         state = json.loads(path.read_text()) if path.exists() else {"started": 0, "rejected": 0}
-        state["started"] += 1
+        state["started"] += int(display)
         path.write_text(json.dumps(state))
     binary = os.environ.get("LUVUS_SMOKE_REMOTE_BINARY", os.environ["LUVUS_SMOKE_BINARY"])
     for key in list(os.environ):
@@ -523,7 +526,10 @@ def main():
                 assert admitted()["started"] == 1, "switching workspaces opened extra display bridges"
             print(f"PASS: 16 remote workspaces use {expected_channels} display bridge(s) without an SSH startup rejection", state, flush=True)
             if os.environ.get("LUVUS_TEST_SSH_POOL_CONFIG"):
-                channels = [json.loads(line) for line in (root / "ssh-pool-commands").read_text().splitlines()]
+                def display_channels():
+                    return [entry for line in (root / "ssh-pool-commands").read_text().splitlines()
+                            if "remote-client-bridge" in (entry := json.loads(line))["args"]]
+                channels = display_channels()
                 assert len(channels) == expected_channels, channels
                 os.kill(channels[0]["pid"], signal.SIGKILL)
                 def recovered():
@@ -536,7 +542,7 @@ def main():
                     wait_for(lambda: any(w["id"] == destination["id"] and w["active"] for w in projected()))
                 for healthy in channels[1:]:
                     os.kill(healthy["pid"], 0)
-                assert len((root / "ssh-pool-commands").read_text().splitlines()) == expected_channels + 1
+                assert len(display_channels()) == expected_channels + 1
                 print(f"PASS: one killed display channel reconnects; {expected_channels - 1} healthy SSH display processes survive", flush=True)
             return
         select_hosts(["fake-dev", "fake-old"])
@@ -841,6 +847,18 @@ def main():
             wait_for(lambda: "fake-dev / api" in screen_text())
             (root / "notification-popup-screen.txt").write_text(screen_text())
             assert screen_text().count("REMOTE_TOAST_PROOF") == 1, screen_text()
+            def inbox_corner():
+                screen_text()
+                label_y = next(y for y, line in enumerate(terminal.display) if "Notification inbox" in line
+                               and y < len(terminal.display) - 1)
+                return next((x, label_y - 1) for x, cell in terminal.buffer[label_y - 1].items()
+                            if cell.data == "╭")
+            before_clear = inbox_corner()
+            os.write(master, b"x")
+            wait_for(lambda: "No notifications" in screen_text())
+            assert inbox_corner() == before_clear, (before_clear, inbox_corner())
+            assert "0/0" in terminal.display[-1], terminal.display[-1]
+            (root / "empty-notification-popup-screen.txt").write_text(screen_text())
             os.write(master, b"\x1b")
             drain(master)
             workspace = next(w["workspace"] for w in api("workspace.list")["workspaces"] if w.get("host") == "fake-dev")
@@ -914,10 +932,17 @@ def main():
             assert appearance["colors"] == {"10": [0x38, 0x3a, 0x42], "11": [0xfa, 0xfa, 0xfa]}, appearance
             assert appearance["diff"] == [230, 255, 237], appearance
             print("PASS: None forwards the real light terminal probe to remote child OSC 10/11 queries", flush=True)
-            os.write(master, b"q")
-            drain(master)
-            click(master, 80, 10, button=6)
+            os.write(master, b"w")
+            wait_for(lambda: "文文文" in screen_text())
+            # Anchor the menu inside the second cell of a CJK glyph. The old
+            # overlay clear left the head intact and lost this entire border.
+            menu_y = 10
+            menu_x = next(x + 1 for x in range(60, 90)
+                          if terminal.buffer[menu_y - 1][x - 1].data == "文")
+            click(master, menu_x, menu_y, button=6)
             wait_for(lambda: "Split" in screen_text())
+            assert terminal.buffer[menu_y - 1][menu_x - 1].data == "╭", screen_text()
+            assert terminal.buffer[menu_y - 1][menu_x - 2].data == " ", screen_text()
             x, y = row_for("Split")
             os.write(master, f"\x1b[<35;{x};{y}M".encode())
             drain(master)
@@ -925,6 +950,9 @@ def main():
                 [terminal.buffer[y][x]._asdict() for x in range(terminal.columns)]
                 for y in range(terminal.lines)]))
             os.write(master, b"\x1b")
+            drain(master)
+            assert terminal.buffer[menu_y - 1][menu_x - 2].data == "文", screen_text()
+            os.write(master, b"q")
             drain(master)
             (root / "appearance-screen.txt").write_text(screen_text())
             print("PASS: bottom preview and floating inbox collect inactive and active remote toasts/bar notices once, with source; history survives TTL; host details open on real thin client", flush=True)

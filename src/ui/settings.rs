@@ -5,7 +5,7 @@
 use super::*;
 use crate::app::{GeneralRow, LayoutRow, ModuleRow, SettingsTab};
 use crate::module::manifest::SettingKind;
-use ratatui::widgets::{Borders, Clear};
+use ratatui::widgets::Borders;
 
 pub(super) struct SettingsHits {
     pub modal: Rect,
@@ -95,7 +95,7 @@ pub(super) fn draw_settings(
         centered_rect(area, w, h)
     };
 
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -1697,7 +1697,7 @@ pub(super) fn draw_module_setting_prompt(f: &mut RenderTarget, area: Rect, app: 
         w,
         h,
     );
-    f.render_widget(Clear, rect);
+    f.clear_overlay(rect);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())

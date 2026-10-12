@@ -263,6 +263,8 @@ lock scopes short and never hold it across unrelated slow work.
   file/preview views. Preserve OSC 8 hyperlink targets and forward bounded
   pane-originated OSC 52 clipboard writes through the client clipboard path;
   never enable OSC 52 clipboard reads implicitly.
+- Clear UI overlays through `RenderTarget::clear_overlay` so wide glyphs
+  crossing their edges cannot hide borders in full or incremental frames.
 - OSC 7501 records belong to the owning terminal, survive alternate-screen
   switches, and remain bounded untrusted status metadata. They may override
   screen-state heuristics but never authenticated integration leases, native

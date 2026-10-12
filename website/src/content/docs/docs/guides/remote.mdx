@@ -49,6 +49,13 @@ the session count or connection error. Opening the session switcher, or pressing
 `r` there, refreshes the list, including sessions created independently on the
 remote host. There is no idle polling and no connection to unselected hosts.
 
+On Unix, bounded version checks, session discovery and lifecycle commands reuse a
+per-host SSH connection, kept for up to 30 seconds while idle. These commands
+run one at a time per host within their existing timeouts. They use a separate
+connection from workspace display channels. Installation keeps an independent
+connection so slow downloads cannot delay discovery or reconnection checks.
+Windows retains independent SSH connections.
+
 Local **Settings → Theme**, **Settings → Language**, and **Layout → Rounded corners** changes synchronize
 the selected value to all running
 sessions on connected selected hosts, including when the focused workspace is

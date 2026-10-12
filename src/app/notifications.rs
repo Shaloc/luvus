@@ -367,6 +367,37 @@ mod tests {
     }
 
     #[test]
+    fn clearing_an_open_inbox_keeps_its_status_anchor() {
+        let _env = crate::persist::test_env("empty-inbox-anchor");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(140, 40, tx).unwrap();
+        app.config.notifications.display = crate::config::NotificationDisplay::Inbox;
+        app.show_toast("anchor proof");
+        app.open_notification_inbox();
+        let area = Rect::new(0, 0, 140, 40);
+        let draw = |app: &mut App| {
+            let mut buffer = ratatui::buffer::Buffer::empty(area);
+            crate::ui::render_into(&mut crate::ui::RenderTarget::new(&mut buffer, area), app);
+        };
+        draw(&mut app);
+        let popup = app.notification_inbox.rect;
+        let trigger = app.notification_inbox.trigger;
+        assert!(!trigger.is_empty());
+        app.notification_inbox_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        draw(&mut app);
+        assert!(app.bar.history.is_empty());
+        assert_eq!(
+            app.notification_inbox.rect, popup,
+            "clearing history must not move the open popup"
+        );
+        assert!(!app.notification_inbox.trigger.is_empty());
+        assert_eq!(app.notification_inbox.trigger.x, trigger.x);
+        app.notification_inbox_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        draw(&mut app);
+        assert!(app.notification_inbox.trigger.is_empty());
+    }
+
+    #[test]
     fn notification_inbox_is_optional_quiet_and_passive_geometry_safe() {
         let _env = crate::persist::test_env("notification-inbox");
         let (tx, _rx) = std::sync::mpsc::channel();

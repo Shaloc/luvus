@@ -7,7 +7,7 @@ use crate::app::{
     PaneMenuItem, PopupId, TabMenuItem, WsMenuItem,
 };
 use crate::i18n::Catalog;
-use ratatui::widgets::{Borders, Clear};
+use ratatui::widgets::Borders;
 
 /// One row of a context-menu popup.
 struct MenuRow {
@@ -86,7 +86,7 @@ fn render_popup(
     };
     let popup = Rect::new(x, y, w, h);
 
-    f.render_widget(Clear, popup);
+    f.clear_overlay(popup);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -989,6 +989,51 @@ mod label_case_tests {
     ];
 
     #[test]
+    fn popup_occludes_a_wide_glyph_crossing_its_left_edge() {
+        let area = Rect::new(0, 0, 50, 20);
+        let mut buffer = Buffer::empty(area);
+        let canvas = Style::new().fg(Color::Black).bg(Color::White);
+        for y in 5..9 {
+            buffer.set_string(3, y, "我们", canvas);
+        }
+        let baseline = crate::ipc::protocol::frame_from_buffer(&buffer, None, false);
+        assert_eq!(baseline.cells[5 * 50 + 3].symbol, "我");
+        let mut target = RenderTarget::new(&mut buffer, area);
+        target.rounded_corners = true;
+        let mut scroll = MenuScroll::default();
+        render_popup(
+            &mut target,
+            area,
+            (4, 5),
+            &[MenuRow {
+                text: "关闭".into(),
+                divider: false,
+                destructive: true,
+            }],
+            &Theme::noir(),
+            PopupCtx {
+                hover: None,
+                selected: Some(0),
+                mobile: false,
+                id: PopupId::Pane,
+                scroll: &mut scroll,
+            },
+        );
+        let full = crate::ipc::protocol::frame_from_buffer(&buffer, None, false);
+        assert_eq!(
+            full.cells[5 * 50 + 4].symbol,
+            "╭",
+            "wide underlay must not swallow popup border"
+        );
+        assert_eq!(buffer[(3, 5)].symbol(), " ");
+        assert_eq!(buffer[(3, 5)].bg, canvas.bg.unwrap());
+        assert_eq!(buffer[(3, 8)].symbol(), "我", "outside rows stay intact");
+        let mut incremental = baseline;
+        crate::ipc::protocol::diff_buffer(&mut incremental, &buffer);
+        assert_eq!(incremental.cells, full.cells);
+    }
+
+    #[test]
     fn rounded_popup_has_a_continuous_background_and_full_width_highlight() {
         let area = Rect::new(0, 0, 50, 20);
         let mut buffer = Buffer::empty(area);
@@ -1527,7 +1572,7 @@ pub(super) fn draw_host_inspect(
             .style(Style::new().fg(t.text).bg(t.surface0))
             .border_style(Style::new().fg(t.border_focus));
         let inner = block.inner(modal);
-        f.render_widget(Clear, modal);
+        f.clear_overlay(modal);
         f.render_widget(block, modal);
         let body = Rect::new(
             inner.x,

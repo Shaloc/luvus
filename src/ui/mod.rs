@@ -77,6 +77,30 @@ impl<'a> RenderTarget<'a> {
     pub fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
         widget.render(area, self.buf);
     }
+    /// Clear a foreground layer, including glyphs straddling its edges. A
+    /// leftover wide head just outside the left edge makes both Ratatui and
+    /// our wire encoder skip the first overlay cell as its continuation.
+    pub(crate) fn clear_overlay(&mut self, area: Rect) {
+        let area = area.intersection(self.buf.area);
+        if area.is_empty() {
+            return;
+        }
+        for y in area.y..area.bottom() {
+            if area.x > self.buf.area.x && display_width(self.buf[(area.x - 1, y)].symbol()) == 2 {
+                self.buf[(area.x - 1, y)]
+                    .set_symbol(" ")
+                    .set_diff_option(ratatui::buffer::CellDiffOption::None);
+            }
+            if area.right() < self.buf.area.right()
+                && display_width(self.buf[(area.right() - 1, y)].symbol()) == 2
+            {
+                self.buf[(area.right(), y)]
+                    .set_symbol(" ")
+                    .set_diff_option(ratatui::buffer::CellDiffOption::None);
+            }
+        }
+        ratatui::widgets::Clear.render(area, self.buf);
+    }
     pub fn set_cursor_position<P: Into<Position>>(&mut self, position: P) {
         let p = position.into();
         self.cursor = Some((p.x, p.y));
@@ -2276,7 +2300,7 @@ pub(crate) fn clip_columns(s: &str, max: usize) -> String {
 /// A small centered toast box near the bottom (e.g. "✓ Copied"). Drawn last, so
 /// it floats over everything; the loop clears it after ~1.4s.
 fn draw_toast(f: &mut RenderTarget, area: Rect, text: &str, t: &Theme) {
-    use ratatui::widgets::{Borders, Clear};
+    use ratatui::widgets::Borders;
     let w = (display_width(text) as u16 + 6).min(area.width);
     let h = 3u16;
     if w < 6 || area.height < h + 3 {
@@ -2285,7 +2309,7 @@ fn draw_toast(f: &mut RenderTarget, area: Rect, text: &str, t: &Theme) {
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.bottom().saturating_sub(h + 2); // just above the status line
     let rect = Rect::new(x, y, w, h);
-    f.render_widget(Clear, rect);
+    f.clear_overlay(rect);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -2524,6 +2548,29 @@ mod retained_render_tests {
 
     use crate::terminal::appearance::PaneAppearance;
     use crate::terminal::vt::{create_engine, VtEngineKind};
+
+    #[test]
+    fn overlay_clear_clips_wide_edges_without_erasing_adjacent_text() {
+        let area = Rect::new(3, 2, 20, 4);
+        let mut buffer = Buffer::empty(area);
+        let style = Style::new().fg(Color::Blue).bg(Color::White);
+        buffer.set_string(3, 3, "A中B文C", style);
+        buffer.set_style(area, style);
+        // Clear the second half of 中 through the first half of 文.
+        RenderTarget::new(&mut buffer, area).clear_overlay(Rect::new(5, 3, 3, 1));
+        assert_eq!(buffer[(3, 3)].symbol(), "A");
+        assert_eq!(buffer[(9, 3)].symbol(), "C");
+        for x in 4..9 {
+            assert_eq!(buffer[(x, 3)].symbol(), " ", "stale glyph at {x}");
+        }
+        for x in [4, 8] {
+            assert_eq!(buffer[(x, 3)].bg, Color::White);
+        }
+        // A full-canvas clear and a fully clipped rectangle remain bounded.
+        RenderTarget::new(&mut buffer, area).clear_overlay(Rect::new(0, 0, 100, 100));
+        RenderTarget::new(&mut buffer, area).clear_overlay(Rect::new(100, 100, 1, 1));
+        assert!(buffer.content.iter().all(|cell| cell.symbol() == " "));
+    }
 
     #[test]
     fn successful_terminal_resize_invalidates_committed_search_coordinates() {

@@ -1,7 +1,7 @@
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::app::App;
 use crate::ui::theme::{State, Theme};
@@ -12,7 +12,7 @@ use super::MobileLayout;
 pub(crate) fn render_header(f: &mut RenderTarget, layout: MobileLayout, app: &mut App, t: &Theme) {
     // This surface replaces the desktop tab bar. Clear symbols as well as
     // styling so a previous wider frame cannot bleed through its blank cells.
-    f.render_widget(Clear, layout.header);
+    f.clear_overlay(layout.header);
     f.render_widget(Block::new().style(Style::new().bg(t.crust)), layout.header);
     app.switcher_button_rect = Some(layout.menu_button);
     app.switcher_close_rect = None;

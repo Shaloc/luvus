@@ -1012,11 +1012,11 @@ pub(super) fn draw_detail(
     cat: &Catalog,
     t: &Theme,
 ) {
-    use ratatui::widgets::{Block, Borders, Clear};
+    use ratatui::widgets::{Block, Borders};
     super::help::dim_backdrop(f, area, t);
     let w = area.width.saturating_sub(6).clamp(40, 64).min(area.width);
     let modal = super::help::centered_rect(area, w, 16);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -1093,11 +1093,11 @@ pub(super) fn draw_detail(
 /// reply that is sent to the selected blocked agent's pane. `⏎` sends, `esc`
 /// cancels. Drawn last, over a dimmed backdrop.
 pub(super) fn draw_answer(f: &mut RenderTarget, area: Rect, text: &str, cat: &Catalog, t: &Theme) {
-    use ratatui::widgets::{Block, Borders, Clear};
+    use ratatui::widgets::{Block, Borders};
     super::help::dim_backdrop(f, area, t);
     let w = area.width.saturating_sub(6).clamp(40, 72).min(area.width);
     let modal = super::help::centered_rect(area, w, 5);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())

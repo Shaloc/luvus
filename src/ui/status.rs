@@ -42,7 +42,8 @@ pub(super) fn draw_status(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
     f.render_widget(Block::new().style(Style::new().bg(t.crust)), area);
     app.version_rect = None;
 
-    let inbox = app.notifications_in_inbox() && !app.bar.history.is_empty();
+    let inbox = app.notifications_in_inbox()
+        && (app.notification_inbox.open || !app.bar.history.is_empty());
     let preview_reserve =
         if app.notification_inbox.open || app.bar.notification_preview_until.is_some() {
             40

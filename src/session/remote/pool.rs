@@ -8,6 +8,87 @@ const CHANNELS_PER_MASTER: usize = 8;
 #[cfg(unix)]
 const MAX_DISPLAY_CHANNELS: usize = 512;
 
+/// Bounded probes, lists and lifecycle commands share a short-command master.
+/// Keep it separate from leased display channels. Long installations bypass
+/// this pool so they cannot block discovery or reconnection preflights.
+pub(super) fn short_command(
+    host: &str,
+    command: Command,
+    deadline: Instant,
+) -> Result<(Command, Option<File>), String> {
+    #[cfg(unix)]
+    {
+        let directory = host_directory(host).map_err(|error| error.to_string())?;
+        // Real loopback SSH reproduced two concurrent initial probes opening
+        // separate masters. Reuse bounded admission; only short commands wait
+        // here, never display channels or the event loop.
+        let admission = acquire_admission(
+            &directory.join("commands.admission"),
+            &ConnectionScope::default(),
+            deadline,
+            "SSH command admission timed out",
+        )?;
+        let logical = directory.join("commands.sock");
+        let socket = crate::session::socket_alias_path(logical, "luvus", "ssh");
+        crate::persist::ensure_private_server_dir(socket.parent().unwrap())
+            .map_err(|error| error.to_string())?;
+        // All callers pass ssh_base commands before adding stdio; retain the
+        // original environment and working directory when prepending options.
+        let mut shared = Command::new(command.get_program());
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                shared.env(key, value);
+            } else {
+                shared.env_remove(key);
+            }
+        }
+        if let Some(directory) = command.get_current_dir() {
+            shared.current_dir(directory);
+        }
+        multiplex(&mut shared, &socket);
+        shared.args(command.get_args());
+        Ok((shared, Some(admission)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (host, deadline);
+        Ok((command, None))
+    }
+}
+
+fn acquire_admission(
+    path: &Path,
+    scope: &ConnectionScope,
+    deadline: Instant,
+    timeout: &str,
+) -> Result<File, String> {
+    let handshake = private_file(path).map_err(|error| error.to_string())?;
+    loop {
+        if !scope.wait_for_retry(Duration::ZERO) {
+            return Err("remote subscription closed".into());
+        }
+        match handshake.try_lock_exclusive() {
+            Ok(()) => return Ok(handshake),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return Err(timeout.into());
+                }
+                if !scope.wait_for_retry(Duration::from_millis(25)) {
+                    return Err("remote subscription closed".into());
+                }
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+}
+
+fn multiplex(command: &mut Command, socket: &Path) {
+    command
+        .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=30"])
+        .arg("-S")
+        .arg(socket.to_string_lossy().replace('%', "%%"));
+}
+
 pub(crate) struct DisplayConnection {
     handshake: Option<File>,
     _channel: Option<File>,
@@ -17,27 +98,12 @@ pub(crate) struct DisplayConnection {
 impl DisplayConnection {
     pub(crate) fn acquire(host: &str, scope: &ConnectionScope) -> Result<Self, String> {
         let directory = host_directory(host).map_err(|e| e.to_string())?;
-        let handshake = private_file(&directory.join("handshake")).map_err(|e| e.to_string())?;
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            if !scope.wait_for_retry(Duration::ZERO) {
-                return Err("remote subscription closed".into());
-            }
-            match handshake.try_lock_exclusive() {
-                Ok(()) => break,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    if Instant::now() >= deadline {
-                        return Err("SSH display admission timed out".into());
-                    }
-                    // Only a waiting startup worker sleeps; cancellation wakes
-                    // it immediately through the subscription's existing signal.
-                    if !scope.wait_for_retry(Duration::from_millis(25)) {
-                        return Err("remote subscription closed".into());
-                    }
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
+        let handshake = acquire_admission(
+            &directory.join("handshake"),
+            scope,
+            Instant::now() + Duration::from_secs(120),
+            "SSH display admission timed out",
+        )?;
         #[allow(unused_mut)]
         let mut connection = Self {
             handshake: Some(handshake),
@@ -81,11 +147,8 @@ impl DisplayConnection {
             let mut command = Command::new(base.get_program());
             // Options precede the destination. A private socket plus channel
             // leases prevents other Luvus sessions from overfilling this master.
-            command
-                .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=30"])
-                .arg("-S")
-                .arg(socket.to_string_lossy().replace('%', "%%"))
-                .args(base.get_args());
+            multiplex(&mut command, socket);
+            command.args(base.get_args());
             command
         } else {
             base
@@ -132,6 +195,64 @@ fn private_file(path: &Path) -> io::Result<File> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installer_transport_does_not_wait_for_probe_admission() {
+        let _env = crate::persist::test_env("ssh-installer-independent");
+        let (_probe, _admission) = short_command(
+            "fixture",
+            ssh_base("fixture"),
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+        // The installer uses this bounded executor with a separate SSH
+        // command. Holding probe admission must not delay its execution.
+        let mut installer = Command::new("sh");
+        installer.args(["-c", "printf installed"]);
+        let output =
+            run_ssh_command_with_timeout(installer, "fixture", 128, Duration::from_secs(1))
+                .expect("installer must bypass short-command admission");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"installed");
+    }
+
+    #[test]
+    fn short_commands_reuse_a_host_master_without_display_capacity() {
+        let _env = crate::persist::test_env("ssh-short-command-pool");
+        let socket = |command: &Command| {
+            let args: Vec<_> = command.get_args().collect();
+            args[args.iter().position(|arg| *arg == "-S").unwrap() + 1].to_owned()
+        };
+        let mut base = ssh_base("test-host");
+        base.arg("luvus")
+            .arg("--version")
+            .env("POOL_TEST", "retained");
+        base.current_dir(std::env::current_dir().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (first, admission) = short_command("test-host", base, deadline).unwrap();
+        let error = short_command("test-host", ssh_base("test-host"), Instant::now()).unwrap_err();
+        assert!(error.contains("SSH command admission timed out"));
+        let display = DisplayConnection::acquire("test-host", &ConnectionScope::default()).unwrap();
+        assert_ne!(Path::new(&socket(&first)), display.socket.as_ref().unwrap());
+        drop(admission);
+        let (second, _admission) =
+            short_command("test-host", ssh_base("test-host"), deadline).unwrap();
+        assert_eq!(socket(&first), socket(&second));
+        let (other, _other_admission) =
+            short_command("other-host", ssh_base("other-host"), deadline).unwrap();
+        assert_ne!(socket(&first), socket(&other));
+        assert!(first
+            .get_args()
+            .any(|arg| arg == "StrictHostKeyChecking=yes"));
+        assert_eq!(first.get_args().last().unwrap(), "--version");
+        assert!(first
+            .get_envs()
+            .any(|(key, value)| key == "POOL_TEST" && value == Some("retained".as_ref())));
+        assert_eq!(
+            first.get_current_dir(),
+            Some(std::env::current_dir().unwrap().as_path())
+        );
+    }
 
     #[test]
     fn pool_shards_display_channels_and_reuses_released_capacity() {

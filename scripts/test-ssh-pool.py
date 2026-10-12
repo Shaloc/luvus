@@ -81,7 +81,10 @@ try:
         assert smoke.parent == repo / "target" and smoke.name.startswith("remote-smoke-")
     result.check_returncode()
     commands = [json.loads(line)["args"] for line in (smoke / "ssh-pool-commands").read_text().splitlines()]
-    paths = [args[args.index("-S") + 1] for args in commands]
+    paths = [args[args.index("-S") + 1] for args in commands if "remote-client-bridge" in args]
+    short_paths = [args[args.index("-S") + 1] for args in commands if "remote-client-bridge" not in args]
+    assert len(short_paths) >= 2 and len(set(short_paths)) == 1, short_paths
+    assert set(short_paths).isdisjoint(paths), "short commands must not consume display slots"
     shared_display = "use 1 display bridge(s)" in result.stdout
     initial_channels = 1 if shared_display else 16
     counts = {path: paths[:initial_channels].count(path) for path in set(paths)}
@@ -91,10 +94,10 @@ try:
     # One public-key authentication per master, including after channel retry.
     ssh_log = (root / "sshd.log").read_text()
     authentications = len(re.findall(r"Accepted publickey for", ssh_log))
-    expected_auth = 1 if shared_display else 2
+    expected_auth = (1 if shared_display else 2) + 1
     assert authentications == expected_auth, f"expected {expected_auth} SSH transports, got {authentications}"
     assert "no more sessions" not in ssh_log.lower()
-    print(f"PASS: 16 workspaces use {initial_channels} display channels and {expected_auth} authenticated SSH connections; MaxStartups=10 and MaxSessions=10", flush=True)
+    print(f"PASS: 16 workspaces use {initial_channels} display channels; {len(short_paths)} short commands share one additional master; {expected_auth} authenticated SSH connections total; MaxStartups=10 and MaxSessions=10", flush=True)
 finally:
     if result is None or result.returncode:
         print("Isolated sshd diagnostics:\n" + (root / "sshd.log").read_text(), flush=True)

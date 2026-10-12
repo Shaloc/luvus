@@ -1022,15 +1022,26 @@ fn run_version_command(command: Command, host: &str) -> Result<VersionOutput, St
 }
 
 fn run_ssh_command(command: Command, host: &str, limit: usize) -> Result<VersionOutput, String> {
-    run_ssh_command_with_timeout(command, host, limit, VERSION_CHECK_TIMEOUT)
+    let deadline = Instant::now() + VERSION_CHECK_TIMEOUT;
+    let (command, _admission) = pool::short_command(host, command, deadline)?;
+    run_ssh_command_with_timeout(
+        command,
+        host,
+        limit,
+        deadline.saturating_duration_since(Instant::now()),
+    )
 }
 
+// Installation uses this executor directly: downloads must not hold the probe
+// admission needed by healthy owners' discovery, control and reconnection.
 fn run_ssh_command_with_timeout(
     mut command: Command,
     host: &str,
     limit: usize,
     timeout: Duration,
 ) -> Result<VersionOutput, String> {
+    let deadline = Instant::now() + timeout;
+    command.stdin(Stdio::null());
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
@@ -1047,7 +1058,6 @@ fn run_ssh_command_with_timeout(
     };
     let stdout_reader = thread::spawn(move || drain_bounded(stdout, limit));
     let stderr_reader = thread::spawn(move || drain_bounded(stderr, MAX_VERSION_OUTPUT_BYTES));
-    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Ok(status),

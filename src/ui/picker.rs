@@ -5,7 +5,7 @@ use super::*;
 use crate::app::{FolderPicker, PickerHit, Row};
 use crate::i18n::Catalog;
 use ratatui::crossterm::event::KeyCode;
-use ratatui::widgets::{Borders, Clear};
+use ratatui::widgets::Borders;
 
 /// The pane restart prompt shares the modal footer geometry with other prompts.
 pub(super) fn draw_pane_restart(
@@ -21,7 +21,7 @@ pub(super) fn draw_pane_restart(
         area.width.saturating_sub(4).min(70),
         area.height.min(10),
     );
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -81,7 +81,7 @@ pub(super) fn draw_picker(
     } else {
         centered_rect(area, w, h)
     };
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -364,7 +364,7 @@ pub(super) fn draw_worktree_prompt(
     dim_backdrop(f, area, t);
     let w = area.width.saturating_sub(6).clamp(36, 64).min(area.width);
     let modal = centered_rect(area, w, 6);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -446,7 +446,7 @@ pub(super) fn draw_worktree_open(
         .clamp(7, 20)
         .min(area.height);
     let modal = centered_rect(area, w, h);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -610,7 +610,7 @@ fn draw_rename(
     dim_backdrop(f, area, t);
     let w = area.width.saturating_sub(6).clamp(36, 64).min(area.width);
     let modal = centered_rect(area, w, 6);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -657,7 +657,7 @@ pub(super) fn draw_rename_titled(
     dim_backdrop(f, area, t);
     let w = area.width.saturating_sub(6).clamp(36, 70).min(area.width);
     let modal = centered_rect(area, w, 7);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())

@@ -13,9 +13,10 @@ pub(super) fn preview(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme
     if area.width < 4 || area.height == 0 {
         return;
     }
-    let Some(latest) = app.bar.history.back() else {
+    let latest = app.bar.history.back();
+    if latest.is_none() && !app.notification_inbox.open {
         return;
-    };
+    }
     let unread = app.bar.history.iter().filter(|item| item.unread).count();
     let text = if app.notification_inbox.open {
         format!(
@@ -24,7 +25,10 @@ pub(super) fn preview(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme
             app.bar.history.len()
         )
     } else if app.bar.notification_preview_until.is_some() {
-        format!(" ● {unread} {}", latest.text.lines().next().unwrap_or(""))
+        format!(
+            " ● {unread} {}",
+            latest.map_or("", |item| item.text.lines().next().unwrap_or(""))
+        )
     } else {
         format!(" ● {unread} ")
     };
@@ -43,7 +47,7 @@ pub(super) fn preview(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme
                 .fg(if hovered {
                     t.on_color(background)
                 } else {
-                    level_color(latest.level, t)
+                    latest.map_or(t.accent, |item| level_color(item.level, t))
                 })
                 .bg(background),
         ),
@@ -81,7 +85,7 @@ pub(super) fn popup(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         .border_style(Style::new().fg(t.border_focus))
         .style(Style::new().fg(t.text).bg(t.base));
     let inner = border.inner(popup);
-    f.render_widget(ratatui::widgets::Clear, popup);
+    f.clear_overlay(popup);
     f.render_widget(border, popup);
     draw(f, inner, app, t);
     app.notification_inbox.rect = popup;

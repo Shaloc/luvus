@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::App;
 use crate::search::{SearchMatch, SearchScope};
@@ -50,7 +50,7 @@ pub(super) fn draw_search(f: &mut RenderTarget, area: Rect, app: &mut App, t: &T
         width,
         height,
     );
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())

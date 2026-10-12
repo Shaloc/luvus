@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::app::Cmd;
-use ratatui::widgets::{Borders, Clear};
+use ratatui::widgets::Borders;
 
 pub(super) fn draw_help(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) {
     dim_backdrop(f, area, t);
@@ -56,7 +56,7 @@ pub(super) fn draw_help(f: &mut RenderTarget, area: Rect, app: &mut App, t: &The
     let w = area.width.saturating_sub(4).clamp(54, 96).min(area.width);
     let h = area.height.saturating_sub(2).clamp(12, 32).min(area.height);
     let modal = centered_rect(area, w, h);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())

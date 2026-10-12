@@ -61,6 +61,11 @@ def main():
                 os.write(1, b"\x1b]10;#abcdef\x07\x1b]11;#123456\x07\x1b]4;2;#246824\x07")
             elif key == b"r":
                 os.write(1, b"\x1b]110\x07\x1b]111\x07\x1b]104;2\x07")
+            elif key == b"w":
+                cols, rows = os.get_terminal_size(1)
+                os.write(1, ("\x1b[0m\x1b[2J\x1b[H" + "\r\n".join(
+                    "文" * (cols // 2) for _ in range(rows - 1))).encode())
+                continue
             elif key != b"p":
                 continue
             probe()

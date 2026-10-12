@@ -10,7 +10,7 @@ use crate::app::OrchView;
 use crate::automation::{Automation, AutomationState, RunStatus, Trigger};
 use crate::i18n::Catalog;
 use crate::orch::{OrchState, Task, TaskStatus};
-use ratatui::widgets::{Borders, Clear, Wrap};
+use ratatui::widgets::{Borders, Wrap};
 
 /// Keep the fleet summary renderer available without spending a viewport row
 /// while the task and automation tables already expose the same state.
@@ -1768,7 +1768,7 @@ pub(super) fn draw_form(
         })
         .sum::<u16>();
     let modal = centered_rect(area, w, row_count.saturating_add(7).min(area.height));
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -2247,7 +2247,7 @@ pub(super) fn draw_start(
     };
     let h = requested_h.min(area.height.saturating_sub(2).max(4));
     let modal = centered_rect(area, 44.min(area.width), h);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -2426,7 +2426,7 @@ pub(super) fn draw_detail(
     let w = area.width.saturating_sub(6).clamp(44, 78).min(area.width);
     let h = area.height.saturating_sub(4).clamp(8, 24).min(area.height);
     let modal = centered_rect(area, w, h);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
@@ -2607,7 +2607,7 @@ pub(super) fn draw_automation_detail(
     let w = area.width.saturating_sub(6).clamp(44, 84).min(area.width);
     let h = area.height.saturating_sub(4).clamp(10, 28).min(area.height);
     let modal = centered_rect(area, w, h);
-    f.render_widget(Clear, modal);
+    f.clear_overlay(modal);
     let block = Block::new()
         .borders(Borders::ALL)
         .border_type(f.border_type())
