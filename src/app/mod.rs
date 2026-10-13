@@ -10355,6 +10355,14 @@ impl App {
 
     /// Close a workspace and all of its panes.
     fn close_workspace(&mut self, index: usize) {
+        if self
+            .workspaces
+            .get(index)
+            .is_some_and(|ws| ws.remote.is_some())
+        {
+            self.close_remote_workspace(index);
+            return;
+        }
         self.close_workspace_with_suppression(index, true);
     }
 

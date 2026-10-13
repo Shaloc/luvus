@@ -195,6 +195,10 @@ configure remote owners separately; merge does not copy the setting to them.
 `session merge` and registration changes refresh an already-running local
 server; no restart is needed. Disabling a host or merge removes local
 projections and disconnects their bridges without stopping remote panes.
+A remote workspace's Close action and Close Workspace shortcut close its panes
+on the owner and preserve the closure across restart. CLI/API `workspace.close`
+and `node.close` reject local remote projections with `remote_workspace`;
+use `--host <host> --session <owner-session>` and the owner's workspace selector.
 Managed attaches retain the local session switcher and local prefix, even when
 the remote prefix differs. Workspace suffixes (`?`, digits and custom bindings)
 are interpreted by the owner's prefix handler; global navigation and local

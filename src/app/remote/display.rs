@@ -216,6 +216,11 @@ impl App {
 
     pub(in crate::app) fn cancel_workspace_switch(&mut self) {
         if let Some(pending) = self.pending_workspace_switch.take() {
+            if pending.commands.iter().any(|message|
+                matches!(message, ClientMessage::Command(command) if command == Cmd::CloseWorkspace.id()))
+            {
+                self.show_toast(self.catalog.remote_workspace_close_cancelled);
+            }
             if let Some(input) = self
                 .remote_session_displays
                 .values()
@@ -853,6 +858,75 @@ mod tests {
             ));
             assert!(!app.remote_workspace_view(1).unwrap().projection.active);
         }
+    }
+
+    #[test]
+    fn session_display_workspace_close_waits_for_the_exact_owner_selection() {
+        let _env = crate::persist::test_env("session-display-workspace-close");
+        let (mut app, connection, input) = fixture();
+        let count = app.workspaces.len();
+        app.open_ws_menu(2, 2, 2);
+        app.ws_menu_action(crate::app::WsMenuItem::Close);
+        assert_eq!(app.workspaces.len(), count);
+        assert_eq!(app.active_ws, 1);
+        assert!(!input
+            .try_iter()
+            .any(|message| matches!(message, ClientMessage::Command(_))));
+        let (state, frame) = response(&app);
+        let mut wrong_owner = state.clone();
+        wrong_owner.server_generation = "old owner".into();
+        app.apply_prepared_workspace(connection, 1, wrong_owner, frame.clone(), vec![]);
+        assert!(!input
+            .try_iter()
+            .any(|message| matches!(message, ClientMessage::Command(_))));
+        app.apply_prepared_workspace(connection, 1, state.clone(), frame, vec![]);
+        let messages: Vec<_> = input.try_iter().collect();
+        let commit = messages.iter().position(|message|
+            matches!(message, ClientMessage::CommitWorkspace { epoch } if *epoch == state.epoch)).unwrap();
+        let close = messages.iter().position(|message|
+            matches!(message, ClientMessage::Command(command) if command == "close_node")).unwrap();
+        assert!(commit < close);
+        assert_eq!(app.workspaces.len(), count);
+        assert!(app.closed_remote_workspaces.is_empty());
+    }
+
+    #[test]
+    fn session_display_workspace_close_reports_cancellation_before_owner_confirmation() {
+        let _env = crate::persist::test_env("session-display-workspace-close-cancel");
+        for next_close in [false, true] {
+            let (mut app, connection, input) = fixture();
+            app.close_workspace(2);
+            let (cancelled, frame) = response(&app);
+            if next_close {
+                app.close_workspace(3);
+            } else {
+                app.focus_workspace(0);
+            }
+            assert!(app.toast.is_some(), "cancelled close must be visible");
+            app.apply_prepared_workspace(connection, 1, cancelled, frame, vec![]);
+            assert!(!input.try_iter().any(|message|
+                matches!(message, ClientMessage::Command(command) if command == "close_node")));
+            assert_eq!(app.workspaces.len(), 17);
+            if next_close {
+                let (state, frame) = response(&app);
+                app.apply_prepared_workspace(connection, 1, state, frame, vec![]);
+                assert!(input.try_iter().any(|message|
+                    matches!(message, ClientMessage::Command(command) if command == "close_node")));
+            }
+        }
+    }
+
+    #[test]
+    fn session_display_workspace_close_cannot_use_an_unbound_shared_sender() {
+        let _env = crate::persist::test_env("session-display-workspace-close-unbound");
+        let (mut app, _, input) = fixture();
+        app.remote_session_displays.clear();
+        app.close_workspace(2);
+        assert_eq!(app.workspaces.len(), 17);
+        assert!(app.toast.is_some());
+        assert!(!input
+            .try_iter()
+            .any(|message| matches!(message, ClientMessage::Command(_))));
     }
 
     #[test]

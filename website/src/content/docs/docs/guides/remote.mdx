@@ -342,9 +342,20 @@ single global merge toggle, automatically grouping every same-name session.
 Enabling it from a standalone remote view switches to the matching local
 session and shows the local and remote workspaces together.
 
-Closing a projected remote workspace hides that projection in the current
-local run; it does not close the workspace or its processes on the remote
-owner. Use an explicit `--host` command when you intend to mutate remote state.
+Closing a remote workspace from its sidebar menu or the Close Workspace
+shortcut closes that workspace and its panes on the owning server. The sidebar
+removes the row when the owner reports the change. If the connection is
+unavailable, Luvus keeps the row and reports the failure. Navigating elsewhere
+before the owner confirms a pending switch cancels that close and prompts you
+to retry. The owner's saved
+session records the closure, so restarting either side does not reopen it.
+
+CLI/API workspace closes follow the same explicit-owner rule as pane and tab
+mutations. A request aimed at a local remote projection returns
+`remote_workspace`; select the owner with `--host`, then use its workspace index
+or ID. For example, list with `luvus --host devbox --session api workspace list`
+and close with `luvus --host devbox --session api workspace close <owner-index>`.
+Turning merge off or deselecting a host still only disconnects its projections.
 
 The workspace **+** action in merge mode first asks which enabled host should
 own the workspace (or **Local machine**). Its folder browser reads that owner's

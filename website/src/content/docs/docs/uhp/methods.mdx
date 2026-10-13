@@ -949,6 +949,13 @@ the sidebar.
 Missing or malformed parameters return `invalid_request`, while an out-of-range
 workspace returns `not_found` without changing state.
 
+`workspace.close` and its `node.close` alias operate on the selected server's
+own workspaces. A local projection of an SSH workspace returns
+`remote_workspace` without hiding or closing it. Route the request with
+`--host <alias> --session <owner-session>` and use that owner's workspace
+selector. The interactive remote sidebar and Close Workspace shortcut forward
+the close to the owner and wait for its topology update.
+
 After the final project workspace closes, the server and client remain available
 and Luvus immediately creates a neutral workspace with one terminal rooted at
 the user's home directory. Normal tab and pane methods keep working. If a restore

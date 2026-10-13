@@ -2003,7 +2003,51 @@ impl App {
             .is_some_and(|input| input.send(message).is_ok())
     }
 
+    pub(super) fn close_remote_workspace(&mut self, index: usize) {
+        // A projection is not a workspace owner. Keep the row until the
+        // owner's topology confirms the close, including on send failure.
+        let available = self.remote_workspace_view(index).is_some_and(|view| {
+            !view.target.workspace_id.is_empty()
+                && view.input.is_some()
+                && (view.projection.display.session_display || view.state == RemoteViewState::Ready)
+        });
+        if !available {
+            self.show_toast(self.catalog.remote_workspace_unavailable);
+            return;
+        }
+        if self.remote_workspace_view(index).is_some_and(|view| {
+            view.projection.display.projection && !view.projection.display.session_display
+        }) {
+            // Legacy owners ignore commands while their dedicated projection
+            // is suspended. Reuse normal focus/activation before sending close.
+            self.focus_workspace(index);
+        }
+        if !self.send_workspace_remote(
+            index,
+            ClientMessage::Command(Cmd::CloseWorkspace.id().into()),
+        ) {
+            self.show_toast(self.catalog.remote_workspace_unavailable);
+        }
+    }
+
     pub(crate) fn send_workspace_remote(&mut self, index: usize, message: ClientMessage) -> bool {
+        if let Some(view) = self
+            .remote_workspace_view(index)
+            .filter(|view| view.projection.display.session_display)
+        {
+            let owner = RemoteSession {
+                host: view.target.host.clone(),
+                session: view.target.session.clone(),
+            };
+            // A shared sender alone does not identify its selected workspace.
+            // Without the owning display, preparation cannot fence this input.
+            if !self
+                .remote_session_displays
+                .contains_key(&owner.canonical_name())
+            {
+                return false;
+            }
+        }
         if self
             .remote_workspace_view(index)
             .is_some_and(|v| v.projection.display.session_display)
@@ -5668,6 +5712,144 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_workspace_close_menu_and_shortcuts_keep_projection_until_owner_removes_it() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let _env = crate::persist::test_env("remote-workspace-close-routes");
+        for route in ["menu", "prefix", "direct"] {
+            let mut app = remote_ui_app();
+            let (pane, input, path) = add_remote_workspace(&mut app);
+            let target = app.workspaces[1].remote.clone().unwrap();
+            match route {
+                "menu" => {
+                    // Closing a background row must not close the focused local workspace.
+                    app.active_ws = 0;
+                    app.open_ws_menu(1, 2, 2);
+                    app.ws_menu_action(super::super::WsMenuItem::Close);
+                }
+                "prefix" => {
+                    app.mode = Mode::Prefix;
+                    app.handle_active_remote_key(KeyEvent::new(
+                        KeyCode::Char('D'),
+                        KeyModifiers::SHIFT,
+                    ));
+                }
+                _ => {
+                    app.direct_keymap = super::super::keys::build_direct_keymap(
+                        &std::collections::HashMap::from([("close_node".into(), "alt+w".into())]),
+                    );
+                    app.handle_active_remote_key(KeyEvent::new(
+                        KeyCode::Char('w'),
+                        KeyModifiers::ALT,
+                    ));
+                }
+            }
+            assert_eq!(app.workspaces.len(), 2, "{route}: wait for owner topology");
+            assert!(app.views.contains_key(&pane));
+            assert!(!app.closed_remote_workspaces.contains(&target));
+            assert!(!app.closed_workspace_paths.contains(&path));
+            assert!(input.try_iter().any(|message|
+                matches!(message, ClientMessage::Command(command) if command == "close_node")),
+                "{route}: close must reach the owner");
+            app.apply_remote_session_discovered(
+                RemoteSession::new(&target.host, &target.session).unwrap(),
+                Ok(RemoteSessionSnapshot {
+                    display: RemoteDisplay::default(),
+                    event_sequence: 2,
+                    workspaces: vec![],
+                }),
+            );
+            assert_eq!(app.workspaces.len(), 1);
+            assert!(app.workspaces[0].remote.is_none());
+            assert!(!app.views.contains_key(&pane));
+            assert!(!app.closed_remote_workspaces.contains(&target));
+        }
+    }
+
+    #[test]
+    fn remote_workspace_close_reactivates_a_background_legacy_projection() {
+        let _env = crate::persist::test_env("remote-workspace-close-legacy");
+        let mut app = remote_ui_app();
+        let (pane, input, _) = add_remote_workspace(&mut app);
+        set_presentable_projection(&mut app, pane, 1);
+        app.focus_workspace(0);
+        app.resize_active_remote_projection();
+        assert!(input.try_iter().any(|message| matches!(
+            message,
+            ClientMessage::ProjectionInterest { active: false, .. }
+        )));
+        app.open_ws_menu(1, 2, 2);
+        app.ws_menu_action(super::super::WsMenuItem::Close);
+        let messages: Vec<_> = input.try_iter().collect();
+        let activate = messages
+            .iter()
+            .position(|message| {
+                matches!(
+                    message,
+                    ClientMessage::ProjectionInterest { active: true, .. }
+                )
+            })
+            .expect("legacy owner must be activated before it accepts commands");
+        let close = messages
+            .iter()
+            .position(|message| {
+                matches!(message,
+            ClientMessage::Command(command) if command == "close_node")
+            })
+            .unwrap();
+        assert!(activate < close);
+        assert_eq!(app.workspaces.len(), 2, "still wait for owner topology");
+    }
+
+    #[test]
+    fn remote_workspace_close_without_connection_keeps_the_row_and_reports_failure() {
+        let _env = crate::persist::test_env("remote-workspace-close-disconnected");
+        for connected in [false, true] {
+            let mut app = remote_ui_app();
+            let (pane, input, _) = add_remote_workspace(&mut app);
+            if !connected {
+                let ViewKind::Remote(view) = app.views.get_mut(&pane).unwrap() else {
+                    unreachable!()
+                };
+                view.input = None;
+                view.state = RemoteViewState::Disconnected;
+            } else {
+                // A stale sender whose bridge has already closed must also fail visibly.
+                drop(input);
+            }
+            app.close_workspace(1);
+            assert_eq!(app.workspaces.len(), 2);
+            assert!(app.toast.is_some());
+            assert!(app.closed_remote_workspaces.is_empty());
+        }
+    }
+
+    #[test]
+    fn remote_workspace_close_api_requires_owner_for_aliases_and_all_selectors() {
+        let _env = crate::persist::test_env("remote-workspace-close-api");
+        for method in ["workspace.close", "node.close"] {
+            for params in [
+                json!({}),
+                json!({"workspace":"1"}),
+                json!({"workspace_id":"workspace_local_projection"}),
+            ] {
+                let mut app = remote_ui_app();
+                let (_, input, _) = add_remote_workspace(&mut app);
+                let error = app
+                    .dispatch(method, &params)
+                    .expect_err("projection cannot be closed by a local API request");
+                assert_eq!(error.0, "remote_workspace");
+                assert!(error.1.contains("--host dev-207 --session api"));
+                assert_eq!(app.workspaces.len(), 2);
+                assert!(input.try_recv().is_err());
+                // The same API remains usable for an explicitly selected local workspace.
+                app.dispatch(method, &json!({"workspace":"0"})).unwrap();
+                assert_eq!(app.workspaces.len(), 1);
+                assert!(app.workspaces[0].remote.is_some());
+            }
+        }
+    }
+
+    #[test]
     fn remote_workspaces_are_not_persisted_or_recorded_as_closed_local_paths() {
         let _env = crate::persist::test_env("remote-view-persistence-boundary");
         let (tx, _rx) = mpsc::channel();
@@ -5683,30 +5865,23 @@ pub(crate) mod tests {
         let remote_index = app.active_ws;
         app.close_workspace(remote_index);
         assert!(!app.closed_workspace_paths.contains(&remote_path));
-        assert!(matches!(receiver.recv().unwrap(), ClientMessage::Detach));
+        assert!(
+            matches!(receiver.recv().unwrap(), ClientMessage::Command(command) if command == "close_node")
+        );
+        assert!(app.workspaces[remote_index].remote.is_some());
         app.apply_remote_session_discovered(
             RemoteSession::new("dev-207", "api").unwrap(),
             Ok(RemoteSessionSnapshot {
                 display: RemoteDisplay::default(),
                 event_sequence: 2,
-                workspaces: vec![RemoteWorkspaceMeta {
-                    runtime: None,
-                    focused_pane: None,
-                    agents: Vec::new(),
-                    history: Vec::new(),
-                    scheduled: Vec::new(),
-                    worktree: None,
-                    id: "workspace_remote".into(),
-                    name: "api".into(),
-                    cwd: remote_path.display().to_string(),
-                    branch: None,
-                }],
+                workspaces: vec![],
             }),
         );
         assert!(app
             .workspaces
             .iter()
             .all(|workspace| workspace.remote.is_none()));
+        assert!(matches!(receiver.recv().unwrap(), ClientMessage::Detach));
     }
 
     #[test]

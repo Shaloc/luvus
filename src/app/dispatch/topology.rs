@@ -1039,6 +1039,9 @@ impl App {
         let _ = (method, p);
         {
             let i = self.optional_socket_workspace(p)?.unwrap_or(self.active_ws);
+            // Like pane/tab mutations, the API must target the owner explicitly.
+            // A display command cannot provide this request's owner-side result.
+            self.require_local_workspace(i)?;
             self.close_workspace(i);
             Ok(json!({"type":"ok"}))
         }

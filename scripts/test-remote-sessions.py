@@ -15,6 +15,7 @@ Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
 Use --colors-only for child color queries and composed local/remote backgrounds (requires pyte).
 Use --appearance-only for pane mouse controls, None theme, notifications and host diagnostics (requires pyte).
+Use --workspace-close-only for owner-routed workspace close and restart persistence (requires pyte).
 Use --reconnect-only for remote owner restart and automatic reconnection.
 Use --event-backpressure-only for event draining during a stalled topology snapshot.
 That mode uses a real VT decoder: uv run --with pyte==0.8.2 scripts/test-remote-sessions.py target/debug/luvus --reconnect-only
@@ -231,7 +232,8 @@ def main():
     theme_sync_only = "--theme-sync-only" in sys.argv[1:]
     colors_only = "--colors-only" in sys.argv[1:]
     appearance_only = "--appearance-only" in sys.argv[1:]
-    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only:
+    workspace_close_only = "--workspace-close-only" in sys.argv[1:]
+    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -241,7 +243,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -687,7 +689,7 @@ def main():
             if colors_only:
                 color_output.clear()
                 color_output.extend(screen)
-            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only:
+            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -751,6 +753,105 @@ def main():
 
         def click(master, x, y, button=0):
             os.write(master, f"\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m".encode())
+
+        if workspace_close_only:
+            def detach_client(process, master):
+                # Like the terminal-color fixture, keep reading final frames
+                # while the real client handles its normal detach shortcut.
+                os.write(master, b"\x02q")
+
+                def exited():
+                    if select.select([master], [], [], 0.03)[0]:
+                        try:
+                            os.read(master, 65536)
+                        except OSError:
+                            pass
+                    return process.poll() is not None
+
+                wait_for(exited)
+                assert process.returncode == 0, process.returncode
+
+            closed_paths = []
+            second_owner = api("workspace.list", remote=True, session="second")["workspaces"]
+            local_original = api("workspace.list")["workspaces"][0]["workspace_id"]
+            for mode in ("merge", "direct-remote"):
+                merged = mode == "merge"
+                run("session", "merge", "on" if merged else "off")
+                session = "api" if merged else "remote-fake-dev-api"
+                argv = ["--session", "api"] if merged else ["session", "attach", session]
+                process, master = start_client(argv)
+
+                def screen_text():
+                    drain(master, .12)
+                    text = "\n".join(client_terminals[master][0].display)
+                    (root / f"workspace-close-{mode}.txt").write_text(text)
+                    return text
+
+                def row_for(label, limit=120):
+                    for y, line in enumerate(client_terminals[master][0].display):
+                        if label in line[:limit]:
+                            return line.index(label) + 1, y + 1
+                    raise AssertionError((label, screen_text()))
+
+                def owner_rows():
+                    return api("workspace.list", remote=True)["workspaces"]
+
+                def display_rows():
+                    return presentation_api("workspace.list", session=session)["workspaces"]
+
+                for action in ("menu", "prefix"):
+                    name = f"cut-{action[0]}-{mode[0]}"
+                    path = root / f"shared-{action}-{mode[0]}"
+                    path.mkdir()
+                    # The same path on both owners must not collapse their identities.
+                    api("workspace.open", {"path": str(path)})
+                    local = next(w for w in api("workspace.list")["workspaces"]
+                                 if w["cwd"] == str(path) and not w.get("host"))
+                    api("workspace.rename", {"workspace": local["workspace"], "name": "keep-" + action})
+                    api("workspace.open", {"path": str(path)}, remote=True)
+                    victim = next(w for w in owner_rows() if w["cwd"] == str(path))
+                    api("workspace.rename", {"workspace": victim["workspace"], "name": name}, remote=True)
+                    remote_view = wait_for(lambda: next((w for w in display_rows()
+                        if w.get("host") == "fake-dev" and w["cwd"] == str(path)), None))
+                    if action == "menu":
+                        survivor = next(w for w in display_rows() if w.get("host") == "fake-dev"
+                                        and w["cwd"] == str(root / "project"))
+                        presentation_api("workspace.focus", {"workspace_id": survivor["workspace_id"]}, session=session)
+                        wait_for(lambda: any(w["workspace_id"] == survivor["workspace_id"] and w["active"] for w in display_rows()))
+                        wait_for(lambda: name in screen_text())
+                        click(master, *row_for(name, limit=30), button=2)
+                        wait_for(lambda: "Close" in screen_text())
+                        click(master, *row_for("Close"))
+                    else:
+                        presentation_api("workspace.focus", {"workspace_id": remote_view["workspace_id"]}, session=session)
+                        wait_for(lambda: any(w["workspace_id"] == remote_view["workspace_id"] and w["active"] for w in display_rows()))
+                        screen_text()
+                        # Display prefix is Ctrl+B, owner prefix is Ctrl+Space.
+                        os.write(master, b"\x02D")
+                    wait_for(lambda: screen_text() and all(w["workspace_id"] != victim["workspace_id"] for w in owner_rows()))
+                    wait_for(lambda: all(w["workspace_id"] != remote_view["workspace_id"] for w in display_rows()))
+                    assert any(w["workspace_id"] == local["workspace_id"] for w in api("workspace.list")["workspaces"])
+                    assert api("workspace.list", remote=True, session="second")["workspaces"] == second_owner
+                    closed_paths.append(str(path))
+                    saved = root / "remote-state/sessions/api/session.json"
+                    wait_for(lambda: str(path) in json.loads(saved.read_text()).get("closed_workspace_paths", []))
+                    print(f"PASS: {mode} {action} closes the owner, keeps same-path local workspace and other owner session", flush=True)
+
+                run("--session", "api", "server", "restart", remote=True)
+                wait_for(lambda: any(w.get("host") == "fake-dev" for w in display_rows()))
+                assert all(w["cwd"] not in closed_paths for w in owner_rows())
+                assert all(w["cwd"] not in closed_paths for w in display_rows() if w.get("host") == "fake-dev")
+                # Stop only this private display and reattach through its real entry point.
+                detach_client(process, master)
+                run("--session", session, "remote-server-command", "stop")
+                process, master = start_client(argv)
+                wait_for(lambda: any(w.get("host") == "fake-dev" for w in display_rows()))
+                assert all(w["cwd"] not in closed_paths for w in display_rows() if w.get("host") == "fake-dev")
+                assert any(w["workspace_id"] == local_original for w in api("workspace.list")["workspaces"])
+                screen_text()
+                print(f"PASS: {mode} closed workspaces stay absent after owner and display restart", flush=True)
+                detach_client(process, master)
+            return
 
         if appearance_only:
             api("config.patch", {"patch": {"notifications": {"display": "inbox"},
@@ -2346,19 +2447,6 @@ def main():
                                         if t["active"] for p in t["panes"] if p["kind"] == "terminal")
                 source_name = next(w["name"] for w in owner("workspace.list")["workspaces"]
                                    if w["workspace"] == "0")
-                if remote:
-                    # Hide only the display projection. Reopening through the
-                    # owner MENU must rediscover AND focus it, without closing
-                    # the owner's workspace or its terminal process.
-                    display_session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
-                    visible = wait_for(lambda: next((w for w in presentation_api(
-                        "workspace.list", session=display_session)["workspaces"]
-                        if w.get("host") == "fake-dev" and w["cwd"] == str(path)), None))
-                    presentation_api("workspace.close", {"workspace": visible["workspace"]},
-                                     session=display_session)
-                    assert not any(w.get("host") == "fake-dev" and w["cwd"] == str(path)
-                                   for w in presentation_api("workspace.list", session=display_session)["workspaces"])
-                    assert any(w["cwd"] == str(path) for w in owner("workspace.list")["workspaces"])
                 # Exercise owner MENU navigation through real client input,
                 # not merely successful owner CLI mutations. At this width
                 # only the remote projection uses its mobile MENU header.
@@ -2822,7 +2910,7 @@ def main():
                 run("--session", name, "remote-server-command", "stop", remote=remote, okay=False)
         # Graphics and appearance checkpoints can be inspected after teardown.
         # Other successful fixtures are disposable; failures retain evidence.
-        if sys.exc_info()[0] is None and not graphics_only and not appearance_only and not ssh_admission_only:
+        if sys.exc_info()[0] is None and not graphics_only and not appearance_only and not workspace_close_only and not ssh_admission_only:
             assert_isolated(env)
             assert_isolated(remote_env)
             shutil.rmtree(root)

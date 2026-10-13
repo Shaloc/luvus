@@ -330,6 +330,10 @@ helper. OSC52 clipboard reads remain unsupported.
 Merged `agent list` rows expose `host`, `owner_session`, `owner_pane`,
 `owner_workspace_id` and `terminal_id`; follow-up automation uses the owner
 selectors with `--host`, not the local projection's `workspace_id`.
+CLI/API `workspace.close` and `node.close` also require the owner selector and
+reject local remote projections with `remote_workspace`. The interactive remote
+workspace Close action forwards to the owner, closes its panes, and preserves
+the closure across restart.
 
 Local Settings and the Agents All/Active, workspace-scope and Next Attention
 controls remain local in managed remote and merge mode. A remote workspace's
