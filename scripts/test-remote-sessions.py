@@ -10,6 +10,7 @@ Use --dimensions-only for the local split/close/resize regression.
 Use --session-discovery-only for owner inventory and session deletion regression.
 Use --remote-only-open-only for merge routing without implicit local owners.
 Use --agent-focus-only for Agents highlight and owner focus synchronization.
+Use --agent-title-only for agent title initials, compact groups and display-local toggles (requires pyte).
 Use --agent-seen-only for native Done acknowledgement after remote owner restart.
 Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
@@ -224,6 +225,7 @@ def main():
     restart_only = "--restart-only" in sys.argv[1:]
     agent_state_only = "--agent-state-only" in sys.argv[1:]
     agent_focus_only = "--agent-focus-only" in sys.argv[1:]
+    agent_title_only = "--agent-title-only" in sys.argv[1:]
     agent_seen_only = "--agent-seen-only" in sys.argv[1:]
     reconnect_only = "--reconnect-only" in sys.argv[1:]
     network_reconnect_only = "--network-reconnect-only" in sys.argv[1:]
@@ -233,7 +235,7 @@ def main():
     colors_only = "--colors-only" in sys.argv[1:]
     appearance_only = "--appearance-only" in sys.argv[1:]
     workspace_close_only = "--workspace-close-only" in sys.argv[1:]
-    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only:
+    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -243,7 +245,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -689,7 +691,7 @@ def main():
             if colors_only:
                 color_output.clear()
                 color_output.extend(screen)
-            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only:
+            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -754,23 +756,23 @@ def main():
         def click(master, x, y, button=0):
             os.write(master, f"\x1b[<{button};{x};{y}M\x1b[<{button};{x};{y}m".encode())
 
+        def detach_client(process, master):
+            # Like the terminal-color fixture, keep reading final frames
+            # while the real client handles its normal detach shortcut.
+            os.write(master, b"\x02q")
+
+            def exited():
+                if select.select([master], [], [], 0.03)[0]:
+                    try:
+                        os.read(master, 65536)
+                    except OSError:
+                        pass
+                return process.poll() is not None
+
+            wait_for(exited)
+            assert process.returncode == 0, process.returncode
+
         if workspace_close_only:
-            def detach_client(process, master):
-                # Like the terminal-color fixture, keep reading final frames
-                # while the real client handles its normal detach shortcut.
-                os.write(master, b"\x02q")
-
-                def exited():
-                    if select.select([master], [], [], 0.03)[0]:
-                        try:
-                            os.read(master, 65536)
-                        except OSError:
-                            pass
-                    return process.poll() is not None
-
-                wait_for(exited)
-                assert process.returncode == 0, process.returncode
-
             closed_paths = []
             second_owner = api("workspace.list", remote=True, session="second")["workspaces"]
             local_original = api("workspace.list")["workspaces"][0]["workspace_id"]
@@ -1913,6 +1915,77 @@ def main():
                 os.close(master)
                 clients.pop()
                 print(f"PASS: {mode}: restart and stopped-owner recovery restore output/input/prefix/Agents/PTY size/clipboard without local restart or input replay", flush=True)
+            return
+
+        if agent_title_only:
+            local_pane = api("pane.list")["panes"][0]["pane"]
+            for owner_pane, remote, tool, title in ((local_pane, False, "codex", "Local title"),
+                                                  (pane, True, "qodercli", "Remote title")):
+                api("agent.report", {"pane": owner_pane, "source": "smoke/title", "agent": tool,
+                                     "status": "idle", "ttl_s": 300}, remote=remote)
+                api("ui.agent_title.push", {"titles": [{"pane": owner_pane, "title": title}]}, remote=remote)
+            for mode in ("merge", "direct-remote"):
+                merged = mode == "merge"
+                run("session", "merge", "on" if merged else "off")
+                session = "api" if merged else "remote-fake-dev-api"
+                process, master = start_client(["--session", "api"] if merged else
+                                               ["session", "attach", session])
+                presentation_api("config.patch", {"patch": {
+                    "agents_active_only": True, "agents_group_by_workspace": True,
+                    "layout": {"agent_title_first": False, "agent_title": True,
+                               "agent_paths": True, "agent_status_names": False}}}, session=session)
+                def sidebar():
+                    drain(master, .12)
+                    lines = client_terminals[master][0].display
+                    (root / f"agent-title-{mode}.txt").write_text("\n".join(lines))
+                    # The fixture uses the default 32-column sidebar.
+                    return [line[:31] for line in lines]
+                def row_for(label):
+                    for y, line in enumerate(client_terminals[master][0].display):
+                        if label in line[:50]:
+                            return line.index(label) + 1, y + 1
+                    raise AssertionError((label, sidebar()))
+                wait_for(lambda: any("qodercli" in line for line in sidebar()))
+                x, y = row_for("qodercli")
+                click(master, x, y, button=2)
+                wait_for(lambda: any("Title first" in line for line in sidebar()))
+                x, y = row_for("Title first")
+                click(master, x, y)
+                os.write(master, b"\x1b")
+                wait_for(lambda: any("Q Remote title" in line for line in sidebar()))
+                if merged:
+                    assert any("C Local title" in line for line in sidebar()), sidebar()
+                current = presentation_api("config.get", session=session)["config"]["layout"]
+                assert current["agent_title_first"] and current["agent_title"] and current["agent_paths"]
+                assert not api("config.get", remote=True)["config"]["layout"]["agent_title_first"], "display toggle reached owner"
+                lines = sidebar()
+                agent_row = next(i for i, line in enumerate(lines) if "Q Remote title" in line)
+                assert "▾" in lines[agent_row - 1], ("group heading must directly precede its agent", lines)
+                # Detail visibility remains independent of the new mode.
+                presentation_api("config.patch", {"patch": {"layout": {"agent_paths": False}}}, session=session)
+                wait_for(lambda: any("Q Remote title" in line for line in sidebar()))
+                api("ui.agent_title.push", {"titles": [{"pane": pane, "title": "Remote updated"}]}, remote=True)
+                wait_for(lambda: any("Q Remote updated" in line for line in sidebar()))
+                presentation_api("config.patch", {"patch": {"layout": {"agent_title_first": False}}}, session=session)
+                wait_for(lambda: any("qodercli" in line for line in sidebar()))
+                # Hover uses the same foreground clearing as menus, through a
+                # real local/remote thin client and its incremental wire frames.
+                x, y = row_for("qodercli")
+                os.write(master, f"\x1b[<35;{x};{y}M".encode())
+                def hover_visible():
+                    drain(master, .12)
+                    lines = client_terminals[master][0].display
+                    (root / f"hover-{mode}.txt").write_text("\n".join(lines))
+                    return any("qodercli · idle ·" in line.lower() for line in lines)
+                wait_for(hover_visible)
+                repaint(master)
+                assert hover_visible(), "hover hint differs after a full frame"
+                os.write(master, b"\x1b[<35;119;29M")
+                detach_client(process, master)
+                os.close(master)
+                clients.remove((process, master))
+                api("ui.agent_title.push", {"titles": [{"pane": pane, "title": "Remote title"}]}, remote=True)
+                print(f"PASS: {mode}: title initials, independent details, single-row groups and live title refresh", flush=True)
             return
 
         if agent_focus_only:

@@ -1920,9 +1920,12 @@ mod tests {
         app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        app.handle_agent_menu_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        let menu = app.agent_menu.as_ref().unwrap();
+        let items = app.agent_menu_items(menu.target.clone());
         assert_eq!(
-            app.agent_menu.as_ref().and_then(|menu| menu.selected),
-            Some(5),
+            items[menu.selected.unwrap()],
+            crate::app::AgentMenuItem::ToggleWorkspaceScope,
             "keyboard navigation skips the divider"
         );
     }

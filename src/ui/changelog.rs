@@ -720,7 +720,7 @@ mod tests {
         let before = app.changelog_link_rects.clone();
         assert!(!before.is_empty(), "links on the first screen");
 
-        app.changelog_scroll = 500; // clamped to the end on the next draw
+        app.changelog_scroll = u16::MAX; // clamped to the end regardless of release-note length
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         let after = app.changelog_link_rects.clone();
         assert_ne!(before, after, "the visible link set changed");

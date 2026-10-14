@@ -1209,6 +1209,7 @@ pub struct AgentMenu {
 pub enum AgentMenuItem {
     ToggleWorkspaceGrouping,
     ToggleStatusNames,
+    ToggleTitleFirst,
     CollapseWorkspace,
     ExpandWorkspace,
     ToggleStatus(State),
@@ -5290,8 +5291,31 @@ impl App {
         }
         let mut rows = self.agent_dock_targets();
         self.normalize_agent_cursor(&rows, false);
-        let stride = if self.config.layout.agent_paths { 2 } else { 1 };
-        let page = (usize::from(self.agents_area.height) / stride).max(1) as isize;
+        let row_height = |row: &AgentDockTarget| {
+            if matches!(
+                row,
+                AgentDockTarget::Workspace(_)
+                    | AgentDockTarget::Elsewhere(_)
+                    | AgentDockTarget::RemoteElsewhere { .. }
+            ) || !self.config.layout.agent_paths
+            {
+                1
+            } else {
+                2
+            }
+        };
+        let page = if key.code == KeyCode::PageUp {
+            workspace_sidebar::fitting_rows(
+                rows[..self.agent_cursor].iter().rev().map(row_height),
+                usize::from(self.agents_area.height),
+            )
+        } else {
+            workspace_sidebar::fitting_rows(
+                rows[self.agent_cursor..].iter().map(row_height),
+                usize::from(self.agents_area.height),
+            )
+        }
+        .max(1) as isize;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => self.sidebar_focus = None,
             KeyCode::Up | KeyCode::Char('k') => {
@@ -5729,7 +5753,7 @@ impl App {
 
     pub(crate) fn hidden_title_changed(&self, id: PaneId) -> bool {
         let changed = self.agent_session_title_changed(id);
-        self.config.layout.agent_title && changed
+        (self.config.layout.agent_title || self.config.layout.agent_title_first) && changed
     }
 
     /// Report whether an agent's OSC title generation moved, and announce
@@ -7461,6 +7485,7 @@ impl App {
         }
         items.push(AgentMenuItem::TogglePath);
         items.push(AgentMenuItem::ToggleStatusNames);
+        items.push(AgentMenuItem::ToggleTitleFirst);
         if let AgentTarget::RemoteLive { view, pane } = target {
             items.push(if self.remote_agent_is_pinned(view, pane) {
                 AgentMenuItem::Unpin
@@ -8667,6 +8692,11 @@ impl App {
     /// unrelated live pane.
     pub fn agent_menu_action(&mut self, item: AgentMenuItem) {
         match item {
+            AgentMenuItem::ToggleTitleFirst => {
+                self.config.layout.agent_title_first = !self.config.layout.agent_title_first;
+                self.persist_config();
+                return;
+            }
             AgentMenuItem::ToggleStatusNames => {
                 self.config.layout.agent_status_names = !self.config.layout.agent_status_names;
                 self.persist_config();
@@ -8798,6 +8828,7 @@ impl App {
             (
                 AgentMenuItem::Divider
                 | AgentMenuItem::ToggleStatusNames
+                | AgentMenuItem::ToggleTitleFirst
                 | AgentMenuItem::CollapseWorkspace
                 | AgentMenuItem::ExpandWorkspace,
                 _,
@@ -19308,14 +19339,15 @@ fi
         let items = &app.agent_menu.as_ref().unwrap().items;
         assert_eq!(
             items.len(),
-            6,
-            "session menu has Resume + Close + path + status names + divider + workspace scope"
+            7,
+            "session menu has Resume + Close + path + status names + title first + divider + workspace scope"
         );
         assert_eq!(items[0].0, AgentMenuItem::Resume);
         assert_eq!(items[2].0, AgentMenuItem::TogglePath);
         assert_eq!(items[3].0, AgentMenuItem::ToggleStatusNames);
-        assert_eq!(items[4].0, AgentMenuItem::Divider);
-        assert_eq!(items[5].0, AgentMenuItem::ToggleWorkspaceScope);
+        assert_eq!(items[4].0, AgentMenuItem::ToggleTitleFirst);
+        assert_eq!(items[5].0, AgentMenuItem::Divider);
+        assert_eq!(items[6].0, AgentMenuItem::ToggleWorkspaceScope);
         let rendered = |term: &Terminal<TestBackend>| {
             term.backend()
                 .buffer()

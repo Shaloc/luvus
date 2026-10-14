@@ -24,9 +24,15 @@ export interface TabSnapshot {
 }
 
 export interface WorkspaceSnapshot {
+  id?: string;
   index: number;
   name: string;
   cwd: string;
+  host?: string | null;
+  owner_session?: string;
+  connected?: boolean;
+  sidebar_order?: number;
+  parent_id?: string | null;
   branch?: string | null;
   active: boolean;
   tabs: TabSnapshot[];
@@ -73,6 +79,8 @@ export interface TerminalFrame extends UhpEvent {
     text: string;
     truncated: boolean;
     cursor?: { offset: number; padding_cells: number } | null;
+    /** Native Web bridge: [Unicode scalar offset, scalar count, terminal cells]. */
+    cell_widths?: Array<[number, number, number]>;
   };
 }
 

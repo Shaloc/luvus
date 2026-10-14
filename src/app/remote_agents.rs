@@ -614,6 +614,151 @@ mod tests {
     }
 
     #[test]
+    fn agent_title_first_remote_rows_keep_owner_actions_and_local_preferences() {
+        let _env = crate::persist::test_env("remote-agent-title-first");
+        let mut app = remote_ui_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.app_tx = tx;
+        let (view, input, _) = add_remote_workspace(&mut app);
+        let mut row = agent(7, false);
+        row.title = Some("调查远端任务".into());
+        remote_view(&mut app, view).agents = vec![row];
+        let target = AgentTarget::RemoteLive {
+            view,
+            pane: PaneId(7),
+        };
+        app.open_agent_menu(target.clone(), 2, 2);
+        assert!(app
+            .agent_menu_items(target)
+            .contains(&AgentMenuItem::ToggleTitleFirst));
+        let previous = (
+            app.config.layout.agent_paths,
+            app.config.layout.agent_title,
+            app.config.layout.agent_status_names,
+        );
+        app.agent_menu_action(AgentMenuItem::ToggleTitleFirst);
+        app.flush_config_for_test(&rx);
+        let stored = crate::config::load();
+        assert!(stored.layout.agent_title_first);
+        assert_eq!(
+            (
+                stored.layout.agent_paths,
+                stored.layout.agent_title,
+                stored.layout.agent_status_names
+            ),
+            previous
+        );
+        assert!(
+            input.try_recv().is_err(),
+            "display toggle must not reach owner"
+        );
+        app.agent_menu = None;
+        app.set_agents_filter(true);
+        app.config.agents_group_by_workspace = true;
+        for paths in [false, true] {
+            app.config.layout.agent_paths = paths;
+            let buffer = render_buffer(&mut app);
+            let rect = app.remote_agent_rects[0].2;
+            let text = (rect.x..rect.right())
+                .map(|x| buffer[(x, rect.y)].symbol())
+                .collect::<String>();
+            assert!(text.replace(' ', "").contains("C调查远端任务"), "{text}");
+            assert!(
+                !text.contains("blocked") && !text.contains("codex"),
+                "{text}"
+            );
+            assert_eq!(rect.y, app.agent_group_rects[0].1.bottom());
+            assert_eq!(app.agent_group_rects[0].1.height, 1);
+            let hint = app.chrome_hint_at(Some((rect.x, rect.y))).unwrap().1;
+            assert!(
+                hint.contains("p7") && hint.contains("codex") && hint.contains("调查远端任务"),
+                "{hint}"
+            );
+            assert!(hint.contains(app.catalog.menu_agent_states[1]), "{hint}");
+        }
+        remote_view(&mut app, view).history = vec![AgentHistoryRow {
+            title: Some("历史会话标题".into()),
+            key: [1; 32],
+            agent: "qodercli".into(),
+            cwd: "/srv/history".into(),
+        }];
+        app.set_agents_filter(false);
+        let buffer = render_buffer(&mut app);
+        let rect = app.remote_history_rects[0].2;
+        let text = (rect.x..rect.right())
+            .map(|x| buffer[(x, rect.y)].symbol())
+            .collect::<String>();
+        assert!(
+            text.contains('Q') && text.replace(' ', "").contains("历史"),
+            "{text}"
+        );
+        let hint = app.chrome_hint_at(Some((rect.x, rect.y))).unwrap().1;
+        assert!(hint.contains("qodercli"), "{hint}");
+        app.open_agent_menu(
+            AgentTarget::RemoteLive {
+                view,
+                pane: PaneId(7),
+            },
+            2,
+            2,
+        );
+        app.agent_menu_action(AgentMenuItem::Pin);
+        assert!(
+            matches!(input.try_recv().unwrap(), ClientMessage::Command(cmd) if cmd == "agent_pin 7")
+        );
+    }
+
+    #[test]
+    fn agent_group_heights_keep_keyboard_selection_visible_after_scroll_and_resize() {
+        use crate::app::SidebarListFocus;
+        let _env = crate::persist::test_env("agent-group-scroll-height");
+        let mut app = remote_ui_app();
+        let (view, _input, _) = add_remote_workspace(&mut app);
+        remote_view(&mut app, view).agents = (1..=12).map(|pane| agent(pane, false)).collect();
+        app.agents_active_only = true;
+        app.config.agents_group_by_workspace = true;
+        app.config.layout.agent_paths = true;
+        app.sidebar_focus = Some(SidebarListFocus::Agents);
+        for height in [30, 14, 9, 60] {
+            app.agents_scroll = 0;
+            let draw = |app: &mut App| {
+                let area = Rect::new(0, 0, 120, height);
+                let mut buffer = ratatui::buffer::Buffer::empty(area);
+                crate::ui::render_into(&mut crate::ui::RenderTarget::new(&mut buffer, area), app);
+            };
+            app.handle_agents_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+            draw(&mut app);
+            if app.agents_area.height >= 3 {
+                assert_eq!(app.agent_group_rects[0].1.height, 1);
+                assert_eq!(
+                    app.remote_agent_rects[0].2.y,
+                    app.agent_group_rects[0].1.bottom()
+                );
+            }
+            for key in [
+                KeyCode::PageDown,
+                KeyCode::End,
+                KeyCode::PageUp,
+                KeyCode::Home,
+            ] {
+                app.handle_agents_key(KeyEvent::new(key, KeyModifiers::NONE));
+                draw(&mut app);
+                let target = &app.agent_dock_targets()[app.agent_cursor];
+                let crate::app::AgentDockTarget::RemoteLive { pane, .. } = target else {
+                    panic!("{target:?}")
+                };
+                let rect = app
+                    .remote_agent_rects
+                    .iter()
+                    .find(|(_, id, _)| id == pane)
+                    .unwrap()
+                    .2;
+                assert!(rect.y >= app.agents_area.y && rect.bottom() <= app.agents_area.bottom());
+            }
+        }
+    }
+
+    #[test]
     fn agent_presentation_badges_status_names_and_folds_keep_owner_routes() {
         use crate::app::{AgentDockTarget, SidebarListFocus};
         use crate::event::AppEvent;
@@ -955,12 +1100,16 @@ mod tests {
             app.config.layout.agent_paths = paths;
             render(&mut app);
             let stride = if paths { 2 } else { 1 };
-            assert_eq!(app.agent_rects[0].1.y, app.agents_area.y + stride);
+            assert_eq!(app.agent_rects[0].1.y, app.agents_area.y + 1);
+            assert!(app
+                .agent_group_rects
+                .iter()
+                .all(|(_, rect)| rect.height == 1));
             assert_eq!(app.remote_agent_rects.len(), 1);
             assert_eq!(app.remote_agent_rects[0].1, "7");
             assert_eq!(
                 app.remote_agent_rects[0].2.y,
-                app.agents_area.y + 3 * stride
+                app.agents_area.y + 2 + stride
             );
             app.agent_cursor = 1;
             app.handle_agents_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));

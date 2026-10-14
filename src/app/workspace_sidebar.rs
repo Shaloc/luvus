@@ -34,34 +34,27 @@ pub(crate) fn visible_end(
     height: usize,
     paths: bool,
 ) -> usize {
-    let mut used = 0;
-    let mut end = start.min(rows.len());
-    while end < rows.len() && used < height {
-        let next = rows[end].height(paths);
-        if used > 0 && used + next > height {
-            break;
-        }
-        used += next;
-        end += 1;
-    }
-    end
+    let start = start.min(rows.len());
+    start + fitting_rows(rows[start..].iter().map(|row| row.height(paths)), height)
 }
 
 pub(crate) fn last_scroll(rows: &[WorkspaceSidebarRow], height: usize, paths: bool) -> usize {
-    let mut start = rows.len();
+    rows.len() - fitting_rows(rows.iter().rev().map(|row| row.height(paths)), height)
+}
+
+/// Shared by WORKSPACES and AGENTS: headings occupy one cell row even when
+/// entries have a detail line. Only the first item may be clipped.
+pub(crate) fn fitting_rows(heights: impl Iterator<Item = usize>, height: usize) -> usize {
     let mut used = 0;
-    while start > 0 {
-        let next = rows[start - 1].height(paths);
-        if used > 0 && used + next > height {
+    let mut count = 0;
+    for next in heights {
+        if used >= height || (used > 0 && used + next > height) {
             break;
         }
         used += next;
-        start -= 1;
-        if used >= height {
-            break;
-        }
+        count += 1;
     }
-    start
+    count
 }
 
 impl App {

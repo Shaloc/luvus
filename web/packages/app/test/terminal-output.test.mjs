@@ -75,3 +75,16 @@ test("removed or edited selected text is not restored at unrelated offsets", () 
   assert.equal(retainedTerminalSelection("before selected after", "before replaced after", 7, 15), undefined);
   assert.equal(retainedTerminalSelection("text", "text", 2, 2), undefined);
 });
+
+test("native cell widths align fallback glyphs while preserving text, ANSI and cursor offsets", () => {
+  const text = "A\x1b[31m中🧭e\u0301\x1b[0m |";
+  const parts = terminalFrameParts(text, 5, 0, [[1, 1, 2], [2, 1, 2], [3, 2, 1]]);
+  assert.equal(plain(parts), "A中🧭e\u0301 |");
+  assert.equal(beforeCursor(parts), "A中🧭e\u0301");
+  const sized = parts.filter(part => part.style?.width);
+  assert.deepEqual(sized.map(part => [part.text, part.style.width]), [["中", "2ch"], ["🧭", "2ch"], ["e\u0301", "1ch"]]);
+  assert.ok(sized.every(part => part.style.color === "var(--ansi-1)"));
+  assert.equal(parts.at(-1).style, undefined);
+  assert.equal(plain(terminalFrameParts("中", 0, 2, [[0, 1, 2]])), "  中");
+  assert.equal(plain(terminalFrameParts("中", undefined, 0, [null, [0, 1, -1], [0, 1, 99]])), "中");
+});

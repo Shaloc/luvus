@@ -754,10 +754,7 @@ fn render_into_mode(f: &mut RenderTarget, app: &mut App, resize_panes: bool, wor
             } else {
                 rect.y.saturating_sub(1).max(area.y)
             };
-            f.render_widget(
-                Paragraph::new(text).style(Style::new().fg(t.on_color(t.surface1)).bg(t.surface1)),
-                Rect::new(x, y, width, 1),
-            );
+            draw_chrome_hint(f, Rect::new(x, y, width, 1), text, &t);
             app.rendered_hyperlinks.retain(|link| link.y != y);
         }
     }
@@ -2297,6 +2294,15 @@ pub(crate) fn clip_columns(s: &str, max: usize) -> String {
     out
 }
 
+/// Hover hints are foreground layers too: erase retained glyphs and styles.
+fn draw_chrome_hint(f: &mut RenderTarget, area: Rect, text: String, t: &Theme) {
+    f.clear_overlay(area);
+    f.render_widget(
+        Paragraph::new(text).style(Style::new().fg(t.on_color(t.surface1)).bg(t.surface1)),
+        area,
+    );
+}
+
 /// A small centered toast box near the bottom (e.g. "✓ Copied"). Drawn last, so
 /// it floats over everything; the loop clears it after ~1.4s.
 fn draw_toast(f: &mut RenderTarget, area: Rect, text: &str, t: &Theme) {
@@ -2548,6 +2554,46 @@ mod retained_render_tests {
 
     use crate::terminal::appearance::PaneAppearance;
     use crate::terminal::vt::{create_engine, VtEngineKind};
+
+    #[test]
+    fn hover_hint_clears_wide_glyphs_and_styles_in_full_and_diff_frames() {
+        use crate::ipc::protocol::{diff_buffer, frame_from_buffer};
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buffer = Buffer::empty(area);
+        buffer.set_string(
+            0,
+            0,
+            "A中中文界界中文B",
+            Style::new().reversed().underlined(),
+        );
+        let mut previous = frame_from_buffer(&buffer, None, false);
+        let theme = Theme::quattro_rally();
+        let hint = Rect::new(2, 0, 14, 1);
+        draw_chrome_hint(
+            &mut RenderTarget::new(&mut buffer, area),
+            hint,
+            " p8 · 中 | xyz ".into(),
+            &theme,
+        );
+        assert_eq!(buffer[(0, 0)].symbol(), "A");
+        assert_eq!(buffer[(1, 0)].symbol(), " ", "clear wide head before hint");
+        for x in hint.x..hint.right() {
+            assert_eq!(buffer[(x, 0)].bg, theme.surface1);
+            assert!(!buffer[(x, 0)].modifier.intersects(
+                ratatui::style::Modifier::REVERSED | ratatui::style::Modifier::UNDERLINED
+            ));
+        }
+        let full = frame_from_buffer(&buffer, None, false);
+        assert_eq!(
+            full.cells[11].symbol, "|",
+            "underlying glyph must not consume hint cells"
+        );
+        assert!(!diff_buffer(&mut previous, &buffer).is_empty());
+        assert_eq!(
+            previous.cells, full.cells,
+            "incremental frame must match fresh frame"
+        );
+    }
 
     #[test]
     fn overlay_clear_clips_wide_edges_without_erasing_adjacent_text() {

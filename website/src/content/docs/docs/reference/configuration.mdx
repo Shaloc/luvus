@@ -34,6 +34,8 @@ cleanly across versions because unknown fields get defaults.
 | `layout.mobile_width` | inclusive viewport width for automatic mobile presentation; defaults to `64`, and `0` disables it. The legacy `layout.compact_width` key is accepted and migrated. (See [Mobile Sessions](/docs/guides/mobile/).) |
 | `layout.rounded_corners` | optional rounded box borders and tab/title caps; defaults to `false`. Uses standard Unicode glyphs, without changing terminal output or hit targets. Local Settings changes also synchronize to running sessions on connected, selected SSH hosts. |
 | `layout.agent_status_names` | show the state name beside agent dots; defaults to `true`. Toggle **Show Status Names** in the agent context menu. |
+| `layout.agent_title_first` | prefer the session title on the main AGENTS row, with a state dot and tool initial; defaults to `false`. Toggle **Title first** in the agent menu or Settings → General. Works independently of **Show Path** and temporarily omits state names to make room for the title. |
+| `layout.agent_title` | prefer the session title on the optional detail line when Title first is off; defaults to `false`. This does not control whether the detail line is visible. |
 | `layout.show_titles` | show pane identities in lone-pane headers and split-pane borders |
 | `layout.pane_title_path` | append each terminal's live working directory to its explicit pane name or OSC 0/2 title; without a title, show the directory alone |
 | `layout.resume_in_new_workspace` | resume a session into its own workspace instead of a new tab |

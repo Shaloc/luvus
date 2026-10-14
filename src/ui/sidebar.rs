@@ -95,11 +95,6 @@ fn dock_row_stride(paths_visible: bool) -> u16 {
     }
 }
 
-/// How many items fit in a list `rows` tall at its current row height.
-fn list_capacity(rows: u16, row_stride: u16) -> usize {
-    (rows / row_stride) as usize
-}
-
 /// A scrollbar on the sidebar's right edge, shown only when the list overflows
 /// its area. Thin block glyphs keep the indicator lighter than a full-cell
 /// background strip while remaining terminal-native: a faint one-eighth-cell
@@ -715,6 +710,7 @@ fn draw_workspaces_dock(
 /// one scrollable list, with an All/Active header filter. `area` is the dock
 /// slot; the header is on `area.y`, the list below it.
 fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) -> AgentHits {
+    use crate::app::workspace_sidebar::fitting_rows;
     let cat = app.catalog;
     let cx = area.x + 2;
     let cw = area.width.saturating_sub(3);
@@ -766,6 +762,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let arows = area.bottom().saturating_sub(alist_top);
     let paths_visible = app.config.layout.agent_paths;
     let grouped = active_only && app.config.agents_group_by_workspace;
+    let title_first = app.config.layout.agent_title_first;
     let status_names = app.config.layout.agent_status_names;
     let row_stride = dock_row_stride(paths_visible);
     app.agents_area = Rect::new(area.x, alist_top, area.width, arows);
@@ -949,16 +946,38 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         app.agent_cursor = (app.agent_cursor + 1).min(keyboard_total.saturating_sub(1));
     }
     app.agents_elsewhere_rect = None;
-    let acap = list_capacity(arows.saturating_sub(u16::from(has_elsewhere)), row_stride);
+    let viewport_height = arows.saturating_sub(u16::from(has_elsewhere));
+    let row_height = |k| {
+        if matches!(live.get(k), Some(AgentDockRow::Workspace(..))) {
+            1
+        } else {
+            usize::from(row_stride)
+        }
+    };
+    let visible_end = |start| {
+        start
+            + fitting_rows(
+                (start..atotal).map(row_height),
+                usize::from(viewport_height),
+            )
+    };
+    let last_scroll = atotal
+        - fitting_rows(
+            (0..atotal).rev().map(row_height),
+            usize::from(viewport_height),
+        );
+    app.agents_scroll = app.agents_scroll.min(last_scroll);
     if keyboard_focused && app.agent_cursor < atotal {
-        if app.agent_cursor < app.agents_scroll {
-            app.agents_scroll = app.agent_cursor;
-        } else if acap > 0 && app.agent_cursor >= app.agents_scroll + acap {
-            app.agents_scroll = app.agent_cursor + 1 - acap;
+        app.agents_scroll = app.agents_scroll.min(app.agent_cursor);
+        while viewport_height > 0
+            && app.agents_scroll < app.agent_cursor
+            && app.agent_cursor >= visible_end(app.agents_scroll)
+        {
+            app.agents_scroll += 1;
         }
     }
-    app.agents_scroll = app.agents_scroll.min(atotal.saturating_sub(acap));
     let ascroll = app.agents_scroll;
+    let acap = visible_end(ascroll).saturating_sub(ascroll);
 
     if atotal == 0 {
         line_at(
@@ -983,12 +1002,15 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 _ => None,
             })
             .unwrap_or(false);
-        for (vi, k) in (ascroll..atotal).take(acap).enumerate() {
-            let y = alist_top + vi as u16 * row_stride;
+        let mut next_y = alist_top;
+        for k in (ascroll..atotal).take(acap) {
+            let y = next_y;
+            let height = (row_height(k) as u16).min(alist_top + viewport_height - y);
+            next_y += height;
             let selected = keyboard_focused && app.agent_cursor == k;
             if selected {
                 f.buffer_mut().set_style(
-                    Rect::new(area.x, y, area.width.saturating_sub(1), row_stride),
+                    Rect::new(area.x, y, area.width.saturating_sub(1), height),
                     Style::new().bg(t.surface1),
                 );
             }
@@ -1024,7 +1046,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     ),
                 );
                 app.agent_group_rects
-                    .push((*wi, Rect::new(area.x, y, area.width, row_stride)));
+                    .push((*wi, Rect::new(area.x, y, area.width, height)));
                 continue;
             }
             let indent = if !grouped {
@@ -1035,8 +1057,8 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 "  "
             };
             if let Some(row @ (AgentDockRow::Local(..) | AgentDockRow::Remote(..))) = live.get(k) {
-                let rect = Rect::new(area.x, y, area.width, row_stride);
-                let (st, agent, focused, meta, host) = match row {
+                let rect = Rect::new(area.x, y, area.width, height);
+                let (st, agent, focused, meta, host, title) = match row {
                     AgentDockRow::Local(id, wi) => {
                         let wsname = &app.workspaces[*wi].name;
                         agent_rects.push((*id, rect));
@@ -1044,12 +1066,12 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                             .agent_name_for(*id)
                             .map(|name| format!("={name}"))
                             .unwrap_or_else(|| format!("={}", id.0));
-                        let meta = app
-                            .config
-                            .layout
-                            .agent_title
+                        let title = (app.config.layout.agent_title || title_first)
                             .then(|| app.pane_title(*id))
-                            .flatten()
+                            .flatten();
+                        let meta = title
+                            .as_deref()
+                            .filter(|_| app.config.layout.agent_title && !title_first)
                             .map(|title| format!("  {title}"))
                             .unwrap_or_else(|| format!("  {wsname} · {mention}"));
                         (
@@ -1061,6 +1083,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                             *id == focus,
                             meta,
                             None,
+                            title,
                         )
                     }
                     AgentDockRow::Remote(workspace_index, agent_index) => {
@@ -1075,7 +1098,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                             agent.name.as_deref().unwrap_or(&agent.pane)
                         );
                         let name = agent.agent.clone();
-                        let meta = if app.config.layout.agent_title {
+                        let meta = if app.config.layout.agent_title && !title_first {
                             agent
                                 .title
                                 .as_ref()
@@ -1090,6 +1113,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                             focused,
                             meta,
                             (!grouped).then(|| target.host.clone()),
+                            agent.title.clone(),
                         );
                         let hit = (target.clone(), agent.pane.clone(), rect);
                         app.remote_agent_rects.push(hit);
@@ -1099,7 +1123,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 };
                 if focused && !selected {
                     f.buffer_mut().set_style(
-                        Rect::new(area.x, y, area.width.saturating_sub(1), row_stride),
+                        Rect::new(area.x, y, area.width.saturating_sub(1), height),
                         Style::new().bg(t.sel_bg),
                     );
                 }
@@ -1111,29 +1135,41 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 // Working stays visually prominent without scheduling animation
                 // frames while the agent is busy.
                 let dot = st.dot();
-                let label = if status_names {
+                let label = if status_names && !title_first {
                     format!(" {}  ", st.label())
                 } else {
                     " ".into()
+                };
+                let mut prefix = vec![
+                    Span::raw(indent),
+                    Span::styled(dot, Style::new().fg(st.color(t))),
+                    Span::styled(label, Style::new().fg(st.color(t))),
+                ];
+                if title_first {
+                    prefix.push(agent_initial(&agent, name_style));
+                }
+                let label = if title_first {
+                    title
+                        .as_deref()
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or(&agent)
+                } else {
+                    &agent
                 };
                 line_at(
                     f,
                     y,
                     agent_label_line(
-                        vec![
-                            Span::raw(indent),
-                            Span::styled(dot, Style::new().fg(st.color(t))),
-                            Span::styled(label, Style::new().fg(st.color(t))),
-                        ],
+                        prefix,
                         host.as_deref(),
-                        &agent,
+                        label,
                         name_style,
                         cw as usize,
                         app.config.layout.rounded_corners,
                         t,
                     ),
                 );
-                if paths_visible {
+                if height > 1 {
                     line_at(
                         f,
                         y + 1,
@@ -1156,7 +1192,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                 AgentDockRow::Scheduled(i) => scheduled.get(*i),
                 _ => None,
             }) {
-                let rect = Rect::new(area.x, y, area.width, row_stride);
+                let rect = Rect::new(area.x, y, area.width, height);
                 if let Some(view) = owner {
                     app.remote_automation_rects
                         .push((*view, automation.clone(), rect));
@@ -1203,7 +1239,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         t,
                     ),
                 );
-                if paths_visible {
+                if height > 1 {
                     line_at(
                         f,
                         y + 1,
@@ -1222,8 +1258,8 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             } else {
                 // A resumable session discovered on disk — click to reopen.
                 let visible_index = k - live.len();
-                let row = Rect::new(area.x, y, area.width, row_stride);
-                let (agent, proj, host) = if visible_index >= resumable_total {
+                let row = Rect::new(area.x, y, area.width, height);
+                let (agent, proj, host, title) = if visible_index >= resumable_total {
                     let (view, session, host) = &remote_history[visible_index - resumable_total];
                     app.remote_history_rects.push((*view, session.key, row));
                     let project = std::path::Path::new(&session.cwd)
@@ -1231,14 +1267,19 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         .and_then(|name| name.to_str())
                         .unwrap_or("project");
                     let agent = session.agent.clone();
-                    let title = app
+                    let detail = app
                         .config
                         .layout
                         .agent_title
-                        .then_some(session.title.as_deref())
+                        .then_some(session.title.as_deref().filter(|_| !title_first))
                         .flatten()
                         .unwrap_or(project);
-                    (agent, title.to_string(), Some(host.clone()))
+                    (
+                        agent,
+                        detail.to_string(),
+                        Some(host.clone()),
+                        session.title.clone(),
+                    )
                 } else {
                     let si = if scoped {
                         resumable_scoped[visible_index]
@@ -1247,14 +1288,14 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     };
                     let session = &app.resumable[si];
                     session_rects.push((si, row));
+                    let title =
+                        app.agent_row_title_for_session(&session.agent, &session.session_id);
                     (
                         session.agent.clone(),
                         app.config
                             .layout
                             .agent_title
-                            .then(|| {
-                                app.agent_row_title_for_session(&session.agent, &session.session_id)
-                            })
+                            .then_some(title.filter(|_| !title_first))
                             .flatten()
                             .unwrap_or_else(|| {
                                 session
@@ -1265,27 +1306,44 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                             })
                             .to_string(),
                         None,
+                        title.map(str::to_owned),
                     )
                 };
                 let meta = format!("  {proj}");
-                let label = if status_names { " resume  " } else { " " };
+                let label = if status_names && !title_first {
+                    " resume  "
+                } else {
+                    " "
+                };
+                let mut prefix = vec![
+                    Span::styled("○", Style::new().fg(t.overlay1)),
+                    Span::styled(label, Style::new().fg(t.overlay1)),
+                ];
+                if title_first {
+                    prefix.push(agent_initial(&agent, Style::new().fg(t.subtext0)));
+                }
+                let label = if title_first {
+                    title
+                        .as_deref()
+                        .filter(|title| !title.trim().is_empty())
+                        .unwrap_or(&proj)
+                } else {
+                    &agent
+                };
                 line_at(
                     f,
                     y,
                     agent_label_line(
-                        vec![
-                            Span::styled("○", Style::new().fg(t.overlay1)),
-                            Span::styled(label, Style::new().fg(t.overlay1)),
-                        ],
+                        prefix,
                         host.as_deref(),
-                        &agent,
+                        label,
                         Style::new().fg(t.subtext0),
                         cw as usize,
                         app.config.layout.rounded_corners,
                         t,
                     ),
                 );
-                if paths_visible {
+                if height > 1 {
                     line_at(
                         f,
                         y + 1,
@@ -2252,6 +2310,94 @@ mod tests {
     }
 
     #[test]
+    fn agent_title_first_keeps_titles_on_compact_rows_and_preserves_detail_mode() {
+        use crate::terminal::appearance::PaneAppearance;
+        use crate::terminal::vt::{create_engine, VtEngineKind};
+        let _env = crate::persist::test_env("agent-title-first");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.panes.get_mut(&pane).unwrap().engine = create_engine(
+            VtEngineKind::Alacritty,
+            80,
+            24,
+            tx,
+            4 * 1024 * 1024,
+            PaneAppearance::default(),
+        );
+        app.panes[&pane]
+            .engine
+            .lock()
+            .unwrap()
+            .advance("\x1b]0;调查 87410735 问题 | task_service\x07".as_bytes());
+        app.config.layout.agent_title_first = true;
+        app.agents_active_only = true;
+        app.config.agents_group_by_workspace = true;
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        let line = |term: &Terminal<TestBackend>, rect: Rect, offset: u16| {
+            let mut text = String::new();
+            let mut x = rect.x;
+            while x < rect.right() {
+                let symbol = term.backend().buffer()[(x, rect.y + offset)].symbol();
+                text.push_str(symbol);
+                x += crate::ui::display_width(symbol).max(1) as u16;
+            }
+            text
+        };
+        for paths in [false, true] {
+            for title_detail in [false, true] {
+                app.config.layout.agent_paths = paths;
+                app.config.layout.agent_title = title_detail;
+                term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+                let rect = app.agent_rects[0].1;
+                let text = line(&term, rect, 0);
+                assert!(text.replace(' ', "").contains("C调查87410735"), "{text}");
+                assert!(!text.contains("codex") && !text.contains("idle"), "{text}");
+                assert_eq!(rect.y, app.agent_group_rects[0].1.bottom());
+                assert_eq!(app.agent_group_rects[0].1.height, 1);
+                assert_eq!(rect.height, if paths { 2 } else { 1 });
+                if paths {
+                    assert!(line(&term, rect, 1).contains('='), "detail remains visible");
+                    assert!(
+                        !line(&term, rect, 1).replace(' ', "").contains("调查"),
+                        "avoid repeating the primary title"
+                    );
+                }
+                let hint = app.chrome_hint_at(Some((rect.x, rect.y))).unwrap().1;
+                assert!(
+                    hint.contains("codex")
+                        && hint.contains("调查 87410735")
+                        && hint.contains(&format!("p{}", pane.0)),
+                    "{hint}"
+                );
+            }
+        }
+        app.config.layout.agent_title_first = false;
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let rect = app.agent_rects[0].1;
+        assert!(line(&term, rect, 0).contains("codex"));
+        assert!(
+            line(&term, rect, 1).replace(' ', "").contains("调查"),
+            "the existing detail title option is retained: {:?}, title={:?}",
+            line(&term, rect, 1),
+            app.pane_title(pane)
+        );
+        app.config.layout.agent_title_first = true;
+        app.panes[&pane]
+            .engine
+            .lock()
+            .unwrap()
+            .advance(b"\x1b]0;\x07");
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(
+            line(&term, app.agent_rects[0].1, 0).contains("C codex"),
+            "untitled agents remain identifiable"
+        );
+    }
+
+    #[test]
     fn resumable_rows_show_module_session_title() {
         let _env = crate::persist::test_env("resumable-module-title");
         let (tx, _rx) = std::sync::mpsc::channel();
@@ -2608,8 +2754,13 @@ mod dock_tone_tests {
     }
 }
 
-/// The label budgets badge and text together so long aliases cannot cover the
-/// scrollbar. Host badge colors are stable by host name, independent of workspace order.
+/// Plain initials work without terminal-specific icon fonts, including custom agents.
+fn agent_initial(agent: &str, style: Style) -> Span<'static> {
+    let initial = agent.chars().find(|c| c.is_alphanumeric()).unwrap_or('?');
+    Span::styled(format!("{} ", initial.to_ascii_uppercase()), style)
+}
+
+/// Budget host badges and text together so neither covers the scrollbar.
 fn agent_label_line(
     mut prefix: Vec<Span<'static>>,
     host: Option<&str>,

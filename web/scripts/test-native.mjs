@@ -416,6 +416,19 @@ async function testRemote() {
   await streamAction(socket, "enter", "send_key", {key:"enter"});
   await pasted;
 
+  // Modified logical keys must negotiate with the owner PTY, including releases.
+  const expectedKeys = Buffer.from("\x1b[32;6u\x1b[32;6:3u\x1b[13;2u\x1b[13;2:3u");
+  const keyProbe = `sh -c 'mode=$(stty -g); trap "stty $mode; printf \\\"\\\\033[<u\\\"" EXIT; stty -echo -icanon min 1 time 0; printf "\\033[>3uREMOTE_KEYS_READY\\n"; captured=$(od -An -v -t x1 -N ${expectedKeys.length} | tr -d " \\n"); printf "REMOTE_KEYS_HEX:%s:END\\n" "$captured"'`;
+  const keysReady = waitFor(socket, f => f.frame?.data?.text?.split(/\r?\n/).includes("REMOTE_KEYS_READY"), 15_000);
+  await streamAction(socket, "remote-key-probe", "submit_text", {text:keyProbe});
+  await keysReady;
+  const keyOutput = waitFor(socket, f => /REMOTE_KEYS_HEX:([0-9a-f\s]+):END/.test(f.frame?.data?.text ?? ""), 15_000);
+  await streamAction(socket, "remote-ctrl-shift-space", "send_key", {key:"ctrl-shift-space"});
+  await streamAction(socket, "remote-shift-enter", "send_key", {key:"shift-enter"});
+  const keyFrame = await keyOutput;
+  assert.equal(keyFrame.frame.data.text.match(/REMOTE_KEYS_HEX:([0-9a-f\s]+):END/)[1].replace(/\s/g, ""), expectedKeys.toString("hex"));
+  assert.ok(!JSON.stringify(native("pane.read", {pane:local.pane_id})).includes("REMOTE_KEYS_HEX"));
+
   const upload = (await streamAction(socket, "upload-start", "upload_start", {name: "remote proof.txt", size: 8})).result;
   assert.equal(upload.type, "terminal_upload");
   assert.equal((await streamAction(socket, "upload-chunk", "upload_chunk", {
@@ -446,7 +459,7 @@ async function testRemote() {
   let current;
   for (let n = 0; n < 30; n++) {
     current = await snapshot();
-    if (remotePane(current)?.agent_status === "blocked") break;
+    if (remotePane(current)?.agent_status === "blocked" && remotePane(current)?.is_agent === true) break;
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   assert.equal(remotePane(current)?.agent_status, "blocked");
@@ -492,7 +505,7 @@ async function testRemote() {
     await new Promise(resolve => setTimeout(resolve, 150));
   }
   assert.ok(!remotePane(disconnected));
-  assert.ok(disconnected.workspaces.some(w => w.host === "fake-dev" && w.name.includes("offline")));
+  assert.ok(disconnected.workspaces.some(w => w.host === "fake-dev" && w.connected === false && w.owner_session === "api"));
   assert.equal((await open(offline, "offline-owner", target)).error.code, "stale_terminal");
   assert.equal((await open(offline, "local-live", {...target,pane_id:local.pane_id,terminal_id:local.terminal_id})).result.type, "terminal_backend_stream");
   offline.close(); await closed(offline);

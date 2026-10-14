@@ -28,7 +28,7 @@ export function navigationDot(label: string, controls: string, onClick: () => vo
 /** Keep keyboard navigation inside a visible drawer or device dialog. */
 export function trapNavigationFocus(event: KeyboardEvent, root: HTMLElement): void {
   if (event.key !== "Tab") return;
-  const controls = Array.from(root.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]"))
+  const controls = Array.from(root.querySelectorAll<HTMLElement>("button:not(:disabled), summary, input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]"))
     .filter((control) => control.getClientRects().length > 0 && control.getAttribute("tabindex") !== "-1");
   const first = controls[0];
   const last = controls.at(-1);
@@ -39,6 +39,54 @@ export function trapNavigationFocus(event: KeyboardEvent, root: HTMLElement): vo
   } else if (!event.shiftKey && focused === last) {
     event.preventDefault();
     first?.focus();
+  }
+}
+
+/** Shared collapsible navigation groups; retain live rows, focus and folds. */
+export class SidebarGroups {
+  #groups = new Map<string, { root: HTMLDetailsElement; label: HTMLElement; count: HTMLElement; body: HTMLElement }>();
+
+  update(root: HTMLElement, entries: Array<{ groups: Array<{ key: string; label: string }>; node: HTMLElement }>, empty: HTMLElement): void {
+    const children = new Map<HTMLElement, HTMLElement[]>([[root, []]]);
+    const used = new Map<string, number>();
+    for (const entry of entries) {
+      let parent = root;
+      for (const descriptor of entry.groups) {
+        let group = this.#groups.get(descriptor.key);
+        if (!group) {
+          const label = element("span", { className: "sidebar-group-name" });
+          const count = element("span", { className: "terminal-sidebar-count" });
+          const body = element("div", { className: "sidebar-group-body" });
+          const heading = element("summary", { attrs: { "data-view-key": `group:${descriptor.key}` } }, label, count);
+          const details = element("details", { className: "sidebar-group", attrs: { open: "" } }, heading, body);
+          group = { root: details, label, count, body };
+          this.#groups.set(descriptor.key, group);
+        }
+        if (!used.has(descriptor.key)) {
+          if (group.label.textContent !== descriptor.label) group.label.textContent = descriptor.label;
+          group.root.title = descriptor.label;
+          children.get(parent)!.push(group.root);
+          children.set(group.body, []);
+        }
+        used.set(descriptor.key, (used.get(descriptor.key) ?? 0) + 1);
+        parent = group.body;
+      }
+      children.get(parent)!.push(entry.node);
+    }
+    children.get(root)!.push(empty);
+    for (const [key, group] of this.#groups) {
+      const count = used.get(key);
+      if (count === undefined) { group.root.remove(); this.#groups.delete(key); }
+      else if (group.count.textContent !== String(count)) group.count.textContent = String(count);
+    }
+    for (const [parent, nodes] of children) {
+      let next = parent.firstChild;
+      for (const node of nodes) {
+        if (node !== next) parent.insertBefore(node, next);
+        next = node.nextSibling;
+      }
+      while (next) { const removed = next; next = next.nextSibling; removed.remove(); }
+    }
   }
 }
 

@@ -137,6 +137,7 @@ pub enum GeneralRow {
     NewPaneToWorkspaceRoot,
     /// Show each agent's live session title in the AGENTS sidebar.
     AgentTitle,
+    AgentTitleFirst,
     NotificationDisplay,
     NotificationInbox,
     SoundStyle,
@@ -172,6 +173,7 @@ impl App {
             GeneralRow::ResumeFlags,
             GeneralRow::NewPaneToWorkspaceRoot,
             GeneralRow::AgentTitle,
+            GeneralRow::AgentTitleFirst,
             GeneralRow::NotificationDisplay,
             GeneralRow::NotificationInbox,
             GeneralRow::SoundStyle,
@@ -1731,6 +1733,10 @@ impl App {
                 self.config.layout.agent_title = !self.config.layout.agent_title;
                 self.persist_config();
             }
+            Some(GeneralRow::AgentTitleFirst) => {
+                self.config.layout.agent_title_first = !self.config.layout.agent_title_first;
+                self.persist_config();
+            }
             Some(GeneralRow::NotificationDisplay) => {
                 use crate::config::NotificationDisplay;
                 self.config.notifications.display = if self.notifications_in_inbox() {
@@ -2638,7 +2644,7 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 17);
+        assert_eq!(app.settings_rows(SettingsTab::General), 18);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
         assert_eq!(

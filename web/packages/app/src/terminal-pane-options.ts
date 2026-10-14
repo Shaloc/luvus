@@ -3,6 +3,7 @@ import { agentCardTitle, displayText } from "./dashboard-agents.js";
 
 export interface TerminalPaneOption {
   pane: PaneSnapshot;
+  workspace: WorkspaceContext;
   title: string;
   agentName: string;
   context: string;
@@ -10,14 +11,17 @@ export interface TerminalPaneOption {
 }
 
 export function terminalPaneOptions(snapshot: SessionSnapshot): TerminalPaneOption[] {
+  const contexts = workspaceContexts(snapshot);
   return snapshot.workspaces.flatMap((workspace, workspaceIndex) => {
-    const workspaceName = displayText(workspace.name, `Workspace ${workspaceIndex + 1}`);
+    const context = contexts[workspaceIndex]!;
+    const workspaceName = `${context.host ? `${context.host} / ` : ""}${context.name}`;
     return workspace.tabs.flatMap((tab, tabIndex) => {
       const tabName = displayText(tab.name, `Tab ${tabIndex + 1}`);
       return tab.panes.flatMap((pane, paneIndex) => {
         if (pane.kind !== "terminal" || !pane.terminal_id) return [];
         return [{
           pane,
+          workspace: context,
           title: pane.is_agent === true ? agentCardTitle(pane).title : "",
           agentName: displayText(pane.agent_name, displayText(pane.agent, pane.is_agent === true ? "Agent" : `Terminal ${paneIndex + 1}`)),
           context: `${workspaceName} / ${tabName}`,
@@ -90,11 +94,60 @@ export class TerminalWorkspaceSelection {
   }
 }
 
-export interface TerminalWorkspaceOption {
+export interface WorkspaceContext {
+  key: string;
   index: number;
   name: string;
-  branch: string;
   path: string;
+  host: string;
+  session: string;
+  order: number;
+  connected: boolean;
+  parent?: WorkspaceContext;
+}
+
+/** The server supplies the same worktree order/parents used by the TUI. */
+function workspaceContexts(snapshot: SessionSnapshot): WorkspaceContext[] {
+  const scope = JSON.stringify([snapshot.session, snapshot.server_generation]);
+  const contexts: WorkspaceContext[] = snapshot.workspaces.map((workspace, position) => ({
+    key: JSON.stringify([scope, workspace.id ?? [workspace.index, workspace.cwd]]),
+    index: workspace.index,
+    name: displayText(workspace.name, `Workspace ${position + 1}`),
+    path: displayText(workspace.cwd, "Path unavailable"),
+    host: displayText(workspace.host, ""),
+    session: displayText(workspace.owner_session, snapshot.session),
+    order: Number.isSafeInteger(workspace.sidebar_order) ? workspace.sidebar_order! : position,
+    connected: workspace.connected !== false,
+  }));
+  const byId = new Map(snapshot.workspaces.flatMap((workspace, position) => workspace.id ? [[workspace.id, position] as const] : []));
+  snapshot.workspaces.forEach((workspace, position) => {
+    const parentPosition = workspace.parent_id ? byId.get(workspace.parent_id) : undefined;
+    const parentSnapshot = parentPosition === undefined ? undefined : snapshot.workspaces[parentPosition];
+    const parent = parentPosition === undefined ? undefined : contexts[parentPosition];
+    const child = contexts[position]!;
+    // Keep old servers usable, and never infer grouping from paths or names.
+    if (parent && parent !== child && !parentSnapshot?.parent_id
+      && parent.host === child.host && parent.session === child.session) child.parent = parent;
+  });
+  return contexts;
+}
+
+export function compareWorkspaceContexts(a: WorkspaceContext, b: WorkspaceContext): number {
+  return (a.host < b.host ? -1 : a.host > b.host ? 1 : 0) || a.order - b.order;
+}
+
+export function workspaceGroupLabels(workspace: WorkspaceContext, includeWorkspace: boolean): Array<{ key: string; label: string }> {
+  const groups = [{ key: JSON.stringify(["host", workspace.host]), label: workspace.host || "Local" }];
+  if (includeWorkspace) {
+    for (const item of workspace.parent ? [workspace.parent, workspace] : [workspace]) {
+      groups.push({ key: item.key, label: `${item.name}${item.session !== "default" ? ` · ${item.session}` : ""}${item.connected ? "" : " (offline)"}` });
+    }
+  }
+  return groups;
+}
+
+export interface TerminalWorkspaceOption extends WorkspaceContext {
+  branch: string;
   selected: boolean;
   target: PaneSnapshot | undefined;
   tabs: Array<{
@@ -108,6 +161,7 @@ export interface TerminalWorkspaceOption {
 
 /** Browser navigation uses live terminal identities, not the TUI's active tab. */
 export function terminalWorkspaceOptions(snapshot: SessionSnapshot, selected: PaneSnapshot | undefined): TerminalWorkspaceOption[] {
+  const contexts = workspaceContexts(snapshot);
   return snapshot.workspaces.map((workspace, workspacePosition) => {
     const tabs = workspace.tabs.map((tab, tabPosition) => {
       const panes = tab.panes.filter((pane) => pane.kind === "terminal" && pane.terminal_id);
@@ -121,17 +175,15 @@ export function terminalWorkspaceOptions(snapshot: SessionSnapshot, selected: Pa
       };
     });
     return {
-      index: workspace.index,
-      name: displayText(workspace.name, `Workspace ${workspacePosition + 1}`),
+      ...contexts[workspacePosition]!,
       branch: displayText(workspace.branch, ""),
-      path: displayText(workspace.cwd, "Path unavailable"),
       selected: tabs.some((tab) => tab.selected),
       target: tabs.find((tab) => tab.selected)?.target
         ?? tabs[workspace.tabs.findIndex((tab) => tab.active)]?.target
         ?? tabs.find((tab) => tab.target)?.target,
       tabs,
     };
-  });
+  }).sort(compareWorkspaceContexts);
 }
 
 /** Bounded, browser-owned recency; native focus and live updates never promote panes. */

@@ -11,6 +11,13 @@ import { captureTerminalScroll, restoreTerminalScroll, terminalFrameParts, updat
 import { TerminalTargetTracker, type TerminalTarget } from "./terminal-target.js";
 import { sameViewport, terminalViewportFor, type TerminalViewport } from "./terminal-viewport.js";
 
+interface TerminalPaint {
+  text: string;
+  cursorOffset: number | undefined;
+  cursorPadding: number;
+  cellWidths: Array<[number, number, number]>;
+}
+
 export class TerminalView {
   readonly root = element("section", { className: "terminal-screen" });
   #stream: StreamHandle | undefined;
@@ -35,9 +42,11 @@ export class TerminalView {
     attrs: { role: "log", tabindex: "0", "aria-label": "Terminal output" },
   }, this.#content);
   #paintFrame: number | undefined;
-  #pendingPaint: { text: string; cursorOffset: number | undefined; cursorPadding: number } | undefined;
-  #renderedPaint: { text: string; cursorOffset: number | undefined; cursorPadding: number } | undefined;
+  #pendingPaint: TerminalPaint | undefined;
+  #renderedPaint: TerminalPaint | undefined;
   #input: NativeTerminalInput | undefined;
+  #modifierButtons: Partial<Record<"ctrl" | "shift", HTMLButtonElement>> = {};
+  #inputPlaceholder = element("span", { className: "terminal-input-placeholder", text: "Type or hold to paste", attrs: { "aria-hidden": "true" } });
   #inputHint = element("span", { className: "terminal-input-hint", text: "Tap terminal to type" });
   #attach: HTMLButtonElement | undefined;
   #uploadTail: Promise<void> = Promise.resolve();
@@ -83,6 +92,7 @@ export class TerminalView {
     private readonly canUploadFiles: boolean,
     private readonly streamCursor: boolean,
     private readonly viewportSizing: boolean,
+    private readonly modifiedKeys: boolean,
     private readonly paneOptions: () => TerminalPaneOption[],
     private readonly onSelectPane: (pane: PaneSnapshot) => void,
     onBack: () => void,
@@ -98,6 +108,11 @@ export class TerminalView {
         (message) => this.#inputFailed(message),
         (files) => {
           if (this.canUploadFiles) this.#queueFiles(files);
+        },
+        (modifiers) => {
+          for (const modifier of ["ctrl", "shift"] as const) this.#modifierButtons[modifier]?.setAttribute("aria-pressed", String(modifiers[modifier]));
+          const active = [modifiers.ctrl ? "Ctrl" : "", modifiers.shift ? "Shift" : ""].filter(Boolean).join(" + ");
+          this.#inputPlaceholder.textContent = active ? `${active} · next key` : "Type or hold to paste";
         },
       );
       this.#input.element.addEventListener("focus", () => this.#scheduleViewport(true));
@@ -161,10 +176,24 @@ export class TerminalView {
     keyboard.disabled = !control;
     keyboard.setAttribute("aria-label", "Show or hide keyboard");
     keyboard.title = "Keyboard";
+    keyboard.addEventListener("pointerdown", (event) => event.preventDefault());
+
+    const modifiers = (["ctrl", "shift"] as const).map((modifier) => {
+      const label = modifier === "ctrl" ? "Ctrl" : "Shift";
+      const toggle = button(label, "terminal-tool terminal-modifier", () => this.#input?.toggleModifier(modifier));
+      toggle.disabled = !control || !modifiedKeys;
+      toggle.setAttribute("aria-label", modifier === "ctrl" ? "Control modifier" : "Shift modifier");
+      toggle.setAttribute("aria-pressed", "false");
+      toggle.title = modifiedKeys ? `${label} — next key` : "Update the Luvus server to use terminal modifiers";
+      toggle.addEventListener("pointerdown", (event) => event.preventDefault());
+      this.#modifierButtons[modifier] = toggle;
+      return toggle;
+    });
 
     const keySpecs = [
       ["escape", "Esc"],
       ["tab", "Tab"],
+      ["enter", "↵"],
       ["up", "↑"],
       ["down", "↓"],
       ["left", "←"],
@@ -178,12 +207,19 @@ export class TerminalView {
       controlButton.addEventListener("pointerdown", (event) => event.preventDefault());
       return controlButton;
     });
-    const tools = element("div", { className: "terminal-tools" }, attach, keyboard, ...keys);
+    const tools = element("div", { className: "terminal-tools" }, attach, keyboard, ...modifiers, ...keys);
+    tools.inert = true;
+    tools.setAttribute("aria-hidden", "true");
     const controlsToggle = button("", "terminal-controls-toggle", () => {
       const expanded = this.root.classList.toggle("controls-expanded");
+      tools.inert = !expanded;
+      tools.setAttribute("aria-hidden", String(!expanded));
+      if (!expanded) this.#input?.clearModifiers();
       controlsToggle.setAttribute("aria-expanded", String(expanded));
       controlsToggle.setAttribute("aria-label", expanded ? "Hide terminal controls" : "Show terminal controls");
       controlsToggle.title = expanded ? "Hide terminal controls" : "Show terminal controls";
+      if (this.#followTail) this.#scrollToLatest();
+      this.#scheduleViewport();
     });
     controlsToggle.setAttribute("aria-expanded", "false");
     controlsToggle.setAttribute("aria-label", "Show terminal controls");
@@ -224,6 +260,10 @@ export class TerminalView {
     this.#main = element("div", { className: "terminal-main" },
       this.#output,
       element("div", { className: "terminal-controls-wrap" },
+        this.#input ? element("div", { className: "terminal-input-surface" },
+          this.#input.element,
+          this.#inputPlaceholder,
+        ) : undefined,
         element("div", { className: "terminal-controls" },
           this.#inputHint,
           tools,
@@ -236,12 +276,14 @@ export class TerminalView {
       this.#navigation,
       this.#contentFrame,
       fileInput,
-      ...(this.#input ? [this.#input.element] : []),
     );
     this.#output.append(this.#cellProbe);
     this.#placePaneSidebar();
     if (this.viewportSizing) {
-      this.#outputResize = new ResizeObserver(() => this.#scheduleViewport());
+      this.#outputResize = new ResizeObserver(() => {
+        if (this.#followTail) this.#scrollToLatest();
+        this.#scheduleViewport();
+      });
       this.#outputResize.observe(this.#output);
     }
     this.#output.addEventListener("scroll", () => {
@@ -416,11 +458,13 @@ export class TerminalView {
   }
 
   #updateSidebar(options?: TerminalPaneOption[]): void {
-    this.#sidebar.update(this.#desktopNavigation.matches || this.#navigationOpen ? options ?? this.paneOptions() : [], this.#target?.pane);
+    if (!this.#desktopNavigation.matches && !this.#navigationOpen) return;
+    this.#sidebar.update(options ?? this.paneOptions(), this.#target?.pane);
   }
 
   #updateWorkspaces(): void {
-    this.#workspaces.update((this.#desktopNavigation.matches || this.#navigationOpen) && this.#snapshot.session === this.#targetTracker.session
+    if (!this.#desktopNavigation.matches && !this.#navigationOpen) return;
+    this.#workspaces.update(this.#snapshot.session === this.#targetTracker.session
       ? terminalWorkspaceOptions(this.#snapshot, this.#target?.pane)
       : []);
   }
@@ -475,12 +519,13 @@ export class TerminalView {
         typeof cursorPadding === "number" && Number.isSafeInteger(cursorPadding) && cursorPadding >= 0
           ? cursorPadding
           : 0,
+        frame.data.cell_widths,
       );
     }
   }
 
-  #paint(text: string, cursorOffset?: number, cursorPadding = 0): void {
-    this.#pendingPaint = { text, cursorOffset, cursorPadding };
+  #paint(text: string, cursorOffset?: number, cursorPadding = 0, cellWidths: Array<[number, number, number]> = []): void {
+    this.#pendingPaint = { text, cursorOffset, cursorPadding, cellWidths };
     if (this.#paintFrame !== undefined) return;
     this.#paintFrame = requestAnimationFrame(() => {
       this.#paintFrame = undefined;
@@ -492,7 +537,7 @@ export class TerminalView {
         && pending.cursorPadding === this.#renderedPaint.cursorPadding) return;
       const followTail = this.#followTail;
       const anchor = followTail ? undefined : captureTerminalScroll(this.#output, this.#content);
-      updateTerminalFrame(this.#content, terminalFrameParts(pending.text, pending.cursorOffset, pending.cursorPadding));
+      updateTerminalFrame(this.#content, terminalFrameParts(pending.text, pending.cursorOffset, pending.cursorPadding, pending.cellWidths));
       this.#renderedPaint = pending;
       if (followTail) this.#scrollToLatest();
       else if (anchor) restoreTerminalScroll(this.#output, this.#content, anchor);

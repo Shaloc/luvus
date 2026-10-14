@@ -1,7 +1,7 @@
 import type { PaneSnapshot } from "@luvus/uhp-client";
 import { element } from "./dom.js";
-import { sidebarToggle, updateSidebarToggle } from "./sidebar-controls.js";
-import type { TerminalWorkspaceOption } from "./terminal-pane-options.js";
+import { SidebarGroups, sidebarToggle, updateSidebarToggle } from "./sidebar-controls.js";
+import { workspaceGroupLabels, type TerminalWorkspaceOption } from "./terminal-pane-options.js";
 
 type WorkspaceRow = {
   option: TerminalWorkspaceOption | undefined;
@@ -21,6 +21,7 @@ export class TerminalWorkspaceSidebar {
   #empty = element("p", { className: "terminal-sidebar-empty", text: "No workspaces available." });
   #footer = element("footer", { className: "terminal-workspace-footer", attrs: { hidden: "" } });
   #rows = new Map<number, WorkspaceRow>();
+  #groups = new SidebarGroups();
 
   constructor(private readonly onSelectPane: (pane: PaneSnapshot) => void, onOverview: () => void, onToggle: () => void) {
     this.#toggle = sidebarToggle("workspaces", this.root.id, onToggle);
@@ -55,13 +56,14 @@ export class TerminalWorkspaceSidebar {
       row.root.remove();
       this.#rows.delete(id);
     }
-    let next = this.#list.firstChild;
+    const entries = [];
     for (const workspace of options) {
       const row = this.#rows.get(workspace.index) ?? this.#createWorkspace(workspace.index);
       row.option = workspace;
       row.root.classList.toggle("current", workspace.selected);
+      row.root.classList.toggle("worktree-child", Boolean(workspace.parent));
       row.button.disabled = !workspace.target;
-      row.button.title = `${workspace.name}${workspace.branch ? ` · ${workspace.branch}` : ""}\n${workspace.path}${workspace.target ? "" : "\nNo live terminal panes in this workspace"}`;
+      row.button.title = `${workspace.host || "Local"} / ${workspace.session}\n${workspace.name}${workspace.branch ? ` · ${workspace.branch}` : ""}\n${workspace.path}${workspace.target ? "" : "\nNo live terminal panes in this workspace"}`;
       row.button.setAttribute("aria-label", `Open workspace ${workspace.name}${workspace.branch ? `, branch ${workspace.branch}` : ""}, ${workspace.path}`);
       if (workspace.selected) row.button.setAttribute("aria-current", "true");
       else row.button.removeAttribute("aria-current");
@@ -69,10 +71,10 @@ export class TerminalWorkspaceSidebar {
       setText(row.branch, workspace.branch);
       row.branch.hidden = !workspace.branch;
       setText(row.path, workspace.path);
-      if (row.root !== next) this.#list.insertBefore(row.root, next);
-      next = row.root.nextSibling;
+      entries.push({ groups: workspaceGroupLabels(workspace, false), node: row.root });
     }
     this.#empty.hidden = options.length > 0;
+    this.#groups.update(this.#list, entries, this.#empty);
   }
 
   #createWorkspace(index: number): WorkspaceRow {

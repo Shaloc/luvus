@@ -1,8 +1,8 @@
 import type { PaneSnapshot } from "@luvus/uhp-client";
 import { displayText, paneStateClass } from "./dashboard-agents.js";
 import { element } from "./dom.js";
-import { sidebarToggle, updateSidebarToggle } from "./sidebar-controls.js";
-import { filterTerminalPanes, terminalPaneLabel, type TerminalPaneOption } from "./terminal-pane-options.js";
+import { SidebarGroups, sidebarToggle, updateSidebarToggle } from "./sidebar-controls.js";
+import { compareWorkspaceContexts, filterTerminalPanes, terminalPaneLabel, workspaceGroupLabels, type TerminalPaneOption } from "./terminal-pane-options.js";
 
 export interface TerminalPaneFilter {
   showShells: boolean;
@@ -29,6 +29,7 @@ export class TerminalPaneSidebar {
   #empty = element("p", { className: "terminal-sidebar-empty" });
   #filters = new Map<boolean, HTMLButtonElement>();
   #rows = new Map<string, PaneRow>();
+  #groups = new SidebarGroups();
   #options: TerminalPaneOption[] = [];
   #selected: PaneSnapshot | undefined;
   #showShells: boolean;
@@ -73,7 +74,8 @@ export class TerminalPaneSidebar {
     this.#showShells = showShells;
     this.#options = options;
     this.#selected = selected;
-    const visible = filterTerminalPanes(options, this.#showShells);
+    const visible = [...filterTerminalPanes(options, this.#showShells)]
+      .sort((a, b) => compareWorkspaceContexts(a.workspace, b.workspace));
     this.#heading.textContent = this.#showShells ? "Panes" : "Agents";
     this.#count.textContent = String(visible.length);
     this.#count.setAttribute("aria-label", `${visible.length} ${this.#showShells ? "terminal panes" : "active agents"}`);
@@ -85,7 +87,7 @@ export class TerminalPaneSidebar {
       row.button.remove();
       this.#rows.delete(id);
     }
-    let next = this.#list.firstChild;
+    const entries = [];
     for (const option of visible) {
       const id = option.pane.pane_id;
       const row = this.#rows.get(id) ?? this.#createRow(option);
@@ -104,11 +106,11 @@ export class TerminalPaneSidebar {
       setText(row.agent, option.agentName);
       setText(row.context, `${option.title ? "| " : ""}${option.context}`);
       // Do not detach unchanged buttons while the user is pressing or focusing them.
-      if (row.button !== next) this.#list.insertBefore(row.button, next);
-      next = row.button.nextSibling;
+      entries.push({ groups: workspaceGroupLabels(option.workspace, true), node: row.button });
     }
     this.#empty.hidden = visible.length > 0;
     setText(this.#empty, this.#showShells ? "No terminal panes available." : "No active agents. Choose All panes to show shells.");
+    this.#groups.update(this.#list, entries, this.#empty);
   }
 
   #createRow(option: TerminalPaneOption): PaneRow {

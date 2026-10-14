@@ -16,8 +16,18 @@
   },
   "targets": {
     "aarch64-apple-darwin": {
-      "executable_bytes": 13375376,
-      "archive_bytes": 5731548
+      "executable_bytes": 14667280,
+      "archive_bytes": 6299284,
+      "source": {
+        "repository": "Shaloc/luvus",
+        "commit": "d55175a489e196883fb66c89fa0d6ac2480c7df0",
+        "workflow_run": 38379463389,
+        "job": 115235975663,
+        "artifact_run": 38379466579,
+        "artifact_sha256": "631f1b01b17c61353d71a35bdb1e8357699b4150a0f0741a04bdc2a359f9a117",
+        "rustc": "1.99.0",
+        "measurement": "Native macOS ARM64 CI release executable and binary-only tar.gz from the previous published fork-1.0.99-d55175a; its separate public release archive was independently checksummed. Refresh the cumulative baseline after remote ownership, terminal appearance and Web additions. The agent navigation/mobile candidate adds 16,736 executable bytes (+0.11%) and 15,392 archive bytes (+0.24%) versus this release, with no dependency changes. Retain the 5% warning and 10% block thresholds."
+      }
     },
     "x86_64-apple-darwin": {
       "executable_bytes": 15441272,

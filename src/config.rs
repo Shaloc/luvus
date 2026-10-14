@@ -349,6 +349,10 @@ pub struct LayoutConfig {
     /// used as a title.
     #[serde(default)]
     pub agent_title: bool,
+    /// Prefer the session title on the main AGENTS row, with a compact tool
+    /// initial and state dot. Independent of the optional detail line.
+    #[serde(default)]
+    pub agent_title_first: bool,
     /// Show the cwd line beneath each WORKSPACES entry. On by default to retain
     /// the established two-row presentation; the row context menu persists the
     /// compact one-row preference when this is disabled.
@@ -659,6 +663,7 @@ impl Default for LayoutConfig {
             pane_title_path: false,
             rounded_corners: false,
             agent_title: false,
+            agent_title_first: false,
             workspace_paths: true,
             workspace_display: WorkspaceDisplay::Flat,
             auto_workspace_rehome: false,
@@ -1033,6 +1038,8 @@ mod tests {
         config.notifications.display = NotificationDisplay::Inbox;
         assert!(config.layout.agent_status_names);
         assert!(!config.layout.rounded_corners);
+        assert!(!config.layout.agent_title_first);
+        config.layout.agent_title_first = true;
         config.layout.agent_status_names = false;
         config.layout.rounded_corners = true;
         let restored: Config =
@@ -1040,6 +1047,9 @@ mod tests {
         assert_eq!(restored.notifications.display, NotificationDisplay::Inbox);
         assert!(!restored.layout.agent_status_names);
         assert!(restored.layout.rounded_corners);
+        assert!(restored.layout.agent_title_first);
+        assert!(!restored.layout.agent_title);
+        assert!(restored.layout.agent_paths);
     }
 
     #[test]

@@ -124,6 +124,16 @@ impl App {
             .map(|(name, pane)| (*pane, name))
             .collect();
         let mut workspaces = Vec::with_capacity(self.workspaces.len());
+        // Reuse the TUI's owner-aware worktree/pin order. Browser clients must
+        // not infer parents from names or coincident paths on different hosts.
+        let mut sidebar = vec![(0, None); self.workspaces.len()];
+        let mut parent = None;
+        for (position, (index, child)) in self.workspace_sidebar_order().into_iter().enumerate() {
+            sidebar[index] = (position, if child { parent } else { None });
+            if !child {
+                parent = Some(index);
+            }
+        }
         for (workspace_index, workspace) in self.workspaces.iter().enumerate() {
             let mut tabs = Vec::with_capacity(workspace.tabs.len());
             for (tab_index, tab) in workspace.tabs.iter().enumerate() {
@@ -192,6 +202,8 @@ impl App {
             workspaces.push(json!({
                 "id":workspace.id,
                 "index":workspace_index + 1,
+                "sidebar_order":sidebar[workspace_index].0,
+                "parent_id":sidebar[workspace_index].1.map(|parent| &self.workspaces[parent].id),
                 "name":workspace.name,
                 "cwd":workspace.cwd.display().to_string(),
                 "branch":workspace.branch,

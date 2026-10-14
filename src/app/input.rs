@@ -6322,6 +6322,18 @@ fn encode_key_with_modes(
     app_cursor: bool,
     protocol: KeyboardProtocol,
 ) -> Option<Vec<u8>> {
+    encode_key_with_identity(key, newline, app_cursor, protocol, cfg!(windows))
+}
+
+/// Logical control keys have an explicit identity even on Windows. Only native
+/// console input needs the shifted-punctuation ambiguity fallback.
+pub(super) fn encode_key_with_identity(
+    key: &KeyEvent,
+    newline: &[u8],
+    app_cursor: bool,
+    protocol: KeyboardProtocol,
+    windows_console: bool,
+) -> Option<Vec<u8>> {
     // AltGr arrives as Ctrl+Alt on Windows (`keys::is_ctrl_chord`) and types a
     // character — it is neither a Ctrl chord nor an `ESC`-prefixed Alt key.
     let ctrl = super::keys::is_ctrl_chord(key.modifiers);
@@ -6347,7 +6359,7 @@ fn encode_key_with_modes(
                 ctrl,
                 alt,
                 altgr,
-                cfg!(windows),
+                windows_console,
             ))
     {
         return None;
@@ -6357,7 +6369,7 @@ fn encode_key_with_modes(
         KeyCode::Char(c) => {
             if report_all
                 && !altgr
-                && modified_char_has_canonical_identity(c, key.modifiers, cfg!(windows))
+                && modified_char_has_canonical_identity(c, key.modifiers, windows_console)
             {
                 let codepoint = if ctrl && matches!(c, '/' | '7') {
                     '/'
@@ -6408,7 +6420,7 @@ fn encode_key_with_modes(
                 ));
             } else if ctrl {
                 if disambiguate
-                    && modified_char_has_canonical_identity(c, key.modifiers, cfg!(windows))
+                    && modified_char_has_canonical_identity(c, key.modifiers, windows_console)
                 {
                     // Once the nested application opts into Kitty keyboard
                     // disambiguation, every Ctrl+character chord with a known
@@ -6448,7 +6460,7 @@ fn encode_key_with_modes(
                     || key
                         .modifiers
                         .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META))
-                && modified_char_has_canonical_identity(c, key.modifiers, cfg!(windows))
+                && modified_char_has_canonical_identity(c, key.modifiers, windows_console)
             {
                 // Kitty disambiguate reports alt/super+key as CSI-u instead of
                 // ESC+char or a Super-stripped character.

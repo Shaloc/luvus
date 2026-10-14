@@ -106,13 +106,9 @@ pub(super) fn project(snapshot: &mut Value) -> HashMap<String, Route> {
             }
         }
         workspace["tabs"] = json!(tabs);
-        workspace["name"] = json!(format!(
-            "{} · {}/{}{}",
-            workspace["name"].as_str().unwrap_or("Workspace"),
-            target.host,
-            target.session,
-            if connected { "" } else { " (offline)" }
-        ));
+        workspace["host"] = json!(target.host);
+        workspace["owner_session"] = json!(target.session);
+        workspace["connected"] = json!(connected);
     }
     routes
 }
@@ -286,6 +282,10 @@ mod tests {
         assert_eq!(a["agent_session_title"], "Review changes");
         assert_eq!(a["display_pane_id"], "1");
         assert!(snapshot["workspaces"][1].get("remote").is_none());
+        assert_eq!(snapshot["workspaces"][1]["name"], "Project");
+        assert_eq!(snapshot["workspaces"][1]["host"], "dev-63");
+        assert_eq!(snapshot["workspaces"][1]["owner_session"], "api");
+        assert_eq!(snapshot["workspaces"][1]["connected"], true);
         let route = routes.get(a["terminal_id"].as_str().unwrap()).unwrap();
         let mut frame = json!({"event":"terminal.frame","data":{"server_generation":"owner-a","terminal_id":"terminal-1","pane_id":"1","text":"owner output"}});
         route.project_frame(&mut frame);

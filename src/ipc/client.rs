@@ -928,9 +928,19 @@ fn host_terminal_shares_local_filesystem_with(
 ) -> bool {
     let has_value =
         |value: Option<std::ffi::OsString>| value.is_some_and(|value| !value.is_empty());
-    if ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "TMUX"]
-        .into_iter()
-        .any(|key| has_value(read_env(key)))
+    // Windows Terminal is local, but it claims a `Ctrl`+click on any hyperlink
+    // under the pointer instead of forwarding it (microsoft/terminal#9396), and
+    // it does not open these `file://` targets either: a projected path turns
+    // the gesture into a silent no-op. Leave the click to luvus.
+    if [
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
+        "TMUX",
+        "WT_SESSION",
+    ]
+    .into_iter()
+    .any(|key| has_value(read_env(key)))
     {
         return false;
     }
@@ -941,7 +951,6 @@ fn host_terminal_shares_local_filesystem_with(
     // silently opting into a host-handled file URI.
     [
         "TERM_PROGRAM",
-        "WT_SESSION",
         "KITTY_WINDOW_ID",
         "VTE_VERSION",
         "KONSOLE_VERSION",
@@ -1925,6 +1934,15 @@ mod paint_tests {
             match key {
                 "TERM_PROGRAM" => Some(std::ffi::OsString::from("ghostty")),
                 "TMUX" => Some(std::ffi::OsString::from("/private/tmux/default,1,0")),
+                _ => None,
+            }
+        }));
+        // Windows Terminal would take the Ctrl+click for itself, even when
+        // another variable on its own would count as local terminal evidence.
+        assert!(!host_terminal_shares_local_filesystem_with(|key| {
+            match key {
+                "TERM_PROGRAM" => Some(std::ffi::OsString::from("vscode")),
+                "WT_SESSION" => Some(std::ffi::OsString::from("8f0c-uuid")),
                 _ => None,
             }
         }));

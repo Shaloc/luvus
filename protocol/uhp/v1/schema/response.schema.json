@@ -460,6 +460,14 @@
                   }
                 ]
               },
+              "sidebar_order": {
+                "type": "integer", "minimum": 0,
+                "description": "Zero-based presentation order using the server's existing pin/worktree grouping; never a workspace action index."
+              },
+              "parent_id": {
+                "type": ["string", "null"],
+                "description": "Stable workspace ID of the displayed worktree parent, scoped to its SSH owner."
+              },
               "tabs": {
                 "type": "array",
                 "items": {

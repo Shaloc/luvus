@@ -549,6 +549,7 @@ pub(super) fn draw_agent_menu(
                 let label = agent_label(*it, cat, &extras, scoped, app.config.layout.agent_paths);
                 let checked = match it {
                     AgentMenuItem::ToggleStatusNames => Some(app.config.layout.agent_status_names),
+                    AgentMenuItem::ToggleTitleFirst => Some(app.config.layout.agent_title_first),
                     AgentMenuItem::ToggleWorkspaceGrouping => {
                         Some(app.config.agents_group_by_workspace)
                     }
@@ -597,6 +598,7 @@ fn agent_label(
     match it {
         AgentMenuItem::ToggleWorkspaceGrouping => cat.menu_group_workspaces.into(),
         AgentMenuItem::ToggleStatusNames => cat.menu_status_names.into(),
+        AgentMenuItem::ToggleTitleFirst => cat.settings.agent_title_first.into(),
         AgentMenuItem::CollapseWorkspace => cat.menu_collapse_workspace.into(),
         AgentMenuItem::ExpandWorkspace => cat.menu_expand_workspace.into(),
         AgentMenuItem::AllStatuses => cat.menu_all_statuses.into(),

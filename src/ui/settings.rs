@@ -1146,6 +1146,16 @@ fn draw_content(
                         toggle(app.config.layout.agent_title, t),
                         t,
                     )),
+                    GeneralRow::AgentTitleFirst => ctls.push(ctl_row(
+                        f,
+                        area,
+                        y,
+                        i,
+                        cursor,
+                        cat.settings.agent_title_first,
+                        toggle(app.config.layout.agent_title_first, t),
+                        t,
+                    )),
                     GeneralRow::NotificationDisplay => {
                         let value = if app.notifications_in_inbox() {
                             cat.settings.notify_inbox

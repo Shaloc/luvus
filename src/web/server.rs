@@ -846,6 +846,14 @@ async fn open_stream(
             if let Some(route) = &route {
                 route.project_frame(&mut frame);
             }
+            if frame["event"] == "terminal.frame" {
+                if let Some(widths) = frame["data"]["text"]
+                    .as_str()
+                    .and_then(terminal_cell_widths)
+                {
+                    frame["data"]["cell_widths"] = json!(widths);
+                }
+            }
             let browser =
                 if !acknowledged && frame.get("id").and_then(Value::as_str) == Some(&stream_id) {
                     acknowledged = true;
@@ -994,6 +1002,58 @@ fn rate_limited(outgoing: &Outbound, frame: &Map<String, Value>) -> Result<(), (
 
 fn text_message(frame: Value) -> Message {
     Message::Text(frame.to_string().into())
+}
+
+/// Browser-only typography metadata. Reuse native Unicode widths rather than
+/// letting fallback CJK/emoji fonts decide how many terminal cells they occupy.
+/// This runs on the bounded Web stream worker, not the App/PTY event loop.
+fn terminal_cell_widths(text: &str) -> Option<Vec<[usize; 3]>> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    if text.len() > crate::terminal::backend::MAX_OBSERVE_BYTES {
+        return None;
+    }
+    if text.is_ascii() {
+        return Some(Vec::new());
+    }
+    // Match parseAnsi's SGR vocabulary and per-run control sanitization. The
+    // stream contains generated SGR, but keep malformed sequences literal.
+    let append =
+        |run: &str, plain: &mut String| {
+            plain.extend(run.replace("\r\n", "\n").replace('\r', "\n").chars().filter(|c| {
+            !matches!(c, '\x00'..='\x08' | '\x0b'..='\x0c' | '\x0e'..='\x1f' | '\x7f')
+        }));
+        };
+    let mut plain = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i..].starts_with(b"\x1b[") {
+            let mut end = i + 2;
+            while end < bytes.len() && (bytes[end].is_ascii_digit() || bytes[end] == b';') {
+                end += 1;
+            }
+            if bytes.get(end) == Some(&b'm') {
+                append(&text[start..i], &mut plain);
+                start = end + 1;
+                i = start;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    append(&text[start..], &mut plain);
+    let mut offset = 0;
+    let mut widths = Vec::new();
+    for grapheme in plain.graphemes(true) {
+        let length = grapheme.chars().count();
+        if !grapheme.is_ascii() {
+            widths.push([offset, length, grapheme.width()]);
+        }
+        offset += length;
+    }
+    Some(widths)
 }
 
 fn parse_object(text: &str) -> Result<Map<String, Value>, ()> {
@@ -1238,6 +1298,22 @@ fn set_security_headers(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_cell_widths_preserve_unicode_scalar_offsets_and_graphemes() {
+        let text = "a\x1b[31m中\x1b[0m🧭e\u{301}👨‍👩‍👧\r\n尾";
+        assert_eq!(
+            terminal_cell_widths(text).unwrap(),
+            vec![[1, 1, 2], [2, 1, 2], [3, 2, 1], [5, 5, 2], [11, 1, 2]]
+        );
+        // ANSI styles delimit sanitization runs just as in the browser parser.
+        assert_eq!(
+            terminal_cell_widths("\r\x1b[m\n\x00中\x1b[?m尾").unwrap(),
+            vec![[2, 1, 2], [6, 1, 2]]
+        );
+        assert_eq!(terminal_cell_widths("ascii\x1b[m"), Some(vec![]));
+        assert!(terminal_cell_widths(&"中".repeat(65_536)).is_none());
+    }
 
     #[test]
     fn origins_are_exact_and_pathless() {

@@ -3040,3 +3040,48 @@ fn session_evidence_binds_only_one_matching_pane() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn agent_start_launches_the_descriptor_binary_not_the_kind() {
+    use super::super::agent_workflow::agent_launch_program;
+    assert_eq!(agent_launch_program("antigravity"), "agy");
+    assert_eq!(agent_launch_program("cursor"), "cursor-agent");
+    assert_eq!(agent_launch_program("kiro"), "kiro-cli");
+    assert_eq!(agent_launch_program("codex"), "codex");
+    assert_eq!(
+        agent_launch_program("manifest-only-agent"),
+        "manifest-only-agent",
+        "a detection-manifest agent launches by its kind"
+    );
+}
+
+#[test]
+fn snapshot_reuses_owner_scoped_workspace_hierarchy_without_reindexing() {
+    use crate::app::remote::tests::{add_remote_workspace, remote_ui_app};
+    let _env = crate::persist::test_env("snapshot-workspace-hierarchy");
+    let mut app = remote_ui_app();
+    for _ in 0..3 {
+        let _ = add_remote_workspace(&mut app);
+    }
+    for (index, workspace) in app.workspaces.iter_mut().enumerate() {
+        workspace.id = format!("workspace-{index}");
+        workspace.worktree = Some(crate::git::WorktreeMembership {
+            common_dir: "/shared/repo/.git".into(),
+            directory_identity: None,
+            linked: index == 1,
+        });
+    }
+    app.workspaces[3].remote.as_mut().unwrap().host = "other-host".into();
+    app.workspaces[1].pinned = true;
+    let snapshot = app.runtime_snapshot();
+    let rows = snapshot["workspaces"].as_array().unwrap();
+    assert_eq!(rows[1]["parent_id"], "workspace-2");
+    assert_eq!(rows[0]["parent_id"], Value::Null);
+    assert_eq!(rows[2]["parent_id"], Value::Null);
+    assert_eq!(rows[3]["parent_id"], Value::Null);
+    for (position, (index, _)) in app.workspace_sidebar_order().into_iter().enumerate() {
+        assert_eq!(rows[index]["sidebar_order"], position);
+        assert_eq!(rows[index]["index"], index + 1);
+    }
+    assert_eq!(app.workspaces[1].id, "workspace-1");
+}

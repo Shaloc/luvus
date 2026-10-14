@@ -86,6 +86,21 @@ and resumable rows keep the project folder. Luvus pane aliases (`=name`) are
 not used as titles. Core Luvus does not parse an agent's native session store
 for this line; a module supplies names such as Pi's `session_info.name`.
 
+**Title first**, available in the agent right-click menu and Settings → General,
+is a separate option. It shows the session title on the main row, preceded by
+the colored state dot and the tool's first letter, for example `○ C Fix login`
+or `○ Q Check build`. It works with **Show Path** turned off. Hover for the
+full tool name, state, pane ID and title; tools sharing an initial remain
+distinguishable there. No icon font is required. Without a title, live rows
+show the tool name and resumable rows show their project folder.
+
+Title first temporarily omits state names to leave more space for the title.
+An enabled detail line shows workspace/pane or project information instead of
+repeating the title. Turning Title first off restores the existing state-name
+and detail-title preferences. Group headings always occupy one line, including
+when **Show Path** is on. These display preferences apply to both local and
+projected remote agents; changing them does not send an action to the owner.
+
 ### Explicit program status (OSC 7501)
 
 Luvus supports revision 0.2 of the [Program Status Protocol](https://www.superlogical.com/rex/docs/build/program-status).

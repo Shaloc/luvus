@@ -459,6 +459,11 @@ host tags. Other values are rejected without mutation. This presentation setting
 does not change merge, host admission, workspace indices, or public pin/worktree
 `display_position` values. Tree headers and temporary folds are not workspaces.
 
+`{"patch":{"layout":{"agent_title_first":true}}}` selects title-first AGENTS
+rows with a colored status dot and tool initial. The separate `agent_paths`
+setting still controls the detail line. This display preference affects local
+and projected agents without mutating remote owners.
+
 `{"patch":{"layout":{"auto_workspace_rehome":true}}}` opts into automatic
 workspace creation and whole-tab movement based on scanned process directories.
 The default is `false`, including when upgrading an existing configuration.
@@ -537,6 +542,11 @@ resynchronization rules.
 `uhp.capabilities` negotiates the app-level automation surface and its
 limits. `session.snapshot` returns every workspace, tab, terminal pane, native
 view, stable terminal identity, root process, and agent state in one response.
+Workspace rows optionally include `sidebar_order` (zero-based presentation
+order) and `parent_id` (the stable parent workspace ID, or null). These reuse the
+TUI's owner-scoped worktree hierarchy; they do not change action indices. The
+Web bridge adds `owner_session` and `connected` to projected remote workspaces
+and preserves the owner's workspace name without a host suffix.
 The optional `prefix_bindings` object maps command IDs to the owner's displayed
 prefix keys (an empty value means unbound). It lets merged displays show remote
 shortcuts without using their local keymap for owner actions. Older owners may

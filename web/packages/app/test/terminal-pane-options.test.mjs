@@ -1,9 +1,32 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { filterTerminalPanes, filterWorkspacePanes, TerminalPaneRecency, TerminalWorkspaceSelection, terminalPaneLabel, terminalPaneOptions, terminalWorkspaceOptions } from "../dist/test/terminal-pane-options.js";
+import { compareWorkspaceContexts, filterTerminalPanes, filterWorkspacePanes, TerminalPaneRecency, TerminalWorkspaceSelection, terminalPaneLabel, terminalPaneOptions, terminalWorkspaceOptions, workspaceGroupLabels } from "../dist/test/terminal-pane-options.js";
 
 const pane = (id, fields = {}) => ({ pane_id: id, terminal_id: `terminal-${id}`, kind: "terminal", focused: false, ...fields });
 const snapshot = (panes) => ({ session: "preview", server_generation: "generation-1", workspaces: [{ index: 0, name: "sudos", cwd: "/work/sudos", tabs: [{ index: 0, name: "core", panes }] }] });
+
+test("both sidebars reuse machine and worktree groups without merging owner-local paths or IDs", () => {
+  const workspace = (id, index, host, order, parent_id, isAgent = true) => ({ id, index, name: id, cwd: "/same/path", host, owner_session: "default", sidebar_order: order, parent_id,
+    tabs: [{ index: 1, name: "main", panes: [pane(`${host ?? "local"}:${index}`, { is_agent: isAgent, agent_status: index % 2 ? "idle" : "working" })] }] });
+  const data = { ...snapshot([]), workspaces: [
+    workspace("feature", 4, "dev-207", 2, "main"),
+    workspace("local", 1, null, 0),
+    workspace("other-host", 3, "dev-63", 3, "main"),
+    workspace("main", 2, "dev-207", 1, null, false),
+  ] };
+  const options = terminalWorkspaceOptions(data);
+  assert.deepEqual(options.map(item => item.index), [1, 2, 4, 3]);
+  const child = options.find(item => item.index === 4);
+  assert.equal(child.parent.index, 2);
+  assert.equal(options.find(item => item.index === 3).parent, undefined, "same path on another host is never a worktree parent");
+  assert.deepEqual(workspaceGroupLabels(child, true).map(item => item.label), ["dev-207", "main", "feature"]);
+  const agents = filterTerminalPanes(new TerminalPaneRecency().options(data), false)
+    .sort((a,b) => compareWorkspaceContexts(a.workspace, b.workspace));
+  assert.deepEqual(agents.map(item => item.pane.pane_id), ["local:1", "dev-207:4", "dev-63:3"], "activity includes idle agents across every workspace");
+  assert.equal(agents[1].pane, data.workspaces[0].tabs[0].panes[0], "grouping keeps the original owner route");
+  assert.deepEqual(workspaceGroupLabels(agents[1].workspace, true).map(item => item.label), ["dev-207", "main", "feature"], "keep parent heading even when only a child has an agent");
+  assert.notEqual(terminalWorkspaceOptions({ ...data, server_generation: "replacement" })[0].key, options[0].key);
+});
 
 test("pane picker shows session title before agent name and keeps path separate", () => {
   const agent = pane("1", { is_agent: true, agent: "claude", agent_session_title: "  Review clipboard support  ", cwd: "/work/sudos/web" });

@@ -90,15 +90,19 @@ impl App {
                 return Some((
                     *rect,
                     format!(
-                        "p{} · {} / {} · {} · {} · {}",
+                        "p{} · {} / {} · {} · {} · {} · {}",
                         pane,
                         target.host,
                         target.session,
-                        agent
-                            .name
-                            .as_deref()
+                        self.config
+                            .layout
+                            .agent_title_first
+                            .then_some(agent.title.as_deref())
+                            .flatten()
+                            .or(agent.name.as_deref())
                             .or(agent.title.as_deref())
                             .unwrap_or(&agent.agent),
+                        agent.agent,
                         self.state_hint(agent.state),
                         agent.cwd
                     ),
@@ -109,16 +113,25 @@ impl App {
             let pane = self.panes.get(&id)?;
             let status = self.status.get(&id);
             let title = self
-                .agent_name_for(id)
-                .map(ToOwned::to_owned)
+                .config
+                .layout
+                .agent_title_first
+                .then(|| self.pane_title(id))
+                .flatten()
+                .or_else(|| self.agent_name_for(id).map(ToOwned::to_owned))
                 .or_else(|| self.pane_title(id))
                 .unwrap_or_else(|| pane.cwd.display().to_string());
+            let tool = status
+                .filter(|status| !status.agent.is_empty())
+                .map(|status| format!(" · {}", status.agent))
+                .unwrap_or_default();
             Some((
                 rect,
                 format!(
-                    "p{} · {} · {} · {}",
+                    "p{} · {}{} · {} · {}",
                     id.0,
                     title,
+                    tool,
                     self.state_hint(status.map_or(State::Unknown, |s| s.state)),
                     pane.cwd.display()
                 ),
@@ -153,10 +166,11 @@ impl App {
                 return Some((
                     *rect,
                     format!(
-                        "{} / {} · {} · {}",
+                        "{} / {} · {} · {} · {}",
                         view.target.host,
                         view.target.session,
                         session.title.as_deref().unwrap_or(&session.agent),
+                        session.agent,
                         session.cwd
                     ),
                 ));

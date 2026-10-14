@@ -44,6 +44,22 @@ export async function checkBrowserAppearance({ cdp, sessionId, run, until, click
   assert.equal(await style("WEB_THEME_RGB"), "rgb(12, 34, 56)");
   assert.equal(await style("WEB_THEME_REVERSE"), "rgb(255, 255, 255)");
   assert.equal(await style("WEB_THEME_REVERSE", "backgroundColor"), "rgb(48, 54, 66)");
+  await cdp.call("Input.insertText", { text: "printf '\\033[31m中🧭é\\033[0m|WEB_CELLS\\n'" }, sessionId);
+  await key("Enter", "Enter", 13);
+  await until(() => run("Array.from(document.querySelectorAll('.terminal-content span')).some(node => node.textContent === '中' && node.style.width === '2ch')"));
+  const cells = await run(`(() => {
+    const cell = document.querySelector('.terminal-cell-probe').getBoundingClientRect().width / 10;
+    const nodes = Array.from(document.querySelectorAll('.terminal-content span')).filter(node => ['中','🧭','é'].includes(node.textContent) && node.style.width);
+    const last = nodes.slice(-3);
+    const range = document.createRange();
+    range.setStartBefore(last[0]); range.setEndAfter(last[2]);
+    return {cell, copied:range.toString(), glyphs:last.map(node => ({text:node.textContent, width:node.getBoundingClientRect().width, color:getComputedStyle(node).color}))};
+  })()`);
+  assert.equal(cells.copied, "中🧭é", "cell positioning preserves literal copied text");
+  for (const [index, expected] of [2, 2, 1].entries()) {
+    assert.ok(Math.abs(cells.glyphs[index].width - expected * cells.cell) < .15, JSON.stringify(cells));
+    assert.equal(cells.glyphs[index].color, "rgb(179, 50, 73)");
+  }
   await screenshot("terminal-light");
 
   await click(".appearance-toggle"); // System -> Light

@@ -4,18 +4,47 @@ import { element } from "./dom.js";
 export type TerminalPart = ({ kind: "text" } & AnsiRun) | { kind: "cursor" };
 
 /** Cursor offsets count Unicode characters, not UTF-16 units or ANSI bytes. */
-export function terminalFrameParts(text: string, cursorOffset?: number, cursorPadding = 0): TerminalPart[] {
+export function terminalFrameParts(text: string, cursorOffset?: number, cursorPadding = 0, cellWidths: Array<[number, number, number]> = []): TerminalPart[] {
   const parts: TerminalPart[] = [];
   let remaining = cursorOffset;
   let placed = false;
-  const append = (text: string, style?: AnsiRun["style"]) => {
-    if (text) parts.push({ kind: "text", text, ...(style ? { style } : {}) });
+  const widths = new Map<number, [number, number]>();
+  let end = 0;
+  for (const entry of Array.isArray(cellWidths) ? cellWidths : []) {
+    if (!Array.isArray(entry) || entry.length !== 3) continue;
+    const [offset, length, cells] = entry;
+    if (Number.isSafeInteger(offset) && offset >= end && offset <= text.length
+      && Number.isSafeInteger(length) && length > 0 && length <= text.length
+      && Number.isSafeInteger(cells) && cells >= 0 && cells <= 2) {
+      widths.set(offset, [length, cells]);
+      end = offset + length;
+    }
+  }
+  let offset = 0;
+  const append = (text: string, style?: AnsiRun["style"], padding = false) => {
+    if (!text) return;
+    const characters = Array.from(text);
+    let start = 0;
+    const plain = (end: number) => {
+      if (end > start) parts.push({ kind: "text", text: characters.slice(start, end).join(""), ...(style ? { style } : {}) });
+    };
+    for (let index = 0; !padding && index < characters.length; index += 1) {
+      const width = widths.get(offset + index);
+      if (!width || index + width[0] > characters.length) continue;
+      plain(index);
+      parts.push({ kind: "text", text: characters.slice(index, index + width[0]).join(""),
+        style: { ...style, display: "inline-block", width: `${width[1]}ch`, textAlign: "center", whiteSpace: "pre" } });
+      index += width[0] - 1;
+      start = index + 1;
+    }
+    plain(characters.length);
+    if (!padding) offset += characters.length;
   };
   for (const run of parseAnsi(text)) {
     const characters = Array.from(run.text);
     if (!placed && remaining !== undefined && remaining <= characters.length) {
       append(characters.slice(0, remaining).join(""), run.style);
-      append(" ".repeat(cursorPadding));
+      append(" ".repeat(cursorPadding), undefined, true);
       parts.push({ kind: "cursor" });
       append(characters.slice(remaining).join(""), run.style);
       placed = true;
@@ -25,7 +54,7 @@ export function terminalFrameParts(text: string, cursorOffset?: number, cursorPa
     }
   }
   if (!placed && remaining === 0) {
-    append(" ".repeat(cursorPadding));
+    append(" ".repeat(cursorPadding), undefined, true);
     parts.push({ kind: "cursor" });
   }
   return parts;
