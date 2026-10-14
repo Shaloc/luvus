@@ -39,6 +39,7 @@ cleanly across versions because unknown fields get defaults.
 | `layout.show_titles` | show pane identities in lone-pane headers and split-pane borders |
 | `layout.pane_title_path` | append each terminal's live working directory to its explicit pane name or OSC 0/2 title; without a title, show the directory alone |
 | `layout.resume_in_new_workspace` | resume a session into its own workspace instead of a new tab |
+| `layout.new_pane_copy_on_select` | whether new terminal panes start with **C** (copy on selection) enabled; defaults to `true`, including older configurations. Change it in Settings → General → Copy selection in new panes. Existing panes and their restored/restarted state keep their individual choices. Remote panes use their owning server's setting. |
 | `layout.file_open` | which viewer opens a file: `readonly` (default) or an editor command such as `vim` (see [Browsing & Opening Files](/docs/guides/files/)) |
 | `layout.file_click` | what a plain click in the FILES dock does: `preview` (default) reuses one read-only preview pane, `tab` opens a whole tab through `layout.file_open`. Only `tab` can launch an editor. |
 | `layout.workspace_paths` | show the cwd line beneath WORKSPACES rows; defaults to `true` and can be toggled from any workspace row menu |

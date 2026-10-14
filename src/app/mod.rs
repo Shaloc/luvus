@@ -3501,7 +3501,7 @@ impl App {
         let mut panes = HashMap::new();
         let mut status = HashMap::new();
         if crate::session::remote::view_target().is_none() {
-            let pane = Pane::spawn(
+            let mut pane = Pane::spawn(
                 id,
                 cols,
                 rows,
@@ -3513,6 +3513,7 @@ impl App {
                 pane_appearance,
                 None,
             )?;
+            pane.mouse_options.copy_on_select = config.layout.new_pane_copy_on_select;
             let command = pane.command.clone();
             panes.insert(id, pane);
             status.insert(id, PaneStatus::new(command));
@@ -5930,7 +5931,8 @@ impl App {
             self.pane_appearance,
             cell_pixels,
         ) {
-            Ok(pane) => {
+            Ok(mut pane) => {
+                pane.mouse_options.copy_on_select = self.config.layout.new_pane_copy_on_select;
                 let cmd = pane.command.clone();
                 self.panes.insert(id, pane);
                 self.status.insert(id, PaneStatus::new(cmd));
@@ -5979,7 +5981,7 @@ impl App {
         let id = PaneId::alloc();
         let shell = crate::platform::resolve_shell(&self.config.shell);
         let history_budget_bytes = self.config.scrollback_bytes();
-        let pane = Pane::spawn_deferred(
+        let mut pane = Pane::spawn_deferred(
             id,
             80,
             24,
@@ -5991,6 +5993,7 @@ impl App {
             self.pane_appearance,
             cell_pixels,
         );
+        pane.mouse_options.copy_on_select = self.config.layout.new_pane_copy_on_select;
         let cmd = pane.command.clone();
         self.panes.insert(id, pane);
         self.status.insert(id, PaneStatus::new(cmd));
@@ -6044,7 +6047,8 @@ impl App {
             ),
         };
         match spawned {
-            Ok(pane) => {
+            Ok(mut pane) => {
+                pane.mouse_options.copy_on_select = self.config.layout.new_pane_copy_on_select;
                 if argv.is_none() {
                     pane.send(resume.as_bytes());
                 }

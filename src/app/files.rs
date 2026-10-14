@@ -479,7 +479,8 @@ impl App {
             self.pane_appearance,
             self.workspace_cell_pixels(self.active_ws),
         ) {
-            Ok(pane) => {
+            Ok(mut pane) => {
+                pane.mouse_options.copy_on_select = self.config.layout.new_pane_copy_on_select;
                 let cmd = pane.command.clone();
                 self.panes.insert(id, pane);
                 self.status.insert(id, crate::app::PaneStatus::new(cmd));

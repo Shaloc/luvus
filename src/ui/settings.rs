@@ -1136,6 +1136,16 @@ fn draw_content(
                         toggle(app.config.layout.new_pane_to_workspace_root, t),
                         t,
                     )),
+                    GeneralRow::NewPaneCopyOnSelect => ctls.push(ctl_row(
+                        f,
+                        area,
+                        y,
+                        i,
+                        cursor,
+                        cat.settings.new_pane_copy_on_select,
+                        toggle(app.config.layout.new_pane_copy_on_select, t),
+                        t,
+                    )),
                     GeneralRow::AgentTitle => ctls.push(ctl_row(
                         f,
                         area,

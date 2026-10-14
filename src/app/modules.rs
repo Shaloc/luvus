@@ -581,7 +581,7 @@ impl App {
         // the script reads the workspace cwd from the context.
         let id = PaneId::alloc();
         let history_budget_bytes = self.config.scrollback_bytes();
-        let pane = Pane::spawn_command(
+        let mut pane = Pane::spawn_command(
             id,
             80,
             24,
@@ -594,6 +594,7 @@ impl App {
             self.workspace_cell_pixels(self.active_ws),
         )
         .map_err(|e| format!("cannot spawn module pane: {e}"))?;
+        pane.mouse_options.copy_on_select = self.config.layout.new_pane_copy_on_select;
         let cmd = pane.command.clone();
         self.panes.insert(id, pane);
         self.status.insert(id, PaneStatus::new(cmd));

@@ -39,6 +39,11 @@ The focused terminal pane's header has two toggles alongside restart/zoom/close:
 
 A check mark means enabled. Each pane remembers its own choices across session
 restore and pane restart, including remote panes (update the owning server).
+**Settings → General → Copy selection in new panes** controls the initial **C**
+state of new terminal panes. It defaults to enabled and applies to new splits,
+tabs, workspaces, resumed sessions opened as new panes, and API-created terminals.
+Changing it leaves existing panes unchanged; each pane's **C** toggle still
+overrides its own behavior. Configure the owning server for remote panes.
 Very narrow headers hide these controls; widen or zoom the pane to access them.
 Hover over a control for its label, or over a workspace, agent, or pane title
 for its full name, status, and directory. Pane hints start with the owner pane ID

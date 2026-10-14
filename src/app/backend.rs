@@ -941,7 +941,7 @@ impl App {
             ));
             return;
         }
-        let pane = match result {
+        let mut pane = match result {
             Ok(pane) => pane,
             Err(_) => {
                 fail(BackendError::mutation(
@@ -1050,6 +1050,7 @@ impl App {
             }
         };
 
+        pane.mouse_options.copy_on_select = self.config.layout.new_pane_copy_on_select;
         let command = pane.command.clone();
         self.panes.insert(pane_id, pane);
         self.status.insert(pane_id, PaneStatus::new(command));
@@ -1810,6 +1811,8 @@ mod tests {
         let _env = crate::persist::test_env("backend-create-restore-default");
         let (tx, rx) = std::sync::mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
+        let original = app.layout().focus;
+        app.config.layout.new_pane_copy_on_select = false;
         let (reply, response) = std::sync::mpsc::channel();
         app.start_backend_create(ApiRequest {
             id: "create-restore-default".into(),
@@ -1847,6 +1850,8 @@ mod tests {
                 .unwrap(),
         );
         assert!(!app.backend_non_restorable.contains(&pane));
+        assert!(!app.panes[&pane].mouse_options.copy_on_select);
+        assert!(app.panes[&original].mouse_options.copy_on_select);
         let inventory = app.backend_inventory(&json!({})).unwrap();
         let pane_id = pane.0.to_string();
         let terminal = inventory["terminals"]

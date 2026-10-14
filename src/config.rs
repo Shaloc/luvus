@@ -380,6 +380,10 @@ pub struct LayoutConfig {
     /// user is working; turn this on to always reset to the workspace root.
     #[serde(default)]
     pub new_pane_to_workspace_root: bool,
+    /// Initial selection-copy behavior for newly created terminal panes.
+    /// Existing panes retain their own saved mouse options.
+    #[serde(default = "yes")]
+    pub new_pane_copy_on_select: bool,
     /// Default action when a file is opened from the FILES tree (docs/38):
     /// `"readonly"` (the native viewer) or an editor run-command such as `"vim"`
     /// / `"emacs -nw"`. Consulted whenever a file opens in a *tab* — see
@@ -671,6 +675,7 @@ impl Default for LayoutConfig {
             agent_status_names: true,
             resume_in_new_workspace: true,
             new_pane_to_workspace_root: false,
+            new_pane_copy_on_select: true,
             file_open: default_file_open(),
             file_click: default_file_click(),
             scrollback_bytes: Some(SCROLLBACK_BYTES_DEFAULT),
@@ -1030,6 +1035,20 @@ fn apply_delta(target: &mut Value, delta: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_pane_copy_on_select_defaults_on_and_roundtrips() {
+        assert!(LayoutConfig::default().new_pane_copy_on_select);
+        for source in ["{}", r#"{"layout":{}}"#] {
+            let config: Config = serde_json::from_str(source).unwrap();
+            assert!(config.layout.new_pane_copy_on_select);
+        }
+        let mut config = Config::default();
+        config.layout.new_pane_copy_on_select = false;
+        let restored: Config =
+            serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
+        assert!(!restored.layout.new_pane_copy_on_select);
+    }
 
     #[test]
     fn presentation_preferences_migrate_and_roundtrip() {

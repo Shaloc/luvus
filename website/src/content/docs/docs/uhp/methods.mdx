@@ -453,6 +453,11 @@ opt-in direct shortcuts, and pane history budgets live, then persists
 atomically. Unknown or invalid fields leave the current config unchanged.
 `server.reload_config` reloads the on-disk config through the same apply path.
 
+`{"patch":{"layout":{"new_pane_copy_on_select":false}}}` disables selection
+copy by default for newly created terminal panes on this owner server. The
+default is `true`; only JSON booleans are accepted. Existing panes, including
+their saved state on restore or restart, keep their individual **C** choices.
+
 For example, `{"patch":{"layout":{"workspace_display":"tree"}}}` selects
 the machine-grouped WORKSPACES sidebar; `"flat"` restores the default list with
 host tags. Other values are rejected without mutation. This presentation setting

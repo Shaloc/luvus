@@ -925,6 +925,34 @@ def main():
                 drain(master)
                 os.write(master, b"q")
                 drain(master)
+                # A creation default belongs to the owner and must not replace
+                # existing panes' individual C choices, including over SSH.
+                api("config.patch", {"patch": {"layout": {"new_pane_copy_on_select": False}}}, remote=remote)
+                assert "C✓" in screen_text(), "default change rewrote the existing pane"
+                api("tab.new", remote=remote)
+                disabled = api("pane.current", remote=remote)["pane"]
+                title = "new-copy-default-" + label
+                api("pane.rename", {"pane": disabled, "name": title}, remote=remote)
+                wait_for(lambda: title in screen_text() and "C·" in screen_text())
+                api("config.patch", {"patch": {"layout": {"new_pane_copy_on_select": True}}}, remote=remote)
+                assert "C·" in screen_text(), "enabling the default rewrote an existing pane"
+                x, y = row_for("C·")
+                click(master, x, y)
+                wait_for(lambda: "C✓" in screen_text())
+                x, y = row_for("C✓")
+                click(master, x, y)
+                wait_for(lambda: "C·" in screen_text())
+                api("tab.new", remote=remote)
+                enabled = api("pane.current", remote=remote)["pane"]
+                api("pane.rename", {"pane": enabled, "name": title + "-on"}, remote=remote)
+                wait_for(lambda: title + "-on" in screen_text() and "C✓" in screen_text())
+                api("pane.close", {"pane": enabled}, remote=remote)
+                api("pane.focus", {"pane": disabled}, remote=remote)
+                wait_for(lambda: title in screen_text() and "C·" in screen_text())
+                api("pane.close", {"pane": disabled}, remote=remote)
+                api("pane.focus", {"pane": pane}, remote=remote)
+                wait_for(lambda: "C✓" in screen_text())
+                print(f"PASS: {label} new-pane copy default, owner routing and per-pane overrides", flush=True)
                 print(f"PASS: {label} pane header toggles route right-clicks, preserve Shift menu, and control selection/manual clipboard copy", flush=True)
 
             mouse_options_case(False)

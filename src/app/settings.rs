@@ -135,6 +135,7 @@ pub enum GeneralRow {
     /// Open a new tab/split at the workspace root instead of inheriting the
     /// focused pane's cwd.
     NewPaneToWorkspaceRoot,
+    NewPaneCopyOnSelect,
     /// Show each agent's live session title in the AGENTS sidebar.
     AgentTitle,
     AgentTitleFirst,
@@ -172,6 +173,7 @@ impl App {
             GeneralRow::CheckUpdates,
             GeneralRow::ResumeFlags,
             GeneralRow::NewPaneToWorkspaceRoot,
+            GeneralRow::NewPaneCopyOnSelect,
             GeneralRow::AgentTitle,
             GeneralRow::AgentTitleFirst,
             GeneralRow::NotificationDisplay,
@@ -1729,6 +1731,11 @@ impl App {
                     !self.config.layout.new_pane_to_workspace_root;
                 self.persist_config();
             }
+            Some(GeneralRow::NewPaneCopyOnSelect) => {
+                self.config.layout.new_pane_copy_on_select =
+                    !self.config.layout.new_pane_copy_on_select;
+                self.persist_config();
+            }
             Some(GeneralRow::AgentTitle) => {
                 self.config.layout.agent_title = !self.config.layout.agent_title;
                 self.persist_config();
@@ -2632,6 +2639,83 @@ mod tests {
         assert!(!old.layout.new_pane_to_workspace_root);
     }
 
+    #[test]
+    fn new_pane_copy_on_select_only_changes_new_panes() {
+        let _env = crate::persist::test_env("new-pane-copy-default");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let original = app.layout().focus;
+        assert!(app.panes[&original].mouse_options.copy_on_select);
+        app.catalog = crate::i18n::by_code("zh");
+        app.open_settings();
+        let row = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == GeneralRow::NewPaneCopyOnSelect)
+            .expect("new-pane default is in General settings");
+        assert!(row < app.general_section_start());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.replace(' ', "").contains("新窗格默认选中复制"));
+
+        app.settings_adjust(row, 1);
+        app.flush_config_for_test(&rx);
+        assert!(!crate::config::load().layout.new_pane_copy_on_select);
+        assert!(app.panes[&original].mouse_options.copy_on_select);
+        let split = app
+            .split_pane(original, crate::layout::Axis::Row, false)
+            .unwrap();
+        assert!(!app.panes[&split].mouse_options.copy_on_select);
+        app.new_tab();
+        assert!(!app.focused().unwrap().mouse_options.copy_on_select);
+        let resumed = app
+            .spawn_resume_pane(app.focused_cwd(), "\n", None)
+            .unwrap();
+        assert!(!app.panes[&resumed].mouse_options.copy_on_select);
+        app.close_pane(resumed);
+
+        // Fresh startup reads the saved default; restoration keeps each pane's
+        // saved choice even when it differs from that default.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let fresh = App::new(80, 24, tx).unwrap();
+        assert!(!fresh.focused().unwrap().mouse_options.copy_on_select);
+        drop(fresh);
+        let snapshot = crate::persist::snapshot(&app);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let restored = App::from_snapshot(snapshot, tx).unwrap();
+        assert_eq!(
+            restored
+                .panes
+                .values()
+                .filter(|p| p.mouse_options.copy_on_select)
+                .count(),
+            1
+        );
+        assert_eq!(
+            restored
+                .panes
+                .values()
+                .filter(|p| !p.mouse_options.copy_on_select)
+                .count(),
+            2
+        );
+        drop(restored);
+
+        app.settings_adjust(row, 1);
+        assert!(app.config.layout.new_pane_copy_on_select);
+        assert!(!app.panes[&split].mouse_options.copy_on_select);
+        app.new_tab();
+        assert!(app.focused().unwrap().mouse_options.copy_on_select);
+    }
+
     // The General tab is the two file choosers plus the Notifications section:
     // the selected sound style, two persisted event toggles, and separate test
     // rows for the completion and attention cues.
@@ -2644,7 +2728,7 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 18);
+        assert_eq!(app.settings_rows(SettingsTab::General), 19);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
         assert_eq!(

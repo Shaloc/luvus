@@ -127,6 +127,32 @@ command = ["provider"]
 }
 
 #[test]
+fn config_patch_new_pane_copy_on_select_is_typed_and_preserves_existing_panes() {
+    let (_env, mut app) = app("socket-new-pane-copy-default");
+    let original = app.layout().focus;
+    let result = app
+        .dispatch(
+            "config.patch",
+            &json!({"patch":{"layout":{"new_pane_copy_on_select":false}}}),
+        )
+        .unwrap();
+    assert_eq!(result["config"]["layout"]["new_pane_copy_on_select"], false);
+    assert!(app.panes[&original].mouse_options.copy_on_select);
+    assert!(app
+        .dispatch(
+            "config.patch",
+            &json!({"patch":{"layout":{"new_pane_copy_on_select":"false"}}})
+        )
+        .is_err());
+    assert!(!app.config.layout.new_pane_copy_on_select);
+    let cwd = crate::persist::config_dir().join("new-copy-workspace");
+    std::fs::create_dir_all(&cwd).unwrap();
+    assert!(app.create_workspace_at(cwd));
+    assert!(!app.focused().unwrap().mouse_options.copy_on_select);
+    assert!(app.panes[&original].mouse_options.copy_on_select);
+}
+
+#[test]
 fn config_reload_applies_the_agents_filter_live() {
     let (_env, mut app) = app("socket-config-agents-reload");
     app.agents_active_only = true;
