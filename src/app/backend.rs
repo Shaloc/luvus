@@ -817,6 +817,7 @@ impl App {
             if matches!(commit.placement, backend::CreatePlacement::Workspace) {
                 self.workspaces
                     .iter()
+                    .filter(|workspace| workspace.remote.is_none())
                     .map(|workspace| (workspace.cwd.clone(), workspace.cell_pixels))
                     .collect()
             } else {
@@ -975,7 +976,10 @@ impl App {
                 let workspace_index = self
                     .workspaces
                     .iter()
-                    .position(|workspace| crate::platform::same_path(&workspace.cwd, &cwd))
+                    .position(|workspace| {
+                        workspace.remote.is_none()
+                            && crate::platform::same_path(&workspace.cwd, &cwd)
+                    })
                     .unwrap_or_else(|| {
                         self.workspaces.push(Workspace {
                             cell_pixels: pane.cell_pixels(),
@@ -1871,6 +1875,51 @@ mod tests {
             "terminal_id":runtime.terminal_id,
             "pane_id":pane.0.to_string(),
         })
+    }
+
+    #[test]
+    fn backend_create_workspace_excludes_same_path_remote_projections() {
+        let _env = crate::persist::test_env("backend-create-local-owner");
+        let (tx, events) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let cwd = app.workspaces[0].cwd.clone();
+        app.workspaces[0].remote = Some(crate::app::remote::RemoteWorkspaceRef {
+            host: "test-host".into(),
+            session: "default".into(),
+            workspace_id: "remote-workspace".into(),
+        });
+        app.workspaces[0].cell_pixels = Some((8, 16));
+        app.display_cell_pixels = Some((12, 24));
+        for expected_tabs in 1..=2 {
+            let (reply, response) = std::sync::mpsc::channel();
+            app.start_backend_create(ApiRequest {
+                id: "create-local-owner".into(),
+                method: "terminal.backend.create".into(),
+                params: json!({"cwd":cwd, "placement":{"kind":"workspace"}, "focus":false}),
+                reply,
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let response: Value = loop {
+                if let Ok(response) = response.try_recv() {
+                    break serde_json::from_str(&response).unwrap();
+                }
+                assert!(Instant::now() < deadline, "backend create must finish");
+                if let Ok(event) = events.recv_timeout(Duration::from_millis(50)) {
+                    app.handle_event(event);
+                }
+            };
+            assert!(response.get("result").is_some(), "{response}");
+            assert_eq!(
+                app.workspaces[0].tabs.len(),
+                1,
+                "remote projection is unchanged"
+            );
+            assert_eq!(app.workspaces.len(), 2);
+            assert!(app.workspaces[1].remote.is_none());
+            assert_eq!(app.workspaces[1].tabs.len(), expected_tabs);
+            assert_eq!(app.workspaces[1].cell_pixels, Some((12, 24)));
+            assert_eq!(response["result"]["placement"]["workspace"], 2);
+        }
     }
 
     fn backend_events_after(app: &App, floor: u64, name: &str) -> Vec<Value> {

@@ -319,15 +319,35 @@ def main():
             native["workspaces"][0]["tabs"][0]["panes"]["1"]["agent_session"]["value"] = "fixture-live"
             converted, warnings = MIGRATE.convert_snapshot(native)
             original_ids = {p["pane"] for p in owner_panes()}
+            workspaces = api("workspace.list")["workspaces"]
+            local = next(w for w in workspaces if not w.get("host") and w["cwd"] == str(root / "project"))
+            api("workspace.rename", {"workspace_id": local["workspace_id"], "name": "Keep local name"})
+            # The same directory on another owner must never receive a local
+            # imported pane, even when that projection is first and selected.
+            remote = next(w for w in workspaces if w.get("host") and w["cwd"] == str(root / "project"))
+            api("workspace.move", {"workspace_id": remote["workspace_id"], "to": 0})
+            api("workspace.focus", {"workspace_id": remote["workspace_id"]})
+            remote_before = api("terminal.backend.inventory", remote=True)["terminals"]
+            converted["workspaces"][0]["cwd"] = str(root / "project" / ".." / "project")
             MIGRATE.append_to_default(str(binary), root / "local-state", converted, warnings)
+            selected = next(w for w in api("workspace.list")["workspaces"] if w["active"])
+            assert selected["workspace_id"] == remote["workspace_id"]
+            assert selected["tabs"] == remote["tabs"]
+            assert api("workspace.get", {"workspace_id": local["workspace_id"]})["name"] == "Keep local name"
+            remote_after = api("terminal.backend.inventory", remote=True)["terminals"]
+            assert [(t["terminal_id"], t["root_process"]) for t in remote_after] == [(t["terminal_id"], t["root_process"]) for t in remote_before]
+            migrate("--shells-only")  # completed receipts also work with a remote selection
+            assert next(w for w in api("workspace.list")["workspaces"] if w["active"])["workspace_id"] == remote["workspace_id"]
+            api("workspace.focus", {"workspace_id": local["workspace_id"]})
             new_panes = [p for p in owner_panes() if p["pane"] not in original_ids]
             assert len(new_panes) == 3, new_panes
             deadline = time.monotonic() + 10
             while not any("NATIVE_RESUME:--session fixture-live" in api("pane.read", {"pane": p["pane"]})["text"] for p in new_panes):
                 assert time.monotonic() < deadline, warnings
                 time.sleep(.1)
-            assert next(p for p in owner_panes() if p["focused"])["pane"] == sentinel_id
-            print("PASS: live default uses native discovery/resume and places the agent in the imported tab", flush=True)
+            retained = next(t for t in api("terminal.backend.inventory")["terminals"] if t["pane_id"] == sentinel_id)
+            assert retained["terminal_id"] == sentinel["terminal_id"] and retained["root_process"] == sentinel["root_process"]
+            print("PASS: live default preserves local/remote ownership, remote focus, existing names and native resume", flush=True)
 
             failure = migrate("--dry-run", "--remote", "offline", ok=False)
             assert "ERROR offline" in failure

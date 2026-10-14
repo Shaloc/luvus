@@ -196,12 +196,13 @@ def append_to_default(binary, home, snapshot, warnings):
     def call(method, params=None):
         return api(binary, home, "default", method, params)
 
-    previous = call("pane.list", {"all_tabs": True})["panes"]
-    focused = next((p["pane"] for p in previous if p["focused"]), None)
     original_workspaces = call("workspace.list")["workspaces"]
     original_workspace = next((w for w in original_workspaces if w["active"]), None)
-    original_tab = next((t for t in call("tab.list")["tabs"] if t["active"]), None) if original_workspace else None
-    existing = {w["cwd"] for w in original_workspaces if not w.get("host")}
+    local_selected = original_workspace and not original_workspace.get("host")
+    previous = call("pane.list", {"all_tabs": True})["panes"] if local_selected else []
+    focused = next((p["pane"] for p in previous if p["focused"]), None)
+    original_tab = next((t for t in call("tab.list")["tabs"] if t["active"]), None) if local_selected else None
+    existing = {w["workspace_id"] for w in original_workspaces}
     separate_resume = call("config.get")["config"]["layout"]["resume_in_new_workspace"]
     # Native discovery remains authoritative for a live import. An unavailable
     # reference becomes a shell; do not guess a resume command or a session ID.
@@ -216,9 +217,10 @@ def append_to_default(binary, home, snapshot, warnings):
                 tab_number = anchor["placement"]["tab"]
                 locator = {k: anchor[k] for k in ("server_generation", "terminal_id", "pane_id")}
                 call("pane.focus", {"pane": anchor["pane_id"]})
-                if ws["cwd"] not in existing:
+                destination = call("workspace.get", {"workspace": workspace})
+                if destination["workspace_id"] not in existing:
                     call("workspace.rename", {"workspace": workspace, "name": ws["name"][:40]})
-                    existing.add(ws["cwd"])
+                    existing.add(destination["workspace_id"])
                 if tab.get("name"):
                     call("tab.rename", {"tab": tab_number, "name": tab["name"][:40]})
                 remap = {}
@@ -229,7 +231,7 @@ def append_to_default(binary, home, snapshot, warnings):
                     by_id = [s for s in resumable if ref and s["session_id"] == ref[1]]
                     matches = [s for s in by_id if s["agent"] == ref[0] and s["cwd"] == pane["cwd"]]
                     created = None
-                    if len(by_id) == len(matches) == 1 and (not separate_resume or pane["cwd"] == ws["cwd"]):
+                    if len(by_id) == len(matches) == 1 and (not separate_resume or Path(pane["cwd"]).resolve() == Path(ws["cwd"]).resolve()):
                         call("pane.focus", {"pane": anchor["pane_id"]})
                         before = {p["pane"] for p in call("pane.list", {"all_tabs": True})["panes"]}
                         call("agent.resume", {"session_id": ref[1]})
@@ -262,9 +264,10 @@ def append_to_default(binary, home, snapshot, warnings):
     finally:
         if focused:
             call("pane.focus", {"pane": focused})
-        elif original_workspace and original_tab:
+        elif original_workspace:
             call("workspace.focus", {"workspace_id": original_workspace["workspace_id"]})
-            call("tab.focus", {"tab_id": original_tab["tab_id"]})
+            if original_tab:
+                call("tab.focus", {"tab_id": original_tab["tab_id"]})
 
 
 def worker(request):
@@ -321,7 +324,7 @@ def worker(request):
                     write_new_json(marker, {"identity": session["identity"], "state": "incomplete"})
                     append_to_default(binary, home, session["snapshot"], session["warnings"])
                     marker.write_text(json.dumps({"identity": session["identity"], "state": "complete"}) + "\n")
-                api(binary, home, session["name"], "pane.list", {"all_tabs": True})
+                api(binary, home, session["name"], "terminal.backend.inventory")
                 session["status"] = "opened"
             except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as error:
                 errors.append("{}: {}".format(session["name"], error))
