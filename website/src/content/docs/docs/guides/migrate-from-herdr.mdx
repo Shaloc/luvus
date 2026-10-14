@@ -1,0 +1,149 @@
+---
+title: Migrate from Herdr
+description: Restore local and SSH Herdr workspaces, tabs and shells in the Shaloc Luvus fork on macOS and Linux.
+---
+
+Run `migrate_from_herdr.sh` from a checkout of **Shaloc/luvus**. It uses the
+adjacent `scripts/migrate_from_herdr.py` and Python 3.6 or newer.
+Every remote machine also needs Python 3.6 or newer and working
+noninteractive SSH with a verified host key. No Python packages are required.
+
+```sh
+# Read local and remote snapshots without changing files or starting servers.
+./migrate_from_herdr.sh --dry-run
+
+# Install the fork locally, install on remote machines when needed, and migrate.
+./migrate_from_herdr.sh --install
+```
+
+`--install` reuses the repository's `install.sh` after source preflight succeeds.
+It installs the latest fork release, respects `LUVUS_VERSION` and
+`LUVUS_INSTALL_DIR` locally, and uses that exact installed binary even if PATH
+selects another one. It also enables `--install-remote`. The installer offers
+macOS Apple Silicon and Linux x86_64 binaries. Other architectures require a
+source build and `--luvus-bin /path/to/luvus` instead of `--install`.
+`--install --dry-run` previews migration without installing anything.
+
+To keep the local installation, omit `--install` and optionally use
+`--install-remote`. Without either option, remote admission requires a compatible
+fork already installed. The native host installer keeps existing remote servers running;
+an incompatible running owner requires a separate, user-managed upgrade.
+
+## Session mapping
+
+| Herdr source | Luvus destination |
+|---|---|
+| Local `default` | Local `default` |
+| Remote `default` | `default` on that same remote machine |
+| Named session `work` | `herdr-work` on the same machine |
+
+`--prefix imported-` changes named destinations to `imported-work`. It never
+changes the `default` mapping. `--prefix ''` retains named sessions' original
+names. Existing named destinations are rejected unless this script previously
+imported them.
+
+An existing Luvus default is reused without restarting its server. The script
+appends imported tabs to a workspace with the same directory, or creates the
+workspace when needed. Existing workspace names, panes and focused terminal
+are retained. Newly created sessions use native snapshot restoration, including
+the saved active workspace and tab. Live imports leave the existing focus in place.
+
+Remote hosts are registered through `luvus host add`. Each imported remote
+session is registered with `session remote add --merge`, which **enables global
+same-name merging**. Remote shells run on their original machines. Choose the
+session in Luvus's session switcher, or use the printed attach command. The
+script starts owners in the background; it does not attach a TUI automatically.
+
+## Source discovery and SSH configuration
+
+Local snapshots come from `$XDG_CONFIG_HOME/herdr`, falling back to
+`~/.config/herdr`, including `sessions/<name>/session.json`. Herdr snapshot
+versions 0 through 3 are supported. Saved machines come from
+`$XDG_STATE_HOME/herdr/client/endpoints.json`, falling back to
+`~/.local/state/herdr/client/endpoints.json`. Only enabled machines are read.
+Each distinct target is contacted once for discovery, and all its saved sessions
+are considered. Discovery does not recursively follow another machine's catalog.
+
+The script reads the latest **saved** snapshot. Unsaved Herdr UI changes are
+outside that snapshot. One-off `herdr --remote` connections without a saved
+machine entry need an explicit `--remote TARGET` argument.
+
+```sh
+./migrate_from_herdr.sh --local-only
+./migrate_from_herdr.sh --remote devbox --install-remote
+./migrate_from_herdr.sh --herdr-config /path/to/herdr \
+  --herdr-state /path/to/herdr-state --luvus-bin /path/to/luvus
+./migrate_from_herdr.sh --remote-herdr-config /remote/path/to/herdr
+```
+
+Luvus needs a literal OpenSSH `Host` alias. By default the script runs `ssh -G`
+to resolve each Herdr target, including `user@host` and `ssh://user@host:port`,
+and saves the effective configuration under a deterministic `herdr-...` alias
+in `~/.ssh/luvus-herdr/`. It prepends an Include to `~/.ssh/config`, keeping a
+backup of the original. Private key contents are never copied. These generated
+aliases are snapshots of SSH settings; later changes to the original target's
+settings do not automatically update them.
+
+To reuse an existing alias and avoid editing SSH files, supply a mapping:
+
+```sh
+./migrate_from_herdr.sh --host-map user@build.example=buildbox
+```
+
+A symlinked `~/.ssh/config` requires an existing alias mapping. Connection
+failures and unknown host keys are reported as errors; no host-key policy is
+weakened. The local Luvus data directory defaults to `$LUVUS_HOME` or
+`~/.luvus`; `--luvus-home` overrides it. Remote destinations use `~/.luvus`.
+Inherited pane, socket and session selectors are cleared before Luvus commands.
+
+## Preserved data and limits
+
+The script restores workspace directories and names, tabs, pane directories,
+split directions and ratios, focus within each imported tab, and labels.
+Live import uses Luvus's 40-character workspace/tab name limit and its existing
+agent-alias validation; free-form pane labels use terminal titles.
+Missing directories, unknown snapshot versions and malformed layouts fail
+preflight rather than silently opening a different directory.
+
+Native agent references are passed to Luvus's existing restore implementation
+for new sessions. A live default import resumes only exact agent/session/cwd
+matches found by Luvus's native discovery and compatible with its configured
+resume placement. Other agent panes become shells with a diagnostic. Native
+references with characters or paths Luvus cannot accept are also reported.
+`--shells-only` omits every agent resume reference. Agent startup is separate
+from shell creation: check the resumed agent's readiness in Luvus.
+
+Herdr's running PTYs, executing commands, shell variables, terminal history,
+zoom state, plugins, keybindings and general configuration are not transferred.
+Shells use Luvus's configured shell. Arbitrary saved `launch_argv`, including
+agent permission/model flags, are not replayed. Herdr files and processes are
+left intact, and source repositories/worktrees stay at their existing paths.
+
+## Reruns and partial failures
+
+Each imported destination has a private `herdr-migration.json` receipt.
+Rerunning with the same source and options reuses that import and starts its
+owner if stopped; it does not duplicate tabs or synchronize later Herdr changes.
+Changing `--shells-only` after an import is a different import and is rejected
+at an occupied destination.
+
+Preflight errors stop execution before importing sessions. Errors during
+execution produce a nonzero exit status and keep completed work. A live import
+that fails midway keeps an `incomplete` receipt and refuses an automatic retry
+that could duplicate its tabs. Inspect the imported tabs and that receipt before
+manual cleanup. No rollback deletes existing or newly opened panes. Host
+registration and any SSH config backup also remain available after a failure.
+
+For an isolated development check, build the exact binary and run:
+
+```sh
+cargo build --locked
+python3 scripts/test-migrate-from-herdr.py target/debug/luvus
+# Use Python 3.6 for both local and remote migration workers.
+MIGRATE_TEST_PYTHON=/usr/bin/python3.6 python3 scripts/test-migrate-from-herdr.py target/debug/luvus
+```
+
+The test driver uses Python 3.9+ for the existing shared test helpers; migration
+workers use `MIGRATE_TEST_PYTHON` or the driver's interpreter. The fixture runs
+real servers and PTYs under the checkout's `target/` directory
+and substitutes SSH. It never connects to production hosts or sessions.

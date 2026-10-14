@@ -139,6 +139,32 @@ cd luvus
 cargo build --release --locked --bin luvus
 ```
 
+## Migrate from Herdr
+
+From this fork's checkout, run:
+
+```sh
+./migrate_from_herdr.sh --dry-run
+./migrate_from_herdr.sh --install
+```
+
+The script requires Python 3.6+ on macOS/Linux and on each saved SSH machine.
+`--install` runs this fork's existing installer locally, permits installation of
+missing or incompatible remote binaries, and migrates the saved sessions.
+The installer offers macOS Apple Silicon and Linux x86_64 binaries. For other
+architectures, build the fork from source and use `--luvus-bin /path/to/luvus`.
+
+Herdr's default session goes to Luvus's **default** session on each machine.
+An existing default keeps its panes; imported tabs are appended to workspaces
+with the same directory. Other sessions become `herdr-<name>`. The script reads
+Herdr's saved machine catalog, registers SSH hosts, restores workspaces, tabs,
+split layouts and shell directories, and enables same-name remote merging.
+Herdr stays running. Native agent references use Luvus's resume support;
+running processes, scrollback and shell variables cannot be transferred.
+
+See the [migration guide](website/src/content/docs/docs/guides/migrate-from-herdr.mdx)
+for custom paths, existing SSH aliases, reruns and recovery limits.
+
 ## Quick start
 
 ```bash

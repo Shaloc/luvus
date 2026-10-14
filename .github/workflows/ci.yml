@@ -68,6 +68,7 @@ jobs:
           cargo build --locked
           python3 tests/server_detach_pty.py --luvus target/debug/luvus
           python3 scripts/test-terminal-colors-pty.py --luvus target/debug/luvus
+          python3 scripts/test-migrate-from-herdr.py target/debug/luvus
       - name: Validate web client and bridge
         run: |
           cargo build --locked
@@ -133,6 +134,7 @@ jobs:
           cargo build --locked
           python3 tests/server_detach_pty.py --luvus target/debug/luvus
           python3 scripts/test-terminal-colors-pty.py --luvus target/debug/luvus
+          python3 scripts/test-migrate-from-herdr.py target/debug/luvus
       - name: Validate terminal backend contract
         run: |
           python3 examples/uhp/terminal/consumer.py --fixtures

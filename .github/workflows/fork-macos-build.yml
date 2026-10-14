@@ -91,6 +91,7 @@ jobs:
           "$binary" skill show > "$RUNNER_TEMP/luvus-skill.md"
           cmp skills/luvus/SKILL.md "$RUNNER_TEMP/luvus-skill.md"
           python3 scripts/test-fork-installer.py "target/$TARGET/release/luvus"
+          python3 scripts/test-migrate-from-herdr.py "target/$TARGET/release/luvus"
           echo "name=$package" >> "$GITHUB_OUTPUT"
       - name: Isolated pane controls, native appearance and notification smoke
         run: |
