@@ -258,6 +258,13 @@ def main():
             assert "herdr-default" not in preview
             print("PASS: local/remote dry run writes nothing and maps default directly", flush=True)
 
+            # A piped shell reports argv[0] as 'sh'. Files in the caller's
+            # directory must not turn the trusted bootstrap into a local import.
+            (root / "project/sh").write_text("not the migration entrypoint\n")
+            (root / "project/install.sh").write_text("exit 99\n")
+            (root / "project/scripts").mkdir()
+            (root / "project/scripts/migrate_from_herdr.py").write_text(
+                'raise SystemExit("untrusted working-directory helper was executed")\n')
             for mode in ("pipe", "standalone"):
                 preview = migrate("--dry-run", "--install", mode=mode)
                 assert "default: new" in preview and "Preview only" in preview

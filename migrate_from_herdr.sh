@@ -11,13 +11,18 @@ main() {
         exit 1
     }
 
-    # A checkout uses its own matching files without downloading anything.
-    if [ -f "$0" ]; then
-        script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-        if [ -f "$script_dir/scripts/migrate_from_herdr.py" ] && [ -f "$script_dir/install.sh" ]; then
-            exec python3 "$script_dir/scripts/migrate_from_herdr.py" "$@"
+    # Only an explicit migration script can use checkout helpers. A piped
+    # shell's argv[0] is 'sh', which may also name a file in an untrusted cwd.
+    case "$0" in
+      */migrate_from_herdr.sh|migrate_from_herdr.sh)
+        if [ -f "$0" ]; then
+            script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+            if [ -f "$script_dir/scripts/migrate_from_herdr.py" ] && [ -f "$script_dir/install.sh" ]; then
+                exec python3 "$script_dir/scripts/migrate_from_herdr.py" "$@"
+            fi
         fi
-    fi
+        ;;
+    esac
 
     command -v curl >/dev/null 2>&1 || {
         printf '%s\n' 'error: curl is required to download migration files' >&2
