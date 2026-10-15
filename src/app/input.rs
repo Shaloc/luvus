@@ -11050,6 +11050,24 @@ mod link_click_tests {
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
         let pane = app.layout().focus;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(p, _)| *p == pane)
+            .map(|(_, r)| *r)
+            .expect("pane content rect");
+        // This fixture paints its own grid. The spawned shell must not race
+        // those cells with a prompt or resize redraw between hover and click.
+        // Real PTY coverage lives in test-remote-sessions.py --file-links-only.
+        let (reply_tx, _reply_rx) = std::sync::mpsc::channel();
+        app.panes.get_mut(&pane).unwrap().engine = crate::terminal::vt::create_engine(
+            crate::terminal::vt::VtEngineKind::default(),
+            content.width,
+            content.height,
+            reply_tx,
+            64 * 1024,
+            crate::terminal::appearance::PaneAppearance::default(),
+        );
         app.panes
             .get(&pane)
             .unwrap()
@@ -11058,12 +11076,6 @@ mod link_click_tests {
             .unwrap()
             .advance(format!("\x1b[H\x1b[2J{text}\r\n").as_bytes());
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        let content = app
-            .pane_content_rects
-            .iter()
-            .find(|(p, _)| *p == pane)
-            .map(|(_, r)| *r)
-            .expect("pane content rect");
         (app, term, (content.x + at, content.y))
     }
 

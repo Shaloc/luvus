@@ -203,7 +203,9 @@ def host_admission_smoke(repo, root, binary, env):
         print("PASS: Settings u updates compatible fork binary without restarting either owner")
     finally:
         if client is not None:
-            client.terminate()
+            # This is fixture teardown, not a graceful-detach assertion. Reap
+            # our client even when inherited signal handling ignores SIGTERM.
+            client.kill()
             client.wait(timeout=5)
         os.close(master)
         if slave is not None:
