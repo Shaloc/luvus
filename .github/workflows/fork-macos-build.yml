@@ -105,6 +105,8 @@ jobs:
           NO_COLOR=1 python3 scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --graphics-only
       - name: Isolated remote workspace close and restart smoke
         run: target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --workspace-close-only
+      - name: Isolated terminal file reference smoke
+        run: target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --file-links-only
       - name: Isolated many-workspace SSH admission smoke
         run: python3 scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --ssh-admission-only
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

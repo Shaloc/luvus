@@ -329,6 +329,13 @@ follows it. If you would rather not hold a modifier, **right-click** and pick
 | `src/main.rs` | opens in luvus, where **File click behavior** says |
 | `src/main.rs:42` | the same, scrolled to line 42 |
 
+File references enclosed in parentheses, brackets, or quotes work too. Luvus
+checks the original filename first, then tries removing surrounding punctuation.
+Paths containing a directory separator can also continue at the pane's right
+edge with up to four leading spaces on the next row, provided the complete path
+names an existing file relative to that pane's working directory. Remote file
+checks and opens run on the pane's owner. Only the path characters are underlined.
+
 ### Files
 
 When the terminal forwards the click, a file path opens **in luvus** and lands

@@ -4867,7 +4867,24 @@ impl App {
             return Some(HoverLink { pane, link, target });
         }
 
-        let link = crate::links::link_at(rows.rows(), grid_col, grid_row)?;
+        let visible = crate::links::link_at(rows.rows(), grid_col, grid_row);
+        if !matches!(
+            visible.as_ref().map(|link| &link.hit),
+            Some(crate::links::Hit::Url(_))
+        ) {
+            if let Some((link, path)) =
+                crate::links::file_link_at(rows.rows(), grid_col, grid_row, |text| {
+                    self.resolve_pane_path(pane, text)
+                })
+            {
+                let crate::links::Hit::Path { line, .. } = &link.hit else {
+                    unreachable!()
+                };
+                let target = LinkTarget::File { path, line: *line };
+                return Some(HoverLink { pane, link, target });
+            }
+        }
+        let link = visible?;
         let target = match &link.hit {
             crate::links::Hit::Url(u) => {
                 crate::platform::is_openable_url(u).then(|| LinkTarget::Url(u.clone()))?
@@ -10500,6 +10517,35 @@ mod link_click_tests {
     }
 
     #[test]
+    fn file_hover_underlines_a_path_on_a_colored_background() {
+        use ratatui::style::{Color, Modifier};
+
+        let _env = crate::persist::test_env("link-hover-colored-file");
+        let (mut app, mut term, at) = fixture_showing(
+            "\x1b[48;2;214;255;214mscripts/test-remote-sessions.py\x1b[0m",
+            8,
+        );
+        let pane = app.layout().focus;
+        for modifiers in [KeyModifiers::CONTROL, KeyModifiers::SUPER] {
+            app.handle_event(mouse(MouseEventKind::Moved, at, modifiers));
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let cell = &term.backend().buffer()[at];
+            assert!(cell.modifier.contains(Modifier::UNDERLINED));
+            assert_eq!(cell.bg, Color::Rgb(214, 255, 214));
+            assert!(matches!(
+                &app.hover_link.as_ref().unwrap().target,
+                LinkTarget::File { path, .. }
+                    if *path == app.panes[&pane].cwd.join("scripts/test-remote-sessions.py")
+            ));
+            app.handle_event(mouse(MouseEventKind::Moved, at, KeyModifiers::NONE));
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            assert!(!term.backend().buffer()[at]
+                .modifier
+                .contains(Modifier::UNDERLINED));
+        }
+    }
+
+    #[test]
     fn any_motion_forwarding_does_not_mark_luvus_dirty() {
         let _env = crate::persist::test_env("mouse-any-motion-dirty");
         let Fixture {
@@ -11262,6 +11308,119 @@ mod link_click_tests {
                 "{text:?} must not resolve"
             );
         }
+    }
+
+    #[test]
+    fn file_reference_wrappers_resolve_and_exclude_delimiters() {
+        let _env = crate::persist::test_env("link-file-wrappers");
+        let cwd = crate::persist::config_dir().join("project");
+        let relative = "plan/task-service-master-arkmaster-plan.md";
+        std::fs::create_dir_all(cwd.join("plan")).unwrap();
+        std::fs::write(cwd.join(relative), "plan\n").unwrap();
+        let (mut app, _term, at) = fixture_showing("", 0);
+        let pane = app.layout().focus;
+        app.panes.get_mut(&pane).unwrap().cwd = cwd.clone();
+        for (left, right) in [("(", ")"), ("'", "'"), ("[", "]"), ("\"", "\"")] {
+            app.panes[&pane]
+                .engine
+                .lock()
+                .unwrap()
+                .advance(format!("\x1b[H\x1b[2J{left}{relative}{right}.").as_bytes());
+            let hover = app.link_at_screen(at.0 + 3, at.1).expect("existing file");
+            assert_eq!(
+                hover.target,
+                LinkTarget::File {
+                    path: cwd.join(relative),
+                    line: None
+                }
+            );
+            assert_eq!(hover.link.spans, vec![(0, 1, 1 + relative.len() as u16)]);
+            assert!(
+                app.link_at_screen(at.0, at.1).is_none(),
+                "opening delimiter"
+            );
+            assert!(
+                app.link_at_screen(at.0 + 1 + relative.len() as u16, at.1)
+                    .is_none(),
+                "closing delimiter"
+            );
+        }
+    }
+
+    #[test]
+    fn file_reference_indented_continuation_click_opens_owner_file() {
+        let _env = crate::persist::test_env("link-file-continuation");
+        let cwd = crate::persist::config_dir().join("project");
+        let head = "docs/adr/0032-";
+        let tail = "arkmaster-owns-taskservice-master-placement.md";
+        let path = cwd.join(format!("{head}{tail}"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# Owner document\n").unwrap();
+        let (mut app, mut term, at) = fixture_showing("", 0);
+        let pane = app.layout().focus;
+        app.panes.get_mut(&pane).unwrap().cwd = cwd;
+        let content = app
+            .pane_content_rects
+            .iter()
+            .find(|(id, _)| *id == pane)
+            .unwrap()
+            .1;
+        let prefix = " ".repeat(content.width as usize - head.len() - 1);
+        app.panes[&pane]
+            .engine
+            .lock()
+            .unwrap()
+            .advance(format!("\x1b[H\x1b[2J{prefix}({head}\r\n  {tail})").as_bytes());
+        let first = (at.0 + prefix.len() as u16 + 2, at.1);
+        let continuation = (at.0 + 4, at.1 + 1);
+        for cell in [first, continuation] {
+            let hover = app
+                .link_at_screen(cell.0, cell.1)
+                .expect("full file reference");
+            assert_eq!(
+                hover.target,
+                LinkTarget::File {
+                    path: path.clone(),
+                    line: None
+                }
+            );
+            assert_eq!(
+                hover.link.spans,
+                vec![
+                    (0, prefix.len() as u16 + 1, content.width),
+                    (1, 2, 2 + tail.len() as u16)
+                ]
+            );
+        }
+        app.handle_event(mouse(
+            MouseEventKind::Moved,
+            continuation,
+            KeyModifiers::CONTROL,
+        ));
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let buffer = term.backend().buffer();
+        assert!(buffer[first]
+            .modifier
+            .contains(ratatui::style::Modifier::UNDERLINED));
+        assert!(buffer[continuation]
+            .modifier
+            .contains(ratatui::style::Modifier::UNDERLINED));
+        assert!(!buffer[(at.0, at.1 + 1)]
+            .modifier
+            .contains(ratatui::style::Modifier::UNDERLINED));
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            continuation,
+            KeyModifiers::CONTROL,
+        ));
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            continuation,
+            KeyModifiers::CONTROL,
+        ));
+        assert!(
+            matches!(app.views.get(&app.layout().focus), Some(crate::app::ViewKind::File(view)) if view.path == path)
+        );
     }
 
     /// A bare domain is as clickable as a written-out URL, and gets `https://`.

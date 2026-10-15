@@ -256,6 +256,11 @@ impl Link {
 /// bound keeps a pathological grid from turning a hover into a long walk.
 const MAX_WRAP: usize = 4;
 
+// Agent-rendered paragraphs commonly indent continuation rows by two cells.
+// This fallback is only used for file candidates which the owner validates.
+const MAX_CONTINUATION_INDENT: usize = 4;
+const MAX_PATH_CANDIDATES: usize = 8;
+
 /// Characters that may appear inside a URL or a path: RFC 3986 unreserved +
 /// reserved plus `\` for Windows paths, **ASCII only**, so a space, a
 /// box-drawing glyph or CJK text ends the token.
@@ -328,22 +333,47 @@ fn wraps(rows: &[String], i: usize) -> bool {
 /// Joining rows here is what lets a URL survive an 80-column pane: agents print
 /// long links constantly, and a host terminal that only sees the final screen
 /// can only ever offer you the half before the wrap.
-fn logical_line(rows: &[String], row: u16) -> Vec<(char, u16, u16)> {
+fn continuation_indent(rows: &[String], i: usize, allow_indent: bool) -> Option<usize> {
+    if wraps(rows, i) {
+        return Some(0);
+    }
+    if !allow_indent || !rows.get(i)?.chars().next_back().is_some_and(is_token_char) {
+        return None;
+    }
+    let next = rows.get(i + 1)?;
+    let indent = next.chars().take_while(|c| *c == ' ').count();
+    ((1..=MAX_CONTINUATION_INDENT).contains(&indent)
+        && next.chars().nth(indent).is_some_and(is_token_char))
+    .then_some(indent)
+}
+
+fn logical_line(rows: &[String], row: u16, allow_indent: bool) -> Vec<(char, u16, u16)> {
     let r = row as usize;
     if r >= rows.len() {
         return Vec::new();
     }
     let mut start = r;
-    while start > 0 && r - start < MAX_WRAP && wraps(rows, start - 1) {
+    while start > 0
+        && r - start < MAX_WRAP
+        && continuation_indent(rows, start - 1, allow_indent).is_some()
+    {
         start -= 1;
     }
     let mut end = r;
-    while end + 1 < rows.len() && end - r < MAX_WRAP && wraps(rows, end) {
+    while end + 1 < rows.len()
+        && end - r < MAX_WRAP
+        && continuation_indent(rows, end, allow_indent).is_some()
+    {
         end += 1;
     }
     let mut cells = Vec::new();
     for (i, line) in rows.iter().enumerate().take(end + 1).skip(start) {
-        for (c, ch) in line.chars().enumerate() {
+        let indent = if i > start {
+            continuation_indent(rows, i - 1, allow_indent).unwrap_or(0)
+        } else {
+            0
+        };
+        for (c, ch) in line.chars().enumerate().skip(indent) {
             cells.push((ch, i as u16, c as u16));
         }
     }
@@ -362,21 +392,8 @@ fn count(cells: &[(char, u16, u16)], ch: char) -> usize {
 /// agent and the click ends up at the OS handler. Anything else path-shaped comes
 /// back as [`Hit::Path`] for the caller to resolve and check on disk.
 pub fn link_at(rows: &[String], col: u16, row: u16) -> Option<Link> {
-    let cells = logical_line(rows, row);
-    let idx = cells.iter().position(|(_, r, c)| *r == row && *c == col)?;
-    if !is_token_char(cells[idx].0) {
-        return None;
-    }
-
-    // Widen to the whitespace-delimited token around the cursor.
-    let mut lo = idx;
-    while lo > 0 && is_token_char(cells[lo - 1].0) {
-        lo -= 1;
-    }
-    let mut hi = idx + 1;
-    while hi < cells.len() && is_token_char(cells[hi].0) {
-        hi += 1;
-    }
+    let cells = logical_line(rows, row, false);
+    let (idx, mut lo, mut hi) = token_at(&cells, col, row)?;
 
     // A URL starts at its scheme, so `(https://x` and `see:https://x` both resolve
     // to the bare URL rather than dragging their prefix along. Without a scheme the
@@ -390,20 +407,7 @@ pub fn link_at(rows: &[String], col: u16, row: u16) -> Option<Link> {
         None => false,
     };
 
-    // Trim trailing marks that belong to the prose around it, not to it: sentence
-    // punctuation, and closing brackets that were never opened inside.
-    while hi > lo {
-        let drop = match cells[hi - 1].0 {
-            '.' | ',' | ';' | ':' | '!' | '?' | '\'' => true,
-            ')' => count(&cells[lo..hi], ')') > count(&cells[lo..hi], '('),
-            ']' => count(&cells[lo..hi], ']') > count(&cells[lo..hi], '['),
-            _ => false,
-        };
-        if !drop {
-            break;
-        }
-        hi -= 1;
-    }
+    hi = trim_trailing_marks(&cells, lo, hi, false);
 
     // Trimming can pull the target out from under the cursor ("https://x." with
     // the cursor on the dot is a hover over prose, not over the link).
@@ -423,7 +427,6 @@ pub fn link_at(rows: &[String], col: u16, row: u16) -> Option<Link> {
         // `src/main.rs:42:7` is one reference: the whole thing underlines, but the
         // path handed on excludes the position.
         let (base, line) = split_line_suffix(&text);
-        // Either shape earns a hit; the app works out which it actually is.
         if !looks_like_path(base) && as_domain(&text).is_none() {
             return None;
         }
@@ -433,16 +436,156 @@ pub fn link_at(rows: &[String], col: u16, row: u16) -> Option<Link> {
             line,
         }
     };
+    Some(link_with_spans(hit, &cells[lo..hi]))
+}
 
+fn token_at(cells: &[(char, u16, u16)], col: u16, row: u16) -> Option<(usize, usize, usize)> {
+    let idx = cells.iter().position(|(_, r, c)| *r == row && *c == col)?;
+    if !is_token_char(cells[idx].0) {
+        return None;
+    }
+
+    // Widen to the whitespace-delimited token around the cursor.
+    let mut lo = idx;
+    while lo > 0 && is_token_char(cells[lo - 1].0) {
+        lo -= 1;
+    }
+    let mut hi = idx + 1;
+    while hi < cells.len() && is_token_char(cells[hi].0) {
+        hi += 1;
+    }
+
+    Some((idx, lo, hi))
+}
+
+fn trim_trailing_marks(
+    cells: &[(char, u16, u16)],
+    lo: usize,
+    mut hi: usize,
+    keep_quote: bool,
+) -> usize {
+    // Trim trailing marks that belong to the prose around it, not to it: sentence
+    // punctuation, and closing brackets that were never opened inside.
+    while hi > lo {
+        let drop = match cells[hi - 1].0 {
+            '.' | ',' | ';' | ':' | '!' | '?' => true,
+            '\'' => !(keep_quote && hi > lo + 1 && cells[lo].0 == '\''),
+            ')' => count(&cells[lo..hi], ')') > count(&cells[lo..hi], '('),
+            ']' => count(&cells[lo..hi], ']') > count(&cells[lo..hi], '['),
+            _ => false,
+        };
+        if !drop {
+            break;
+        }
+        hi -= 1;
+    }
+
+    hi
+}
+
+fn link_with_spans(hit: Hit, cells: &[(char, u16, u16)]) -> Link {
     // Group the cells into one span per row.
     let mut spans: Vec<(u16, u16, u16)> = Vec::new();
-    for (_, r, c) in &cells[lo..hi] {
+    for (_, r, c) in cells {
         match spans.last_mut() {
             Some((sr, _, e)) if sr == r && *e == *c => *e = c + 1,
             _ => spans.push((*r, *c, *c + 1)),
         }
     }
-    Some(Link { hit, spans })
+    Link { hit, spans }
+}
+
+/// Find a real file, trying the original spelling before removing prose
+/// delimiters, then trying a bounded indented continuation. The supplied
+/// resolver belongs to the pane's owner; this module performs no IO. Unlike
+/// ordinary link/copy detection, speculative joins must never become URLs or
+/// clickable paths without that validation.
+pub fn file_link_at<T>(
+    rows: &[String],
+    col: u16,
+    row: u16,
+    mut resolve: impl FnMut(&str) -> Option<T>,
+) -> Option<(Link, T)> {
+    for allow_indent in [false, true] {
+        let cells = logical_line(rows, row, allow_indent);
+        let Some((idx, mut lo, mut hi)) = token_at(&cells, col, row) else {
+            continue;
+        };
+        let token: String = cells[lo..hi].iter().map(|c| c.0).collect();
+        // Never reinterpret a URL, or stat ordinary prose. For the speculative
+        // join require a directory component and an actual skipped indentation.
+        let shape = token.trim_matches(['(', ')', '[', ']', '\'', '.', ',', ';', '!', '?']);
+        if token.contains("://")
+            || !looks_like_path(split_line_suffix(shape).0)
+            || (allow_indent
+                && (!token.contains(['/', '\\'])
+                    || !cells[lo..hi]
+                        .windows(2)
+                        .any(|pair| pair[0].1 != pair[1].1 && pair[1].2 > 0)))
+        {
+            continue;
+        }
+        for _ in 0..MAX_PATH_CANDIDATES {
+            if idx < lo || idx >= hi {
+                break;
+            }
+            let raw: String = cells[lo..hi].iter().map(|c| c.0).collect();
+            let (text, line) = split_line_suffix(&raw);
+            if let Some(path) = resolve(text) {
+                let hit = Hit::Path {
+                    text: text.to_string(),
+                    raw,
+                    line,
+                };
+                return Some((link_with_spans(hit, &cells[lo..hi]), path));
+            }
+            if enclosing_pair(&cells[lo..hi]) {
+                lo += 1;
+                hi -= 1;
+            } else {
+                // Keep a paired quote for the next attempt after punctuation
+                // is removed; the ordinary URL/copy parser still trims quotes.
+                let trimmed = trim_trailing_marks(&cells, lo, hi, true);
+                if trimmed == hi {
+                    break;
+                }
+                hi = trimmed;
+            }
+        }
+    }
+    None
+}
+
+fn enclosing_pair(cells: &[(char, u16, u16)]) -> bool {
+    if cells.len() < 2 {
+        return false;
+    }
+    let open = cells[0].0;
+    let close = match open {
+        '(' => ')',
+        '[' => ']',
+        '\'' => '\'',
+        _ => return false,
+    };
+    if cells[cells.len() - 1].0 != close {
+        return false;
+    }
+    if open == close {
+        return true;
+    }
+    let mut depth = 0;
+    for (i, &(ch, _, _)) in cells.iter().enumerate() {
+        if ch == open {
+            depth += 1;
+        }
+        if ch == close {
+            depth -= 1;
+        }
+        if depth == 0 && i + 1 < cells.len() {
+            return false;
+        }
+    }
+    depth == 0
 }
 
 #[cfg(test)]
@@ -648,6 +791,110 @@ mod tests {
                 "{line:?}"
             );
         }
+    }
+
+    #[test]
+    fn file_candidates_preserve_real_delimiters_and_strip_only_outer_pairs() {
+        for name in [
+            "(plan/report.md)",
+            "'plan/report.md'",
+            "plan/report(1).md",
+            "(part)/report(1).md",
+        ] {
+            let rows = grid(&[name], 80);
+            let (link, path) =
+                file_link_at(&rows, 3, 0, |s| (s == name).then(|| s.to_string())).unwrap();
+            assert_eq!(path, name);
+            assert_eq!(link.spans, vec![(0, 0, name.len() as u16)]);
+        }
+        let rows = grid(&["(plan/report.md)"], 80);
+        let mut checked = Vec::new();
+        let (_, path) = file_link_at(&rows, 3, 0, |s| {
+            checked.push(s.to_string());
+            Some(s.to_string())
+        })
+        .unwrap();
+        assert_eq!(path, "(plan/report.md)");
+        assert_eq!(checked, ["(plan/report.md)"]);
+        for token in [
+            "'README.md'",
+            "[README.md]",
+            "((README.md))",
+            "('README.md').",
+            "'README.md'...",
+        ] {
+            let rows = grid(&[token], 80);
+            let col = token.find("README").unwrap() as u16 + 2;
+            let (link, _) =
+                file_link_at(&rows, col, 0, |s| (s == "README.md").then_some(())).unwrap();
+            assert_eq!(link.spans, vec![(0, col - 2, col - 2 + 9)]);
+        }
+    }
+
+    #[test]
+    fn wrapped_file_candidates_keep_suffix_and_grid_spans_from_either_row() {
+        let rows = grid(&["  (docs/adr/0032-", "  placement.md:7)"], 17);
+        for (col, row) in [(4, 0), (5, 1)] {
+            let (link, _) = file_link_at(&rows, col, row, |s| {
+                (s == "docs/adr/0032-placement.md").then_some(())
+            })
+            .unwrap();
+            assert!(matches!(link.hit, Hit::Path { line: Some(7), .. }));
+            assert_eq!(link.spans, vec![(0, 3, 17), (1, 2, 16)]);
+        }
+        assert!(
+            file_link_at(&rows, 0, 1, |_| Some(())).is_none(),
+            "indent is not a link"
+        );
+        assert!(
+            file_link_at(&rows, 2, 0, |s| (s == "docs/adr/0032-placement.md")
+                .then_some(()))
+            .is_none(),
+            "wrapper is not a link"
+        );
+    }
+
+    #[test]
+    fn speculative_file_joins_require_boundaries_and_owner_validation() {
+        let joined = "docs/adr/0032-placement.md";
+        let rows = grid(&["docs/adr/0032-", "  placement.md"], 14);
+        assert!(file_link_at(&rows, 4, 0, |_| None::<()>).is_none());
+        for rows in [
+            grid(&["docs/adr/0032-", "  placement.md"], 30), // line ended early
+            grid(&["docs/adr/0032-", "     placement.md"], 13), // excessive indent
+            grid(&["just prose   ", "  placement.md"], 13),
+        ] {
+            for row in 0..2 {
+                assert!(file_link_at(&rows, 4, row, |s| (s == joined).then_some(())).is_none());
+            }
+        }
+        // A real standalone filename on the continuation row still wins.
+        let (_, path) = file_link_at(&rows, 4, 1, |s| {
+            [joined, "placement.md"].contains(&s).then(|| s.to_string())
+        })
+        .unwrap();
+        assert_eq!(path, "placement.md");
+        let mut calls = 0;
+        for text in [
+            "ordinary prose",
+            "(ordinary)",
+            "https://example.com/file.md",
+        ] {
+            assert!(file_link_at(&grid(&[text], 80), 2, 0, |_| {
+                calls += 1;
+                Some(())
+            })
+            .is_none());
+        }
+        assert_eq!(calls, 0, "URLs and prose must not reach the file resolver");
+        let excessive = vec!["  docs/a".to_string(); MAX_WRAP * 3];
+        let mut calls = 0;
+        assert!(file_link_at(&excessive, 4, MAX_WRAP as u16, |_| {
+            calls += 1;
+            None::<()>
+        })
+        .is_none());
+        assert!(calls <= 2 * MAX_PATH_CANDIDATES);
     }
 
     /// Prose with neither a separator nor an extension must never reach the

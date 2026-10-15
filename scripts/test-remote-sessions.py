@@ -15,6 +15,7 @@ Use --agent-seen-only for native Done acknowledgement after remote owner restart
 Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
 Use --colors-only for child color queries and composed local/remote backgrounds (requires pyte).
+Use --file-links-only for wrapped file references and owner-routed Ctrl-clicks (requires pyte).
 Use --appearance-only for pane mouse controls, None theme, notifications and host diagnostics (requires pyte).
 Use --workspace-close-only for owner-routed workspace close and restart persistence (requires pyte).
 Use --reconnect-only for remote owner restart and automatic reconnection.
@@ -234,8 +235,9 @@ def main():
     theme_sync_only = "--theme-sync-only" in sys.argv[1:]
     colors_only = "--colors-only" in sys.argv[1:]
     appearance_only = "--appearance-only" in sys.argv[1:]
+    file_links_only = "--file-links-only" in sys.argv[1:]
     workspace_close_only = "--workspace-close-only" in sys.argv[1:]
-    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only:
+    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -245,7 +247,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -291,10 +293,10 @@ def main():
                LUVUS_SMOKE_ROOT=str(root), LUVUS_SMOKE_BINARY=str(binary),
                LUVUS_SMOKE_REMOTE_BINARY=str(remote_binary), DISPLAY=":smoke")
     env.pop("WAYLAND_DISPLAY", None)
-    if colors_only or appearance_only:
+    if colors_only or appearance_only or file_links_only:
         env["COLORTERM"] = "truecolor"
         # Tool runners commonly export NO_COLOR. This private display must
-        # actually emit SGR colors for end-to-end color assertions.
+        # emit SGR styles for end-to-end color and underline assertions.
         env.pop("NO_COLOR", None)
     if ssh_admission_only:
         env["LUVUS_SMOKE_SSH_ADMISSION"] = "1"
@@ -691,7 +693,7 @@ def main():
             if colors_only:
                 color_output.clear()
                 color_output.extend(screen)
-            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only:
+            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -771,6 +773,63 @@ def main():
 
             wait_for(exited)
             assert process.returncode == 0, process.returncode
+
+        if file_links_only:
+            for mode in ("local", "direct-remote", "merge"):
+                remote = mode != "local"
+                merged = mode == "merge"
+                run("session", "merge", "on" if merged else "off")
+                session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
+                for wrapped in (False, True):
+                    label = mode + ("-continued" if wrapped else "-parenthesized")
+                    project = root / ("file-links-" + label)
+                    head = "docs/adr/0032-" if wrapped else "plan/"
+                    tail = ("arkmaster-owns-taskservice-master-placement.md" if wrapped
+                            else "task-service-master-arkmaster-plan.md")
+                    path = project / (head + tail)
+                    path.parent.mkdir(parents=True)
+                    marker = f"FILE_OPEN_{mode}_{int(wrapped)}"
+                    path.write_text(marker + "\n")
+                    api("workspace.open", {"path": str(project)}, remote=remote)
+                    pane = api("pane.current", remote=remote)["pane"]
+                    argv = (["session", "attach", session] if mode == "direct-remote"
+                            else ["--session", "api"])
+                    process, master = start_client(argv)
+                    if remote:
+                        projection = wait_for(lambda: next((w for w in presentation_api(
+                            "workspace.list", session=session)["workspaces"]
+                            if w.get("host") == "fake-dev" and w["cwd"] == str(project)), None))
+                        presentation_api("workspace.focus", {"workspace_id": projection["workspace_id"]}, session=session)
+                    drain(master)
+                    # Render the same paragraph shapes into a real owner PTY.
+                    code = ("import os,sys; w=os.get_terminal_size().columns; "
+                            + (f"text=' '*(w-{len(head)}-1)+'({head}\\r\\n  {tail})'; " if wrapped
+                               else f"text='({head}{tail})'; ")
+                            + "sys.stdout.write('\\x1b[H\\x1b[2J\\x1b[48;2;214;255;214m'+text+'\\x1b[0m\\r\\nREADY_'+'LINK_FIXTURE'); sys.stdout.flush(); input()")
+                    run("--session", "api", "pane", "run", str(pane),
+                        shlex.join([sys.executable, "-c", code]), remote=remote)
+
+                    def screen_text():
+                        output = drain(master, .12)
+                        with (root / (label + ".ansi")).open("ab") as capture:
+                            capture.write(output)
+                        text = "\n".join(client_terminals[master][0].display)
+                        (root / (label + ".txt")).write_text(text)
+                        return text
+
+                    wait_for(lambda: "READY_LINK_FIXTURE" in screen_text())
+                    terminal = client_terminals[master][0]
+                    y, line = next((y, line) for y, line in enumerate(terminal.display) if tail in line)
+                    x = line.index(tail) + 3
+                    os.write(master, f"\x1b[<51;{x + 1};{y + 1}M".encode())  # Ctrl + motion, no button held
+                    wait_for(lambda: screen_text() and terminal.buffer[y][x].underscore)
+                    assert terminal.buffer[y][x].bg == "d6ffd6", "hover preserves the child background"
+                    click(master, x + 1, y + 1, button=16)  # Ctrl + left
+                    wait_for(lambda: marker in screen_text())
+                    assert api("pane.current", remote=remote)["pane"] != pane, "owner focus moved to file view"
+                    detach_client(process, master)
+                    print(f"PASS: {label} owner file opened from highlighted reference", flush=True)
+            return
 
         if workspace_close_only:
             closed_paths = []
@@ -3011,7 +3070,7 @@ def main():
                 run("--session", name, "remote-server-command", "stop", remote=remote, okay=False)
         # Graphics and appearance checkpoints can be inspected after teardown.
         # Other successful fixtures are disposable; failures retain evidence.
-        if sys.exc_info()[0] is None and not graphics_only and not appearance_only and not workspace_close_only and not ssh_admission_only:
+        if sys.exc_info()[0] is None and not graphics_only and not appearance_only and not workspace_close_only and not ssh_admission_only and not file_links_only:
             assert_isolated(env)
             assert_isolated(remote_env)
             shutil.rmtree(root)
