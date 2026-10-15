@@ -76,7 +76,7 @@ def remote_env(root):
 
 
 def curl_helper():
-    """Serve only fixture release assets to the unmodified fork installer."""
+    """Serve only fixture migration files and release assets; never network."""
     root = Path(os.environ["LUVUS_SMOKE_ROOT"]).resolve()
     assert root.parent == REPO / "target" and root.name.startswith("remote-smoke-")
     assert (root / ".isolated-smoke").read_text() == str(root)
@@ -94,6 +94,16 @@ def curl_helper():
     url, = args
     with (root / "downloads/calls").open("a") as log:
         log.write(url + "\n")
+    base = "https://raw.githubusercontent.com/Shaloc/luvus/main/"
+    if url.startswith(base):
+        relative = url[len(base):]
+        assert relative in ("install.sh", "scripts/migrate_from_herdr.py")
+        assert output is not None
+        if os.environ.get("MIGRATE_MISSING_HELPER") and relative.endswith(".py"):
+            print("fixture download failed", file=sys.stderr)
+            return 22
+        shutil.copyfile(str(REPO / relative), str(output))
+        return 0
     if url == "https://api.github.com/repos/Shaloc/luvus/releases/latest":
         print('{"tag_name":"fork-migration-fixture"}')
         return 0
@@ -141,6 +151,8 @@ def main():
         (root / "bin/ssh").chmod(0o755)
         (root / "bin/curl").write_text("#!/bin/sh\nexec {} {} --curl-helper \"$@\"\n".format(shlex.quote(sys.executable), shlex.quote(str(Path(__file__).resolve()))))
         (root / "bin/curl").chmod(0o755)
+        standalone = root / "standalone migration.sh"
+        standalone.write_text((REPO / "migrate_from_herdr.sh").read_text())
         payload = ('#!/bin/sh\nprintf "%s\\n" "$*" >> "$MIGRATE_INSTALL_CALLS"\nexec ' + shlex.quote(str(binary)) + ' "$@"\n').encode()
         for target in ("x86_64-unknown-linux-musl", "aarch64-apple-darwin"):
             archive = root / "downloads" / ("luvus-" + target + ".tar.gz")
@@ -200,14 +212,29 @@ def main():
             owned = {w["workspace"] for w in workspaces if not w.get("host")}
             return [p for p in api("pane.list", {"all_tabs": True}, remote=remote, session=session)["panes"] if p["workspace"] in owned]
 
-        def migrate(*args, ok=True):
+        def selected_workspace(workspace_id):
+            # Remote focus completes after the owner supplies its first frame.
+            # The focus API response acknowledges the request before that frame.
+            deadline = time.monotonic() + 10
+            while True:
+                selected = next(w for w in api("workspace.list")["workspaces"] if w["active"])
+                if selected["workspace_id"] == workspace_id:
+                    return selected
+                assert time.monotonic() < deadline, {"selected": selected, "expected": workspace_id}
+                time.sleep(.05)
+
+        def migrate(*args, ok=True, mode="checkout"):
             # Deliberately poison inherited selectors. The script must ignore them.
             poisoned = dict(env, LUVUS_SOCKET_PATH=str(root / "never-contact.sock"),
                             LUVUS_SESSION="unrelated", LUVUS_REMOTE_HOST="offline")
             binary_args = [] if "--install" in args else ["--luvus-bin", str(binary)]
-            result = subprocess.run([str(REPO / "migrate_from_herdr.sh"), *binary_args, *args],
+            entries = {"checkout": [str(REPO / "migrate_from_herdr.sh")],
+                       "pipe": ["sh", "-s", "--"], "standalone": ["sh", str(standalone)]}
+            result = subprocess.run([*entries[mode], *binary_args, *args],
+                                    input=standalone.read_text() if mode == "pipe" else None,
                                     env=poisoned, cwd=root / "project", capture_output=True, text=True, timeout=120)
             assert (result.returncode == 0) == ok, result.stdout + result.stderr
+            assert not list((root / "local-home/cache/luvus").glob(".herdr-migration.*"))
             return result.stdout + result.stderr
 
         try:
@@ -231,6 +258,19 @@ def main():
             assert "herdr-default" not in preview
             print("PASS: local/remote dry run writes nothing and maps default directly", flush=True)
 
+            for mode in ("pipe", "standalone"):
+                preview = migrate("--dry-run", "--install", mode=mode)
+                assert "default: new" in preview and "Preview only" in preview
+            assert not (root / "install with spaces/luvus").exists()
+            assert not list((root / "local-state").rglob("session.json"))
+            assert not list((root / "remote-state").rglob("session.json"))
+            env["MIGRATE_MISSING_HELPER"] = "1"
+            assert "fixture download failed" in migrate("--install", mode="pipe", ok=False)
+            env.pop("MIGRATE_MISSING_HELPER")
+            assert not (root / "install with spaces/luvus").exists()
+            assert not (root / "installed-calls").exists()
+            print("PASS: pipe and standalone bootstrap preserve preview; failed downloads abort and clean up", flush=True)
+
             # Existing default with a live, named shell and layout. Its process,
             # terminal identity, contents and focus must survive the live import.
             cli("--session", "default", "server", "start")
@@ -239,13 +279,13 @@ def main():
             sentinel_id = sentinel["pane_id"]
             before_panes = api("pane.list", {"all_tabs": True})["panes"]
             env["MIGRATE_BAD_CHECKSUM"] = "1"
-            assert "SHA-256 mismatch" in migrate("--shells-only", "--install", ok=False)
+            assert "SHA-256 mismatch" in migrate("--shells-only", "--install", mode="pipe", ok=False)
             env.pop("MIGRATE_BAD_CHECKSUM")
             assert not (root / "install with spaces/luvus").exists()
             assert not (root / "local-state/herdr-migration.json").exists()
             assert len(owner_panes()) == len(before_panes)
             print("PASS: installer checksum failure leaves sessions untouched", flush=True)
-            output = migrate("--shells-only", "--install")
+            output = migrate("--shells-only", "--install", mode="pipe")
             assert "Remote ready:" in output, output
             assert (root / "install with spaces/luvus").read_bytes() == payload
             assert "host add " in (root / "installed-calls").read_text()
@@ -327,17 +367,17 @@ def main():
             remote = next(w for w in workspaces if w.get("host") and w["cwd"] == str(root / "project"))
             api("workspace.move", {"workspace_id": remote["workspace_id"], "to": 0})
             api("workspace.focus", {"workspace_id": remote["workspace_id"]})
+            selected_workspace(remote["workspace_id"])
             remote_before = api("terminal.backend.inventory", remote=True)["terminals"]
             converted["workspaces"][0]["cwd"] = str(root / "project" / ".." / "project")
             MIGRATE.append_to_default(str(binary), root / "local-state", converted, warnings)
-            selected = next(w for w in api("workspace.list")["workspaces"] if w["active"])
-            assert selected["workspace_id"] == remote["workspace_id"]
+            selected = selected_workspace(remote["workspace_id"])
             assert selected["tabs"] == remote["tabs"]
             assert api("workspace.get", {"workspace_id": local["workspace_id"]})["name"] == "Keep local name"
             remote_after = api("terminal.backend.inventory", remote=True)["terminals"]
             assert [(t["terminal_id"], t["root_process"]) for t in remote_after] == [(t["terminal_id"], t["root_process"]) for t in remote_before]
             migrate("--shells-only")  # completed receipts also work with a remote selection
-            assert next(w for w in api("workspace.list")["workspaces"] if w["active"])["workspace_id"] == remote["workspace_id"]
+            selected_workspace(remote["workspace_id"])
             api("workspace.focus", {"workspace_id": local["workspace_id"]})
             new_panes = [p for p in owner_panes() if p["pane"] not in original_ids]
             assert len(new_panes) == 3, new_panes

@@ -141,7 +141,14 @@ cargo build --release --locked --bin luvus
 
 ## Migrate from Herdr
 
-From this fork's checkout, run:
+Install this fork and migrate local and saved SSH sessions with one command:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shaloc/luvus/main/migrate_from_herdr.sh | sh -s -- --install
+```
+
+The entrypoint downloads its helper files automatically. From a checkout, you
+can also preview or migrate using the local files:
 
 ```sh
 ./migrate_from_herdr.sh --dry-run

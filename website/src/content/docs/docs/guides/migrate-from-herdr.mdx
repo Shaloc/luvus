@@ -3,12 +3,26 @@ title: Migrate from Herdr
 description: Restore local and SSH Herdr workspaces, tabs and shells in the Shaloc Luvus fork on macOS and Linux.
 ---
 
-Run `migrate_from_herdr.sh` from a checkout of **Shaloc/luvus**. It uses the
-adjacent `scripts/migrate_from_herdr.py` and Python 3.6 or newer.
-Every remote machine also needs Python 3.6 or newer and working
+Install **Shaloc/luvus** and migrate with one command, without cloning the repository:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shaloc/luvus/main/migrate_from_herdr.sh | sh -s -- --install
+```
+
+The entrypoint automatically downloads `install.sh` and
+`scripts/migrate_from_herdr.py` into a private directory under
+`$XDG_CACHE_HOME/luvus` or `~/.cache/luvus`, then removes those downloads when it
+exits. A standalone copy of the shell script works the same way. A repository
+checkout uses its adjacent files without downloading them.
+
+The local machine needs Python 3.6 or newer. Every remote machine also needs
+Python 3.6 or newer and working
 noninteractive SSH with a verified host key. No Python packages are required.
 
 ```sh
+# Preview without installing or changing Herdr/Luvus data.
+curl -fsSL https://raw.githubusercontent.com/Shaloc/luvus/main/migrate_from_herdr.sh | sh -s -- --dry-run
+
 # Read local and remote snapshots without changing files or starting servers.
 ./migrate_from_herdr.sh --dry-run
 
