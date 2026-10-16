@@ -83,6 +83,7 @@ jobs:
           python3 examples/uhp/terminal/consumer.py --fixtures
           python3 examples/uhp/terminal/mock_conformance.py
           python3 examples/uhp/consumer.py
+          python3 -m unittest discover -s examples/uhp -p test_consumer.py
           cargo build --locked
           python3 examples/uhp/terminal/live_conformance.py --luvus target/debug/luvus
           python3 examples/uhp/terminal/failure_conformance.py --luvus target/debug/luvus
@@ -140,6 +141,7 @@ jobs:
           python3 examples/uhp/terminal/consumer.py --fixtures
           python3 examples/uhp/terminal/mock_conformance.py
           python3 examples/uhp/consumer.py
+          python3 -m unittest discover -s examples/uhp -p test_consumer.py
           cargo build --locked
           python3 examples/uhp/terminal/live_conformance.py --luvus target/debug/luvus
           python3 examples/uhp/terminal/failure_conformance.py --luvus target/debug/luvus
@@ -253,6 +255,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "UHP terminal fixture validation failed" }
           python examples/uhp/consumer.py
           if ($LASTEXITCODE -ne 0) { throw "UHP fixture validation failed" }
+          python -m unittest discover -s examples/uhp -p test_consumer.py
+          if ($LASTEXITCODE -ne 0) { throw "UHP consumer regression failed" }
       - name: Validate named pipes and ConPTY live
         shell: pwsh
         run: |

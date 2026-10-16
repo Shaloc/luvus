@@ -37,6 +37,7 @@ pub const KEY_REFERENCE_KEYS: &[&[&str]] = &[
 
 pub struct Catalog {
     pub notify_display: &'static str,
+    pub notify_terminal_agent: &'static str,
     pub notify_toast: &'static str,
     pub notify_inbox: &'static str,
     pub notify_open: &'static str,
@@ -50,6 +51,8 @@ pub struct Catalog {
     pub remote_install_prompt: &'static str,
     pub rounded_sync_done: &'static str,
     pub rounded_sync_failed: &'static str,
+    pub terminal_notify_sync_done: &'static str,
+    pub terminal_notify_sync_failed: &'static str,
     pub theme_sync_done: &'static str,
     pub theme_sync_failed: &'static str,
     pub focused_pane_metadata: &'static str,
@@ -141,6 +144,7 @@ pub struct Catalog {
 
 pub static EN: Catalog = Catalog {
     notify_display: "Notification display",
+    notify_terminal_agent: "Terminal system alerts for agents",
     notify_toast: "Floating toast",
     notify_inbox: "Notification inbox",
     notify_open: "Open history",
@@ -153,6 +157,8 @@ pub static EN: Catalog = Catalog {
     remote_install_prompt: "Remote machine `{host}` needs Luvus installed/updated. Proceed?",
     rounded_sync_done: "Rounded corners synchronized: {hosts}",
     rounded_sync_failed: "Rounded corner sync failed: {error}",
+    terminal_notify_sync_done: "Agent terminal notification setting synchronized: {hosts}",
+    terminal_notify_sync_failed: "Agent terminal notification setting sync failed: {error}",
     theme_sync_done: "Theme synchronized: {hosts}",
     theme_sync_failed: "Theme sync failed: {error}",
     focused_pane_metadata: "Current tab / pane",
@@ -328,6 +334,7 @@ pub static EN: Catalog = Catalog {
 
 pub static ES: Catalog = Catalog {
     notify_display: "Mostrar notificaciones",
+    notify_terminal_agent: "Avisos del sistema para agentes vía terminal",
     notify_toast: "Aviso flotante",
     notify_inbox: "Bandeja de notificaciones",
     notify_open: "Abrir historial",
@@ -340,6 +347,8 @@ pub static ES: Catalog = Catalog {
     remote_install_prompt: "La máquina remota `{host}` necesita instalar/actualizar Luvus. ¿Continuar?",
     rounded_sync_done: "Esquinas redondeadas sincronizadas: {hosts}",
     rounded_sync_failed: "Error al sincronizar esquinas redondeadas: {error}",
+    terminal_notify_sync_done: "Ajuste de notificaciones de agentes en el terminal sincronizado: {hosts}",
+    terminal_notify_sync_failed: "Error al sincronizar el ajuste de notificaciones de agentes en el terminal: {error}",
     theme_sync_done: "Tema sincronizado: {hosts}",
     theme_sync_failed: "Error al sincronizar el tema: {error}",
     focused_pane_metadata: "Pestaña / panel actual",
@@ -384,6 +393,7 @@ pub static ES: Catalog = Catalog {
 
 pub static PT: Catalog = Catalog {
     notify_display: "Exibir notificações",
+    notify_terminal_agent: "Avisos do sistema para agentes via terminal",
     notify_toast: "Aviso flutuante",
     notify_inbox: "Caixa de notificações",
     notify_open: "Abrir histórico",
@@ -396,6 +406,8 @@ pub static PT: Catalog = Catalog {
     remote_install_prompt: "A máquina remota `{host}` precisa instalar/atualizar o Luvus. Continuar?",
     rounded_sync_done: "Cantos arredondados sincronizados: {hosts}",
     rounded_sync_failed: "Falha ao sincronizar cantos arredondados: {error}",
+    terminal_notify_sync_done: "Configuração de notificações de agentes pelo terminal sincronizada: {hosts}",
+    terminal_notify_sync_failed: "Falha ao sincronizar a configuração de notificações de agentes pelo terminal: {error}",
     theme_sync_done: "Tema sincronizado: {hosts}",
     theme_sync_failed: "Falha ao sincronizar o tema: {error}",
     focused_pane_metadata: "Aba / painel atual",
@@ -438,6 +450,7 @@ pub static PT: Catalog = Catalog {
 
 pub static FR: Catalog = Catalog {
     notify_display: "Affichage des notifications",
+    notify_terminal_agent: "Alertes système des agents via le terminal",
     notify_toast: "Notification flottante",
     notify_inbox: "Boîte de notifications",
     notify_open: "Ouvrir l’historique",
@@ -450,6 +463,8 @@ pub static FR: Catalog = Catalog {
     remote_install_prompt: "La machine distante `{host}` nécessite l’installation/la mise à jour de Luvus. Continuer ?",
     rounded_sync_done: "Coins arrondis synchronisés : {hosts}",
     rounded_sync_failed: "Échec de la synchronisation des coins arrondis : {error}",
+    terminal_notify_sync_done: "Réglage des notifications des agents par le terminal synchronisé : {hosts}",
+    terminal_notify_sync_failed: "Échec de la synchronisation du réglage des notifications des agents par le terminal : {error}",
     theme_sync_done: "Thème synchronisé : {hosts}",
     theme_sync_failed: "Échec de la synchronisation du thème : {error}",
     focused_pane_metadata: "Onglet / panneau actif",
@@ -492,6 +507,7 @@ pub static FR: Catalog = Catalog {
 
 pub static DE: Catalog = Catalog {
     notify_display: "Benachrichtigungsanzeige",
+    notify_terminal_agent: "Systemmeldungen für Agenten über Terminal",
     notify_toast: "Schwebender Hinweis",
     notify_inbox: "Benachrichtigungsfach",
     notify_open: "Verlauf öffnen",
@@ -504,6 +520,8 @@ pub static DE: Catalog = Catalog {
     remote_install_prompt: "Auf dem Remote-Rechner `{host}` muss Luvus installiert/aktualisiert werden. Fortfahren?",
     rounded_sync_done: "Abgerundete Ecken synchronisiert: {hosts}",
     rounded_sync_failed: "Synchronisierung abgerundeter Ecken fehlgeschlagen: {error}",
+    terminal_notify_sync_done: "Einstellung für Agenten-Benachrichtigungen über das Terminal synchronisiert: {hosts}",
+    terminal_notify_sync_failed: "Synchronisierung der Einstellung für Agenten-Benachrichtigungen über das Terminal fehlgeschlagen: {error}",
     theme_sync_done: "Design synchronisiert: {hosts}",
     theme_sync_failed: "Design-Synchronisierung fehlgeschlagen: {error}",
     focused_pane_metadata: "Aktueller Tab / Bereich",
@@ -546,6 +564,7 @@ pub static DE: Catalog = Catalog {
 
 pub static ID: Catalog = Catalog {
     notify_display: "Tampilan notifikasi",
+    notify_terminal_agent: "Notifikasi sistem agen melalui terminal",
     notify_toast: "Notifikasi mengambang",
     notify_inbox: "Kotak notifikasi",
     notify_open: "Buka riwayat",
@@ -558,6 +577,8 @@ pub static ID: Catalog = Catalog {
     remote_install_prompt: "Mesin remote `{host}` memerlukan instalasi/pembaruan Luvus. Lanjutkan?",
     rounded_sync_done: "Sudut membulat disinkronkan: {hosts}",
     rounded_sync_failed: "Sinkronisasi sudut membulat gagal: {error}",
+    terminal_notify_sync_done: "Pengaturan notifikasi agen melalui terminal disinkronkan: {hosts}",
+    terminal_notify_sync_failed: "Sinkronisasi pengaturan notifikasi agen melalui terminal gagal: {error}",
     theme_sync_done: "Tema disinkronkan: {hosts}",
     theme_sync_failed: "Sinkronisasi tema gagal: {error}",
     focused_pane_metadata: "Tab / panel aktif",
@@ -730,6 +751,7 @@ pub static ID: Catalog = Catalog {
 
 pub static ZH: Catalog = Catalog {
     notify_display: "通知显示方式",
+    notify_terminal_agent: "通过终端发送 Agent 系统通知",
     notify_toast: "浮动提示",
     notify_inbox: "通知盒",
     notify_open: "查看通知历史",
@@ -742,6 +764,8 @@ pub static ZH: Catalog = Catalog {
     remote_install_prompt: "远程机器 `{host}` 需要安装/更新 Luvus，是否执行？",
     rounded_sync_done: "圆角模式已同步：{hosts}",
     rounded_sync_failed: "圆角模式同步失败：{error}",
+    terminal_notify_sync_done: "Agent 系统通知设置已同步：{hosts}",
+    terminal_notify_sync_failed: "Agent 系统通知设置同步失败：{error}",
     theme_sync_done: "主题已同步：{hosts}",
     theme_sync_failed: "主题同步失败：{error}",
     focused_pane_metadata: "当前标签页 / 窗格",
@@ -911,6 +935,7 @@ pub static ZH: Catalog = Catalog {
 
 pub static JA: Catalog = Catalog {
     notify_display: "通知の表示方式",
+    notify_terminal_agent: "端末経由でエージェントのシステム通知",
     notify_toast: "フローティング通知",
     notify_inbox: "通知ボックス",
     notify_open: "履歴を開く",
@@ -924,6 +949,8 @@ pub static JA: Catalog = Catalog {
         "リモートマシン `{host}` に Luvus のインストール/更新が必要です。実行しますか？",
     rounded_sync_done: "角丸設定を同期しました：{hosts}",
     rounded_sync_failed: "角丸設定の同期に失敗しました：{error}",
+    terminal_notify_sync_done: "端末経由のエージェント通知設定を同期しました：{hosts}",
+    terminal_notify_sync_failed: "端末経由のエージェント通知設定の同期に失敗しました：{error}",
     theme_sync_done: "テーマを同期しました：{hosts}",
     theme_sync_failed: "テーマの同期に失敗しました：{error}",
     focused_pane_metadata: "現在のタブ / ペイン",
@@ -1101,6 +1128,7 @@ pub static JA: Catalog = Catalog {
 
 pub static KO: Catalog = Catalog {
     notify_display: "알림 표시 방식",
+    notify_terminal_agent: "터미널을 통한 에이전트 시스템 알림",
     notify_toast: "플로팅 알림",
     notify_inbox: "알림함",
     notify_open: "기록 열기",
@@ -1113,6 +1141,8 @@ pub static KO: Catalog = Catalog {
     remote_install_prompt: "원격 머신 `{host}`에 Luvus 설치/업데이트가 필요합니다. 진행할까요?",
     rounded_sync_done: "둥근 모서리 설정 동기화 완료: {hosts}",
     rounded_sync_failed: "둥근 모서리 설정 동기화 실패: {error}",
+    terminal_notify_sync_done: "터미널을 통한 에이전트 알림 설정 동기화 완료: {hosts}",
+    terminal_notify_sync_failed: "터미널을 통한 에이전트 알림 설정 동기화 실패: {error}",
     theme_sync_done: "테마 동기화 완료: {hosts}",
     theme_sync_failed: "테마 동기화 실패: {error}",
     focused_pane_metadata: "현재 탭 / 창",

@@ -689,7 +689,7 @@ pub fn run() -> Result<()> {
             );
         }
         for msg in app.pending_notify.drain(..) {
-            broadcast(&mut clients, ServerMessage::Notify(msg));
+            broadcast_desktop_notification(&mut clients, msg.message, msg.relay_to_remote);
         }
         if let Some(signal) = app.pending_sound.take() {
             broadcast(&mut clients, ServerMessage::Sound(signal));
@@ -1624,6 +1624,15 @@ fn broadcast_projection_notification(clients: &mut Clients, msg: ServerMessage) 
 
 fn broadcast(clients: &mut Clients, msg: ServerMessage) {
     clients.retain(|_, client| client.send_control(msg.clone()).is_ok());
+}
+
+fn broadcast_desktop_notification(clients: &mut Clients, message: String, relay_to_remote: bool) {
+    clients.retain(|_, client| {
+        (!relay_to_remote && (client.projection.is_some() || client.workspace_id.is_some()))
+            || client
+                .send_control(ServerMessage::Notify(message.clone()))
+                .is_ok()
+    });
 }
 
 fn latest_client(clients: &Clients) -> Option<u64> {
@@ -4453,6 +4462,28 @@ mod tests {
                 .active = false;
             fixture.input(2, ClientInput::TerminalColors(Some(light)));
             assert!(!fixture.clients[&2].surface_active());
+        }
+
+        #[test]
+        fn imported_desktop_notifications_only_reach_physical_clients() {
+            let _env = crate::persist::test_env("desktop-notification-routing");
+            let mut fixture = Fixture::new();
+            fixture.clients.get_mut(&2).unwrap().projection = Some(Default::default());
+            for rx in &fixture._client_receivers {
+                rx.try_iter().for_each(drop);
+            }
+            for relay in [false, true] {
+                super::super::broadcast_desktop_notification(
+                    &mut fixture.clients,
+                    "agent done".into(),
+                    relay,
+                );
+                assert!(matches!(
+                    fixture._client_receivers[0].try_recv().unwrap(),
+                    ServerMessage::Notify(_)
+                ));
+                assert_eq!(fixture._client_receivers[1].try_recv().is_ok(), relay);
+            }
         }
 
         #[test]

@@ -1,4 +1,4 @@
-//! Explicit local appearance changes fan out through the existing control API.
+//! Explicit local preference changes fan out through the existing control API.
 //! This is not config replication: inbound patches and config reloads never
 //! fan out, and discovery/reconnect alone never overwrites another owner.
 
@@ -20,6 +20,7 @@ enum Preference {
     Theme,
     Language,
     RoundedCorners,
+    TerminalAgentNotifications,
 }
 
 impl Preference {
@@ -28,6 +29,9 @@ impl Preference {
             Self::Theme => serde_json::json!({"theme": value}),
             Self::Language => serde_json::json!({"language": value}),
             Self::RoundedCorners => serde_json::json!({"layout": {"rounded_corners": value}}),
+            Self::TerminalAgentNotifications => {
+                serde_json::json!({"notifications": {"terminal_on_agent": value}})
+            }
         }
     }
 
@@ -36,6 +40,7 @@ impl Preference {
             Self::Theme => &app.remote_theme_sync,
             Self::Language => &app.remote_language_sync,
             Self::RoundedCorners => &app.remote_rounded_sync,
+            Self::TerminalAgentNotifications => &app.remote_terminal_notify_sync,
         }
     }
 
@@ -44,6 +49,7 @@ impl Preference {
             Self::Theme => &mut app.remote_theme_sync,
             Self::Language => &mut app.remote_language_sync,
             Self::RoundedCorners => &mut app.remote_rounded_sync,
+            Self::TerminalAgentNotifications => &mut app.remote_terminal_notify_sync,
         }
     }
 
@@ -52,6 +58,7 @@ impl Preference {
             Self::Theme => app.config.theme.clone().into(),
             Self::Language => app.config.language.clone().into(),
             Self::RoundedCorners => app.config.layout.rounded_corners.into(),
+            Self::TerminalAgentNotifications => app.config.notifications.terminal_on_agent.into(),
         }
     }
 
@@ -60,6 +67,7 @@ impl Preference {
             Self::Theme => app.theme_selection_revision,
             Self::Language => app.remote_language_sync.revision,
             Self::RoundedCorners => app.remote_rounded_sync.revision,
+            Self::TerminalAgentNotifications => app.remote_terminal_notify_sync.revision,
         }
     }
 
@@ -68,6 +76,7 @@ impl Preference {
             Self::Theme => app.catalog.settings.theme_sync_done,
             Self::Language => app.catalog.settings.language_sync_done,
             Self::RoundedCorners => app.catalog.settings.rounded_sync_done,
+            Self::TerminalAgentNotifications => app.catalog.settings.terminal_notify_sync_done,
         }
     }
 
@@ -76,6 +85,7 @@ impl Preference {
             Self::Theme => app.catalog.settings.theme_sync_failed,
             Self::Language => app.catalog.settings.language_sync_failed,
             Self::RoundedCorners => app.catalog.settings.rounded_sync_failed,
+            Self::TerminalAgentNotifications => app.catalog.settings.terminal_notify_sync_failed,
         }
     }
 }
@@ -165,6 +175,10 @@ fn sync_host_preference(
 }
 
 impl App {
+    pub(super) fn sync_terminal_agent_notifications_to_connected_hosts(&mut self) {
+        self.sync_preference_to_connected_hosts(Preference::TerminalAgentNotifications);
+    }
+
     pub(super) fn sync_rounded_corners_to_connected_hosts(&mut self) {
         self.sync_preference_to_connected_hosts(Preference::RoundedCorners);
     }
@@ -192,6 +206,7 @@ impl App {
             &mut self.remote_theme_sync,
             &mut self.remote_language_sync,
             &mut self.remote_rounded_sync,
+            &mut self.remote_terminal_notify_sync,
         ] {
             state.scopes.retain(|host, scope| {
                 if self.config.remote_hosts.contains(host) {
@@ -318,6 +333,76 @@ mod tests {
             }],
             error: error.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn terminal_notification_settings_sync_coalesces_and_inbound_patch_stays_local() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let _env = persist::test_env("terminal-notify-sync");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        app.config.remote_hosts = vec!["active".into()];
+        app.remote_host_status = vec![status("active", true, None)];
+        // Hold the queue so UI changes can be inspected without starting SSH.
+        app.remote_terminal_notify_sync.inflight = true;
+        app.open_settings();
+        app.settings.as_mut().unwrap().tab = super::super::SettingsTab::General;
+        let row = app
+            .general_rows()
+            .iter()
+            .position(|r| *r == super::super::GeneralRow::TerminalAgentNotifications)
+            .unwrap();
+        app.settings.as_mut().unwrap().cursor = row;
+        for enabled in [true, false, true] {
+            app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.config.notifications.terminal_on_agent, enabled);
+            let pending = app.remote_terminal_notify_sync.pending.as_ref().unwrap();
+            assert_eq!(pending.value, serde_json::json!(enabled));
+            assert_eq!(pending.hosts, ["active"]);
+            assert_eq!(pending.revision, app.remote_terminal_notify_sync.revision);
+        }
+        let request = app.remote_terminal_notify_sync.pending.take().unwrap();
+        assert_eq!(
+            Preference::TerminalAgentNotifications.patch(&request.value),
+            serde_json::json!({"notifications":{"terminal_on_agent":true}})
+        );
+        app.file_tree.scroll = 17;
+        let generation = app.remote_registry_generation;
+        let mut expected = serde_json::to_value(&app.config).unwrap();
+        expected["notifications"]["terminal_on_agent"] = false.into();
+        app.dispatch(
+            "config.patch",
+            &serde_json::json!({"patch":{"notifications":{"terminal_on_agent":false}}}),
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_value(&app.config).unwrap(), expected);
+        assert_eq!(app.remote_registry_generation, generation);
+        assert_eq!(app.file_tree.scroll, 17);
+        assert!(app.remote_terminal_notify_sync.pending.is_none());
+        assert_ne!(request.revision, app.remote_terminal_notify_sync.revision);
+        assert!(
+            app.pending_notify.is_empty(),
+            "sync feedback is not a system alert"
+        );
+        assert!(app
+            .dispatch(
+                "config.patch",
+                &serde_json::json!({"patch":{"notifications":{"terminal_on_agent":"true"}}})
+            )
+            .is_err());
+        assert_eq!(serde_json::to_value(&app.config).unwrap(), expected);
+        app.flush_config_for_test(&rx);
+        assert!(!crate::config::load().notifications.terminal_on_agent);
+        // File reloads and broader patches also invalidate obsolete receipts,
+        // without turning inbound configuration into a new outbound request.
+        let revision = app.remote_terminal_notify_sync.revision;
+        let mut next = app.config.clone();
+        next.remote_hosts.clear();
+        next.notifications.terminal_on_agent = true;
+        app.apply_socket_config(next, None).unwrap();
+        assert_ne!(revision, app.remote_terminal_notify_sync.revision);
+        assert!(app.remote_terminal_notify_sync.pending.is_none());
     }
 
     #[test]
@@ -496,9 +581,14 @@ mod tests {
         app.remote_theme_sync
             .scopes
             .insert("active".into(), scope.clone());
+        let notify_scope = Arc::new(ConnectionScope::default());
+        app.remote_terminal_notify_sync
+            .scopes
+            .insert("active".into(), notify_scope.clone());
         app.config.remote_hosts.clear();
         app.cancel_unselected_preference_sync();
         assert!(!scope.wait_for_retry(Duration::ZERO));
+        assert!(!notify_scope.wait_for_retry(Duration::ZERO));
         app.remote_theme_sync.inflight = false;
         app.start_pending_preference_sync(Preference::Theme);
         assert!(app.remote_theme_sync.pending.is_none());

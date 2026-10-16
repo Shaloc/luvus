@@ -142,7 +142,7 @@ pub enum ServerMessage {
     /// Only the cells that changed since the last frame (docs/18 — the wire-level
     /// diff that keeps remote attach over SSH cheap; also cuts local serialization).
     FrameDiff(FrameDiff),
-    /// Ring the bell + raise a desktop notification on the client's terminal.
+    /// Raise a desktop notification on the client's terminal, without a bell.
     Notify(String),
     /// Play the selected notification cue on the client.
     Sound(SoundSignal),

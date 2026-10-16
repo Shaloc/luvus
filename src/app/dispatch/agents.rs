@@ -507,6 +507,7 @@ impl App {
                     "sequence must increase for this authority".to_string(),
                 ));
             }
+            let previous_state = self.status.get(&id).ok_or_else(not_found)?.state;
             let (changed, cwd, project, branch) = {
                 let status = self.status.get_mut(&id).ok_or_else(not_found)?;
                 let changed = status.state != state || status.agent != agent;
@@ -561,6 +562,20 @@ impl App {
             log_agent_authority(id, agent, crate::logging::Outcome::Ok);
             self.reconcile_durable_active_targets(Some(id));
             if changed {
+                if previous_state == State::Working && matches!(state, State::Done | State::Idle) {
+                    self.queue_agent_terminal_notification(id, agent, State::Done);
+                } else if state == State::Blocked
+                    && self.config.notifications.terminal_on_agent
+                    && self
+                        .status
+                        .get(&id)
+                        .is_some_and(|status| status.notify_armed)
+                {
+                    self.queue_agent_terminal_notification(id, agent, State::Blocked);
+                    if let Some(status) = self.status.get_mut(&id) {
+                        status.notify_armed = false;
+                    }
+                }
                 self.emit_event(
                     "pane.agent_status_changed",
                     json!({"pane":id.0.to_string(), "status":state_str(state), "agent":agent, "cwd":cwd, "project":project, "branch":branch, "authority":"integration_report"}),

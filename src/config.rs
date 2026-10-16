@@ -553,6 +553,10 @@ pub struct NotifyConfig {
     /// Ordinary UI feedback: legacy floating toast or a quiet bottom-bar inbox.
     #[serde(default)]
     pub display: NotificationDisplay,
+    /// Ask the attached terminal to show agent completion/attention alerts.
+    /// Explicit Settings changes sync to connected owners; ordinary UI feedback is excluded.
+    #[serde(default)]
+    pub terminal_on_agent: bool,
     /// The synthesized cue family used by both notification events.
     #[serde(default = "default_sound_style")]
     pub sound_style: String,
@@ -568,6 +572,7 @@ impl Default for NotifyConfig {
     fn default() -> Self {
         Self {
             display: NotificationDisplay::default(),
+            terminal_on_agent: false,
             sound_style: default_sound_style(),
             sound_on_done: false,
             sound_on_blocked: false,
@@ -1221,11 +1226,13 @@ mod tests {
 
         // Sounds are optional and must default to off.
         assert!(!c.notifications.sound_on_done);
+        assert!(!c.notifications.terminal_on_agent);
         assert!(!c.notifications.sound_on_blocked);
         assert_eq!(c.notifications.sound_style, crate::sound::STYLE_RETRO);
         let c2 = Config {
             theme: "mono".into(),
             notifications: NotifyConfig {
+                terminal_on_agent: true,
                 sound_on_done: true,
                 ..Default::default()
             },
@@ -1235,6 +1242,7 @@ mod tests {
         let back: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(back.theme, "mono");
         assert!(back.notifications.sound_on_done);
+        assert!(back.notifications.terminal_on_agent);
         assert!(!back.notifications.sound_on_blocked);
         assert_eq!(back.notifications.sound_style, crate::sound::STYLE_RETRO);
         // Nested clients are opt-in and survive serialization.
@@ -1253,6 +1261,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.notifications.sound_style, crate::sound::STYLE_RETRO);
+        assert!(!old.notifications.terminal_on_agent);
     }
 
     #[test]

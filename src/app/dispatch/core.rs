@@ -270,6 +270,15 @@ impl App {
                                     !layout.is_empty()
                                         && layout.keys().all(|k| k == "rounded_corners")
                                 })
+                            || key == "notifications"
+                                && patch["notifications"]
+                                    .as_object()
+                                    .is_some_and(|notifications| {
+                                        !notifications.is_empty()
+                                            && notifications
+                                                .keys()
+                                                .all(|k| k == "terminal_on_agent")
+                                    })
                     })
             })
         {
@@ -284,6 +293,11 @@ impl App {
             }
             if patch.get("layout").is_some() {
                 self.apply_rounded_corners_locally(next.layout.rounded_corners);
+            }
+            if patch.get("notifications").is_some() {
+                self.apply_terminal_agent_notifications_locally(
+                    next.notifications.terminal_on_agent,
+                );
             }
             self.emit_event("config.changed", json!({}));
             return Ok(());
@@ -319,6 +333,10 @@ impl App {
             self.config.session.persist_pane_screen && !next.session.persist_pane_screen;
         if self.config.layout.rounded_corners != next.layout.rounded_corners {
             self.remote_rounded_sync.revision = self.remote_rounded_sync.revision.wrapping_add(1);
+        }
+        if self.config.notifications.terminal_on_agent != next.notifications.terminal_on_agent {
+            self.remote_terminal_notify_sync.revision =
+                self.remote_terminal_notify_sync.revision.wrapping_add(1);
         }
         self.config = next;
         if discard_pane_screens {

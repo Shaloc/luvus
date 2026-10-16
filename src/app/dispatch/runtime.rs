@@ -981,15 +981,25 @@ impl App {
             // *Done*: one chime per real finish of a working stretch — the
             // debounce already absorbs mid-turn pauses, and it rings whether or
             // not the pane is focused (that's the point: you looked away).
-            if sound_done && is_agent_pane && finished.contains(&id) {
-                self.queue_sound(crate::sound::SoundCue::Done);
+            if is_agent_pane && finished.contains(&id) {
+                if sound_done {
+                    self.queue_sound(crate::sound::SoundCue::Done);
+                }
+                self.queue_agent_terminal_notification(id, &agent, State::Done);
             }
             // *Blocked*: a distinct attention cue, armed per pane — a prompt that
             // flaps while you ignore it rings once, and focusing the pane
             // re-arms it for the next prompt.
             let armed = self.status.get(&id).is_some_and(|s| s.notify_armed);
-            if sound_blocked && is_agent_pane && st == State::Blocked && armed {
-                self.queue_sound(crate::sound::SoundCue::Blocked);
+            if (sound_blocked || self.config.notifications.terminal_on_agent)
+                && is_agent_pane
+                && st == State::Blocked
+                && armed
+            {
+                if sound_blocked {
+                    self.queue_sound(crate::sound::SoundCue::Blocked);
+                }
+                self.queue_agent_terminal_notification(id, &agent, State::Blocked);
                 if let Some(s) = self.status.get_mut(&id) {
                     s.notify_armed = false;
                 }

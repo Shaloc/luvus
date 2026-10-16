@@ -2134,7 +2134,7 @@ mod tests {
         assert!(
             app.pending_notify
                 .iter()
-                .any(|m| m.contains("PR #42 checks failed")),
+                .any(|m| m.message.contains("PR #42 checks failed")),
             "alert on transition to red: {:?}",
             app.pending_notify
         );

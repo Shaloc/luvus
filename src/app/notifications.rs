@@ -4,6 +4,14 @@ use super::App;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
+#[derive(Debug)]
+pub(crate) struct DesktopNotification {
+    pub message: String,
+    /// Imported notifications go only to physical clients, never back to
+    /// registered owners. This stops loops when two hosts register each other.
+    pub relay_to_remote: bool,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct InboxUi {
     pub open: bool,
@@ -33,7 +41,35 @@ impl App {
     pub(crate) fn queue_desktop_notification(&mut self, message: String) {
         self.bar
             .record_notification(&message, None, crate::bar::NotificationLevel::Info);
-        self.pending_notify.push(message);
+        self.pending_notify.push(DesktopNotification {
+            message,
+            relay_to_remote: true,
+        });
+    }
+    pub(crate) fn queue_agent_terminal_notification(
+        &mut self,
+        pane: crate::ids::PaneId,
+        agent: &str,
+        state: crate::ui::theme::State,
+    ) {
+        if !self.config.notifications.terminal_on_agent {
+            return;
+        }
+        let Some((workspace, _)) = self.pane_location(pane) else {
+            return;
+        };
+        let title = self.agent_session_title(pane).unwrap_or_default();
+        self.queue_desktop_notification(format!(
+            "Luvus · {} · p{} · {agent} {}{}",
+            self.workspaces[workspace].name,
+            pane.0,
+            state.label(),
+            if title.is_empty() {
+                String::new()
+            } else {
+                format!(" · {title}")
+            },
+        ));
     }
     pub(crate) fn notifications_in_inbox(&self) -> bool {
         self.config.notifications.display == crate::config::NotificationDisplay::Inbox
@@ -175,6 +211,96 @@ mod tests {
     use crate::event::AppEvent;
     use crossterm::event::KeyModifiers;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn terminal_agent_notifications_follow_reports_and_exclude_ui_feedback() {
+        let _env = crate::persist::test_env("terminal-agent-notifications");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let pane = app.layout().focus;
+        let report = |app: &mut App, state| {
+            app.dispatch(
+                "agent.report",
+                &serde_json::json!({
+                    "pane":pane.0, "source":"test/notify", "agent":"codex", "status":state
+                }),
+            )
+            .unwrap();
+        };
+        report(&mut app, "working");
+        report(&mut app, "done");
+        assert!(app.pending_notify.is_empty(), "off by default");
+        app.config.notifications.terminal_on_agent = true;
+        app.show_toast("Copied to clipboard");
+        app.show_toast("https://example.invalid/link");
+        assert!(
+            app.pending_notify.is_empty(),
+            "ordinary feedback never becomes a system alert"
+        );
+        report(&mut app, "working");
+        assert!(app.pending_notify.is_empty());
+        report(&mut app, "idle");
+        assert_eq!(app.pending_notify.len(), 1);
+        assert!(app.pending_notify[0]
+            .message
+            .contains(&format!("p{} · codex done", pane.0)));
+        assert!(app.pending_notify[0].relay_to_remote);
+        assert!(
+            app.pending_sound.is_none(),
+            "independent from sound settings"
+        );
+        app.pending_notify.clear();
+        report(&mut app, "idle");
+        assert!(
+            app.pending_notify.is_empty(),
+            "repeated reports do not notify twice"
+        );
+        report(&mut app, "blocked");
+        assert_eq!(app.pending_notify.len(), 1);
+        assert!(app.pending_notify[0].message.contains("codex blocked"));
+        app.pending_notify.clear();
+        report(&mut app, "working");
+        report(&mut app, "blocked");
+        assert!(
+            app.pending_notify.is_empty(),
+            "ignored prompt stays disarmed"
+        );
+        app.acknowledge_agent_view(pane);
+        report(&mut app, "working");
+        report(&mut app, "blocked");
+        assert_eq!(
+            app.pending_notify.len(),
+            1,
+            "viewing the pane rearms attention alerts"
+        );
+    }
+
+    #[test]
+    fn terminal_agent_notifications_follow_detection_but_ignore_shells() {
+        let _env = crate::persist::test_env("terminal-agent-detection");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.config.notifications.terminal_on_agent = true;
+        let pane = app.layout().focus;
+        let base = Instant::now() + Duration::from_millis(200);
+        for is_agent in [false, true] {
+            let now = base + Duration::from_secs(u64::from(is_agent));
+            let mut status = super::super::PaneStatus::new("sh".into());
+            status.state = crate::ui::theme::State::Working;
+            status.candidate = crate::ui::theme::State::Idle;
+            status.candidate_since = now - Duration::from_secs(5);
+            status.last_activity = now - Duration::from_secs(5);
+            if is_agent {
+                status.agent_session = Some(super::super::AgentSession {
+                    agent: "claude".into(),
+                    session_id: "fixture".into(),
+                });
+            }
+            app.status.insert(pane, status);
+            app.detect_tick(now);
+            assert_eq!(app.pending_notify.len(), usize::from(is_agent));
+        }
+    }
 
     #[test]
     fn none_theme_keeps_terminal_defaults_after_light_and_dark_probes() {

@@ -1984,7 +1984,8 @@ mod tests {
         assert!(app
             .pending_notify
             .iter()
-            .any(|message| message == &format!("Automation {} failed to start", definition.id)));
+            .any(|message| message.message
+                == format!("Automation {} failed to start", definition.id)));
     }
 
     #[test]

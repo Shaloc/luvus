@@ -47,3 +47,6 @@
 {"id":"session-report-invalid-2","method":"pane.report_session","params":{"agent":"codex","session_id":"session-123","dry_run":true}}
 {"id":"session-report-invalid-3","method":"pane.report_session","params":{"agent":"codex","session_id":"session-123","evidence":{"cwd":"/srv/app","prompt":"review this change","extra":true}}}
 {"id":"session-report-invalid-4","method":"pane.report_session","params":{"agent":"codex","session_id":"session-123","reporter_pid":0}}
+{"id":"transpose-extra","method":"pane.transpose","params":{"pane":"7","all":true}}
+{"id":"transpose-bool","method":"pane.transpose","params":{"pane":true}}
+{"id":"transpose-out-of-range-pane","method":"pane.transpose","params":{"pane":"4294967296"}}

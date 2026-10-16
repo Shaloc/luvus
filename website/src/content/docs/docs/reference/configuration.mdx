@@ -55,6 +55,7 @@ cleanly across versions because unknown fields get defaults.
 | `layout.diff_live_refresh` | refresh visible diff views when the shared FILES status scan changes |
 | `notifications.display` | `toast` (default) keeps floating feedback; `inbox` shows a bottom-bar message preview that opens a floating history panel. Clearing an open panel keeps its bottom-bar entry and position until you close it. Select **Settings → General → Notification display**. **Notification inbox → Open history** also opens history when sidebars are hidden. |
 | `notifications.sound_style` | notification cue family: `retro` (default), `soft`, or `pulse` |
+| `notifications.terminal_on_agent` | send agent completion and attention alerts to the attached terminal's system notifications; defaults to `false`. Select **Settings → General → Terminal system alerts for agents**. Changing it locally also updates running sessions on connected, selected remote hosts. |
 | `notifications.sound_on_done` | play the selected done cue after an agent finishes; defaults to `false` |
 | `notifications.sound_on_blocked` | play the selected blocked cue when an agent needs attention; defaults to `false` |
 | `agents_active_only` | show only live agents in the AGENTS dock when `true`; defaults to `false`, which also shows resumable sessions |
@@ -109,3 +110,38 @@ are suppressed for these projections to avoid duplication. Upgrade both owner
 and display for this behavior. Older owners retain their rendered toast behavior;
 legacy desktop notifications can still be collected. Remote entries are not
 forwarded to another hop, and history is not replayed after reconnect.
+
+### Terminal system notifications
+
+Enable **Terminal system alerts for agents** to receive a system notification
+when an agent finishes a working stretch or needs input. This also works for
+agents using integration reports. Repeated identical states do not notify again;
+ignored attention prompts stay disarmed until you view the pane. The option is
+independent of the sound toggles and does not turn clipboard, link, theme, or
+other ordinary UI feedback into system notifications.
+
+Turning this setting on or off in local Settings also updates every running
+session on the connected hosts selected in **Settings → Remote**. This works
+while viewing a merged remote workspace too. The change is saved on each owner;
+stopped sessions are not started, and disconnected or unselected hosts are not
+updated. Later discovery or reconnect does not overwrite a host's preference.
+Sync feedback remains an ordinary UI notification.
+
+To configure just one owner, use its control API. Direct `config.patch` calls
+and configuration reloads remain local to that owner and never fan out:
+
+```sh
+luvus --host dev --session default uhp proxy <<'JSON'
+{"id":"notify","method":"config.patch","params":{"patch":{"notifications":{"terminal_on_agent":true}}}}
+JSON
+```
+
+Direct SSH attachments and registered-host projections deliver alerts to the
+physical client's terminal, with `host / session` context for projections.
+Only the elected connection forwards a remote owner's alert; disconnected
+generations and repeated forwarding through other hosts are excluded.
+No notification program runs on the remote host. Luvus uses the existing OSC 9
+terminal escape, supported by [Kitty](https://sw.kovidgoyal.net/kitty/desktop-notifications/)
+and [iTerm2](https://iterm2.com/documentation-escape-codes.html), without a terminal
+bell. The terminal must support notifications and have system permission to
+display them. This option does not grant browser notification permission.

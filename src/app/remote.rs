@@ -279,7 +279,11 @@ pub enum RemoteEffect {
         text: String,
         level: crate::bar::NotificationLevel,
     },
-    Notify(String),
+    Notify {
+        pane: PaneId,
+        generation: u64,
+        message: String,
+    },
     Sound(crate::sound::SoundSignal),
     Clipboard(String),
     ScopedClipboard {
@@ -1711,21 +1715,7 @@ impl App {
             } => {
                 // Session-wide feedback does not depend on the selected workspace.
                 // It still belongs to an exact live owner connection lifetime.
-                let target = self
-                    .remote_session_displays
-                    .values()
-                    .find(|link| {
-                        link.id == pane && link.generation == generation && link.input.is_some()
-                    })
-                    .map(|link| (link.target.host.clone(), link.target.session.clone()))
-                    .or_else(|| match self.views.get(&pane) {
-                        Some(ViewKind::Remote(view))
-                            if view.generation == generation && view.input.is_some() =>
-                        {
-                            Some((view.target.host.clone(), view.target.session.clone()))
-                        }
-                        _ => None,
-                    });
+                let target = self.remote_notification_source(pane, generation);
                 if let Some((host, session)) = target {
                     let source = format!("{host} / {session}");
                     // Do not re-export a remote notice: chains of registered hosts
@@ -1747,7 +1737,19 @@ impl App {
                     }
                 }
             }
-            RemoteEffect::Notify(message) => self.pending_notify.push(message),
+            RemoteEffect::Notify {
+                pane,
+                generation,
+                message,
+            } => {
+                if let Some((host, session)) = self.remote_notification_source(pane, generation) {
+                    self.pending_notify
+                        .push(super::notifications::DesktopNotification {
+                            message: format!("{host} / {session}: {message}"),
+                            relay_to_remote: false,
+                        });
+                }
+            }
             RemoteEffect::Sound(signal) => self.pending_sound = Some(signal),
             RemoteEffect::Clipboard(text) => self.pending_clipboard = Some(text),
             RemoteEffect::ScopedClipboard {
@@ -2079,6 +2081,26 @@ impl App {
                 _ => None,
             })
             .is_some_and(|input| input.send(message).is_ok())
+    }
+
+    /// Resolve a notification only while its exact owner connection is live.
+    fn remote_notification_source(
+        &self,
+        pane: PaneId,
+        generation: u64,
+    ) -> Option<(String, String)> {
+        self.remote_session_displays
+            .values()
+            .find(|link| link.id == pane && link.generation == generation && link.input.is_some())
+            .map(|link| (link.target.host.clone(), link.target.session.clone()))
+            .or_else(|| match self.views.get(&pane) {
+                Some(ViewKind::Remote(view))
+                    if view.generation == generation && view.input.is_some() =>
+                {
+                    Some((view.target.host.clone(), view.target.session.clone()))
+                }
+                _ => None,
+            })
     }
 
     /// Map an outer menu's click into the selected owner's display viewport.
@@ -3100,7 +3122,11 @@ fn run_projection(
                 Ok(ServerMessage::Notify(message)) => {
                     if effect_leader.load(Ordering::Acquire) {
                         let _ = app_tx.send(AppEvent::RemoteEffect {
-                            effect: RemoteEffect::Notify(message.clone()),
+                            effect: RemoteEffect::Notify {
+                                pane,
+                                generation,
+                                message: message.clone(),
+                            },
                         });
                         if !display.notifications {
                             let _ = app_tx.send(AppEvent::RemoteEffect {
@@ -4020,6 +4046,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn remote_desktop_notification_requires_live_generation_and_does_not_relay() {
+        let _env = crate::persist::test_env("remote-desktop-notification");
+        let mut app = remote_ui_app();
+        let (source, _input) = navigation_projection(&mut app, "dev-207", "api", "source");
+        for generation in [0, 1, 2] {
+            app.handle_event(AppEvent::RemoteEffect {
+                effect: RemoteEffect::Notify {
+                    pane: source,
+                    generation,
+                    message: "codex done".into(),
+                },
+            });
+        }
+        assert_eq!(app.pending_notify.len(), 1);
+        let notification = app.pending_notify.pop().unwrap();
+        assert_eq!(notification.message, "dev-207 / api: codex done");
+        assert!(!notification.relay_to_remote);
+        let Some(ViewKind::Remote(view)) = app.views.get_mut(&source) else {
+            unreachable!()
+        };
+        view.input = None;
+        app.handle_event(AppEvent::RemoteEffect {
+            effect: RemoteEffect::Notify {
+                pane: source,
+                generation: 1,
+                message: "late".into(),
+            },
+        });
+        assert!(app.pending_notify.is_empty());
+    }
+
+    #[test]
     fn remote_navigation_pending_is_discarded_on_source_leave_generation_change_or_disconnect() {
         let _env = crate::persist::test_env("remote-navigation-source-lifetime");
         let mut app = remote_ui_app();
@@ -4030,7 +4088,11 @@ pub(crate) mod tests {
             .is_some());
         app.active_ws = 0;
         app.handle_event(AppEvent::RemoteEffect {
-            effect: RemoteEffect::Notify("fixture".into()),
+            effect: RemoteEffect::Notify {
+                pane: source,
+                generation: 1,
+                message: "fixture".into(),
+            },
         });
         assert!(app.pending_remote_navigation.is_none());
 

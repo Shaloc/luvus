@@ -701,6 +701,24 @@ def valid_global_request(value, methods):
         return integer(after) and after >= 0
     if value["method"] == "pane.report_session":
         return valid_session_report_params(value["params"])
+    if value["method"] == "pane.transpose":
+        params = value["params"]
+        target = params.get("pane")
+        revision = params.get("if_revision", 0)
+        valid_target = target is None or (
+            type(target) is int and 0 <= target <= 4294967295
+        )
+        if isinstance(target, str) and target.isascii() and target.isdigit():
+            digits = target.lstrip("0") or "0"
+            valid_target = len(digits) < 10 or (
+                len(digits) == 10 and digits <= "4294967295"
+            )
+        return (
+            set(params) <= {"pane", "if_revision"}
+            and valid_target
+            and integer(revision)
+            and revision >= 0
+        )
     if value["method"] == "pane.list":
         params = value["params"]
         return set(params) <= {"all_tabs"} and (

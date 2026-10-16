@@ -141,6 +141,7 @@ pub enum GeneralRow {
     AgentTitleFirst,
     NotificationDisplay,
     NotificationInbox,
+    TerminalAgentNotifications,
     SoundStyle,
     SoundDone,
     SoundBlocked,
@@ -178,6 +179,7 @@ impl App {
             GeneralRow::AgentTitleFirst,
             GeneralRow::NotificationDisplay,
             GeneralRow::NotificationInbox,
+            GeneralRow::TerminalAgentNotifications,
             GeneralRow::SoundStyle,
             GeneralRow::SoundDone,
             GeneralRow::SoundBlocked,
@@ -1357,6 +1359,15 @@ impl App {
         self.persist_config_patch(&serde_json::json!({"layout": {"rounded_corners": rounded}}));
     }
 
+    pub(in crate::app) fn apply_terminal_agent_notifications_locally(&mut self, enabled: bool) {
+        self.config.notifications.terminal_on_agent = enabled;
+        self.remote_terminal_notify_sync.revision =
+            self.remote_terminal_notify_sync.revision.wrapping_add(1);
+        self.persist_config_patch(
+            &serde_json::json!({"notifications": {"terminal_on_agent": enabled}}),
+        );
+    }
+
     /// Layout tab ‹ ›/click on a row's control (docs/29). Width sliders step by
     /// `delta`; toggles flip; a `Dock` row's `[Left]`/`[Right]` buttons (which map
     /// to `delta < 0` / `delta > 0`) place the dock on that side.
@@ -1756,6 +1767,12 @@ impl App {
                 self.persist_config();
             }
             Some(GeneralRow::NotificationInbox) => {}
+            Some(GeneralRow::TerminalAgentNotifications) => {
+                self.apply_terminal_agent_notifications_locally(
+                    !self.config.notifications.terminal_on_agent,
+                );
+                self.sync_terminal_agent_notifications_to_connected_hosts();
+            }
             Some(GeneralRow::SoundStyle) => self.cycle_sound_style(delta),
             Some(GeneralRow::SoundDone) => {
                 self.config.notifications.sound_on_done = !self.config.notifications.sound_on_done;
@@ -2722,15 +2739,24 @@ mod tests {
     #[test]
     fn general_tab_toggles_sounds_and_tests_the_chime() {
         let _env = crate::persist::test_env("general-tab");
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, rx) = std::sync::mpsc::channel();
         let mut app = crate::app::App::new(80, 24, tx).unwrap();
         app.open_settings();
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 19);
+        assert_eq!(app.settings_rows(SettingsTab::General), 20);
         let rows = app.general_rows();
         assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
+        let terminal = rows
+            .iter()
+            .position(|r| *r == GeneralRow::TerminalAgentNotifications)
+            .unwrap();
+        assert!(!app.config.notifications.terminal_on_agent);
+        app.settings_activate(terminal);
+        assert!(app.config.notifications.terminal_on_agent);
+        app.flush_config_for_test(&rx);
+        assert!(crate::config::load().notifications.terminal_on_agent);
         assert_eq!(
             rows[1],
             GeneralRow::FileClick,

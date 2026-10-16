@@ -49,6 +49,35 @@ fn diff_color_label(value: crate::diff::DiffColorMode, app: &App) -> &'static st
     }
 }
 
+/// Keep two padding cells for the selected pill, including truncated mobile
+/// labels. The surrounding grid rectangle remains the full mouse target.
+fn draw_tab(f: &mut RenderTarget, rect: Rect, label: &str, selected: bool, t: &Theme) {
+    let label = if rect.width >= 2 {
+        format!(
+            " {} ",
+            truncate(label, rect.width.saturating_sub(2) as usize)
+        )
+    } else {
+        truncate(label, rect.width as usize)
+    };
+    let width = display_width(&label) as u16;
+    let label_rect = Rect::new(
+        rect.x + rect.width.saturating_sub(width) / 2,
+        rect.y,
+        width,
+        1,
+    );
+    let style = if selected {
+        Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
+    } else {
+        Style::new().fg(t.subtext0)
+    };
+    f.render_widget(Paragraph::new(Span::styled(label, style)), label_rect);
+    if selected {
+        f.pill_caps(label_rect, t.accent, t.surface0);
+    }
+}
+
 pub(super) fn key_reference_label(section: usize, row: usize, app: &App) -> String {
     let cat = app.catalog.settings;
     match (section, row) {
@@ -192,15 +221,7 @@ pub(super) fn draw_settings(
     if inner.height < 9 {
         if inner.height > 2 && inner.width > 0 {
             let rect = Rect::new(inner.x, inner.y + 2, inner.width, 1);
-            let label = format!(" {} ", tab.label(app.catalog));
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    truncate(&label, rect.width as usize),
-                    Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold(),
-                ))
-                .alignment(Alignment::Center),
-                rect,
-            );
+            draw_tab(f, rect, tab.label(app.catalog), true, t);
             tabs.push((tab, rect));
         }
         return SettingsHits {
@@ -234,17 +255,7 @@ pub(super) fn draw_settings(
                 cell_width,
                 1,
             );
-            let style = if st == tab {
-                Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
-            } else {
-                Style::new().fg(t.subtext0)
-            };
-            let label = format!(" {} ", st.label(app.catalog));
-            f.render_widget(
-                Paragraph::new(Span::styled(truncate(&label, cell_width as usize), style))
-                    .alignment(Alignment::Center),
-                rect,
-            );
+            draw_tab(f, rect, st.label(app.catalog), st == tab, t);
             tabs.push((st, rect));
         }
     } else {
@@ -271,18 +282,12 @@ pub(super) fn draw_settings(
                 );
                 x = x.saturating_add(separator_width);
             }
-            let label = format!(" {} ", st.label(app.catalog));
-            let cw = display_width(&label) as u16;
+            let cw = display_width(st.label(app.catalog)) as u16 + 2;
             if x + cw > inner.right() {
                 break;
             }
-            let style = if st == tab {
-                Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
-            } else {
-                Style::new().fg(t.subtext0)
-            };
             let rect = Rect::new(x, ty, cw, 1);
-            f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
+            draw_tab(f, rect, st.label(app.catalog), st == tab, t);
             tabs.push((st, rect));
             x = x.saturating_add(cw);
         }
@@ -1214,6 +1219,16 @@ fn draw_content(
                         );
                         ctls.push((i, r));
                     }
+                    GeneralRow::TerminalAgentNotifications => ctls.push(ctl_row(
+                        f,
+                        area,
+                        y,
+                        i,
+                        cursor,
+                        cat.settings.notify_terminal_agent,
+                        toggle(n.terminal_on_agent, t),
+                        t,
+                    )),
                     GeneralRow::SoundDone => ctls.push(ctl_row(
                         f,
                         area,
@@ -2082,6 +2097,64 @@ mod tests {
             let separator_x = pair[0].1.right();
             assert_eq!(pair[1].1.x.saturating_sub(separator_x), 3);
             assert_eq!(wide_buffer[(separator_x + 1, pair[0].1.y)].symbol(), "·");
+        }
+    }
+
+    #[test]
+    fn rounded_settings_tabs_keep_labels_and_mouse_targets_on_desktop_and_mobile() {
+        use crate::app::SettingsTab;
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let _env = crate::persist::test_env("settings-rounded-tabs");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = crate::app::App::new(100, 30, tx).unwrap();
+        app.open_settings();
+        for language in ["en", "zh"] {
+            app.catalog = crate::i18n::by_code(language);
+            for (width, height) in [(100, 30), (80, 30), (40, 35), (24, 35), (24, 6)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                app.config.layout.rounded_corners = false;
+                app.settings.as_mut().unwrap().tab = SettingsTab::General;
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &mut app))
+                    .unwrap();
+                let plain_hits = app.settings_tab_rects.clone();
+                app.config.layout.rounded_corners = true;
+                for (tab, hit) in &plain_hits {
+                    app.handle_settings_click(hit.right() - 1, hit.y);
+                    assert_eq!(app.settings.as_ref().unwrap().tab, *tab);
+                    terminal
+                        .draw(|frame| crate::ui::render(frame, &mut app))
+                        .unwrap();
+                    assert_eq!(app.settings_tab_rects, plain_hits);
+                    let buffer = terminal.backend().buffer();
+                    let caps: Vec<_> = (hit.x..hit.right())
+                        .filter(|x| matches!(buffer[(*x, hit.y)].symbol(), "◖" | "◗"))
+                        .collect();
+                    assert_eq!(caps.len(), 2, "{language} {width}x{height} {tab:?}");
+                    assert_eq!(buffer[(caps[0], hit.y)].symbol(), "◖");
+                    assert_eq!(buffer[(caps[1], hit.y)].symbol(), "◗");
+                    for x in &caps {
+                        assert_eq!(buffer[(*x, hit.y)].fg, app.theme.accent);
+                        assert_eq!(buffer[(*x, hit.y)].bg, app.theme.surface0);
+                    }
+                    // Both ASCII and CJK labels keep their first character;
+                    // the cap must replace padding, never the label itself.
+                    assert_eq!(
+                        buffer[(caps[0] + 1, hit.y)].symbol(),
+                        tab.label(app.catalog).chars().next().unwrap().to_string()
+                    );
+                    let mut x = caps[0] + 1;
+                    while x < caps[1] {
+                        assert_eq!(buffer[(x, hit.y)].bg, app.theme.accent);
+                        // The test backend skips CJK continuation cells; their
+                        // visible color is supplied by the wide glyph's head.
+                        x += display_width(buffer[(x, hit.y)].symbol()).max(1) as u16;
+                    }
+                    app.handle_settings_click(caps[0], hit.y);
+                    assert_eq!(app.settings.as_ref().unwrap().tab, *tab);
+                }
+            }
         }
     }
 

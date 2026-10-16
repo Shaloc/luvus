@@ -59,3 +59,5 @@
 {"id":"session-report-valid-0","method":"pane.report_session","params":{"agent":"codex","session_id":"session-123","pane":"7","reporter_pid":101}}
 {"id":"session-report-valid-1","method":"pane.report_session","params":{"agent":"codex","session_id":"session-123","evidence":{"cwd":"/srv/app","prompt":"review this change"},"dry_run":true}}
 {"id":"session-report-numeric-pane","method":"pane.report_session","params":{"agent":"codex","session_id":"session-123","pane":7,"reporter_pid":101}}
+{"id":"transpose-pane","method":"pane.transpose","params":{"pane":"7","if_revision":41}}
+{"id":"transpose-current","method":"pane.transpose","params":{}}

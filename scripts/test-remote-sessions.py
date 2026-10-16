@@ -15,6 +15,8 @@ Use --agent-seen-only for native Done acknowledgement after remote owner restart
 Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
 Use --colors-only for child color queries and composed local/remote backgrounds (requires pyte).
+Use --terminal-notify-only for agent-only terminal system alerts from local and remote owners.
+Use --transpose-only for owner-routed menu, shortcut and CLI split transposition (requires pyte).
 Use --file-links-only for wrapped file references and owner-routed Ctrl-clicks (requires pyte).
 Use --appearance-only for pane mouse controls, None theme, notifications and host diagnostics (requires pyte).
 Use --workspace-close-only for owner-routed workspace close and restart persistence (requires pyte).
@@ -235,9 +237,11 @@ def main():
     theme_sync_only = "--theme-sync-only" in sys.argv[1:]
     colors_only = "--colors-only" in sys.argv[1:]
     appearance_only = "--appearance-only" in sys.argv[1:]
+    terminal_notify_only = "--terminal-notify-only" in sys.argv[1:]
+    transpose_only = "--transpose-only" in sys.argv[1:]
     file_links_only = "--file-links-only" in sys.argv[1:]
     workspace_close_only = "--workspace-close-only" in sys.argv[1:]
-    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only:
+    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or transpose_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -247,7 +251,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -380,9 +384,11 @@ def main():
             raise
         print("PASS:", label, flush=True)
 
-    def wait_for(check, timeout=10):
+    def wait_for(check, timeout=10, *, pump=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
+            if pump is not None:
+                pump()
             value = check()
             if value:
                 return value
@@ -693,7 +699,7 @@ def main():
             if colors_only:
                 color_output.clear()
                 color_output.extend(screen)
-            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only:
+            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or transpose_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -773,6 +779,138 @@ def main():
 
             wait_for(exited)
             assert process.returncode == 0, process.returncode
+
+        if terminal_notify_only:
+            for mode in ("local", "direct-remote", "merge"):
+                remote = mode != "local"
+                run("session", "merge", "on" if mode == "merge" else "off")
+                session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
+                project = root / ("notify-" + mode)
+                project.mkdir()
+                api("workspace.open", {"path": str(project)}, remote=remote)
+                pane = api("pane.current", remote=remote)["pane"]
+                # Direct config patches stay owner-local. Unlike a Settings
+                # click, enabling the owner here must not fan out to the display.
+                for owner_remote in (False, True):
+                    api("config.patch", {"patch": {"notifications": {"terminal_on_agent": False}}}, remote=owner_remote)
+                argv = (["session", "attach", session] if mode == "direct-remote"
+                        else ["--session", "api"])
+                process, master = start_client(argv)
+                if remote:
+                    projection = wait_for(lambda: next((w for w in presentation_api(
+                        "workspace.list", session=session)["workspaces"]
+                        if w.get("host") == "fake-dev" and w["cwd"] == str(project)), None))
+                    presentation_api("workspace.focus", {"workspace_id": projection["workspace_id"]}, session=session)
+                drain(master)
+                output = bytearray()
+                def notices(duration=.15):
+                    output.extend(drain(master, duration))
+                    (root / ("notify-" + mode + ".ansi")).write_bytes(output)
+                    return re.findall(rb"\x1b\]9;([^\x1b]*)\x1b\\", output)
+                def report(state):
+                    api("agent.report", {"pane": pane, "source": "test/system-notify",
+                        "agent": "codex", "status": state}, remote=remote)
+                report("working")
+                report("done")
+                assert not notices(.5), "disabled setting must be quiet"
+                api("config.patch", {"patch": {"notifications": {"terminal_on_agent": True}}}, remote=remote)
+                for text in ("Copied to clipboard", "https://example.invalid/link", "Theme synchronized"):
+                    api("ui.notification.push", {"text": text}, remote=remote)
+                assert not notices(.5), "ordinary UI notices must not become system notifications"
+                report("working")
+                report("idle")
+                wait_for(lambda: len(notices()) == 1)
+                assert b"codex done" in notices()[0]
+                if remote:
+                    assert b"fake-dev / api" in notices()[0], notices()
+                report("idle")
+                assert len(notices(.5)) == 1, "same-state reports must not duplicate alerts"
+                report("blocked")
+                wait_for(lambda: len(notices()) == 2)
+                assert b"codex blocked" in notices()[1]
+                assert all(b"\x07" not in message for message in notices())
+                assert len(notices(.5)) == 2, "multiple workspace projections must not duplicate alerts"
+                api("config.patch", {"patch": {"notifications": {"terminal_on_agent": False}}}, remote=remote)
+                report("working")
+                report("done")
+                assert len(notices(.5)) == 2, "turning the setting off takes effect immediately"
+                detach_client(process, master)
+                print(f"PASS: {mode} agent-only OSC 9 completion/attention, opt-in, no duplicate or UI notices; physical client delivery", flush=True)
+            return
+
+        if transpose_only:
+            for mode in ("local", "direct-remote", "merge"):
+                remote = mode != "local"
+                run("session", "merge", "on" if mode == "merge" else "off")
+                session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
+                project = root / ("transpose-" + mode)
+                project.mkdir()
+                api("workspace.open", {"path": str(project)}, remote=remote)
+                pane = api("pane.current", remote=remote)["pane"]
+                api("pane.rename", {"pane": pane, "name": "transpose-target"}, remote=remote)
+                argv = (["session", "attach", session] if mode == "direct-remote"
+                        else ["--session", "api"])
+                process, master = start_client(argv)
+                if remote:
+                    projection = wait_for(lambda: next((w for w in presentation_api(
+                        "workspace.list", session=session)["workspaces"]
+                        if w.get("host") == "fake-dev" and w["cwd"] == str(project)), None))
+                    presentation_api("workspace.focus", {"workspace_id": projection["workspace_id"]}, session=session)
+                def screen_text():
+                    drain(master, .12)
+                    text = "\n".join(client_terminals[master][0].display)
+                    (root / ("transpose-" + mode + ".txt")).write_text(text)
+                    return text
+                def row_for(label):
+                    for y, line in enumerate(client_terminals[master][0].display):
+                        if label in line:
+                            return line.index(label) + 1, y + 1
+                    raise AssertionError((label, screen_text()))
+                wait_for(lambda: "transpose-target" in screen_text())
+                click(master, *row_for("transpose-target"), button=2)
+                wait_for(lambda: "Split Vertical" in screen_text())
+                assert "Transpose Split" not in screen_text(), "single panes hide the action"
+                os.write(master, b"\x1b")
+                wait_for(lambda: "Split Vertical" not in screen_text())
+                api("pane.split", {"pane": pane, "direction": "right"}, remote=remote)
+                sibling = api("pane.current", remote=remote)["pane"]
+                api("pane.rename", {"pane": sibling, "name": "transpose-sibling"}, remote=remote)
+                # Target is not focused; menu action must preserve the sibling.
+                api("layout.set_split_ratio", {"path": [], "ratio": 0.6}, remote=remote)
+                def layout():
+                    result = api("layout.export", remote=remote)
+                    result.pop("revision", None)
+                    (root / ("transpose-layout-" + mode + ".json")).write_text(json.dumps(result, indent=2))
+                    return result
+                before = layout()
+                (root / ("transpose-before-" + mode + ".json")).write_text(json.dumps(before, indent=2))
+                expected = json.loads(json.dumps(before))
+                expected["tree"]["Split"]["axis"] = 1
+                for pid in (pane, sibling):
+                    api("pane.run", {"pane": pid, "command": "printf TRANSPOSE_PTY_SURVIVES"}, remote=remote)
+                wait_for(lambda: "transpose-sibling" in screen_text())
+                other_workspace = next(w["workspace_id"] for w in api("workspace.list", remote=not remote)["workspaces"] if not w.get("host"))
+                other_params = {"workspace_id": other_workspace}
+                untouched = api("layout.export", other_params, remote=not remote)["tree"]
+                click(master, *row_for("transpose-target"), button=2)
+                wait_for(lambda: "Transpose Split" in screen_text())
+                click(master, *row_for("Transpose Split"))
+                wait_for(lambda: screen_text() and layout() == expected)
+                # Display uses Ctrl+B; remote owner uses Ctrl+Space.
+                os.write(master, b"\x02T")
+                wait_for(lambda: screen_text() and layout() == before)
+                response = (host_cli("pane", "transpose", str(pane)) if remote else
+                            json.loads(run("--session", "api", "pane", "transpose", str(pane)).stdout))
+                response = response.get("result", response)
+                assert response["changed"] is True, response
+                wait_for(lambda: screen_text() and layout() == expected)
+                assert api("layout.export", other_params, remote=not remote)["tree"] == untouched, "other owner must not change"
+                for pid in (pane, sibling):
+                    assert "TRANSPOSE_PTY_SURVIVES" in json.dumps(api("pane.read", {"pane": pid}, remote=remote))
+                assert api("pane.current", remote=remote)["pane"] == sibling
+                detach_client(process, master)
+                print(f"PASS: {mode} transpose menu, prefix and CLI; owner-only layout, preserved focus, ratio and PTYs", flush=True)
+            return
 
         if file_links_only:
             for mode in ("local", "direct-remote", "merge"):
@@ -1533,6 +1671,27 @@ def main():
             # A new owner created after discovery must be included too.
             run("--session", "theme-fresh", "server", "start", remote=True)
             owners = ("api", "second", "theme-fresh")
+            output = bytearray()
+
+            def pump_settings():
+                # Act like a real terminal while waiting on API state. A full
+                # PTY output queue blocks painting and subsequent key forwarding
+                # in the thin client; sleeping or extending the timeout cannot
+                # make an Enter queued behind that paint reach the owner.
+                output.extend(drain(master, 0.05))
+                assert len(output) < 2 * 1024 * 1024, "unexpected settings output volume"
+
+            def wait_for_settings(check):
+                try:
+                    return wait_for(check, pump=pump_settings)
+                except AssertionError:
+                    diagnostic = {"local": api("config.get")["config"],
+                                  "owners": {name: api("config.get", remote=True, session=name)["config"]
+                                             for name in owners}}
+                    (root / "settings-sync-failure.json").write_text(json.dumps(diagnostic, indent=2))
+                    (root / "settings-sync-output.ansi").write_bytes(output)
+                    raise
+
             before = {name: api("config.get", remote=True, session=name)["config"] for name in owners}
             generations = {name: api("uhp.capabilities", remote=True, session=name)["server_generation"]
                            for name in owners}
@@ -1547,14 +1706,14 @@ def main():
             click(master, *position(settings_screen + repaint(master), "Theme"))
             themes_screen = drain(master)
             click(master, *position(themes_screen + repaint(master), "one-light"))
-            wait_for(lambda: synced("one-light"))
+            wait_for_settings(lambda: synced("one-light"))
             assert api("config.get")["config"]["theme"] == "one-light"
             os.write(master, b"\x1b")
             drain(master)
             print("PASS: local Settings theme click updates every running remote owner without restart", flush=True)
 
             run("session", "merge", "on")
-            wait_for(projected)
+            wait_for_settings(projected)
             remote_workspace = next(w["workspace"] for w in api("workspace.list")["workspaces"]
                                     if w.get("host") == "fake-dev")
             api("workspace.focus", {"workspace": remote_workspace})
@@ -1564,7 +1723,7 @@ def main():
             click(master, *position(settings_screen + repaint(master), "Theme"))
             themes_screen = drain(master)
             click(master, *position(themes_screen + repaint(master), "one-dark"))
-            wait_for(lambda: synced("one-dark"))
+            wait_for_settings(lambda: synced("one-dark"))
             assert api("config.get")["config"]["theme"] == "one-dark"
             os.write(master, b"\x1b")
             drain(master)
@@ -1579,13 +1738,13 @@ def main():
             # Wide glyphs may be emitted in separate cursor-addressed runs;
             # the canonical language code is one contiguous clickable token.
             click(master, *position(language_screen + repaint(master), "zh"))
-            wait_for(lambda: all(api("config.get", remote=True, session=name)["config"]["language"] == "zh"
+            wait_for_settings(lambda: all(api("config.get", remote=True, session=name)["config"]["language"] == "zh"
                                 for name in owners))
             assert api("config.get")["config"]["language"] == "zh"
             assert synced("one-dark"), "language overwrote the theme"
             language_screen = drain(master)
             click(master, *position(language_screen + repaint(master), "English"))
-            wait_for(lambda: all(api("config.get", remote=True, session=name)["config"]["language"] == "en"
+            wait_for_settings(lambda: all(api("config.get", remote=True, session=name)["config"]["language"] == "en"
                                 for name in owners))
             os.write(master, b"\x1b")
             drain(master)
@@ -1597,26 +1756,62 @@ def main():
             layout_screen = drain(master)
             click(master, *position(layout_screen + repaint(master), "Rounded corners"))
             # Clicking this toggle row selects and activates it.
-            wait_for(lambda: all(api("config.get", remote=True, session=name)["config"]["layout"]["rounded_corners"]
+            wait_for_settings(lambda: all(api("config.get", remote=True, session=name)["config"]["layout"]["rounded_corners"]
                                 for name in owners))
             assert api("config.get")["config"]["layout"]["rounded_corners"]
             os.write(master, b"\r")
-            wait_for(lambda: all(not api("config.get", remote=True, session=name)["config"]["layout"]["rounded_corners"]
+            wait_for_settings(lambda: all(not api("config.get", remote=True, session=name)["config"]["layout"]["rounded_corners"]
                                 for name in owners))
             os.write(master, b"\x1b")
             drain(master)
             print("PASS: Layout rounded corners synchronizes both directions to running owners without restart", flush=True)
 
+            # The agent alert toggle uses the same local Settings fanout even
+            # while the focused workspace is owned by a remote server.
+            os.write(master, b"\x02=")
+            settings_screen = drain(master)
+            click(master, *position(settings_screen + repaint(master), "General"))
+            general_screen = drain(master)
+            click(master, *position(general_screen + repaint(master), "Terminal system alerts for agents"))
+            wait_for_settings(lambda: all(api("config.get", remote=True, session=name)["config"]["notifications"]["terminal_on_agent"]
+                                for name in owners))
+            assert api("config.get")["config"]["notifications"]["terminal_on_agent"]
+            wait_for_settings(lambda: json.loads((root / "remote-state/config.json").read_text())["notifications"]["terminal_on_agent"])
+            output.extend(drain(master))
+            def system_alerts():
+                output.extend(drain(master, .15))
+                return re.findall(rb"\x1b\]9;([^\x1b]*)\x1b\\", output)
+            assert not system_alerts(), "setting sync feedback must not become a system notification"
+            pane = api("pane.current", remote=True)["pane"]
+            def report_agent(state):
+                api("agent.report", {"pane": pane, "source": "test/notify-sync",
+                    "agent": "codex", "status": state}, remote=True)
+            report_agent("working")
+            report_agent("done")
+            wait_for(lambda: len(system_alerts()) == 1)
+            assert b"fake-dev / api" in system_alerts()[0]
+            assert b"codex done" in system_alerts()[0]
+            os.write(master, b"\r")
+            wait_for_settings(lambda: all(not api("config.get", remote=True, session=name)["config"]["notifications"]["terminal_on_agent"]
+                                for name in owners))
+            assert not api("config.get")["config"]["notifications"]["terminal_on_agent"]
+            report_agent("working")
+            report_agent("done")
+            assert len(system_alerts()) == 1, "disabling locally must stop remote agent alerts"
+            os.write(master, b"\x1b")
+            drain(master)
+            print("PASS: local Settings agent alerts sync on/off to every running owner; remote OSC 9 reaches the physical client; sync feedback stays internal", flush=True)
+
             # Selecting another local theme must not inherit any remote config.
             run("--session", "api", "theme", "use", "one-dark")
             run("--session", "api", "theme", "use", "one-light")
             run("--session", "api", "theme", "use", "noir")
-            wait_for(lambda: synced("noir"))
+            wait_for_settings(lambda: synced("noir"))
             for name in owners:
                 current = api("config.get", remote=True, session=name)["config"]
                 assert current == dict(before[name], theme="noir"), (name, current)
                 assert api("uhp.capabilities", remote=True, session=name)["server_generation"] == generations[name]
-            wait_for(lambda: json.loads((root / "remote-state/config.json").read_text())["theme"] == "noir")
+            wait_for_settings(lambda: json.loads((root / "remote-state/config.json").read_text())["theme"] == "noir")
             assert not (root / "remote-state/sessions/search-stopped/server.pid").exists()
             assert not (root / "remote-state/server.pid").exists(), "theme sync started a default owner"
             print("PASS: rapid CLI selections converge; only theme changes; stopped owners remain stopped", flush=True)
@@ -1647,12 +1842,12 @@ def main():
             # and still rejects this theme; healthy later owners must not be skipped.
             run("--session", "second", "theme", "install", str(source), "--yes", remote=True)
             run("--session", "api", "theme", "use", "sync-local-only")
-            wait_for(lambda: api("config.get", remote=True, session="second")["config"]["theme"] == "sync-local-only")
+            wait_for_settings(lambda: api("config.get", remote=True, session="second")["config"]["theme"] == "sync-local-only")
             assert api("config.get", remote=True, session="api")["config"]["theme"] == "one-light"
             print("PASS: a rejecting first owner does not block later healthy owners on the same host", flush=True)
 
             select_hosts([])
-            wait_for(lambda: not projected())
+            wait_for_settings(lambda: not projected())
             run("--session", "api", "theme", "use", "one-dark")
             time.sleep(0.4)
             assert api("config.get", remote=True)["config"]["theme"] == "one-light"
@@ -3053,6 +3248,17 @@ def main():
     finally:
         for process, master in clients:
             process.terminate()
+            deadline = time.monotonic() + 5
+            while process.poll() is None and time.monotonic() < deadline:
+                if select.select([master], [], [], 0.05)[0]:
+                    try:
+                        os.read(master, 65536)
+                    except OSError:
+                        break
+            if process.poll() is None:
+                # Never mask a smoke assertion with a client cleanup timeout or
+                # skip teardown of this fixture's isolated server namespaces.
+                process.kill()
             process.wait(timeout=5)
             os.close(master)
         for remote in (False, True):

@@ -98,6 +98,7 @@ fn affects_snapshot(name: &str) -> bool {
             | "pane.moved"
             | "pane.renamed"
             | "pane.swapped"
+            | "pane.transposed"
             | "pane.focused"
             | "tab.created"
             | "tab.closed"
