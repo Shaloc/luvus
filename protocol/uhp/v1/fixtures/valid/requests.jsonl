@@ -61,3 +61,5 @@
 {"id":"session-report-numeric-pane","method":"pane.report_session","params":{"agent":"codex","session_id":"session-123","pane":7,"reporter_pid":101}}
 {"id":"transpose-pane","method":"pane.transpose","params":{"pane":"7","if_revision":41}}
 {"id":"transpose-current","method":"pane.transpose","params":{}}
+{"id":"task-guard-valid-0","method":"task.update","params":{"id":"t1","status":"failed","output":"launch failed","if_running":{"pane":7,"attempt":1}}}
+{"id":"task-guard-valid-1","method":"task.update","params":{"id":"t1","status":"failed","output":"launch failed","if_running":{"pane":"7","attempt":2}}}

@@ -154,6 +154,9 @@ open. The sole focused Git project remains unambiguous when another workspace
 is only a non-Git launch directory. `task next` stays within that project, and
 path leases overlap only among tasks in the same project, including different
 worktrees of one repository.
+Asynchronous UHP workers can guard `task.update` with
+`if_running: {"pane": 7, "attempt": 1}` from the task snapshot. The server
+rejects stale ownership with `stale_attempt` before changing status or logs.
 Use `task update --note` for work progress. `task heartbeat --context-used
 <0..1>` reports only the fraction of the model context window already consumed,
 where `0.6` means 60% consumed, not 60% task progress. Omit the heartbeat when
@@ -593,6 +596,9 @@ Disabling a definition prevents future occurrences but never kills its current
 ORCH task or pane. Detection-only manifest agents cannot be scheduled.
 Luvus uses reviewed one-shot flags from the built-in adapter and never types a
 blind approval response or changes an agent's permanent permission config.
+A scheduled automation worker pane restores as a plain shell. Its headless
+agent run is never resumed interactively; resume that conversation explicitly
+by its exact session ID in a new pane when you need it.
 
 To continue an existing interactive conversation, set `target.kind` to
 `active_agent` and provide the exact `pane_id`, 32-character `terminal_id`,

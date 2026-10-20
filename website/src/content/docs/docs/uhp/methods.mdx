@@ -148,6 +148,15 @@ leases collide only between tasks in the same project. Git worktrees share the
 repository common directory, so they still coordinate with each other while
 unrelated repositories do not.
 
+`task.update` optionally accepts `if_running: {"pane": 7, "attempt": 1}`.
+Both fields are required: `pane` is a numeric or decimal-string pane ID, and
+`attempt` is a positive 32-bit integer from the task snapshot. The server
+checks that the task is still running in that pane and attempt in the same
+dispatch as the update. A mismatch returns `stale_attempt` without changing
+status, prompt, output, or notes. This lets an asynchronous worker report a
+launch failure without overwriting a completed, released, reassigned, or
+retried task. Existing updates without this guard retain their behavior.
+
 For `task.heartbeat`, the canonical UHP `context` field is the fraction of the
 model context window already consumed. `0.6` means 60% of that window has been
 used, not 60% task progress. Send work progress through the `note` field of
@@ -678,6 +687,19 @@ rejected with `authority_conflict`, and the lease expires automatically. The
 owner renews with another report or calls `agent.release`. This lets unfamiliar
 agents integrate immediately without weakening process-based fallback detection
 or leaving stale state after an adapter crashes.
+
+A program can also report its own state from inside the pane with OSC 7501
+(see [Program status](/docs/uhp/terminal/#program-status)). Those panes report
+`state_source: "osc7501"` with self-reported state evidence, and
+`agent.explain` adds a `program_status` array of the raw records (`id`, `state`
+including `error`, `kind`, `progress`, `app`, `effective_app`, `title`,
+`message`), or `null` when the pane has none. An active `agent.report` lease
+still wins over OSC 7501. `agent.list` also lists such panes, so each row
+carries `is_agent` (whether the pane is a native or manifest agent) and
+`display_agent` (the label Luvus draws; an `app` that matches an agent id or
+identity string is shown as `program`). `agent` remains the trusted
+process-derived identity; target agent methods by that, never by
+`display_agent`. Older servers omit both fields.
 
 The normative schemas and fixtures live under `protocol/uhp/v1` and are
 embedded in packaged binaries. Print that exact contract with `luvus uhp schema`.

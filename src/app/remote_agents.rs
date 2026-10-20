@@ -48,6 +48,9 @@ mod tests {
             title: None,
             pane: pane.to_string(),
             agent: "codex".into(),
+            display_agent: None,
+            is_agent: true,
+            progress: None,
             state: crate::ui::theme::State::Blocked,
             tab: 1,
             focused: false,
@@ -611,6 +614,39 @@ mod tests {
             matches!(input.try_recv().unwrap(), ClientMessage::Command(command) if command == "remote_agent_focus 7")
         );
         assert_ne!(app.sidebar_focus, Some(SidebarListFocus::Agents));
+    }
+
+    #[test]
+    fn remote_alias_and_reporter_labels_preserve_identity_and_owner_actions() {
+        let _env = crate::persist::test_env("remote-agent-alias");
+        let mut app = remote_ui_app();
+        let (view, _input, _) = add_remote_workspace(&mut app);
+        let mut row = agent(7, false);
+        row.name = Some("reviewer".into());
+        remote_view(&mut app, view).agents = vec![row];
+        app.set_agents_filter(true);
+        app.config.agents_group_by_workspace = true;
+        app.config.layout.agent_paths = false;
+        app.config.layout.agent_title_first = false;
+        app.sidebars.left.width = 48;
+        assert!(render(&mut app).contains("reviewer"));
+        app.config.layout.agent_title_first = true;
+        assert!(render(&mut app).contains("C reviewer"));
+        let row = &mut remote_view(&mut app, view).agents[0];
+        row.name = None;
+        row.is_agent = false;
+        row.agent = "sh".into();
+        row.display_agent = Some("terraform".into());
+        row.progress = Some(35);
+        app.config.layout.agent_title_first = false;
+        let output = render(&mut app);
+        assert!(output.contains("terraform · 35%"), "{output}");
+        let list = app.dispatch("agent.list", &serde_json::json!({})).unwrap();
+        let row = &list["agents"][0];
+        assert_eq!(row["agent"], "sh");
+        assert_eq!(row["is_agent"], false);
+        assert_eq!(row["display_agent"], "terraform");
+        assert_eq!(row["owner_pane"], "7");
     }
 
     #[test]

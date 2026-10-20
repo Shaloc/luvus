@@ -381,7 +381,7 @@
       ]
     },
     "agentListTitles": {
-      "description": "Each agent.list row may carry the same bounded session title as the snapshot. Other row fields remain extensible.",
+      "description": "Each agent.list row may carry the same bounded session title as the snapshot. display_agent is presentation only; is_agent retains native or manifest identity. Older servers may omit these fields. Other row fields remain extensible.",
       "type": "object",
       "required": [
         "agents"
@@ -394,7 +394,9 @@
             "properties": {
               "agent_session_title": {
                 "$ref": "#/$defs/agentSessionTitle"
-              }
+              },
+              "display_agent": { "type": ["string", "null"] },
+              "is_agent": { "type": "boolean" }
             }
           }
         }

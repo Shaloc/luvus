@@ -106,6 +106,15 @@ def pane(value):
     return isinstance(value, str) and PANE.fullmatch(value) is not None
 
 
+def input_pane(value):
+    if integer(value):
+        return 0 <= value <= 4294967295
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        digits = value.lstrip("0") or "0"
+        return len(digits) < 10 or (len(digits) == 10 and digits <= "4294967295")
+    return False
+
+
 def bounded_string(value, maximum, allow_empty=True):
     return isinstance(value, str) and (allow_empty or bool(value)) and len(value) <= maximum
 
@@ -705,17 +714,9 @@ def valid_global_request(value, methods):
         params = value["params"]
         target = params.get("pane")
         revision = params.get("if_revision", 0)
-        valid_target = target is None or (
-            type(target) is int and 0 <= target <= 4294967295
-        )
-        if isinstance(target, str) and target.isascii() and target.isdigit():
-            digits = target.lstrip("0") or "0"
-            valid_target = len(digits) < 10 or (
-                len(digits) == 10 and digits <= "4294967295"
-            )
         return (
             set(params) <= {"pane", "if_revision"}
-            and valid_target
+            and (target is None or input_pane(target))
             and integer(revision)
             and revision >= 0
         )
@@ -777,6 +778,18 @@ def valid_global_request(value, methods):
             return False
         if mode == "workspace" and "branch" in params:
             return False
+    if value["method"] == "task.update":
+        params = value["params"]
+        if not set(params) <= {"id", "status", "output", "note", "prompt", "if_running"}:
+            return False
+        if not bounded_string(params.get("id"), 128, allow_empty=False):
+            return False
+        if "if_running" in params:
+            guard = params["if_running"]
+            if not isinstance(guard, dict) or set(guard) != {"pane", "attempt"}:
+                return False
+            if not input_pane(guard["pane"]) or not integer(guard["attempt"]) or not 1 <= guard["attempt"] <= 4294967295:
+                return False
     if value["method"] == "task.retry":
         params = value["params"]
         return (

@@ -111,6 +111,7 @@ jobs:
         run: |
           target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --transpose-only
           python3 scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --terminal-notify-only
+          python3 scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --program-status-only
           python3 scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --theme-sync-only
           python3 scripts/test-local-focus-pty.py --luvus "target/$TARGET/release/luvus"
       - name: Isolated many-workspace SSH admission smoke

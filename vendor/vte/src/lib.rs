@@ -43,7 +43,8 @@ pub use params::{Params, ParamsIter};
 
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
-const MAX_OSC_RAW: usize = 1024;
+// OSC 7501 permits a complete 4096-byte sequence, including its envelope.
+const MAX_OSC_RAW: usize = 4096;
 const MAX_APC_RAW: usize = 8192;
 
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
@@ -65,8 +66,10 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     osc_raw: Vec<u8>,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
-    osc_program_status: bool,
-    osc_bytes: usize,
+    osc_overflowed: bool,
+    osc_invalid: bool,
+    osc_wire_len: usize,
+    osc_pending_st: bool,
     ignoring: bool,
     apc_truncated: bool,
     partial_utf8: [u8; 4],
@@ -194,19 +197,6 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
-            State::ProgramStatusEscape => {
-                if byte == b'\\' {
-                    if self.osc_bytes <= 4092 {
-                        self.osc_end(performer, byte);
-                    }
-                    self.state = State::Ground;
-                } else {
-                    self.osc_raw.clear();
-                    self.osc_num_params = 0;
-                    self.state = State::Escape;
-                    self.advance_esc(performer, byte);
-                }
-            },
             State::ApcString => self.advance_apc_string(performer, byte),
             State::ApcEscape => {
                 if byte == b'\\' {
@@ -380,6 +370,19 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     #[inline(always)]
     fn advance_esc<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        if self.osc_pending_st {
+            self.osc_pending_st = false;
+            if byte == b'\\' {
+                self.osc_wire_len = self.osc_wire_len.saturating_add(1);
+                self.osc_end(performer, 0x1B);
+                self.state = State::Ground;
+                return;
+            }
+            // An escape other than ST aborts a program-status report. Do not
+            // accept a report whose terminator was split across PTY reads.
+            self.osc_raw.clear();
+            self.osc_num_params = 0;
+        }
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => performer.execute(byte),
             0x20..=0x2F => {
@@ -414,8 +417,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x5D => {
                 self.osc_raw.clear();
                 self.osc_num_params = 0;
-                self.osc_program_status = false;
-                self.osc_bytes = 0;
+                self.osc_overflowed = false;
+                self.osc_invalid = false;
+                self.osc_wire_len = 2;
+                self.osc_pending_st = false;
                 self.state = State::OscString
             },
             0x5E => self.state = State::SosPmApcString,
@@ -454,68 +459,61 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     #[inline(always)]
     fn advance_osc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
-        // OSC 7501 has its own wire cap. Count separators and ignored bytes too,
-        // never buffer an oversized report, and only dispatch a complete ST.
-        // Keep the body together so malformed semicolons cannot hide later pairs
-        // behind the generic OSC parameter limit.
-        if self.osc_program_status {
-            match byte {
-                0x07 => {
-                    if self.osc_bytes <= 4092 {
-                        self.osc_end(performer, byte);
-                    }
-                    self.state = State::Ground;
-                },
-                0x1B => self.state = State::ProgramStatusEscape,
-                0x18 | 0x1A => {
-                    self.osc_raw.clear();
-                    self.osc_num_params = 0;
-                    performer.execute(byte);
-                    self.state = State::Ground;
-                },
-                _ => {
-                    self.osc_bytes = self.osc_bytes.saturating_add(1);
-                    #[cfg(not(feature = "std"))]
-                    if self.osc_raw.is_full() {
-                        self.osc_bytes = 4093;
-                    }
-                    if self.osc_bytes <= 4092 {
-                        self.action_osc_put(byte);
-                    }
-                },
-            }
-            return;
-        }
-        self.osc_bytes = self.osc_bytes.saturating_add(1);
-        if byte == b';' && self.osc_num_params == 0 && self.osc_raw.as_slice() == b"7501" {
-            self.osc_program_status = true;
+        self.osc_wire_len = self.osc_wire_len.saturating_add(1);
+        let program_status = self.is_program_status();
+        // A missing/late separator must not turn a malformed 7501 candidate
+        // into an unbounded generic OSC allocation. Keep other OSC behavior,
+        // especially large clipboard payloads, unchanged.
+        let program_status_candidate = program_status
+            || (self.osc_num_params == 0 && self.osc_raw.starts_with(b"7501"));
+        if program_status_candidate && self.osc_wire_len > 4096 {
+            self.osc_overflowed = true;
         }
         match byte {
-            0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => (),
+            0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => {
+                if program_status && !self.osc_overflowed {
+                    // Preserve bad-value evidence for the pair parser, rather
+                    // than repairing `wo<control>rking` into `working`.
+                    self.action_osc_put(byte);
+                } else if self.osc_num_params == 0 {
+                    self.osc_invalid = true;
+                }
+            },
             0x07 => {
                 self.osc_end(performer, byte);
                 self.state = State::Ground
             },
             0x18 | 0x1A => {
+                if program_status { self.osc_invalid = true; }
                 self.osc_end(performer, byte);
                 performer.execute(byte);
                 self.state = State::Ground
             },
             0x1B => {
-                self.osc_end(performer, byte);
+                if program_status {
+                    self.osc_pending_st = true;
+                } else {
+                    self.osc_end(performer, byte);
+                }
                 self.reset_params();
                 self.state = State::Escape
             },
             0x3B => {
                 #[cfg(not(feature = "std"))]
-                {
-                    if self.osc_raw.is_full() {
-                        return;
+                if self.osc_raw.is_full() { self.osc_overflowed = true; return; }
+                if !self.osc_overflowed {
+                    if program_status {
+                        // Keep malformed body pairs intact so the OSC 7501
+                        // parser can skip them without dropping valid pairs.
+                        self.action_osc_put(byte);
+                    } else {
+                        self.action_osc_put_param();
                     }
                 }
-                self.action_osc_put_param()
             },
-            _ => self.action_osc_put(byte),
+            _ => {
+                if !self.osc_overflowed { self.action_osc_put(byte); }
+            },
         }
     }
 
@@ -653,17 +651,37 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         #[cfg(not(feature = "std"))]
         {
             if self.osc_raw.is_full() {
+                if self.is_program_status()
+                    || (self.osc_num_params == 0 && self.osc_raw.starts_with(b"7501"))
+                {
+                    self.osc_overflowed = true;
+                }
                 return;
             }
         }
         self.osc_raw.push(byte);
     }
 
+    fn is_program_status(&self) -> bool {
+        self.osc_num_params > 0 && self.osc_params[0] == (0, 4)
+            && self.osc_raw.get(..4) == Some(b"7501")
+    }
+
     fn osc_end<P: Perform>(&mut self, performer: &mut P, byte: u8) {
-        self.action_osc_put_param();
-        self.osc_dispatch(performer, byte);
+        let program_status = self.is_program_status();
+        let program_status_candidate = program_status
+            || (self.osc_num_params == 0 && self.osc_raw.starts_with(b"7501"));
+        if !(program_status_candidate && self.osc_overflowed)
+            && !(program_status && (self.osc_invalid || self.osc_wire_len > 4096)) {
+            self.action_osc_put_param();
+            self.osc_dispatch(performer, byte);
+        }
         self.osc_raw.clear();
         self.osc_num_params = 0;
+        self.osc_overflowed = false;
+        self.osc_invalid = false;
+        self.osc_wire_len = 0;
+        self.osc_pending_st = false;
     }
 
     /// Reset escape sequence parameters and intermediates.
@@ -856,7 +874,6 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
 #[derive(PartialEq, Eq, Debug, Default, Copy, Clone)]
 enum State {
-    ProgramStatusEscape,
     CsiEntry,
     CsiIgnore,
     CsiIntermediate,
@@ -1236,6 +1253,33 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "std"))]
+    #[test]
+    fn small_program_status_buffer_rejects_targeted_clear_atomically() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::<15>::new_with_size();
+        parser.advance(&mut dispatcher, b"\x1b]7501;state=clear:id=task\x07");
+        assert!(dispatcher.dispatched.is_empty());
+        parser.advance(&mut dispatcher, b"\x1b]7501;?\x07");
+        assert!(matches!(&dispatcher.dispatched[..], [Sequence::Osc(_, true)]));
+    }
+
+    #[test]
+    fn malformed_program_status_prefix_has_bounded_storage() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+        parser.advance(&mut dispatcher, b"\x1b]7501");
+        for _ in 0..16 {
+            parser.advance(&mut dispatcher, &[b'x'; 4096]);
+        }
+        assert!(parser.osc_raw.len() <= 4096);
+        assert!(parser.osc_overflowed);
+        parser.advance(&mut dispatcher, b";state=done\x07");
+        assert!(dispatcher.dispatched.is_empty());
+        parser.advance(&mut dispatcher, b"\x1b]7501;state=idle\x07");
+        assert!(matches!(&dispatcher.dispatched[..], [Sequence::Osc(_, true)]));
+    }
+
     #[test]
     fn exceed_max_buffer_size() {
         const NUM_BYTES: usize = MAX_OSC_RAW + 100;
@@ -1254,15 +1298,15 @@ mod tests {
         // Terminate escape for dispatch
         parser.advance(&mut dispatcher, INPUT_END);
 
+        // Generic OSC behavior remains unchanged; OSC 7501 applies its own
+        // whole-sequence limit before the handler receives the report.
         assert_eq!(dispatcher.dispatched.len(), 1);
         match &dispatcher.dispatched[0] {
             Sequence::Osc(params, _) => {
                 assert_eq!(params.len(), 2);
                 assert_eq!(params[0], b"52");
-
                 #[cfg(feature = "std")]
                 assert_eq!(params[1].len(), NUM_BYTES + INPUT_END.len());
-
                 #[cfg(not(feature = "std"))]
                 assert_eq!(params[1].len(), MAX_OSC_RAW - params[0].len());
             },

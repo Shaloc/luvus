@@ -16,6 +16,7 @@ Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
 Use --colors-only for child color queries and composed local/remote backgrounds (requires pyte).
 Use --terminal-notify-only for agent-only terminal system alerts from local and remote owners.
+Use --program-status-only for OSC 7501 lifecycle, read acknowledgement and agent notifications across SSH.
 Use --transpose-only for owner-routed menu, shortcut and CLI split transposition (requires pyte).
 Use --file-links-only for wrapped file references and owner-routed Ctrl-clicks (requires pyte).
 Use --appearance-only for pane mouse controls, None theme, notifications and host diagnostics (requires pyte).
@@ -238,6 +239,7 @@ def main():
     colors_only = "--colors-only" in sys.argv[1:]
     appearance_only = "--appearance-only" in sys.argv[1:]
     terminal_notify_only = "--terminal-notify-only" in sys.argv[1:]
+    program_status_only = "--program-status-only" in sys.argv[1:]
     transpose_only = "--transpose-only" in sys.argv[1:]
     file_links_only = "--file-links-only" in sys.argv[1:]
     workspace_close_only = "--workspace-close-only" in sys.argv[1:]
@@ -251,7 +253,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -356,6 +358,27 @@ def main():
         assert "result" in value, (method, params, value)
         return value["result"]
 
+    def agent_fixture_command(agent):
+        flag = {"codex": "--codex-fixture", "qodercli": "--qoder-fixture"}[agent]
+        fixture = root / "bin" / f"{agent}.py"
+        if not fixture.exists():
+            fixture.symlink_to(Path(__file__).resolve())
+        # macOS framework Python rewrites argv[0], defeating `exec -a`.
+        # The interpreter's script slot provides native process identity on
+        # both platforms without an integration report or a detection override.
+        return shlex.join([sys.executable, str(fixture), flag])
+
+    def pane_diagnostics(pane, *, remote=False):
+        details = {"pane": pane, "remote": remote, "python": sys.executable}
+        for method, params in (("agent.explain", {"target": pane}),
+                               ("pane.processes", {"pane": pane}),
+                               ("pane.read", {"pane": pane})):
+            try:
+                details[method] = api(method, params, remote=remote)
+            except Exception as error:
+                details[method] = {"diagnostic_error": str(error)}
+        return details
+
     def host_cli(*args):
         value = json.loads(run("--host", "fake-dev", "--session", "api", *args).stdout)
         assert "error" not in value, (args, value)
@@ -384,7 +407,7 @@ def main():
             raise
         print("PASS:", label, flush=True)
 
-    def wait_for(check, timeout=10, *, pump=None):
+    def wait_for(check, timeout=10, *, pump=None, diagnostics=None):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if pump is not None:
@@ -393,7 +416,8 @@ def main():
             if value:
                 return value
             time.sleep(0.08)
-        raise AssertionError("condition did not become true")
+        detail = "" if diagnostics is None else ": " + json.dumps(diagnostics(), ensure_ascii=True)[:12000]
+        raise AssertionError("condition did not become true" + detail)
 
     def select_hosts(hosts):
         api("config.patch", {"patch": {"remote_hosts": hosts}})
@@ -779,6 +803,88 @@ def main():
 
             wait_for(exited)
             assert process.returncode == 0, process.returncode
+
+        if program_status_only:
+            for mode in ("local", "direct-remote", "merge"):
+                remote = mode != "local"
+                run("session", "merge", "on" if mode == "merge" else "off")
+                session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
+                project = root / ("program-" + mode)
+                project.mkdir()
+                api("workspace.open", {"path": str(project)}, remote=remote)
+                pane = api("pane.current", remote=remote)["pane"]
+                def wait_program(check, target=None):
+                    return wait_for(check, diagnostics=lambda: {
+                        "mode": mode, **pane_diagnostics(target or pane, remote=remote)})
+                task = api("task.add", {"title": "Missing agent binary", "prompt": "Not executed", "pane": pane}, remote=remote)["task"]
+                api("task.start", {"id": task["id"], "mode": "workspace", "agent": str(root / "missing-agent"), "focus": False}, remote=remote)
+                failed = wait_program(lambda: (t if (t := api("task.get", {"id": task["id"]}, remote=remote)["task"])["status"] == "failed" else None))
+                assert any("could not start manual agent" in output for output in failed.get("outputs", [])), failed
+                api("config.patch", {"patch": {"notifications": {"terminal_on_agent": True}}}, remote=remote)
+                api("pane.run", {"pane": pane, "command": agent_fixture_command("codex")}, remote=remote)
+                wait_program(lambda: "CODEX_FIXTURE_READY" in api("pane.read", {"pane": pane}, remote=remote)["text"])
+                # Keep the producer outside the owner's active workspace too.
+                other = root / ("program-other-" + mode)
+                other.mkdir()
+                api("workspace.open", {"path": str(other)}, remote=remote)
+                argv = (["session", "attach", session] if mode == "direct-remote" else ["--session", "api"])
+                process, master = start_client(argv)
+                output = bytearray()
+                def notices(duration=.1):
+                    output.extend(drain(master, duration))
+                    (root / ("program-" + mode + ".ansi")).write_bytes(output)
+                    return re.findall(rb"\x1b\]9;([^\x1b]*)\x1b\\", output)
+                def row(owner=True):
+                    notices()
+                    result = (api("agent.list", remote=remote) if owner else presentation_api("agent.list", session=session))
+                    return next((a for a in result["agents"] if a.get("pane" if owner or not remote else "owner_pane") == pane), {})
+                def report(body, target=None):
+                    api("pane.run", {"pane": target or pane, "command": "OSC7501:" + body}, remote=remote)
+                def explain():
+                    return api("agent.explain", {"target": pane}, remote=remote)
+                report("state=working:app=spoofed")
+                wait_program(lambda: row().get("status") == "working" and row().get("agent") == "codex")
+                assert row()["agent"] == "codex", row()
+                report("state=done")
+                wait_program(lambda: row().get("status") == "done" and len(notices()) == 1)
+                wait_program(lambda: row(False).get("status") == "done")
+                assert b"codex done" in notices()[0], notices()
+                report("state=done")
+                assert len(notices(.7)) == 1, "identical result must not duplicate a terminal notification"
+                assert row()["status"] == "done", "passive display must leave results unread"
+                # Actual foreground frame presentation acknowledges the owner.
+                if remote:
+                    projection = wait_program(lambda: next((w for w in presentation_api("workspace.list", session=session)["workspaces"]
+                        if w.get("host") == "fake-dev" and w["cwd"] == str(project)), None))
+                    presentation_api("workspace.focus", {"workspace_id": projection["workspace_id"]}, session=session)
+                else:
+                    api("workspace.focus", {"workspace_id": next(w["workspace_id"] for w in api("workspace.list")["workspaces"] if w["cwd"] == str(project))})
+                wait_program(lambda: row().get("status") == "idle")
+                assert explain()["program_status"][0]["state"] == "done"
+                report("state=done")
+                assert len(notices(.7)) == 1, "read result must not rearm"
+                report("state=blocked:kind=permission:msg=QXBwcm92ZT8=:progress=40")
+                wait_program(lambda: row().get("status") == "blocked" and len(notices()) == 2)
+                report("state=blocked:kind=permission:msg=TmV3:progress=45")
+                wait_program(lambda: notices() and explain()["state_evidence"]["blocked_hint"] == "New")
+                assert len(notices()) == 2, "metadata-only change must not duplicate the alert"
+                api("pane.run", {"pane": pane, "command": "OSC_BOUNDARY"}, remote=remote)
+                wait_program(lambda: {r["id"] for r in explain().get("program_status") or []} == {"fresh"})
+                assert explain()["program_status"][0]["state"] == "working"
+                # Ordinary reporters are visible, but never become agents or
+                # generate the agent-only terminal alert.
+                api("pane.split", {"pane": pane, "direction": "right"}, remote=remote)
+                program = api("pane.current", remote=remote)["pane"]
+                api("pane.run", {"pane": program, "command": shlex.join([sys.executable, str(Path(__file__).resolve()), "--program-fixture"])}, remote=remote)
+                wait_program(lambda: "PROGRAM_FIXTURE_READY" in api("pane.read", {"pane": program}, remote=remote)["text"], program)
+                report("state=working:app=terraform:progress=25", program)
+                wait_program(lambda: next((a for a in api("agent.list", remote=remote)["agents"] if a["pane"] == program and a["display_agent"] == "terraform" and not a["is_agent"]), None), program)
+                report("state=done:app=terraform", program)
+                wait_program(lambda: api("agent.explain", {"target": program}, remote=remote).get("program_status", [{}])[0].get("state") == "done", program)
+                assert len(notices(3)) == 2, "ordinary program completion must not notify the operating system"
+                detach_client(process, master)
+                print(f"PASS: {mode} OSC 7501 owner state, unread/read results, command boundaries, metadata updates and agent-only deduplicated OSC 9", flush=True)
+            return
 
         if terminal_notify_only:
             for mode in ("local", "direct-remote", "merge"):
@@ -2352,8 +2458,8 @@ def main():
             pane = api("pane.list", remote=True)["panes"][0]["pane"]
             target = api("workspace.list", remote=True)["workspaces"][0]
             api("workspace.new", {"path": str(root / "second")}, remote=True)
-            command = "exec -a qodercli " + shlex.join([sys.executable, str(Path(__file__).resolve()), "--qoder-fixture"])
-            api("pane.run", {"pane":pane, "command":"bash -c " + shlex.quote(command)}, remote=True)
+            command = agent_fixture_command("qodercli")
+            api("pane.run", {"pane":pane, "command":command}, remote=True)
             wait_for(lambda: "QODER_FIXTURE_READY" in api("pane.read", {"pane":pane}, remote=True)["text"])
             def status(remote):
                 drain(master, 0.1)
@@ -2385,9 +2491,8 @@ def main():
             wait_for(projected)
             process, master = start_client(["--session", "api"])
             drain(master)
-            command = "exec -a qodercli " + shlex.join([sys.executable, str(Path(__file__).resolve()), "--qoder-fixture"])
-            run("--host", "fake-dev", "--session", "api", "pane", "run", pane,
-                "bash -c " + shlex.quote(command))
+            command = agent_fixture_command("qodercli")
+            run("--host", "fake-dev", "--session", "api", "pane", "run", pane, command)
             wait_for(lambda: "QODER_FIXTURE_READY" in api("pane.read", {"pane":pane}, remote=True)["text"])
             # Native Qoder screen evidence, not agent.report. No local click,
             # resize or API mutation may be needed to refresh a remote row.
@@ -2415,7 +2520,7 @@ def main():
                       f"{time.monotonic() - started:.3f}s", flush=True)
             for bound in (False, True):
                 if bound:
-                    api("pane.run", {"pane": pane, "command": "bash -c " + shlex.quote(command)}, remote=True)
+                    api("pane.run", {"pane": pane, "command": command}, remote=True)
                     wait_for(lambda: any(a["pane"] == pane and a["agent"] == "qodercli"
                                          for a in api("agent.list", remote=True)["agents"]))
                     api("pane.report_session", {"pane": pane, "agent": "qodercli",
@@ -2429,8 +2534,8 @@ def main():
                 wait_for(exit_synchronized)
                 assert process.poll() is None
                 print(f"PASS: Ctrl+C removes the remote agent row without navigation (session hook={bound})", flush=True)
-            command = "exec -a codex " + shlex.join([sys.executable, str(Path(__file__).resolve()), "--codex-fixture"])
-            api("pane.run", {"pane": pane, "command": "bash -c " + shlex.quote(command)}, remote=True)
+            command = agent_fixture_command("codex")
+            api("pane.run", {"pane": pane, "command": command}, remote=True)
             wait_for(lambda: "CODEX_FIXTURE_READY" in api("pane.read", {"pane": pane}, remote=True)["text"])
             for expected, text in (("working", "⠋ Thinking"), ("idle", "CODEX_IDLE_DECORATION")):
                 api("pane.run", {"pane": pane, "command": text}, remote=True)
@@ -3302,12 +3407,16 @@ if __name__ == "__main__":
             destination.write_bytes(b"invalid download")
         else:
             shutil.copyfile(root / "official-kitten", destination)
-    elif "--qoder-fixture" in sys.argv or "--codex-fixture" in sys.argv:
+    elif "--qoder-fixture" in sys.argv or "--codex-fixture" in sys.argv or "--program-fixture" in sys.argv:
         fixture_root()
         codex = "--codex-fixture" in sys.argv
-        print("CODEX_FIXTURE_READY" if codex else "QODER_FIXTURE_READY", flush=True)
+        program = "--program-fixture" in sys.argv
+        print("PROGRAM_FIXTURE_READY" if program else "CODEX_FIXTURE_READY" if codex else "QODER_FIXTURE_READY", flush=True)
         for line in sys.stdin:
             text = line.strip()
+            if text == "OSC_BOUNDARY":
+                print("\033]7501;state=done:id=old\007\033]133;A\007\033]7501;state=working:id=fresh\007\033]133;C\007", end="", flush=True)
+                continue
             if text.startswith("OSC7501:"):
                 print("\033]7501;" + text[len("OSC7501:"):] + "\007", end="", flush=True)
                 continue

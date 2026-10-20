@@ -264,9 +264,13 @@ struct ClientState {
 struct ProjectionSubscription {
     active: bool,
     epoch: u64,
-    seen_frame: Option<(u64, crate::ids::PaneId, (Instant, crate::ui::theme::State))>,
+    seen_frame: Option<(
+        u64,
+        crate::ids::PaneId,
+        (Instant, crate::ui::theme::State, u64),
+    )>,
     last_focus: Option<crate::ids::PaneId>,
-    last_observation: Option<(Instant, crate::ui::theme::State)>,
+    last_observation: Option<(Instant, crate::ui::theme::State, u64)>,
 }
 
 #[derive(Default)]
@@ -670,7 +674,7 @@ pub fn run() -> Result<()> {
         // A state transition here (e.g. a silent agent reaching Done) has no PtyData
         // to ride on, so repaint when detection reports a visible change.
         let now = Instant::now();
-        if app.detect_tick_with(now, !clients.is_empty()) {
+        if app.detect_tick_with_view(now, !clients.is_empty(), foreground.is_some()) {
             render_request.record(RenderCause::Detection);
         }
         // Parked `wait.output` deadlines lapse on the tick (docs/81); a no-op

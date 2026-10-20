@@ -794,7 +794,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         for tab in &ws.tabs {
             for id in tab.layout.leaves() {
                 if let Some(s) = app.status.get(&id) {
-                    let is_agent = app.manifests.is_agent(&s.agent) || s.agent_session.is_some();
+                    let is_agent = app.is_status_reporter_pane(id);
                     if !is_agent {
                         continue;
                     }
@@ -1058,7 +1058,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             };
             if let Some(row @ (AgentDockRow::Local(..) | AgentDockRow::Remote(..))) = live.get(k) {
                 let rect = Rect::new(area.x, y, area.width, height);
-                let (st, agent, focused, meta, host, title) = match row {
+                let (st, agent, display_name, focused, meta, host, title, progress) = match row {
                     AgentDockRow::Local(id, wi) => {
                         let wsname = &app.workspaces[*wi].name;
                         agent_rects.push((*id, rect));
@@ -1080,10 +1080,19 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                                 .get(id)
                                 .map(|s| s.agent.clone())
                                 .unwrap_or_default(),
+                            app.agent_name_for(*id)
+                                .or_else(|| app.status_reporter_label(*id))
+                                .unwrap_or_default()
+                                .to_string(),
                             *id == focus,
                             meta,
                             None,
                             title,
+                            app.status
+                                .get(id)
+                                .filter(|s| s.state_source == "osc7501")
+                                .and_then(|s| s.program_status.as_ref())
+                                .and_then(|store| store.effective_progress()),
                         )
                     }
                     AgentDockRow::Remote(workspace_index, agent_index) => {
@@ -1110,10 +1119,17 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         let presentation = (
                             agent.state,
                             name,
+                            agent
+                                .name
+                                .as_deref()
+                                .or(agent.display_agent.as_deref())
+                                .unwrap_or(&agent.agent)
+                                .to_string(),
                             focused,
                             meta,
                             (!grouped).then(|| target.host.clone()),
                             agent.title.clone(),
+                            agent.progress,
                         );
                         let hit = (target.clone(), agent.pane.clone(), rect);
                         app.remote_agent_rects.push(hit);
@@ -1152,17 +1168,20 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     title
                         .as_deref()
                         .filter(|title| !title.trim().is_empty())
-                        .unwrap_or(&agent)
+                        .unwrap_or(&display_name)
                 } else {
-                    &agent
+                    &display_name
                 };
+                let label = progress
+                    .map(|progress| format!("{label} · {progress}%"))
+                    .unwrap_or_else(|| label.to_string());
                 line_at(
                     f,
                     y,
                     agent_label_line(
                         prefix,
                         host.as_deref(),
-                        label,
+                        &label,
                         name_style,
                         cw as usize,
                         app.config.layout.rounded_corners,
@@ -1665,6 +1684,9 @@ mod tests {
                     title: None,
                     pane: (index + 1).to_string(),
                     agent: "codex".into(),
+                    display_agent: None,
+                    is_agent: true,
+                    progress: None,
                     state,
                     tab: index + 1,
                     focused: index == 1,
@@ -2307,6 +2329,50 @@ mod tests {
             !buffer_contains(&term, "=chezmoi"),
             "a Luvus pane alias must not stand in for the session title"
         );
+    }
+
+    #[test]
+    fn osc7501_program_reporter_has_display_row_without_agent_capabilities() {
+        let _env = crate::persist::test_env("osc7501-sidebar-program");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let pane = app.layout().focus;
+        let mut store = crate::terminal::program_status::ProgramStatusStore::default();
+        store.apply(
+            crate::terminal::program_status::parse_report(b"state=working:app=cargo:progress=40")
+                .unwrap(),
+        );
+        app.status.get_mut(&pane).unwrap().agent = "zsh".into();
+        app.config.layout.agent_title_first = false;
+        app.sync_program_status(pane, store);
+        app.status.get_mut(&pane).unwrap().state = crate::ui::theme::State::Working;
+        app.status.get_mut(&pane).unwrap().state_source = "osc7501";
+        assert!(!app.is_agent_pane(pane));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "cargo · 40%"));
+        assert!(app.agent_rects.iter().any(|(id, _)| *id == pane));
+    }
+
+    #[test]
+    fn agent_alias_is_visible_and_title_initial_keeps_the_tool_identity() {
+        let _env = crate::persist::test_env("sidebar-alias-label");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        app.config.layout.agent_paths = false;
+        app.config.layout.agent_title_first = false;
+        app.set_agent_name(pane, Some("reviewer"));
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "reviewer"));
+        app.config.layout.agent_title_first = true;
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "C reviewer"));
+        app.set_agent_name(pane, None);
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        assert!(buffer_contains(&term, "C codex"));
     }
 
     #[test]

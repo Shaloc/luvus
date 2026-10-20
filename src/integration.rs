@@ -1405,7 +1405,12 @@ console.log(JSON.stringify(calls));
                 cmd.env("DEVIN_PROJECT_DIR", "/work/project");
             }
             let mut child = cmd.spawn().unwrap();
-            child.stdin.take().unwrap().write_all(payload).unwrap();
+            // A Devin host exits before reading stdin, so its end of the pipe
+            // can already be closed when the payload is written: a broken pipe
+            // is that skip working, not a failure.
+            if let Err(error) = child.stdin.take().unwrap().write_all(payload) {
+                assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{error}");
+            }
             assert!(child.wait().unwrap().success());
             fs::read_to_string(&log).unwrap_or_default()
         };

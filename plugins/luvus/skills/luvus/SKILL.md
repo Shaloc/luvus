@@ -641,6 +641,9 @@ surface:
   non-Git launch-directory workspace. `task next` stays inside that project,
   and leases collide only inside the same project, including across its Git
   worktrees.
+  Asynchronous UHP workers can guard `task.update` with
+  `if_running: {"pane": 7, "attempt": 1}` from the task snapshot. The server
+  rejects stale ownership with `stale_attempt` before changing status or logs.
   Report work progress only with `task update --note`. `task heartbeat
   --context-used <0..1>` means the fraction of the model context window already
   consumed, never task-completion progress; `0.6` means 60% consumed. Omit the
@@ -656,6 +659,9 @@ surface:
   or a lost response, inspect state and retry the same idempotency key; do not
   assume the definition is absent or create a duplicate schedule. A failed
   prelaunch occurrence is not automatically relaunched on storage recovery.
+  Scheduled worker panes restore as plain shells and never resume their headless
+  conversations interactively. This marker lasts for the pane lifetime; use a
+  new pane for an interactive session that should resume after restart.
   `target=new_worker` is the durable default. Use `active_agent` only with
   the exact discovered pane, terminal lifetime, agent, and workspace identities;
   treat `delivered` as input-queue evidence rather than completed work, and do

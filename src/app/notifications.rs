@@ -52,7 +52,7 @@ impl App {
         agent: &str,
         state: crate::ui::theme::State,
     ) {
-        if !self.config.notifications.terminal_on_agent {
+        if !self.config.notifications.terminal_on_agent || !self.is_agent_pane(pane) {
             return;
         }
         let Some((workspace, _)) = self.pane_location(pane) else {

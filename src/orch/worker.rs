@@ -107,7 +107,7 @@ pub(crate) fn run(args: &[String]) -> Result<i32> {
     // Shell input and app mutations run independently. Keep the one-use record
     // intact until the server has committed the task/pane ownership that
     // authorizes this process to consume it.
-    wait_for_owner(&staged.task_id, pane.0)?;
+    let attempt = wait_for_owner(&staged.task_id, pane.0)?;
     let spec = take(pane)?;
     if spec != staged {
         return Err(anyhow!("manual task launch changed before it was consumed"));
@@ -117,8 +117,42 @@ pub(crate) fn run(args: &[String]) -> Result<i32> {
             "task briefing must not contain terminal control characters"
         ));
     }
-    let status = launch(&spec.agent, &spec.briefing, &spec.task_id)?;
+    let status = match launch(&spec.agent, &spec.briefing, &spec.task_id) {
+        Ok(status) => status,
+        Err(error) => {
+            fail_unstarted(&spec.task_id, pane.0, attempt, &error.to_string());
+            return Err(error);
+        }
+    };
     Ok(status.code().unwrap_or(1))
+}
+
+/// A task whose agent never started has no process left to settle it, so the
+/// runner records the failure instead of leaving the task `running`. The task
+/// may have changed while the agent was starting (completed, blocked, retried
+/// or reassigned); only the attempt this pane still owns is marked failed.
+fn fail_unstarted(task_id: &str, pane: u32, attempt: u64, detail: &str) {
+    let response = crate::cli::send_request(
+        "task.update",
+        failure_update_params(task_id, pane, attempt, detail),
+    );
+    match response {
+        Ok(response) if response.get("error").is_none() => {}
+        Ok(response) => eprintln!("could not mark task {task_id} failed: {response}"),
+        Err(error) => eprintln!("could not mark task {task_id} failed: {error}"),
+    }
+}
+
+pub(crate) fn failure_update_params(
+    task_id: &str,
+    pane: u32,
+    attempt: u64,
+    detail: &str,
+) -> serde_json::Value {
+    json!({
+        "id":task_id, "status":"failed", "output":detail,
+        "if_running":{"pane":pane, "attempt":attempt}
+    })
 }
 
 fn take(pane: crate::ids::PaneId) -> Result<ManualLaunchSpec> {
@@ -150,9 +184,18 @@ fn launch_path(pane: crate::ids::PaneId) -> PathBuf {
     crate::persist::session_dir().join(format!("task-launch-{}.json", pane.0))
 }
 
-fn wait_for_owner(task_id: &str, pane: u32) -> Result<()> {
-    wait_for_owner_with(OWNERSHIP_WAIT, || owner_ready(task_id, pane))
-        .map_err(|error| anyhow!("manual task ownership was not committed: {error}"))
+fn wait_for_owner(task_id: &str, pane: u32) -> Result<u64> {
+    let mut attempt = None;
+    wait_for_owner_with(OWNERSHIP_WAIT, || {
+        let task = fetch_task(task_id)?;
+        let ready = owner_ready(&task, task_id, pane)?;
+        if ready {
+            attempt = task.get("attempt").and_then(|value| value.as_u64());
+        }
+        Ok(ready)
+    })
+    .map_err(|error| anyhow!("manual task ownership was not committed: {error}"))?;
+    attempt.ok_or_else(|| anyhow!("manual task snapshot has no attempt number: {task_id}"))
 }
 
 fn wait_for_owner_with(timeout: Duration, mut ready: impl FnMut() -> Result<bool>) -> Result<()> {
@@ -168,15 +211,19 @@ fn wait_for_owner_with(timeout: Duration, mut ready: impl FnMut() -> Result<bool
     }
 }
 
-fn owner_ready(task_id: &str, pane: u32) -> Result<bool> {
+fn fetch_task(task_id: &str) -> Result<serde_json::Value> {
     let response = crate::cli::send_request("task.get", json!({"id":task_id}))?;
     if let Some(error) = response.get("error") {
         return Err(anyhow!("could not load manual task: {error}"));
     }
-    let task = response
+    response
         .get("result")
         .and_then(|result| result.get("task"))
-        .ok_or_else(|| anyhow!("manual task snapshot is unavailable: {task_id}"))?;
+        .cloned()
+        .ok_or_else(|| anyhow!("manual task snapshot is unavailable: {task_id}"))
+}
+
+fn owner_ready(task: &serde_json::Value, task_id: &str, pane: u32) -> Result<bool> {
     let status = task.get("status").and_then(|value| value.as_str());
     let assignee = task.get("assignee").and_then(|value| value.as_u64());
     if status == Some("running") && assignee == Some(u64::from(pane)) {

@@ -648,12 +648,6 @@ pub trait Handler {
     /// Reset terminal state.
     fn reset_state(&mut self) {}
 
-    /// Bounded program-status metadata from OSC 7501, including feature query.
-    fn program_status(&mut self, _body: &[u8]) {}
-
-    /// A new shell prompt (OSC 133 A) ends transient program status.
-    fn shell_prompt(&mut self) {}
-
     /// Reverse Index.
     ///
     /// Move the active position to the same horizontal position on the
@@ -711,6 +705,15 @@ pub trait Handler {
 
     /// Reset an indexed color to original value.
     fn reset_color(&mut self, _: usize) {}
+
+    /// Receive an OSC 7501 Program Status Protocol report.
+    fn program_status(&mut self, _: &[u8], _: bool) {}
+
+    /// Receive an OSC 133 shell prompt marker.
+    fn prompt_start(&mut self) {}
+
+    /// Receive an OSC 133 command/output start marker.
+    fn command_start(&mut self) {}
 
     /// Store data into clipboard.
     fn clipboard_store(&mut self, _: u8, _: &[u8]) {}
@@ -1412,8 +1415,6 @@ where
         }
 
         match params[0] {
-            b"7501" if params.len() == 2 => self.handler.program_status(params[1]),
-            b"133" if params.get(1) == Some(&b"A".as_slice()) => self.handler.shell_prompt(),
             // Set window title.
             b"0" | b"2" => {
                 if params.len() >= 2 {
@@ -1545,6 +1546,20 @@ where
                     return;
                 }
                 unhandled(params);
+            },
+
+            // Program Status Protocol.
+            b"7501" if params.len() == 2 => {
+                self.handler.program_status(params[1], bell_terminated);
+            },
+
+            // OSC 133;A marks the beginning of a new shell prompt.
+            b"133" if params.get(1).is_some_and(|value| *value == b"A") => {
+                self.handler.prompt_start();
+            },
+
+            b"133" if params.get(1).is_some_and(|value| *value == b"C") => {
+                self.handler.command_start();
             },
 
             // Set clipboard.

@@ -60,6 +60,9 @@ pub struct RemoteWorkspaceRef {
 pub struct RemoteAgentMeta {
     pub pane: String,
     pub agent: String,
+    pub display_agent: Option<String>,
+    pub is_agent: bool,
+    pub progress: Option<u8>,
     pub state: crate::ui::theme::State,
     pub tab: usize,
     pub focused: bool,
@@ -85,9 +88,13 @@ fn parse_remote_agents(workspace: &Value) -> Vec<RemoteAgentMeta> {
                 .map(move |pane| (tab, pane))
         })
         .filter(|(_, pane)| {
-            pane.get("is_agent")
+            pane.get("is_status_reporter")
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
+                || pane
+                    .get("is_agent")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
                 || pane
                     .get("agent_session")
                     .is_some_and(|value| !value.is_null())
@@ -103,6 +110,20 @@ fn parse_remote_agents(workspace: &Value) -> Vec<RemoteAgentMeta> {
             Some(RemoteAgentMeta {
                 pane: pane.get("pane_id")?.as_str()?.into(),
                 agent: pane.get("agent")?.as_str()?.into(),
+                display_agent: pane
+                    .get("display_agent")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                is_agent: pane
+                    .get("is_agent")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                    || pane.get("agent_session").is_some_and(|v| !v.is_null()),
+                progress: pane
+                    .get("program_status_progress")
+                    .and_then(Value::as_u64)
+                    .filter(|n| *n <= 100)
+                    .map(|n| n as u8),
                 state,
                 tab: tab.get("index").and_then(Value::as_u64).unwrap_or(1) as usize,
                 focused: pane

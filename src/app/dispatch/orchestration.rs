@@ -476,13 +476,42 @@ impl App {
     pub(super) fn api_task_update(&mut self, method: &str, p: &Value) -> DispatchResult {
         let _ = (method, p);
         {
-            reject_api_fields(p, &["id", "status", "output", "note", "prompt"])?;
+            reject_api_fields(
+                p,
+                &["id", "status", "output", "note", "prompt", "if_running"],
+            )?;
             let id = req_str(p, "id")?.to_string();
-            let current = self
+            let task = self
                 .orch
                 .task(&id)
-                .ok_or_else(|| ("not_found".to_string(), format!("no such task: {id}")))?
-                .status;
+                .ok_or_else(|| ("not_found".to_string(), format!("no such task: {id}")))?;
+            // Evaluate worker ownership on the single App owner, in the same
+            // dispatch as the update. A preceding task.get cannot fence this.
+            if let Some(guard) = p.get("if_running") {
+                reject_api_fields(guard, &["pane", "attempt"])?;
+                let pane = parse_u32_value(&guard["pane"], "if_running.pane")?;
+                let attempt = guard
+                    .get("attempt")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        (
+                            "invalid_request".to_string(),
+                            "if_running.attempt must be a positive 32-bit integer".to_string(),
+                        )
+                    })?;
+                if task.status != crate::orch::TaskStatus::Running
+                    || task.assignee != Some(pane)
+                    || task.attempt != attempt
+                {
+                    return Err((
+                        "stale_attempt".to_string(),
+                        format!("{id} is no longer running attempt {attempt} in pane {pane}"),
+                    ));
+                }
+            }
+            let current = task.status;
             let status = if let Some(s) = p.get("status").and_then(|v| v.as_str()) {
                 let st = crate::orch::TaskStatus::parse(s)
                     .ok_or_else(|| ("bad_request".to_string(), format!("unknown status: {s}")))?;

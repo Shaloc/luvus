@@ -2,6 +2,110 @@ use super::super::*;
 use super::support::*;
 
 #[test]
+fn task_launch_failure_cannot_overwrite_a_changed_attempt() {
+    use crate::orch::TaskStatus;
+    let (_env, mut app) = app("socket-task-launch-failure");
+    for changed in [
+        "done", "blocked", "review", "failed", "released", "retry", "reassign",
+    ] {
+        let task = app
+            .orch
+            .add_task(changed.into(), vec![], vec![], None)
+            .unwrap();
+        let id = task.id.clone();
+        app.orch.claim(&id, 7).unwrap();
+        app.orch.set_status(&id, TaskStatus::Running).unwrap();
+        // The worker has observed ownership, but the owner processes another
+        // request before the launch failure reaches task.update.
+        let attempt = u64::from(app.orch.task(&id).unwrap().attempt);
+        let failure = crate::orch::worker::failure_update_params(&id, 7, attempt, "launch failed");
+        match changed {
+            "done" => {
+                app.orch.set_status(&id, TaskStatus::Done).unwrap();
+            }
+            "blocked" => {
+                app.orch.set_status(&id, TaskStatus::Blocked).unwrap();
+            }
+            "review" => {
+                app.orch.set_status(&id, TaskStatus::Review).unwrap();
+            }
+            "failed" => {
+                app.orch.set_status(&id, TaskStatus::Failed).unwrap();
+            }
+            "released" => {
+                app.orch.release_task(&id).unwrap();
+            }
+            "retry" => {
+                app.orch.set_status(&id, TaskStatus::Failed).unwrap();
+                app.dispatch("task.retry", &json!({"id":id})).unwrap();
+                app.orch.claim(&id, 7).unwrap();
+                app.orch.set_status(&id, TaskStatus::Running).unwrap();
+            }
+            "reassign" => {
+                app.orch.release_task(&id).unwrap();
+                app.orch.claim(&id, 8).unwrap();
+                app.orch.set_status(&id, TaskStatus::Running).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = app.dispatch("task.get", &json!({"id":id})).unwrap();
+        let error = app.dispatch("task.update", &failure).expect_err(changed);
+        assert_eq!(error.0, "stale_attempt", "{changed}");
+        assert_eq!(app.dispatch("task.get", &json!({"id":id})).unwrap(), before);
+    }
+}
+
+#[test]
+fn task_update_checks_running_guard_before_any_mutation() {
+    use crate::orch::TaskStatus;
+    let (_env, mut app) = app("socket-task-update-guard");
+    app.orch
+        .add_task("start".into(), vec![], vec![], None)
+        .unwrap();
+    app.orch.claim("t1", 7).unwrap();
+    app.orch.set_status("t1", TaskStatus::Running).unwrap();
+    let before = app.dispatch("task.get", &json!({"id":"t1"})).unwrap();
+    for guard in [
+        Value::Null,
+        json!({}),
+        json!({"pane":7}),
+        json!({"pane":7,"attempt":0}),
+        json!({"pane":7,"attempt":4294967296_u64}),
+        json!({"pane":7,"attempt":"1"}),
+        json!({"pane":false,"attempt":1}),
+        json!({"pane":4294967296_u64,"attempt":1}),
+        json!({"pane":7,"attempt":1,"extra":true}),
+    ] {
+        let error = app.dispatch("task.update", &json!({
+            "id":"t1","status":"failed","output":"must not append","note":"must not append","if_running":guard
+        })).unwrap_err();
+        assert_eq!(error.0, "invalid_request", "{guard}");
+        assert_eq!(
+            app.dispatch("task.get", &json!({"id":"t1"})).unwrap(),
+            before
+        );
+    }
+    let mut failure = crate::orch::worker::failure_update_params("t1", 7, 1, "missing executable");
+    failure["if_running"]["pane"] = json!("7");
+    let result = app.dispatch("task.update", &failure).unwrap();
+    assert_eq!(result["task"]["status"], "failed");
+    assert_eq!(result["task"]["outputs"], json!(["missing executable"]));
+    // A duplicate worker completion cannot append another output either.
+    assert_eq!(
+        app.dispatch("task.update", &failure).unwrap_err().0,
+        "stale_attempt"
+    );
+    assert_eq!(
+        app.dispatch("task.get", &json!({"id":"t1"})).unwrap(),
+        result
+    );
+    // Unguarded existing callers retain their prior behavior.
+    assert!(app
+        .dispatch("task.update", &json!({"id":"t1","note":"reviewed"}))
+        .is_ok());
+}
+
+#[test]
 fn task_update_rejects_an_unknown_task_without_emitting_null_success() {
     let (_env, mut app) = app("socket-task-update-missing");
 

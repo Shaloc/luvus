@@ -85,6 +85,8 @@ pub enum AppEvent {
     Resize,
     /// The given pane produced output; the screen changed.
     PtyData(PaneId),
+    /// Coalesced status wake independent of terminal repaint consumption.
+    ProgramStatusChanged(PaneId),
     /// Child OSC52 clipboard writes are effects, independent of frame redraws.
     PtyClipboard {
         pane: PaneId,

@@ -171,6 +171,10 @@ impl App {
                                 "agent_name":agent_names.get(&pane_id).copied(),
                                 "agent":status.map(|status| status.agent.clone()),
                                 "is_agent":self.is_agent_pane(pane_id),
+                                "is_status_reporter":self.is_status_reporter_pane(pane_id),
+                                "display_agent":self.status_reporter_label(pane_id),
+                                "program_status_progress":status.filter(|s| s.state_source == "osc7501")
+                                    .and_then(|s| s.program_status.as_ref()).and_then(|store| store.effective_progress()),
                                 "title":self.cached_pane_title(pane_id),
                                 "agent_pinned":self.pinned_agents.contains(&pane_id),
                                 "workspace_focused":tab_index == workspace.active_tab && tab.layout.focus == pane_id,
