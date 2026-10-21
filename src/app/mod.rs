@@ -72,6 +72,7 @@ pub(crate) use keys::build_direct_keymap;
 pub use keys::{key_reference_rows, presets, Cmd, PrefixSpec};
 pub use modules::ModuleMenuAction;
 pub use picker::{FolderPicker, PickerHit, Row};
+pub(crate) use settings::THEME_PREFERENCE_ROWS;
 pub use settings::{
     GeneralRow, LayoutRow, ModuleRow, SettingsTab, SettingsUi, KEYS_HEADER_ROWS, KEYS_PREFIX_ROW,
     KEYS_PRESET_ROW,
@@ -3516,12 +3517,28 @@ fn child_appearance(
     theme_id: &str,
     theme: &Theme,
     probed: Option<crate::terminal::appearance::PaneAppearance>,
+    config: &crate::config::Config,
 ) -> crate::terminal::appearance::PaneAppearance {
     let declared = registry
         .get(theme_id)
         .map(|entry| entry.appearance)
         .unwrap_or(crate::theme::format::Appearance::Dark);
-    crate::terminal::appearance::PaneAppearance::resolve(theme.text, theme.mantle, declared, probed)
+    let mut appearance = crate::terminal::appearance::PaneAppearance::resolve(
+        theme.text,
+        theme.mantle,
+        declared,
+        probed,
+    );
+    if config.theme_terminal_background {
+        appearance.background = probed.and_then(|p| p.background);
+        if let Some(probed) = probed {
+            appearance.scheme = probed.scheme;
+        }
+    }
+    if let Some(scheme) = config.theme_appearance.scheme() {
+        appearance.scheme = scheme;
+    }
+    appearance
 }
 
 impl App {
@@ -3537,7 +3554,8 @@ impl App {
         crate::layout::set_gaps(config.layout.col_gap, config.layout.row_gap);
         let theme_registry = crate::theme::ThemeRegistry::load();
         let theme = theme_registry.theme_or_default(&config.theme);
-        let pane_appearance = child_appearance(&theme_registry, &config.theme, &theme, None);
+        let pane_appearance =
+            child_appearance(&theme_registry, &config.theme, &theme, None, &config);
         let catalog = crate::i18n::by_code(&config.language);
         let sidebars = Sidebars::from_config(&config.sidebars());
         let shell = crate::platform::resolve_shell(&config.shell);
@@ -4008,7 +4026,8 @@ impl App {
         let agents_this_workspace = config.agents_this_workspace;
         let theme_registry = crate::theme::ThemeRegistry::load();
         let theme = theme_registry.theme_or_default(&config.theme);
-        let pane_appearance = child_appearance(&theme_registry, &config.theme, &theme, None);
+        let pane_appearance =
+            child_appearance(&theme_registry, &config.theme, &theme, None, &config);
         let keymap = keys::build_keymap(&config.keybindings);
         let direct_keymap = keys::build_direct_keymap(&config.direct_keybindings);
         let prefix = keys::PrefixSpec::parse(&config.prefix).unwrap_or_default();
@@ -4763,13 +4782,18 @@ impl App {
     }
 
     /// Apply colors reported by the terminal displaying the foreground client.
-    pub fn apply_terminal_colors(&mut self, colors: &crate::terminal::theme_probe::TerminalColors) {
-        self.display_terminal_colors = Some(colors.clone());
+    pub fn apply_terminal_colors(
+        &mut self,
+        colors: Option<&crate::terminal::theme_probe::TerminalColors>,
+    ) {
+        self.display_terminal_colors = colors.cloned();
         self.probed_appearance =
-            Some(crate::terminal::appearance::PaneAppearance::from_terminal_colors(colors));
+            colors.map(crate::terminal::appearance::PaneAppearance::from_terminal_colors);
         let theme_id = self.config.theme.clone();
-        let derived = crate::ui::theme::Theme::for_terminal(&theme_id, Some(colors));
-        self.set_effective_theme(&theme_id, derived);
+        if crate::ui::theme::follows_terminal(&theme_id) || self.config.theme_terminal_background {
+            let selected = self.theme_registry.theme_or_default(&theme_id);
+            self.set_effective_theme(&theme_id, selected);
+        }
     }
 
     /// Use the interactive display's negotiated appearance during pane creation.
@@ -4780,9 +4804,9 @@ impl App {
         action: impl FnOnce(&mut Self) -> T,
     ) -> T {
         let previous = self.pane_appearance;
-        let temporary = colors
-            .filter(|_| crate::ui::theme::follows_terminal(&self.config.theme))
-            .map(crate::terminal::appearance::PaneAppearance::from_terminal_colors);
+        let temporary = (crate::ui::theme::follows_terminal(&self.config.theme)
+            || self.config.theme_terminal_background)
+            .then(|| self.appearance_for_display(colors));
         if let Some(appearance) = temporary {
             self.pane_appearance = appearance;
         }
@@ -4793,15 +4817,41 @@ impl App {
         result
     }
 
+    pub(crate) fn appearance_for_display(
+        &self,
+        colors: Option<&crate::terminal::theme_probe::TerminalColors>,
+    ) -> crate::terminal::appearance::PaneAppearance {
+        let theme = if crate::ui::theme::follows_terminal(&self.config.theme) {
+            Theme::for_terminal(&self.config.theme, colors, self.config.theme_appearance)
+        } else {
+            self.theme_registry.theme_or_default(&self.config.theme)
+        };
+        child_appearance(
+            &self.theme_registry,
+            &self.config.theme,
+            &theme,
+            colors.map(crate::terminal::appearance::PaneAppearance::from_terminal_colors),
+            &self.config,
+        )
+    }
+
     /// Install one resolved UI theme and broadcast its pane appearance through
     /// the VT interface. Keeping both mutations here prevents config, Settings,
     /// and terminal-probe paths from leaving child query state stale.
     pub(crate) fn set_effective_theme(&mut self, theme_id: &str, mut theme: Theme) {
+        if crate::ui::theme::follows_terminal(theme_id) {
+            theme = Theme::for_terminal(
+                theme_id,
+                self.display_terminal_colors.as_ref(),
+                self.config.theme_appearance,
+            );
+        }
         let appearance = child_appearance(
             &self.theme_registry,
             theme_id,
             &theme,
             self.probed_appearance,
+            &self.config,
         );
         self.pane_appearance = appearance;
         for pane in self.panes.values() {

@@ -26,7 +26,7 @@ enum Preference {
 impl Preference {
     fn patch(self, value: &serde_json::Value) -> serde_json::Value {
         match self {
-            Self::Theme => serde_json::json!({"theme": value}),
+            Self::Theme => value.clone(),
             Self::Language => serde_json::json!({"language": value}),
             Self::RoundedCorners => serde_json::json!({"layout": {"rounded_corners": value}}),
             Self::TerminalAgentNotifications => {
@@ -55,7 +55,7 @@ impl Preference {
 
     fn value(self, app: &App) -> serde_json::Value {
         match self {
-            Self::Theme => app.config.theme.clone().into(),
+            Self::Theme => app.theme_preferences_patch(),
             Self::Language => app.config.language.clone().into(),
             Self::RoundedCorners => app.config.layout.rounded_corners.into(),
             Self::TerminalAgentNotifications => app.config.notifications.terminal_on_agent.into(),
@@ -64,7 +64,7 @@ impl Preference {
 
     fn revision(self, app: &App) -> u64 {
         match self {
-            Self::Theme => app.theme_selection_revision,
+            Self::Theme => app.remote_theme_sync.revision,
             Self::Language => app.remote_language_sync.revision,
             Self::RoundedCorners => app.remote_rounded_sync.revision,
             Self::TerminalAgentNotifications => app.remote_terminal_notify_sync.revision,
@@ -497,7 +497,7 @@ mod tests {
         }
         assert_eq!(
             app.remote_theme_sync.pending.as_ref().unwrap().value,
-            "one-light"
+            app.theme_preferences_patch()
         );
         let language = app.remote_language_sync.pending.as_ref().unwrap();
         assert_eq!(language.value, "zh");
@@ -542,9 +542,11 @@ mod tests {
         let generation = app.remote_registry_generation;
         let mut expected = serde_json::to_value(&app.config).unwrap();
         expected["theme"] = "one-light".into();
+        expected["theme_appearance"] = "dark".into();
+        expected["theme_terminal_background"] = true.into();
         app.dispatch(
             "config.patch",
-            &serde_json::json!({"patch":{"theme":"one-light"}}),
+            &serde_json::json!({"patch":{"theme":"one-light", "theme_appearance":"dark", "theme_terminal_background":true}}),
         )
         .unwrap();
         assert_eq!(serde_json::to_value(&app.config).unwrap(), expected);
@@ -558,8 +560,24 @@ mod tests {
             )
             .is_err());
         assert_eq!(serde_json::to_value(&app.config).unwrap(), expected);
+        for patch in [
+            serde_json::json!({"theme_appearance":"dim"}),
+            serde_json::json!({"theme_terminal_background":"yes"}),
+        ] {
+            assert!(app
+                .dispatch("config.patch", &serde_json::json!({"patch":patch}))
+                .is_err());
+            assert_eq!(serde_json::to_value(&app.config).unwrap(), expected);
+        }
+        assert_eq!(
+            app.pane_appearance.scheme,
+            crate::terminal::appearance::ColorScheme::Dark
+        );
         app.flush_config_for_test(&rx);
-        assert_eq!(crate::config::load().theme, "one-light");
+        let saved = crate::config::load();
+        assert_eq!(saved.theme, "one-light");
+        assert_eq!(saved.theme_appearance, crate::config::ThemeAppearance::Dark);
+        assert!(saved.theme_terminal_background);
     }
 
     #[test]
@@ -574,8 +592,8 @@ mod tests {
         app.apply_theme("one-dark");
         app.apply_theme("one-light");
         let pending = app.remote_theme_sync.pending.as_ref().unwrap();
-        assert_eq!(pending.value, "one-light");
-        assert_eq!(pending.revision, app.theme_selection_revision);
+        assert_eq!(pending.value, app.theme_preferences_patch());
+        assert_eq!(pending.revision, app.remote_theme_sync.revision);
         assert_eq!(pending.hosts, vec!["active"]);
         let scope = Arc::new(ConnectionScope::default());
         app.remote_theme_sync

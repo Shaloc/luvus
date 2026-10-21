@@ -492,7 +492,8 @@ fn draw_content(
             // more palettes than fit a short modal).
             let avail = area.height.max(1) as usize;
             let themes = app.theme_registry.entries();
-            let total = themes.len();
+            let offset = crate::app::THEME_PREFERENCE_ROWS;
+            let total = offset + themes.len();
             let scroll = cursor
                 .saturating_sub(avail.saturating_sub(1))
                 .min(total.saturating_sub(avail));
@@ -505,7 +506,41 @@ fn draw_content(
                 .max()
                 .unwrap_or(9);
             for (vi, i) in (scroll..total).take(avail).enumerate() {
-                let entry = &themes[i];
+                if i < offset {
+                    let y = area.y + vi as u16;
+                    if i == 0 {
+                        let value = match app.config.theme_appearance {
+                            crate::config::ThemeAppearance::Auto => cat.settings.appearance_auto,
+                            crate::config::ThemeAppearance::Light => cat.settings.appearance_light,
+                            crate::config::ThemeAppearance::Dark => cat.settings.appearance_dark,
+                        };
+                        let row = slider_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor == i,
+                            cat.settings.theme_appearance,
+                            value.into(),
+                            t,
+                            &mut arrows,
+                        );
+                        ctls.push((i, row));
+                    } else {
+                        ctls.push(ctl_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor,
+                            cat.settings.theme_terminal_background,
+                            toggle(app.config.theme_terminal_background, t),
+                            t,
+                        ));
+                    }
+                    continue;
+                }
+                let entry = &themes[i - offset];
                 let name = entry.id.as_str();
                 let row = Rect::new(area.x, area.y + vi as u16, area.width, 1);
                 let sel = i == cursor;

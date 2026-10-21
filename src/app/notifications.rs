@@ -317,7 +317,7 @@ mod tests {
                 bg,
                 palette: crate::terminal::theme_probe::default_ansi_palette(fg, bg),
             };
-            app.apply_terminal_colors(&colors);
+            app.apply_terminal_colors(Some(&colors));
             for color in [
                 app.theme.base,
                 app.theme.mantle,
@@ -356,7 +356,7 @@ mod tests {
                 palette: crate::terminal::theme_probe::default_ansi_palette(fg, bg),
             };
             colors.palette[4] = [40, 75, 180];
-            app.apply_terminal_colors(&colors);
+            app.apply_terminal_colors(Some(&colors));
             let theme = app.theme.chrome(Some(&colors));
             let b = draw(&mut app);
             assert_eq!(b[(80, 12)].bg, Color::Reset);

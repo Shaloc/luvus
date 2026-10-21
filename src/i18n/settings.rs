@@ -53,6 +53,11 @@ pub struct Catalog {
     pub rounded_sync_failed: &'static str,
     pub terminal_notify_sync_done: &'static str,
     pub terminal_notify_sync_failed: &'static str,
+    pub theme_appearance: &'static str,
+    pub appearance_auto: &'static str,
+    pub appearance_light: &'static str,
+    pub appearance_dark: &'static str,
+    pub theme_terminal_background: &'static str,
     pub theme_sync_done: &'static str,
     pub theme_sync_failed: &'static str,
     pub focused_pane_metadata: &'static str,
@@ -143,6 +148,12 @@ pub struct Catalog {
 }
 
 pub static EN: Catalog = Catalog {
+    theme_appearance: "Appearance",
+    appearance_auto: "Auto",
+    appearance_light: "Light",
+    appearance_dark: "Dark",
+    theme_terminal_background: "Use terminal background",
+
     notify_display: "Notification display",
     notify_terminal_agent: "Terminal system alerts for agents",
     notify_toast: "Floating toast",
@@ -333,6 +344,12 @@ pub static EN: Catalog = Catalog {
 };
 
 pub static ES: Catalog = Catalog {
+    theme_appearance: "Apariencia",
+    appearance_auto: "Automática",
+    appearance_light: "Clara",
+    appearance_dark: "Oscura",
+    theme_terminal_background: "Usar el fondo del terminal",
+
     notify_display: "Mostrar notificaciones",
     notify_terminal_agent: "Avisos del sistema para agentes vía terminal",
     notify_toast: "Aviso flotante",
@@ -392,6 +409,12 @@ pub static ES: Catalog = Catalog {
 };
 
 pub static PT: Catalog = Catalog {
+    theme_appearance: "Aparência",
+    appearance_auto: "Automática",
+    appearance_light: "Clara",
+    appearance_dark: "Escura",
+    theme_terminal_background: "Usar o fundo do terminal",
+
     notify_display: "Exibir notificações",
     notify_terminal_agent: "Avisos do sistema para agentes via terminal",
     notify_toast: "Aviso flutuante",
@@ -449,6 +472,12 @@ pub static PT: Catalog = Catalog {
 };
 
 pub static FR: Catalog = Catalog {
+    theme_appearance: "Apparence",
+    appearance_auto: "Automatique",
+    appearance_light: "Claire",
+    appearance_dark: "Sombre",
+    theme_terminal_background: "Utiliser le fond du terminal",
+
     notify_display: "Affichage des notifications",
     notify_terminal_agent: "Alertes système des agents via le terminal",
     notify_toast: "Notification flottante",
@@ -506,6 +535,12 @@ pub static FR: Catalog = Catalog {
 };
 
 pub static DE: Catalog = Catalog {
+    theme_appearance: "Darstellung",
+    appearance_auto: "Automatisch",
+    appearance_light: "Hell",
+    appearance_dark: "Dunkel",
+    theme_terminal_background: "Terminalhintergrund verwenden",
+
     notify_display: "Benachrichtigungsanzeige",
     notify_terminal_agent: "Systemmeldungen für Agenten über Terminal",
     notify_toast: "Schwebender Hinweis",
@@ -563,6 +598,12 @@ pub static DE: Catalog = Catalog {
 };
 
 pub static ID: Catalog = Catalog {
+    theme_appearance: "Tampilan",
+    appearance_auto: "Otomatis",
+    appearance_light: "Terang",
+    appearance_dark: "Gelap",
+    theme_terminal_background: "Gunakan latar terminal",
+
     notify_display: "Tampilan notifikasi",
     notify_terminal_agent: "Notifikasi sistem agen melalui terminal",
     notify_toast: "Notifikasi mengambang",
@@ -750,6 +791,12 @@ pub static ID: Catalog = Catalog {
 };
 
 pub static ZH: Catalog = Catalog {
+    theme_appearance: "明暗模式",
+    appearance_auto: "自动",
+    appearance_light: "亮色",
+    appearance_dark: "暗色",
+    theme_terminal_background: "使用终端背景",
+
     notify_display: "通知显示方式",
     notify_terminal_agent: "通过终端发送 Agent 系统通知",
     notify_toast: "浮动提示",
@@ -934,6 +981,12 @@ pub static ZH: Catalog = Catalog {
 };
 
 pub static JA: Catalog = Catalog {
+    theme_appearance: "外観モード",
+    appearance_auto: "自動",
+    appearance_light: "ライト",
+    appearance_dark: "ダーク",
+    theme_terminal_background: "ターミナルの背景を使用",
+
     notify_display: "通知の表示方式",
     notify_terminal_agent: "端末経由でエージェントのシステム通知",
     notify_toast: "フローティング通知",
@@ -1127,6 +1180,12 @@ pub static JA: Catalog = Catalog {
 };
 
 pub static KO: Catalog = Catalog {
+    theme_appearance: "화면 모드",
+    appearance_auto: "자동",
+    appearance_light: "라이트",
+    appearance_dark: "다크",
+    theme_terminal_background: "터미널 배경 사용",
+
     notify_display: "알림 표시 방식",
     notify_terminal_agent: "터미널을 통한 에이전트 시스템 알림",
     notify_toast: "플로팅 알림",

@@ -24,15 +24,19 @@ def main():
 
     def probe():
         nonlocal revision
-        os.write(1, b"\x1b]10;?\x07\x1b]11;?\x1b\\")
+        os.write(1, b"\x1b]10;?\x07\x1b]11;?\x1b\\\x1b[?996n")
         received = bytearray()
         colors = {}
+        scheme = None
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and len(colors) < 2:
+        while time.monotonic() < deadline and (len(colors) < 2 or scheme is None):
             if not select.select([0], [], [], 0.02)[0]:
                 continue
             received.extend(os.read(0, 4096))
             assert len(received) < 16384
+            scheme_match = re.search(rb"\x1b\[\?997;([12])n", received)
+            if scheme_match:
+                scheme = "dark" if scheme_match[1] == b"1" else "light"
             for match in re.finditer(rb"\x1b](10|11);rgb:([a-fA-F0-9]+)/([a-fA-F0-9]+)/([a-fA-F0-9]+)(?:\x07|\x1b\\)", received):
                 colors[match[1].decode()] = [int(value, 16) * 255 // ((1 << (4 * len(value))) - 1)
                                            for value in match.group(2, 3, 4)]
@@ -47,7 +51,7 @@ def main():
         os.write(1, output.encode())
         revision += 1
         temporary = report.with_suffix(".pending")
-        temporary.write_text(json.dumps({"revision": revision, "colors": colors, "diff": diff}))
+        temporary.write_text(json.dumps({"revision": revision, "colors": colors, "diff": diff, "scheme": scheme}))
         temporary.replace(report)
 
     try:

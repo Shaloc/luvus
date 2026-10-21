@@ -461,7 +461,8 @@ pub fn run() -> Result<()> {
     app.reconcile_automations();
     shutdown::install(tx.clone());
 
-    let mut terminal_theme_enabled = crate::ui::theme::follows_terminal(&app.config.theme);
+    let mut terminal_theme_enabled = crate::ui::theme::follows_terminal(&app.config.theme)
+        || app.config.theme_terminal_background;
     let terminal_theme = Arc::new(AtomicBool::new(terminal_theme_enabled));
     api::start_server(api_listener, tx.clone(), events);
     start_client_listener(client_listener, tx.clone(), terminal_theme.clone());
@@ -604,7 +605,8 @@ pub fn run() -> Result<()> {
             );
             record_event_render_request(source, changed, &mut render_request);
         }
-        let enabled = crate::ui::theme::follows_terminal(&app.config.theme);
+        let enabled = crate::ui::theme::follows_terminal(&app.config.theme)
+            || app.config.theme_terminal_background;
         if enabled != terminal_theme_enabled {
             terminal_theme_enabled = enabled;
             terminal_theme.store(enabled, Ordering::Relaxed);
@@ -1669,14 +1671,11 @@ fn workspace_size_owner(
 }
 
 fn apply_foreground_theme(app: &mut App, clients: &Clients, foreground: Option<u64>) {
-    let colors = foreground
-        .and_then(|id| clients.get(&id))
-        .and_then(|client| client.terminal_colors.as_ref());
-    app.display_terminal_colors = colors.cloned();
-    if crate::ui::theme::follows_terminal(&app.config.theme) {
-        if let Some(colors) = colors {
-            app.apply_terminal_colors(colors);
-        }
+    if let Some(client) = foreground.and_then(|id| clients.get(&id)) {
+        app.apply_terminal_colors(client.terminal_colors.as_ref());
+    } else {
+        // No display took ownership; keep headless panes' last appearance.
+        app.display_terminal_colors = None;
     }
 }
 
@@ -2022,6 +2021,7 @@ fn render_client(
         let mut theme = crate::ui::theme::Theme::for_terminal(
             &app.config.theme,
             client.terminal_colors.as_ref(),
+            app.config.theme_appearance,
         );
         if app.downsample {
             theme = theme.to_256();
@@ -2074,6 +2074,9 @@ fn render_client(
                     Some(id) => app.workspaces.iter().position(|ws| ws.id == id),
                     None => Some(app.active_ws),
                 };
+                let appearance = (crate::ui::theme::follows_terminal(&app.config.theme)
+                    || app.config.theme_terminal_background)
+                    .then(|| app.appearance_for_display(client.terminal_colors.as_ref()));
                 if let Some(workspace) =
                     workspace_index.and_then(|index| app.workspaces.get_mut(index))
                 {
@@ -2083,11 +2086,9 @@ fn render_client(
                         for (id, pane) in &app.panes {
                             if tab.layout.contains(*id) {
                                 pane.set_cell_pixels(client.layout_cell_pixels());
-                                if crate::ui::theme::follows_terminal(&app.config.theme) {
-                                    if let Some(colors) = client.terminal_colors.as_ref() {
-                                        if let Ok(mut engine) = pane.engine.lock() {
-                                            engine.set_appearance(crate::terminal::appearance::PaneAppearance::from_terminal_colors(colors));
-                                        }
+                                if let Some(appearance) = appearance {
+                                    if let Ok(mut engine) = pane.engine.lock() {
+                                        engine.set_appearance(appearance);
                                     }
                                 }
                             }
@@ -4350,7 +4351,7 @@ mod tests {
                         "theme": name, "layout": {"rounded_corners": true}
                     }}),
                 );
-                fixture.app.apply_terminal_colors(&dark);
+                fixture.app.apply_terminal_colors(Some(&dark));
                 let original_theme = fixture.app.theme.clone();
                 fixture.render();
                 let light_theme = if name == "none" {
@@ -4382,6 +4383,12 @@ mod tests {
 
         #[test]
         fn projection_terminal_colors_follow_owner_without_passive_focus_or_palette_changes() {
+            for (theme, terminal_background) in [("none", false), ("one-dark", true)] {
+                check_projection_appearance_ownership(theme, terminal_background);
+            }
+        }
+
+        fn check_projection_appearance_ownership(theme: &str, terminal_background: bool) {
             use crate::ipc::server::ProjectionSubscription;
             use crate::terminal::{
                 appearance::PaneAppearance, pty::InputAction, theme_probe::TerminalColors, vt,
@@ -4390,7 +4397,7 @@ mod tests {
             let mut fixture = Fixture::new();
             fixture.api(
                 "config.patch",
-                serde_json::json!({"patch": {"theme": "none"}}),
+                serde_json::json!({"patch": {"theme": theme, "theme_terminal_background": terminal_background, "theme_appearance": "light"}}),
             );
             let colors = |fg, bg| TerminalColors {
                 fg,
@@ -4454,6 +4461,73 @@ mod tests {
             );
             fixture.render();
             assert!(read_bg(&fixture.app, target, &receivers[1]).contains("f0f0/f0f0/f0f0"));
+            for (pane, rx) in [fixture.foreground_pane, target]
+                .into_iter()
+                .zip(&receivers)
+            {
+                rx.try_iter().for_each(drop);
+                fixture.app.panes[&pane]
+                    .engine
+                    .lock()
+                    .unwrap()
+                    .advance(b"\x1b[?996n");
+                let InputAction::Bytes(bytes) = rx.try_recv().unwrap() else {
+                    panic!("scheme query");
+                };
+                assert_eq!(
+                    bytes, b"\x1b[?997;2n",
+                    "display colors must not override manual appearance"
+                );
+            }
+            // Losing a probe on a passive display cannot erase the owner's
+            // colors; losing the active display's probe must not retain them.
+            fixture.input(3, ClientInput::TerminalColors(None));
+            fixture.render();
+            assert!(read_bg(&fixture.app, target, &receivers[1]).contains("f0f0/f0f0/f0f0"));
+            fixture.input(2, ClientInput::TerminalColors(None));
+            fixture.render();
+            receivers[1].try_iter().for_each(drop);
+            fixture.app.panes[&target]
+                .engine
+                .lock()
+                .unwrap()
+                .advance(b"\x1b]11;?\x07\x1b[?996n");
+            let replies: Vec<_> = receivers[1]
+                .try_iter()
+                .map(|action| {
+                    let InputAction::Bytes(bytes) = action else {
+                        panic!("appearance query");
+                    };
+                    bytes
+                })
+                .collect();
+            assert_eq!(
+                replies,
+                [b"\x1b[?997;2n".to_vec()],
+                "missing active probe must clear RGB while preserving manual Light"
+            );
+            fixture.input(1, ClientInput::TerminalColors(None));
+            super::super::apply_foreground_theme(&mut fixture.app, &fixture.clients, Some(1));
+            receivers[0].try_iter().for_each(drop);
+            fixture.app.panes[&fixture.foreground_pane]
+                .engine
+                .lock()
+                .unwrap()
+                .advance(b"\x1b]11;?\x07\x1b[?996n");
+            let replies: Vec<_> = receivers[0]
+                .try_iter()
+                .map(|action| {
+                    let InputAction::Bytes(bytes) = action else {
+                        panic!("foreground appearance query");
+                    };
+                    bytes
+                })
+                .collect();
+            assert_eq!(
+                replies,
+                [b"\x1b[?997;2n".to_vec()],
+                "missing foreground probe must clear RGB while preserving manual Light"
+            );
             assert_eq!(fixture.foreground, Some(1));
             assert_eq!(fixture.app.ws().id, fixture.foreground_workspace);
             fixture

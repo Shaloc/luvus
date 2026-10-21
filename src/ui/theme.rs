@@ -18,12 +18,30 @@ fn pal(c: [u8; 3]) -> Color {
 impl Theme {
     /// Derive only UI colors; applying this palette must not mutate other
     /// clients' themes or the appearance owned by a live pane.
-    pub(crate) fn for_terminal(name: &str, colors: Option<&TerminalColors>) -> Self {
+    pub(crate) fn for_terminal(
+        name: &str,
+        colors: Option<&TerminalColors>,
+        appearance: crate::config::ThemeAppearance,
+    ) -> Self {
         if name == "none" {
             Self::terminal_unstyled()
         } else {
-            colors.map_or_else(Self::terminal_native, Self::from_terminal)
+            colors.map_or_else(Self::terminal_native, |colors| match appearance.scheme() {
+                None => Self::from_terminal(colors),
+                scheme => Self::from_terminal_with_scheme(colors, scheme),
+            })
         }
+    }
+
+    /// Only ordinary surfaces inherit the terminal background. Overlay callers
+    /// keep the original palette so covered text cannot show through a popup.
+    pub(crate) fn canvas(mut self, terminal_background: bool) -> Self {
+        if terminal_background {
+            self.crust = Color::Reset;
+            self.mantle = Color::Reset;
+            self.base = Color::Reset;
+        }
+        self
     }
 
     /// Resolve only chrome surfaces against the displaying terminal. Main pane
@@ -145,8 +163,17 @@ impl Theme {
     }
 
     pub fn from_terminal(c: &TerminalColors) -> Self {
+        Self::from_terminal_with_scheme(c, None)
+    }
+
+    fn from_terminal_with_scheme(
+        c: &TerminalColors,
+        scheme: Option<crate::terminal::appearance::ColorScheme>,
+    ) -> Self {
         let (bg, fg) = (c.bg, c.fg);
-        let is_dark = crate::terminal::appearance::ColorScheme::from_terminal_colors(c).is_dark();
+        let is_dark = scheme
+            .unwrap_or_else(|| crate::terminal::appearance::ColorScheme::from_terminal_colors(c))
+            .is_dark();
         // palette[8] (bright black) is the terminal designer's chosen "dim/elevated"
         // color — blend toward it for surfaces so the tint matches the scheme.
         let dim = c.palette[8];

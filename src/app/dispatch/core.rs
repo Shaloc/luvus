@@ -268,12 +268,13 @@ impl App {
             .is_some_and(|patch| {
                 !patch.is_empty()
                     && patch.keys().all(|key| {
-                        matches!(key.as_str(), "theme" | "language")
-                            || key == "layout"
-                                && patch["layout"].as_object().is_some_and(|layout| {
-                                    !layout.is_empty()
-                                        && layout.keys().all(|k| k == "rounded_corners")
-                                })
+                        matches!(
+                            key.as_str(),
+                            "theme" | "theme_appearance" | "theme_terminal_background" | "language"
+                        ) || key == "layout"
+                            && patch["layout"].as_object().is_some_and(|layout| {
+                                !layout.is_empty() && layout.keys().all(|k| k == "rounded_corners")
+                            })
                             || key == "notifications"
                                 && patch["notifications"]
                                     .as_object()
@@ -289,8 +290,16 @@ impl App {
             // A remote preference change must not reset scroll/layout, rediscover
             // this owner's SSH hosts, or propagate back to the sender.
             let patch = persist_patch.expect("preference patch");
-            if patch.get("theme").is_some() {
-                self.apply_theme_locally(&next.theme);
+            if ["theme", "theme_appearance", "theme_terminal_background"]
+                .iter()
+                .any(|key| patch.get(key).is_some())
+            {
+                self.apply_theme_preferences_locally(
+                    &next.theme,
+                    next.theme_appearance,
+                    next.theme_terminal_background,
+                    patch.get("theme").is_some(),
+                );
             }
             if patch.get("language").is_some() {
                 self.apply_language_locally(&next.language);
@@ -311,6 +320,8 @@ impl App {
         let keymap = keys::build_keymap(&next.keybindings);
         let direct_keymap = keys::build_direct_keymap(&next.direct_keybindings);
         let history_budget = next.scrollback_bytes();
+        self.config.theme_appearance = next.theme_appearance;
+        self.config.theme_terminal_background = next.theme_terminal_background;
         self.set_effective_theme(&next.theme, theme);
         self.catalog = crate::i18n::by_code(&next.language);
         self.prefix = prefix;

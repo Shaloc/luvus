@@ -778,7 +778,10 @@ fn render_into_mode_impl(
     workspace_only: bool,
 ) {
     f.rounded_corners = app.config.layout.rounded_corners;
-    let t = app.theme.chrome(app.display_terminal_colors.as_ref());
+    let overlay_theme = app.theme.chrome(app.display_terminal_colors.as_ref());
+    let t = overlay_theme
+        .clone()
+        .canvas(app.config.theme_terminal_background);
     // The active i18n catalog (Copy `&'static`), passed to draw fns that don't
     // get the whole `App` (picker, git tab) so all chrome is localized (docs/21).
     let cat = app.catalog;
@@ -1286,6 +1289,7 @@ fn render_into_mode_impl(
         status::draw_owner_bar(f, status, app, &t);
     }
 
+    let t = overlay_theme;
     if !workspace_only {
         notifications::popup(f, area, app, &t);
     }
@@ -2655,9 +2659,16 @@ mod retained_render_tests {
 
     #[test]
     fn damaged_rows_match_a_forced_full_projection() {
+        for terminal_background in [false, true] {
+            check_damaged_rows_match_full_projection(terminal_background);
+        }
+    }
+
+    fn check_damaged_rows_match_full_projection(terminal_background: bool) {
         let _env = crate::persist::test_env("retained-render-equivalence");
         let (app_tx, _app_rx) = mpsc::channel();
         let mut app = App::new(100, 30, app_tx).expect("app starts");
+        app.config.theme_terminal_background = terminal_background;
         let focus = app.layout().focus;
         let (response_tx, _response_rx) = mpsc::channel();
         let engine = create_engine(

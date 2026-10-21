@@ -470,7 +470,11 @@ pub(super) fn patch_terminal_damage(
         return Err(());
     }
 
-    let theme = &app.theme;
+    let canvas = app
+        .theme
+        .clone()
+        .canvas(app.config.theme_terminal_background);
+    let theme = &canvas;
     let focus = app.layout().focus;
     let mut cursor = None;
     for id in leaves {
@@ -1483,15 +1487,35 @@ mod tests {
         );
         let focus = app.layout().focus;
         app.panes.get_mut(&focus).unwrap().engine = engine.clone();
-        for (id, theme) in [
-            ("one-light", Theme::one_light()),
-            ("one-dark", Theme::one_dark()),
+        let colors = crate::terminal::theme_probe::TerminalColors {
+            fg: [56, 58, 66],
+            bg: [250; 3],
+            palette: crate::terminal::theme_probe::default_ansi_palette([56, 58, 66], [250; 3]),
+        };
+        app.apply_terminal_colors(Some(&colors));
+        for (id, theme, terminal_background, mode) in [
+            ("one-light", Theme::one_light(), false, "auto"),
+            ("one-dark", Theme::one_dark(), false, "auto"),
+            ("one-dark", Theme::one_dark(), true, "light"),
+            ("one-light", Theme::one_light(), true, "dark"),
         ] {
-            app.set_effective_theme(id, theme.clone());
+            app.dispatch("config.patch", &serde_json::json!({"patch": {
+                "theme": id, "theme_terminal_background": terminal_background, "theme_appearance": mode,
+            }})).unwrap();
+            let background = if terminal_background {
+                Color::Reset
+            } else {
+                theme.mantle
+            };
+            let query_bg = if terminal_background {
+                Color::Rgb(250, 250, 250)
+            } else {
+                theme.mantle
+            };
             engine.lock().unwrap().advance(
                 b"\x1b[0m\x1b[2J\x1b[H\x1b]10;?\x07\x1b]11;?\x07Q\x1b[48;2;230;255;237mR\x1b[0mS",
             );
-            for (slot, color) in [(10, theme.text), (11, theme.mantle)] {
+            for (slot, color) in [(10, theme.text), (11, query_bg)] {
                 let Color::Rgb(r, g, b) = color else {
                     panic!("static theme must supply RGB");
                 };
@@ -1504,6 +1528,20 @@ mod tests {
                 };
                 assert_eq!(reply, expected.as_bytes());
             }
+            engine.lock().unwrap().advance(b"\x1b[?996n");
+            let crate::terminal::pty::InputAction::Bytes(reply) = response_rx.try_recv().unwrap()
+            else {
+                panic!("scheme reply");
+            };
+            let light = mode == "light" || (mode == "auto" && id == "one-light");
+            assert_eq!(
+                reply,
+                if light {
+                    b"\x1b[?997;2n"
+                } else {
+                    b"\x1b[?997;1n"
+                }
+            );
             let area = Rect::new(0, 0, 80, 24);
             let mut buffer = Buffer::empty(area);
             let mut target = RenderTarget::new(&mut buffer, area);
@@ -1514,11 +1552,11 @@ mod tests {
                 .position(|cell| cell.symbol() == "Q")
                 .unwrap();
             assert_eq!(buffer.content[q].fg, theme.text);
-            assert_eq!(buffer.content[q].bg, theme.mantle);
+            assert_eq!(buffer.content[q].bg, background);
             assert_eq!(buffer.content[q + 1].bg, Color::Rgb(230, 255, 237));
             assert_eq!(
                 buffer.content[q + 2].bg,
-                theme.mantle,
+                background,
                 "SGR reset must clear the previous diff background"
             );
         }

@@ -1738,12 +1738,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     // Cache the bounded startup probe even for a static theme, so switching
     // to None later can immediately answer child color queries correctly.
     let probe = terminal::theme_probe::probe();
-    app.display_terminal_colors = probe.colors.clone();
-    if crate::ui::theme::follows_terminal(&app.config.theme) {
-        if let Some(colors) = probe.colors.as_ref() {
-            app.apply_terminal_colors(colors);
-        }
-    }
+    app.apply_terminal_colors(probe.colors.as_ref());
     let pending = probe.pending;
     // Match the client path: query colors before enabling input protocols, so
     // any interleaved bytes are ordinary keys that can be replayed losslessly.

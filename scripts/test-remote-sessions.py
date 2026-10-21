@@ -705,7 +705,7 @@ def main():
                     or ((theme_sync_only or graphics_only or colors_only) and not re.search(rb"\x1b\[\d+;\d+H", screen))):
                 if select.select([master], [], [], 0.1)[0]:
                     screen.extend(os.read(master, 65536))
-                    if appearance_only and not answered_probe and b"\x1b]10;?" in screen:
+                    if (appearance_only or colors_only) and not answered_probe and b"\x1b]10;?" in screen:
                         # Real thin-client probe: simulate this light host terminal.
                         # A client reached through SSH can receive OSC replies
                         # after the old 50ms startup window. Keep the real input
@@ -1401,7 +1401,7 @@ def main():
                 wait_for(report.exists)
                 revision = json.loads(report.read_text())["revision"]
 
-                def check(fg, bg, key=b"p", index=None):
+                def check(fg, bg, key=b"p", index=None, terminal_background=False, scheme=None):
                     nonlocal revision
                     os.write(master, key)
                     def recorded():
@@ -1411,6 +1411,8 @@ def main():
                     data = wait_for(recorded)
                     revision = data["revision"]
                     assert data["colors"] == {"10": fg, "11": bg}, (label, data)
+                    if scheme is not None:
+                        assert data["scheme"] == scheme, (label, data)
                     observed = {}
                     def colors_match():
                         drain(master, 0.1)
@@ -1428,7 +1430,8 @@ def main():
                                 cell = terminal.buffer[y][column]
                                 observed[marker] = {"fg": cell.fg, "bg": cell.bg}
                                 rgb = lambda value: "".join(f"{part:02x}" for part in value)
-                                if cell.bg != rgb(expected_bg) or (expected_fg is not None and cell.fg != rgb(expected_fg)):
+                                rendered_bg = "default" if terminal_background and marker != "COLOR_DIFF" else rgb(expected_bg)
+                                if cell.bg != rendered_bg or (expected_fg is not None and cell.fg != rgb(expected_fg)):
                                     return False
                         return True
                     try:
@@ -1443,8 +1446,17 @@ def main():
                 check([0xab, 0xcd, 0xef], [0x12, 0x34, 0x56], b"d", [0x24, 0x68, 0x24])
                 run("--session", "api", "theme", "use", "one-dark", remote=remote)
                 check([0xab, 0xb2, 0xbf], [0x28, 0x2c, 0x34], b"r")
+                for mode in ("light", "dark", "auto"):
+                    api("config.patch", {"patch": {"theme_appearance": mode, "theme_terminal_background": True}}, remote=remote)
+                    check([0xab, 0xb2, 0xbf], [0xfa, 0xfa, 0xfa], terminal_background=True,
+                          scheme="light" if mode == "auto" else mode)
+                check([0xab, 0xcd, 0xef], [0x12, 0x34, 0x56], b"d", [0x24, 0x68, 0x24])
+                check([0xab, 0xb2, 0xbf], [0xfa, 0xfa, 0xfa], b"r", terminal_background=True, scheme="light")
+                api("config.patch", {"patch": {"theme_terminal_background": False}}, remote=remote)
+                check([0xab, 0xb2, 0xbf], [0x28, 0x2c, 0x34], scheme="dark")
                 os.write(master, b"q")
                 drain(master)
+                print(f"PASS: {label}: appearance overrides and terminal backgrounds preserve explicit colors and sparse/full frames", flush=True)
                 print(f"PASS: {label}: foreground/background queries match visible colors; overrides, reset and theme change survive sparse/full frames", flush=True)
 
             for remote in (False, True):
@@ -1955,6 +1967,28 @@ def main():
             os.write(master, b"\x1b")
             drain(master)
             print("PASS: local Settings agent alerts sync on/off to every running owner; remote OSC 9 reaches the physical client; sync feedback stays internal", flush=True)
+
+            os.write(master, b"\x02=")
+            settings_screen = drain(master)
+            click(master, *position(settings_screen + repaint(master), "Theme"))
+            drain(master)
+            # Scroll to the two controls above the palette list. Navigation must
+            # not itself toggle either preference.
+            os.write(master, b"\x1b[A" * 32)
+            drain(master)
+            assert api("config.get")["config"]["theme_appearance"] == "auto"
+            for mode in ("light", "dark", "auto"):
+                os.write(master, b"\r")
+                wait_for_settings(lambda: all(api("config.get", remote=True, session=name)["config"]["theme_appearance"] == mode for name in owners))
+                wait_for_settings(lambda: json.loads((root / "remote-state/config.json").read_text())["theme_appearance"] == mode)
+            os.write(master, b"\x1b[B")
+            for enabled in (True, False):
+                os.write(master, b"\r")
+                wait_for_settings(lambda: all(api("config.get", remote=True, session=name)["config"]["theme_terminal_background"] == enabled for name in owners))
+                wait_for_settings(lambda: json.loads((root / "remote-state/config.json").read_text())["theme_terminal_background"] == enabled)
+            os.write(master, b"\x1b")
+            drain(master)
+            print("PASS: Settings Auto/Light/Dark and terminal background sync live and persist on running owners", flush=True)
 
             # Selecting another local theme must not inherit any remote config.
             run("--session", "api", "theme", "use", "one-dark")

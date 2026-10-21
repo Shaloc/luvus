@@ -24,6 +24,8 @@ pub enum SettingsTab {
     Remote,
 }
 
+pub(crate) const THEME_PREFERENCE_ROWS: usize = 2;
+
 impl SettingsTab {
     pub const ALL: [SettingsTab; 8] = [
         SettingsTab::General,
@@ -360,7 +362,7 @@ impl App {
     pub fn settings_rows(&self, tab: SettingsTab) -> usize {
         match tab {
             SettingsTab::General => self.general_rows().len(),
-            SettingsTab::Theme => self.theme_registry.entries().len(),
+            SettingsTab::Theme => THEME_PREFERENCE_ROWS + self.theme_registry.entries().len(),
             SettingsTab::Layout => self.layout_rows().len(),
             // Rebindable commands first, then the read-only reference rows — the
             // cursor steps through both so the whole reference is keyboard-reachable.
@@ -471,7 +473,8 @@ impl App {
             let continuous = match key.code {
                 KeyCode::Up | KeyCode::Down => true,
                 KeyCode::Left | KeyCode::Right => match tab {
-                    SettingsTab::Theme | SettingsTab::Language => true,
+                    SettingsTab::Theme => cursor >= THEME_PREFERENCE_ROWS,
+                    SettingsTab::Language => true,
                     SettingsTab::Layout => matches!(
                         self.layout_rows().get(cursor),
                         Some(
@@ -631,6 +634,7 @@ impl App {
                 ),
                 // Number/enum module settings likewise only move via `‹ ›`.
                 Some(SettingsTab::Modules) => self.module_row_is_slider(i),
+                Some(SettingsTab::Theme) => i == 0,
                 _ => false,
             };
             if !is_slider {
@@ -641,10 +645,12 @@ impl App {
 
     fn settings_set_tab(&mut self, tab: SettingsTab) {
         let cursor = match tab {
-            SettingsTab::Theme => self
-                .theme_registry
-                .index_of(&self.config.theme)
-                .unwrap_or(0),
+            SettingsTab::Theme => {
+                self.theme_registry
+                    .index_of(&self.config.theme)
+                    .unwrap_or(0)
+                    + THEME_PREFERENCE_ROWS
+            }
             SettingsTab::Language => lang_cursor(&self.config.language),
             _ => 0,
         };
@@ -862,11 +868,11 @@ impl App {
             ui.cursor = new;
         }
         // Theme / Language preview live as the selection moves.
-        if tab == SettingsTab::Theme {
+        if tab == SettingsTab::Theme && new >= THEME_PREFERENCE_ROWS {
             if let Some(id) = self
                 .theme_registry
                 .entries()
-                .get(new)
+                .get(new - THEME_PREFERENCE_ROWS)
                 .map(|entry| entry.id.clone())
             {
                 self.apply_theme(&id);
@@ -881,6 +887,9 @@ impl App {
             return;
         };
         match tab {
+            SettingsTab::Theme if cursor < THEME_PREFERENCE_ROWS => {
+                self.adjust_theme_preference(cursor, delta)
+            }
             // radio tabs: ‹ › move the selection like up/down
             SettingsTab::Theme | SettingsTab::Language => self.settings_move(delta),
             SettingsTab::Layout => self.adjust_layout(cursor, delta),
@@ -904,8 +913,12 @@ impl App {
             ui.prefix_candidate = None;
         }
         match tab {
+            SettingsTab::Theme if cursor < THEME_PREFERENCE_ROWS => {
+                self.adjust_theme_preference(cursor, 1)
+            }
             SettingsTab::Theme => {
-                let index = cursor.min(self.theme_registry.entries().len().saturating_sub(1));
+                let index = (cursor - THEME_PREFERENCE_ROWS)
+                    .min(self.theme_registry.entries().len().saturating_sub(1));
                 if let Some(id) = self
                     .theme_registry
                     .entries()
@@ -1170,7 +1183,12 @@ impl App {
     }
 
     fn settings_enter_theme(&mut self, cursor: usize) {
-        let index = cursor.min(self.theme_registry.entries().len().saturating_sub(1));
+        if cursor < THEME_PREFERENCE_ROWS {
+            self.adjust_theme_preference(cursor, 1);
+            return;
+        }
+        let index = (cursor - THEME_PREFERENCE_ROWS)
+            .min(self.theme_registry.entries().len().saturating_sub(1));
         if let Some((id, removable)) = self.theme_registry.entries().get(index).map(|entry| {
             (
                 entry.id.clone(),
@@ -1307,21 +1325,65 @@ impl App {
     /// Inbound config patches stay owner-local and never rebroadcast to SSH
     /// peers. UI/CLI theme selection uses `apply_theme` above.
     pub(super) fn apply_theme_locally(&mut self, name: &str) -> bool {
+        self.apply_theme_preferences_locally(
+            name,
+            self.config.theme_appearance,
+            self.config.theme_terminal_background,
+            true,
+        )
+    }
+
+    pub(super) fn apply_theme_preferences_locally(
+        &mut self,
+        name: &str,
+        appearance: crate::config::ThemeAppearance,
+        terminal_background: bool,
+        select_palette: bool,
+    ) -> bool {
         let Some(selected) = self.theme_registry.theme(name) else {
             return false;
         };
         self.config.theme = theme::canonical(name).to_string();
-        self.theme_selection_revision = self.theme_selection_revision.wrapping_add(1);
-        let theme_id = self.config.theme.clone();
-        self.set_effective_theme(&theme_id, selected);
-        if theme::follows_terminal(&theme_id) {
-            if let Some(colors) = self.display_terminal_colors.clone() {
-                self.apply_terminal_colors(&colors);
-            }
+        self.config.theme_appearance = appearance;
+        self.config.theme_terminal_background = terminal_background;
+        // Palette selection fences uninstall rollback; appearance changes only
+        // supersede pending sync receipts and must not discard that rollback.
+        if select_palette {
+            self.theme_selection_revision = self.theme_selection_revision.wrapping_add(1);
         }
+        self.remote_theme_sync.revision = self.remote_theme_sync.revision.wrapping_add(1);
+        let theme_id = self.config.theme.clone();
+        self.probed_appearance = self
+            .display_terminal_colors
+            .as_ref()
+            .map(crate::terminal::appearance::PaneAppearance::from_terminal_colors);
+        self.set_effective_theme(&theme_id, selected);
         self.changelog_rows = None;
-        self.persist_config_patch(&serde_json::json!({"theme": theme_id}));
+        self.persist_config_patch(&self.theme_preferences_patch());
         true
+    }
+
+    pub(super) fn theme_preferences_patch(&self) -> serde_json::Value {
+        serde_json::json!({"theme": self.config.theme, "theme_appearance": self.config.theme_appearance, "theme_terminal_background": self.config.theme_terminal_background})
+    }
+
+    fn adjust_theme_preference(&mut self, cursor: usize, delta: i32) {
+        use crate::config::ThemeAppearance::{Auto, Dark, Light};
+        let mut appearance = self.config.theme_appearance;
+        let mut terminal_background = self.config.theme_terminal_background;
+        match cursor {
+            0 => {
+                let values = [Auto, Light, Dark];
+                let index = values.iter().position(|v| *v == appearance).unwrap_or(0) as i32;
+                appearance = values[(index + delta).rem_euclid(values.len() as i32) as usize];
+            }
+            1 => terminal_background = !terminal_background,
+            _ => return,
+        }
+        let theme = self.config.theme.clone();
+        if self.apply_theme_preferences_locally(&theme, appearance, terminal_background, false) {
+            self.sync_theme_to_connected_hosts();
+        }
     }
 
     /// Swap the server's in-memory registry after an off-loop scan. A missing
@@ -1852,6 +1914,51 @@ fn lang_cursor(code: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn theme_appearance_controls_are_independent_persisted_and_ignore_key_repeat() {
+        use crate::config::ThemeAppearance;
+        use crossterm::event::KeyEventKind;
+        use ratatui::{backend::TestBackend, Terminal};
+        let _env = crate::persist::test_env("theme-appearance-controls");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        assert_eq!(app.config.theme_appearance, ThemeAppearance::Auto);
+        assert!(!app.config.theme_terminal_background);
+        app.open_settings();
+        app.settings_set_tab(SettingsTab::Theme);
+        app.settings.as_mut().unwrap().cursor = 1;
+        let palette = app.config.theme.clone();
+        app.settings_move(-1);
+        assert_eq!(app.config.theme, palette);
+        assert_eq!(app.config.theme_appearance, ThemeAppearance::Auto);
+        app.handle_settings_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.config.theme_appearance, ThemeAppearance::Light);
+        let repeated =
+            KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Repeat);
+        app.handle_settings_key(repeated);
+        assert_eq!(app.config.theme_appearance, ThemeAppearance::Light);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &mut app))
+            .unwrap();
+        let (_, row) = *app
+            .settings_ctl_rects
+            .iter()
+            .find(|(index, _)| *index == 1)
+            .unwrap();
+        app.handle_settings_click(row.x + 2, row.y);
+        assert!(app.config.theme_terminal_background);
+        assert_eq!(app.config.theme, palette);
+        app.flush_config_for_test(&rx);
+        let saved = crate::config::load();
+        assert_eq!(saved.theme_appearance, ThemeAppearance::Light);
+        assert!(saved.theme_terminal_background);
+        app.settings_enter_theme(0);
+        assert_eq!(app.config.theme_appearance, ThemeAppearance::Dark);
+        app.settings_enter_theme(0);
+        assert_eq!(app.config.theme_appearance, ThemeAppearance::Auto);
+    }
+
     #[test]
     fn kitten_install_is_explicit_and_late_or_other_client_results_are_ignored() {
         use crate::terminal::clipboard::kitten::Status;
@@ -3363,12 +3470,19 @@ mod tests {
             "custom-restore".into(),
             Some((previous, app.theme_selection_revision)),
         );
+        app.adjust_theme_preference(0, 1);
+        app.adjust_theme_preference(1, 1);
         app.finish_theme_uninstall(
             "custom-restore".into(),
             Err("still required by child-theme".into()),
         );
 
         assert_eq!(app.config.theme, "custom-restore");
+        assert_eq!(
+            app.config.theme_appearance,
+            crate::config::ThemeAppearance::Light
+        );
+        assert!(app.config.theme_terminal_background);
         assert!(app
             .toast
             .as_ref()
@@ -3389,7 +3503,7 @@ mod tests {
         assert_eq!(crate::config::load().theme, "custom-enter");
         app.open_settings();
         app.settings_set_tab(SettingsTab::Theme);
-        let index = app.theme_registry.index_of("custom-enter").unwrap();
+        let index = THEME_PREFERENCE_ROWS + app.theme_registry.index_of("custom-enter").unwrap();
         app.settings_activate(index);
         assert!(!app.theme_uninstall_pending("custom-enter"));
         app.settings_enter_theme(index);

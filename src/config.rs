@@ -69,12 +69,38 @@ pub enum CommanderWorkingPolicy {
     AutoSend,
 }
 
+/// Override automatic appearance detection without replacing the selected palette.
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeAppearance {
+    #[default]
+    Auto,
+    Light,
+    Dark,
+}
+
+impl ThemeAppearance {
+    pub(crate) fn scheme(self) -> Option<crate::terminal::appearance::ColorScheme> {
+        use crate::terminal::appearance::ColorScheme;
+        match self {
+            Self::Auto => None,
+            Self::Light => Some(ColorScheme::Light),
+            Self::Dark => Some(ColorScheme::Dark),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Config {
     #[serde(default)]
     pub version: u32,
     #[serde(default = "default_theme")]
     pub theme: String,
+    #[serde(default)]
+    pub theme_appearance: ThemeAppearance,
+    /// Leave ordinary canvas backgrounds to the displaying terminal.
+    #[serde(default)]
+    pub theme_terminal_background: bool,
     /// UI language code (docs/21) — `"en"` (default) or any `i18n::LANGS` code.
     #[serde(default = "default_lang")]
     pub language: String,
@@ -634,6 +660,8 @@ impl Default for Config {
         Config {
             version: CONFIG_VERSION,
             theme: default_theme(),
+            theme_appearance: ThemeAppearance::Auto,
+            theme_terminal_background: false,
             language: default_lang(),
             shell: default_shell_choice(),
             sidebar_width: default_sidebar_width(),
