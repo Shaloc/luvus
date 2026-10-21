@@ -1588,6 +1588,39 @@ def main():
                 output_until(lambda output: has_pixels(output, (0,255,0,255)))
                 print(f"PASS: {label} tele-style virtual PNG placeholders crop by cells, reuse uploads, delete and re-enter without stale IDs", flush=True)
 
+            def check_named_images(pane, label, remote=False):
+                def squares(red):
+                    return [
+                        {"colors": [[255, 0, 0], [0, 255, 0]], "boxes": red},
+                        {"colors": [[0, 0, 255], [255, 255, 0]], "boxes": [[10, 5]]},
+                    ]
+                for key, receipt, suffix, boxes in [
+                    ("n", b"NNNNNNNN", "full", [[16, 8], [8, 4]]),
+                    ("j", b"JJJJJJJJ", "delete-one", [[8, 4]]),
+                    ("k", b"KKKKKKKK", "resize-one", [[12, 6], [8, 4]]),
+                    ("l", b"LLLLLLLL", "delete-image", []),
+                ]:
+                    run("--session", "api", "pane", "send", str(pane), key, remote=remote)
+                    output_until(lambda output: receipt in output)
+                    checkpoint(f"{label}-named-{suffix}", [0, 0, 255],
+                               patterned_squares=squares(boxes))
+                run("--session", "api", "pane", "send", str(pane), "h", remote=remote)
+                output_until(lambda output: b"HHHHHHHH" in output)
+                checkpoint(f"{label}-named-hidden", [0, 0, 255], False)
+                run("--session", "api", "pane", "send", str(pane), "o", remote=remote)
+                output_until(lambda output: b"OOOOOOOO" in output)
+                checkpoint(f"{label}-named-reappear", [0, 0, 255], patterned_squares=squares([]))
+                run("--session", "api", "pane", "send", str(pane), "n", remote=remote)
+                output_until(lambda output: b"NNNNNNNN" in output)
+                checkpoint(f"{label}-named-restored", [255, 0, 0], patterned_squares=squares([[16, 8], [8, 4]]))
+                run("--session", "api", "pane", "send", str(pane), "u", remote=remote)
+                output_until(lambda output: b"UUUUUUUU" in output)
+                checkpoint(f"{label}-named-scroll", [255, 0, 0],
+                           less_than=f"kitty-{label}-named-restored.ansi")
+                run("--session", "api", "pane", "send", str(pane), "g", remote=remote)
+                output_until(lambda output: has_pixels(output, (0, 255, 0, 255)))
+                print(f"PASS: {label} multiple images and named placements resize, delete, scroll and reappear independently", flush=True)
+
             local_pane = launch("local")
             painted = output_until(lambda output: has_pixels(output, (255, 0, 0, 255)))
             assert "\U0010eeee".encode() in painted and b"a=p,U=1" in painted
@@ -1600,6 +1633,7 @@ def main():
             check_chunked_rendering(local_pane, "local")
             check_scrolling(local_pane, "local")
             check_virtual_images(local_pane, "local")
+            check_named_images(local_pane, "local")
             run("--session", "api", "pane", "send", str(local_pane), "q")
             output_until(lambda output: b"a=d,d=I,i=" in output)
             checkpoint("local-exit", [0, 255, 0], False)
@@ -1668,12 +1702,26 @@ def main():
             check_chunked_rendering(remote_pane, "remote", remote=True)
             check_scrolling(remote_pane, "remote", remote=True)
             check_virtual_images(remote_pane, "remote", remote=True)
+            check_named_images(remote_pane, "remote", remote=True)
             run("--session", "api", "pane", "send", str(remote_pane), "q", remote=True)
             output_until(lambda output: b"a=d,d=I,i=" in output)
             checkpoint("remote-exit", [0, 255, 0], False)
             assert process.poll() is None
             print("PASS: local modal remains operable over remote graphics; update and cleanup stay owner-scoped", flush=True)
             check_keyboard(remote_pane, "remote", remote=True)
+            if not os.environ.get("LUVUS_TEST_PIXEL_PERF"):
+                process.terminate()
+                process.wait(timeout=5)
+                run("session", "merge", "off")
+                process, master = start_client(["session", "attach", "remote-fake-dev-api"])
+                (root / "graphics-remote.json").unlink()
+                remote_pane = launch("remote", remote=True)
+                output_until(lambda output: has_pixels(output, (0, 0, 255, 255)))
+                check_named_images(remote_pane, "direct", remote=True)
+                run("--session", "api", "pane", "send", str(remote_pane), "q", remote=True)
+                output_until(lambda output: b"a=d,d=I,i=" in output)
+                checkpoint("direct-exit", [0, 255, 0], False)
+                print("PASS: direct remote client preserves named image placement rendering and cleanup", flush=True)
             print(f"Kitty visual checkpoints: {root}", flush=True)
             if os.environ.get("LUVUS_TEST_PIXEL_PERF") == "1":
                 assert env.get("LUVUS_TEST_PIXEL_BINDING"), "native PixelEngine required"

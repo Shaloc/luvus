@@ -2558,6 +2558,39 @@ impl<T: EventListener> Handler for Term<T> {
         self.event_proxy.send_event(Event::PtyWrite(format!("\x1b[6;{};{}t", self.cell_pixels.1, self.cell_pixels.0)));
     }
 
+    fn report_sgr(&mut self) {
+        let cell = &self.grid.cursor.template;
+        let mut attributes = String::from("\x1bP1$r0");
+        for (flag, code) in [
+            (Flags::BOLD, "1"), (Flags::DIM, "2"), (Flags::ITALIC, "3"),
+            (Flags::UNDERLINE, "4"), (Flags::DOUBLE_UNDERLINE, "4:2"),
+            (Flags::UNDERCURL, "4:3"), (Flags::DOTTED_UNDERLINE, "4:4"),
+            (Flags::DASHED_UNDERLINE, "4:5"), (Flags::INVERSE, "7"),
+            (Flags::HIDDEN, "8"), (Flags::STRIKEOUT, "9"),
+        ] {
+            if cell.flags.contains(flag) {
+                attributes.push(';');
+                attributes.push_str(code);
+            }
+        }
+        for (code, color) in [(38, Some(cell.fg)), (48, Some(cell.bg)), (58, cell.underline_color())] {
+            match color {
+                Some(Color::Spec(rgb)) => {
+                    attributes.push_str(&format!(";{code};2;{};{};{}", rgb.r, rgb.g, rgb.b));
+                },
+                Some(Color::Indexed(index)) => {
+                    attributes.push_str(&format!(";{code};5;{index}"));
+                },
+                Some(Color::Named(named)) if (named as u16) < 16 => {
+                    attributes.push_str(&format!(";{code};5;{}", named as u16));
+                },
+                _ => {},
+            }
+        }
+        attributes.push_str("m\x1b\\");
+        self.event_proxy.send_event(Event::PtyWrite(attributes));
+    }
+
     fn application_command(&mut self, data: &[u8]) {
         if !self.graphics_enabled {
             // Applications may delete resources while an incapable client is

@@ -765,7 +765,12 @@ fn draw_one_pane(
                             .then(|| {
                                 child_graphics.and_then(|(namespace, placements)| {
                                     crate::terminal::graphics::virtual_cell(
-                                        sym, cell.fg, namespace, placements, scene,
+                                        sym,
+                                        cell.fg,
+                                        cell.underline_color,
+                                        namespace,
+                                        placements,
+                                        scene,
                                     )
                                 })
                             })

@@ -199,6 +199,9 @@ pub(crate) fn create_engine(
 pub struct RenderCell {
     pub fg: Color,
     pub bg: Color,
+    /// Unresolved underline color. Kitty placeholders encode a placement ID
+    /// here, so palette/theme transformations must not change these bits.
+    pub underline_color: Option<Color>,
     pub mods: Modifier,
 }
 

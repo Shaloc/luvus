@@ -350,7 +350,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         match byte {
             0x00..=0x17 | 0x19 | 0x1C..=0x7E => performer.put(byte),
             0x18 | 0x1A => {
-                performer.unhook();
+                performer.dcs_cancel();
                 performer.execute(byte);
                 self.state = State::Ground
             },
@@ -950,6 +950,11 @@ pub trait Perform {
     /// The previously selected handler should be notified that the DCS has
     /// terminated.
     fn unhook(&mut self) {}
+
+    /// Abort a DCS with CAN/SUB. Existing consumers still receive unhook.
+    fn dcs_cancel(&mut self) {
+        self.unhook();
+    }
 
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}

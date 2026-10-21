@@ -190,6 +190,17 @@ def main():
             assert stable >= 3, (record.name, checkpoint, count, str(visual))
             for absent in checkpoint.get("absent_colors", []):
                 assert pixels.count(tuple(absent)) == 0, (record.name, "unexpected source pixels", absent)
+            for square in checkpoint.get("patterned_squares", []):
+                # Each source square has two colored halves. Wrong placement
+                # sizes crop one half, unlike a uniform image that can hide the
+                # error. Allow only the 1-pixel filtering at edges and the seam.
+                sizes = [min(cols * geometry["cell_width"], rows * geometry["cell_height"])
+                         for cols, rows in square["boxes"]]
+                lower = sum(max(0, size // 2 - 2) * max(0, size - 2) for size in sizes)
+                upper = sum((size + 1) // 2 * size for size in sizes)
+                for color_value in square["colors"]:
+                    actual = pixels.count(tuple(color_value))
+                    assert lower <= actual <= upper, (record.name, square, actual, lower, upper)
             for comparison in ("less_than", "same_pixels_as"):
                 if comparison in checkpoint:
                     previous = next(item["pixels"] for item in results if item["file"] == checkpoint[comparison])

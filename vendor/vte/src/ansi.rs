@@ -249,6 +249,10 @@ struct ProcessorState<T: Timeout> {
     /// Last processed character for repetition.
     preceding_char: Option<char>,
 
+    /// Exact DECRQSS SGR query: 1 awaits `m`, 2 has it, 0 ignores the DCS.
+    /// No arbitrary DCS payload is retained.
+    sgr_query: u8,
+
     /// State for synchronized terminal updates.
     sync_state: SyncState<T>,
 }
@@ -512,6 +516,9 @@ pub trait Timeout: Default {
 pub trait Handler {
     /// A complete bounded Application Program Command, without ESC _ or ST.
     fn application_command(&mut self, _data: &[u8]) {}
+
+    /// Report current SGR attributes in response to DECRQSS `m`.
+    fn report_sgr(&mut self) {}
 
     /// OSC to set window title.
     fn set_title(&mut self, _: Option<String>) {}
@@ -1375,6 +1382,10 @@ where
     #[inline]
     fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         self.state.terminal_activity = true;
+        self.state.sgr_query = u8::from(
+            !ignore && intermediates == b"$" && action == 'q'
+                && params.iter().all(|param| param == [0]),
+        );
         debug!(
             "[unhandled hook] params={:?}, ints: {:?}, ignore: {:?}, action: {:?}",
             params, intermediates, ignore, action
@@ -1384,13 +1395,21 @@ where
     #[inline]
     fn put(&mut self, byte: u8) {
         self.state.terminal_activity = true;
+        self.state.sgr_query = if self.state.sgr_query == 1 && byte == b'm' { 2 } else { 0 };
         debug!("[unhandled put] byte={:?}", byte);
     }
 
     #[inline]
     fn unhook(&mut self) {
         self.state.terminal_activity = true;
+        if mem::take(&mut self.state.sgr_query) == 2 {
+            self.handler.report_sgr();
+        }
         debug!("[unhandled unhook]");
+    }
+
+    fn dcs_cancel(&mut self) {
+        self.state.sgr_query = 0;
     }
 
     #[inline]
@@ -2231,6 +2250,34 @@ mod tests {
                 reset_colors: Vec::new(),
             }
         }
+    }
+
+    #[test]
+    fn sgr_queries_are_fragment_safe_bounded_and_cancelable() {
+        #[derive(Default)]
+        struct Queries(usize);
+        impl Handler for Queries {
+            fn report_sgr(&mut self) { self.0 += 1; }
+        }
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = Queries::default();
+        for byte in b"\x1bP$qm\x1b\\" {
+            parser.advance(&mut handler, &[*byte]);
+        }
+        assert_eq!(handler.0, 1);
+        for rejected in [
+            &b"\x1bP$qmm\x1b\\"[..], &b"\x1bP1$qm\x1b\\"[..],
+            &b"\x1bP+qm\x1b\\"[..], &b"\x1bP$qm\x18"[..],
+            &b"\x1bP$qm\x1a"[..],
+        ] {
+            parser.advance(&mut handler, rejected);
+        }
+        parser.advance(&mut handler, b"\x1bP$q");
+        parser.advance(&mut handler, &vec![b'm'; 65536]);
+        parser.advance(&mut handler, b"\x1b\\");
+        assert_eq!(handler.0, 1);
+        parser.advance(&mut handler, b"\x1bP$qm\x1b\\");
+        assert_eq!(handler.0, 2);
     }
 
     #[test]

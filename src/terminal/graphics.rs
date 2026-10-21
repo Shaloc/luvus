@@ -151,6 +151,7 @@ pub fn slot_color(slot: u32) -> Color {
 pub fn virtual_cell(
     symbol: &str,
     foreground: Color,
+    underline_color: Option<Color>,
     namespace: &str,
     placements: &[Placement],
     scene: &mut Vec<Graphic>,
@@ -176,10 +177,16 @@ pub fn virtual_cell(
         _ => return None,
     };
     let image_id = low | high << 24;
-    let p = placements
-        .iter()
-        .rev()
-        .find(|p| p.virtual_placement && p.image_id == image_id && p.id == 0)?;
+    let placement_id = match underline_color {
+        Some(Color::Rgb(r, g, b)) => u32::from(r) << 16 | u32::from(g) << 8 | u32::from(b),
+        Some(Color::Indexed(index)) => u32::from(index),
+        _ => 0,
+    };
+    // Missing/zero underline color permits any virtual placement of this
+    // image. An explicit ID must never fall back to a sibling placement.
+    let p = placements.iter().rev().find(|p| {
+        p.virtual_placement && p.image_id == image_id && (placement_id == 0 || p.id == placement_id)
+    })?;
     if row >= p.rows as usize || col >= p.cols as usize {
         return None;
     }
@@ -677,6 +684,7 @@ mod tests {
         let (mapped, foreground) = virtual_cell(
             &symbol,
             Color::Rgb(1, 2, 7),
+            None,
             "owner",
             graphics.visible(),
             &mut scene,
@@ -701,6 +709,7 @@ mod tests {
         assert!(virtual_cell(
             &symbol,
             Color::Rgb(1, 2, 7),
+            None,
             "other-owner",
             graphics.visible(),
             &mut scene
@@ -712,6 +721,7 @@ mod tests {
         assert!(virtual_cell(
             &symbol,
             Color::Rgb(1, 2, 7),
+            None,
             "owner",
             graphics.visible(),
             &mut scene
@@ -724,11 +734,81 @@ mod tests {
             assert!(virtual_cell(
                 &bad,
                 Color::Rgb(1, 2, 7),
+                None,
                 "owner",
                 graphics.visible(),
                 &mut scene
             )
             .is_none());
+        }
+    }
+
+    #[test]
+    fn kitty_named_virtual_cells_select_geometry_and_do_not_alias_deleted_siblings() {
+        let mut graphics = Graphics::default();
+        for (image, pixel) in [(7, "/wAA"), (8, "AP8A")] {
+            let command = format!("Ga=t,i={image},f=24,s=1,v=1;{pixel}");
+            assert!(graphics
+                .command(command.as_bytes(), 0, 0, (8, 16))
+                .0
+                .unwrap()
+                .contains(";OK"));
+        }
+        for options in ["i=7,p=12,c=8,r=4", "i=7,p=13,c=4,r=2", "i=8,p=12,c=6,r=3"] {
+            let command = format!("Ga=p,U=1,{options};");
+            assert!(graphics
+                .command(command.as_bytes(), 0, 0, (8, 16))
+                .0
+                .unwrap()
+                .contains(";OK"));
+        }
+        let marker = format!("{MARKER}{}{}", DIACRITICS[0], DIACRITICS[0]);
+        let mut scene = Vec::new();
+        for (image, placement, size) in [
+            (7, Color::Indexed(12), [8, 4]),
+            (7, Color::Rgb(0, 0, 13), [4, 2]),
+            (8, Color::Rgb(0, 0, 12), [6, 3]),
+        ] {
+            let (_, color) = virtual_cell(
+                &marker,
+                Color::Rgb(0, 0, image),
+                Some(placement),
+                "owner",
+                graphics.visible(),
+                &mut scene,
+            )
+            .unwrap();
+            assert_eq!(scene[index(&marker, color).unwrap()].size, size);
+        }
+        assert_eq!(scene.len(), 3);
+        assert!(Arc::ptr_eq(&scene[0].image, &scene[1].image));
+        assert!(!Arc::ptr_eq(&scene[0].image, &scene[2].image));
+        // Composition removes child placement IDs. Existing remote frames
+        // carry the independently sized resources without a wire extension.
+        let received = apply_updates(&[], updates(&scene, &[])).unwrap();
+        assert!(received.iter().zip(&scene).all(|(a, b)| a == b));
+        graphics.command(b"Ga=d,d=I,i=7,p=13;", 0, 0, (8, 16));
+        assert!(virtual_cell(
+            &marker,
+            Color::Rgb(0, 0, 7),
+            Some(Color::Indexed(13)),
+            "owner",
+            graphics.visible(),
+            &mut Vec::new(),
+        )
+        .is_none());
+        for fallback in [None, Some(Color::Reset), Some(Color::Rgb(0, 0, 0))] {
+            let mut scene = Vec::new();
+            assert!(virtual_cell(
+                &marker,
+                Color::Rgb(0, 0, 7),
+                fallback,
+                "owner",
+                graphics.visible(),
+                &mut scene,
+            )
+            .is_some());
+            assert_eq!(scene[0].size, [8, 4]);
         }
     }
 
@@ -758,6 +838,7 @@ mod tests {
         assert!(virtual_cell(
             &symbol,
             Color::Rgb(0, 0, 7),
+            None,
             "owner",
             graphics.visible(),
             &mut Vec::new()

@@ -323,7 +323,7 @@ impl Graphics {
             return Err("ENOTSUP: use direct transfer t=d");
         }
         let virtual_placement = number(params, b'U', 0)?;
-        if virtual_placement > 1 || (virtual_placement == 1 && number(params, b'p', 0)? != 0) {
+        if virtual_placement > 1 {
             return Err("ENOTSUP: virtual placement option");
         }
         for key in [b'P', b'Q', b'I', b'X', b'Y', b'S', b'O'] {
@@ -587,6 +587,34 @@ mod tests {
             assert!(graphics.visible().is_empty());
             assert!(Arc::ptr_eq(&graphics.images[0].1, &prior));
         }
+    }
+
+    #[test]
+    fn named_virtual_placements_replace_and_delete_only_the_selected_sibling() {
+        let mut graphics = graphics_with_image(80, 40);
+        for options in ["p=12,c=20,r=5", "p=13,c=8,r=2", "p=12,c=12,r=3"] {
+            let command = format!("Ga=p,U=1,i=1,{options};");
+            let (reply, advance) = graphics.command(command.as_bytes(), 0, 0, (8, 16));
+            assert!(reply.unwrap().contains(";OK"));
+            assert!(advance.is_none());
+        }
+        assert_eq!(graphics.visible().len(), 2);
+        assert!(graphics.visible().iter().any(|p| p.id == 12 && p.cols == 12));
+        assert!(graphics.visible().iter().any(|p| p.id == 13 && p.cols == 8));
+        graphics.erase_screen();
+        graphics.scroll(0, 24, -5);
+        assert_eq!(graphics.visible().len(), 2);
+
+        graphics.command(b"Ga=d,d=I,i=1,p=12;", 0, 0, (8, 16));
+        assert_eq!(graphics.visible().len(), 1);
+        assert_eq!(graphics.visible()[0].id, 13);
+        // Deleting one placement must keep the image available for another.
+        let reply = graphics.command(b"Ga=p,U=1,i=1,p=14,c=4,r=1;", 0, 0, (8, 16)).0.unwrap();
+        assert!(reply.contains(";OK"));
+        graphics.command(b"Ga=d,d=I,i=1;", 0, 0, (8, 16));
+        assert!(graphics.visible().is_empty());
+        let reply = graphics.command(b"Ga=p,U=1,i=1,p=14,c=4,r=1;", 0, 0, (8, 16)).0.unwrap();
+        assert!(reply.contains("ENOENT"));
     }
 
     #[test]

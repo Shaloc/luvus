@@ -113,6 +113,52 @@ def virtual_markers(window=False, deleted=False, clear=True):
     os.write(1, b"\x1b[20;1H" + receipt.encode() + b"\x1b[?2026l")
 
 
+named_size = (16, 8)
+named_ids = (12, 0x01020D)
+
+
+def named_command(control, data=b""):
+    os.write(1, b"\x1b_G" + control.encode() + b";" + data + b"\x1b\\")
+
+
+def named_markers(receipt):
+    os.write(1, b"\x1b[?2026h\x1b[2J")
+    for image, placement, x, y, cols, rows in [
+        (virtual_ids[0], named_ids[0], 2, 2, *named_size),
+        (virtual_ids[0], named_ids[1], 22, 2, 8, 4),
+        (virtual_ids[1], named_ids[0], 2, 12, 10, 5),
+    ]:
+        fg = f"\x1b[38;2;{image >> 16};{image >> 8 & 255};{image & 255}m"
+        ul = f"\x1b[58:2::{placement >> 16}:{placement >> 8 & 255}:{placement & 255}m"
+        for row in range(rows):
+            cells = "".join("\U0010eeee" + diacritics[row] + diacritics[col] for col in range(cols))
+            os.write(1, (f"\x1b[{y + row};{x}H" + fg + ul + cells + "\x1b[0m").encode())
+    os.write(1, b"\x1b[20;1H" + receipt + b"\x1b[?2026l")
+
+
+def named_upload():
+    global named_size
+    named_size = (16, 8)
+    named_command("a=d,d=I,i=7,q=2")
+    for second, image in enumerate(virtual_ids):
+        data = base64.b64encode(png_image(second))
+        for offset in range(0, len(data), 4096):
+            more = int(offset + 4096 < len(data))
+            header = (f"a=t,i={image},t=d,f=100,q=0,m={more}" if offset == 0
+                      else f"m={more}")
+            named_command(header, data[offset:offset + 4096])
+    for image, placement, cols, rows in [
+        (virtual_ids[0], named_ids[0], 16, 8),
+        (virtual_ids[0], named_ids[1], 8, 4),
+        (virtual_ids[1], named_ids[0], 10, 5),
+    ]:
+        named_command(f"a=p,U=1,i={image},p={placement},c={cols},r={rows},q=0")
+    replies = read_for(.3)
+    assert replies.count(b";OK") == 5 and b"ENOTSUP" not in replies, repr(replies)
+    (root / f"graphics-named-{label}.json").write_text(json.dumps({"replies": repr(replies)}))
+    named_markers(b"NNNNNNNN")
+
+
 try:
     tty.setraw(0)
     os.write(1, b"\x1b_Gi=4207,a=q,t=d,f=24,s=1,v=1;AAAA\x1b\\\x1b[16t\x1b[c")
@@ -162,6 +208,20 @@ try:
         if b"x" in key:
             os.write(1, f"\x1b_Ga=d,d=I,i={virtual_ids[0]},q=2;\x1b\\".encode())
             virtual_markers(window=True, deleted=True)
+        if b"n" in key:
+            named_upload()
+        if b"j" in key:
+            named_command(f"a=d,d=I,i={virtual_ids[0]},p={named_ids[0]},q=2")
+            named_markers(b"JJJJJJJJ")
+        if b"k" in key:
+            named_size = (12, 6)
+            named_command(f"a=p,U=1,i={virtual_ids[0]},p={named_ids[0]},c=12,r=6,q=2")
+            named_markers(b"KKKKKKKK")
+        if b"l" in key:
+            named_command(f"a=d,d=I,i={virtual_ids[0]},q=2")
+            named_markers(b"LLLLLLLL")
+        if b"o" in key:
+            named_markers(b"OOOOOOOO")
         for trigger, command, receipt in [
             (b"u", b"\x1b[4S", b"UUUUUUUU"),
             (b"r", b"\x1b[4T", b"RRRRRRRR"),

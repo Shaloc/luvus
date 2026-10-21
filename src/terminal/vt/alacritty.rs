@@ -811,6 +811,7 @@ impl VtEngine for AlacrittyEngine {
                 RenderCell {
                     fg: map_foreground(cell, self.term.colors()),
                     bg: map_color(cell.bg, self.term.colors()),
+                    underline_color: cell.underline_color().map(raw_color),
                     mods: map_flags(cell.flags),
                 },
             );
@@ -849,6 +850,7 @@ impl VtEngine for AlacrittyEngine {
                 RenderCell {
                     fg: map_foreground(cell, self.term.colors()),
                     bg: map_color(cell.bg, self.term.colors()),
+                    underline_color: cell.underline_color().map(raw_color),
                     mods: map_flags(cell.flags),
                 },
                 hyperlink.as_ref().map(|hyperlink| hyperlink.uri()),
@@ -930,6 +932,7 @@ impl VtEngine for AlacrittyEngine {
                 let style = RenderCell {
                     fg: map_foreground(cell, self.term.colors()),
                     bg: map_color(cell.bg, self.term.colors()),
+                    underline_color: cell.underline_color().map(raw_color),
                     mods: map_flags(cell.flags),
                 };
                 if let Some(damage_cell) = damaged_row.cells.get_mut(used) {
@@ -1779,7 +1782,9 @@ fn map_flags(fl: Flags) -> Modifier {
     if fl.contains(Flags::ITALIC) {
         m |= Modifier::ITALIC;
     }
-    if fl.contains(Flags::UNDERLINE) {
+    // Capability probes can make editors emit extended styles. Preserve a
+    // visible underline until the display frame supports their exact shape.
+    if fl.intersects(Flags::ALL_UNDERLINES) {
         m |= Modifier::UNDERLINED;
     }
     if fl.contains(Flags::DIM) {
@@ -1930,7 +1935,12 @@ mod tests {
         let mut images = 0;
         engine.for_each_cell(&mut |_, _, symbol, style| {
             if crate::terminal::graphics::virtual_cell(
-                symbol, style.fg, namespace, placements, &mut scene,
+                symbol,
+                style.fg,
+                style.underline_color,
+                namespace,
+                placements,
+                &mut scene,
             )
             .is_some()
             {
@@ -1939,6 +1949,127 @@ mod tests {
         });
         assert_eq!(images, 1);
         assert_eq!(scene.len(), 1);
+    }
+
+    #[test]
+    fn sgr_query_reports_neovim_underline_probe_and_current_colors_without_mutation() {
+        let (tx, rx) = channel();
+        let mut engine = AlacrittyEngine::new(20, 4, tx, budget_for_rows(20, 20));
+        engine.advance(b"\x1b[0m\x1b[4:3m\x1bP$qm\x1b\\");
+        let InputAction::Bytes(reply) = rx.try_recv().unwrap() else {
+            panic!("expected SGR reply")
+        };
+        assert_eq!(reply, b"\x1bP1$r0;4:3m\x1b\\");
+        engine.advance(b"\x1b[0;1;3;38;2;1;2;3;48;5;42;58;2;0;0;12m\x1bP$qm\x1b\\");
+        let InputAction::Bytes(reply) = rx.try_recv().unwrap() else {
+            panic!("expected SGR reply")
+        };
+        assert_eq!(
+            reply,
+            b"\x1bP1$r0;1;3;38;2;1;2;3;48;5;42;58;2;0;0;12m\x1b\\"
+        );
+        engine.advance(b"x");
+        engine.for_each_cell(&mut |row, col, symbol, style| {
+            if row == 0 && col == 0 {
+                assert_eq!(symbol, "x");
+                assert_eq!(style.fg, Color::Rgb(1, 2, 3));
+                assert_eq!(style.bg, Color::Indexed(42));
+                assert_eq!(style.underline_color, Some(Color::Rgb(0, 0, 12)));
+                assert!(style.mods.contains(Modifier::BOLD | Modifier::ITALIC));
+            }
+        });
+    }
+
+    #[test]
+    fn sgr_extended_underline_styles_remain_visible_after_probe() {
+        let (tx, rx) = channel();
+        let mut engine = AlacrittyEngine::new(20, 4, tx, budget_for_rows(20, 20));
+        engine.advance(b"\x1b[0m\x1b[4:3m\x1bP$qm\x1b\\");
+        assert!(matches!(rx.try_recv().unwrap(), InputAction::Bytes(_)));
+        let initial = engine.damage_snapshot();
+        assert!(engine.acknowledge_damage(initial.generation));
+        engine.recycle_damage_snapshot(initial);
+        for (index, character) in b"ABCDE".iter().enumerate() {
+            engine.advance(format!("\x1b[4:{}m{}", index + 1, char::from(*character)).as_bytes());
+        }
+        engine.advance(b"\x1b[24mF");
+        let mut observed = Vec::new();
+        engine.for_each_linked_cell(&mut |row, col, symbol, style, _| {
+            if row == 0 && col < 6 {
+                observed.push((symbol.to_owned(), style.mods.contains(Modifier::UNDERLINED)));
+            }
+        });
+        assert_eq!(
+            observed,
+            [
+                ("A", true),
+                ("B", true),
+                ("C", true),
+                ("D", true),
+                ("E", true),
+                ("F", false)
+            ]
+            .map(|(symbol, underlined)| (symbol.to_owned(), underlined))
+        );
+        let mut full = Vec::new();
+        engine.for_each_cell(&mut |row, col, symbol, style| {
+            if row == 0 && col < 6 {
+                full.push((symbol.to_owned(), style.mods.contains(Modifier::UNDERLINED)));
+            }
+        });
+        assert_eq!(full, observed);
+        let snapshot = engine.damage_snapshot();
+        assert_eq!(snapshot.kind, DamageKind::Partial);
+        let row = snapshot.rows.iter().find(|row| row.row == 0).unwrap();
+        let cells: Vec<_> = row.cells.iter().filter(|cell| cell.column < 6).collect();
+        assert_eq!(cells.len(), 6);
+        for cell in cells {
+            assert_eq!(
+                cell.style.mods.contains(Modifier::UNDERLINED),
+                cell.column < 5
+            );
+        }
+    }
+
+    #[test]
+    fn kitty_named_placement_identity_survives_vt_damage_and_palette_changes() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(20, 4, tx, budget_for_rows(20, 20));
+        engine.set_cell_pixels(8, 16);
+        engine.advance(b"\x1b_Ga=T,U=1,i=7,p=12,f=24,s=1,v=1,c=8,r=4;/wAA\x1b\\");
+        engine.advance(b"\x1b_Ga=p,U=1,i=7,p=13,c=4,r=2;\x1b\\");
+        let generation = engine.damage_snapshot().generation;
+        assert!(engine.acknowledge_damage(generation));
+        engine.advance("\x1b[38;2;0;0;7m\x1b[58:2::0:0:12m\u{10eeee}\u{0305}\u{0305}\x1b[58;5;13m\u{10eeee}\u{0305}\u{0305}\x1b[0m".as_bytes());
+        let snapshot = engine.damage_snapshot();
+        let placeholders: Vec<_> = snapshot
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .filter(|cell| cell.character == crate::terminal::graphics::MARKER)
+            .map(|cell| cell.style.underline_color)
+            .collect();
+        assert_eq!(
+            placeholders,
+            [Some(Color::Rgb(0, 0, 12)), Some(Color::Indexed(13))]
+        );
+        engine.advance(b"\x1b]4;13;rgb:ff/00/00\x1b\\");
+        let (namespace, placements) = engine.graphics().unwrap();
+        let mut scene = Vec::new();
+        engine.for_each_linked_cell(&mut |_, _, symbol, style, _| {
+            crate::terminal::graphics::virtual_cell(
+                symbol,
+                style.fg,
+                style.underline_color,
+                namespace,
+                placements,
+                &mut scene,
+            );
+        });
+        assert_eq!(
+            scene.iter().map(|g| g.size).collect::<Vec<_>>(),
+            [[8, 4], [4, 2]]
+        );
     }
 
     #[test]

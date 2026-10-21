@@ -475,13 +475,48 @@ text. `NO_COLOR` keeps ordinary text colorless while retaining the RGB metadata
 needed by Kitty's Unicode image placeholders. Closing a graphic application or
 switching workspaces removes only the images owned by that Luvus display client.
 
-Inline-image clients can use `U=1` virtual images with a default placement ID
-and explicit Unicode placeholder row/column coordinates. Luvus preserves those
-coordinates while remapping image IDs per pane and display. This supports
+Inline-image clients can use `U=1` virtual images with default or named
+placement IDs and explicit Unicode placeholder row/column coordinates. The
+placeholder's underline color selects its placement, so one image can appear
+at different sizes in multiple locations. Missing or zero underline color
+selects an available virtual placement. Deleting a named placement preserves
+its siblings. Luvus preserves those coordinates while remapping image IDs per
+pane and display, including remote-owner panes. This supports
 tele-style message scrolling and mosaic windows without decoding or cropping
 pixels. Erasing the text does not delete the reusable image; explicit deletion
 and replacement update its lifetime. Retained placeholder text can also display
 in scrollback while its image remains in the bounded owner cache.
+
+Neovim/Snacks can use named placements for Markdown images. Luvus answers the
+DECRQSS SGR query used by Neovim to detect underline-color support, allowing
+different placements of one image to keep their own size. Ordinary text with
+curly, double, dotted or dashed underlines remains visible as a plain underline;
+its exact shape and special color are not preserved. The plugin must
+recognize the display's Kitty support and use direct transfer (`t=d`); image
+paths must exist on the pane's owner. Luvus does not read the display machine's
+files on behalf of a remote pane.
+
+Some Neovim/Snacks combinations set the placement's special color (`sp`)
+without enabling underline. Neovim then omits that color from terminal output,
+so multiple sizes of the same image cannot be distinguished. For those versions,
+add this to the existing Snacks `image.doc` options. It uses the placement
+callback and preserves Snacks' managed highlight colors:
+
+```lua
+on_update_pre = vim.env.LUVUS_ENV == "1" and function(placement)
+  vim.schedule(function()
+    if not placement:valid() or not placement.id then
+      return
+    end
+    local name = "SnacksImage" .. placement.id
+    local hl = vim.api.nvim_get_hl(0, { name = name, link = false })
+    if hl.sp and not hl.underline then
+      hl.underline = true
+      Snacks.util.set_hl({ [name] = hl })
+    end
+  end)
+end or nil,
+```
 
 The tele path is verified with independent protocol fixtures derived from its
 [renderer contract](https://github.com/sorokin-vladimir/tele/blob/98d7489982aa9a5c094d7430ccebc5bcf2f303f4/internal/ui/media/kitty.go),
@@ -490,7 +525,7 @@ does not identify Kitty, start it with `TERM=xterm-kitty tele` or select tele's
 Kitty photo mode. Full application acceptance remains a user test.
 
 The supported Kitty graphics subset is a stable fork feature. Sixel, animation
-commands, relative placements, non-default virtual placement IDs, omitted
+commands, relative placements, omitted
 placeholder coordinates, nonzero z-order, source-pixel cropping, stretched
 ordinary placements, compressed PNG and ordinary-image scrollback are not
 supported. A placement can span at most 297 columns and 297 rows; larger
