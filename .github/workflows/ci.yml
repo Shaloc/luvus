@@ -236,6 +236,8 @@ jobs:
       - name: Test Windows protocol boundaries
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo test --locked platform::windows::tests
           cargo test --locked platform::windows::clipboard
           cargo test --locked terminal::clipboard::png

@@ -2204,6 +2204,7 @@ mod tests {
     fn backend_create_pixels_follow_the_resolved_workspace_or_sibling() {
         let _env = crate::persist::test_env("backend-create-pixels");
         let config = crate::config::Config {
+            #[cfg(unix)]
             shell: "/bin/cat".into(),
             ..Default::default()
         };
