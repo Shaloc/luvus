@@ -8,7 +8,7 @@ const INSTALLER: &str = include_str!("../../../install.sh");
 fn install_command(host: &str) -> Command {
     let mut command = ssh_base(host);
     // A reviewed embedded installer, not curl | sh from a mutable remote URL.
-    // Remote uname chooses Darwin arm64 or Linux x86_64. Downloads come only
+    // Remote uname chooses Darwin arm64 or Linux x86_64/aarch64. Downloads come only
     // from this fork, are checksummed, and replace ~/.local/bin/luvus atomically.
     let script = format!("unset LUVUS_VERSION LUVUS_INSTALL_DIR;\n{INSTALLER}");
     command.arg(format!("sh -c {}", posix_shell_quote(&script)));

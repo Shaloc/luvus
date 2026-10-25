@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import subprocess
 import shlex
@@ -253,7 +254,18 @@ def main():
         assert binary.is_relative_to(repo / "target"), "only test a checkout build"
         payload = binary.read_bytes()
     package = "luvus-1.0.99-0123456789ab"
-    for target in ("x86_64-unknown-linux-musl", "aarch64-apple-darwin"):
+    platforms = {
+        ("Linux", "x86_64"): "x86_64-unknown-linux-musl",
+        ("Linux", "aarch64"): "aarch64-unknown-linux-musl",
+        ("Linux", "arm64"): "aarch64-unknown-linux-musl",
+        ("Darwin", "arm64"): "aarch64-apple-darwin",
+        ("Darwin", "aarch64"): "aarch64-apple-darwin",
+    }
+    # Stub payloads exercise every platform selector. A real binary must use
+    # its native installer path, including in the ARM64 runner's SSH fixtures.
+    fixture_platform = (platform.system(), platform.machine()) if len(sys.argv) > 1 else ("Linux", "x86_64")
+    native_target = platforms[fixture_platform]
+    for target in sorted(set(platforms.values())):
         archive = root / "downloads" / f"luvus-{target}.tar.gz"
         with tarfile.open(archive, "w:gz") as tar:
             info = tarfile.TarInfo(f"{package}-{target}/luvus")
@@ -304,7 +316,7 @@ esac
     install_dir = root / "install with spaces"
     env.update(PATH=f"{root}/bin:{env['PATH']}", LUVUS_INSTALL_DIR=str(install_dir),
                HOME=str(root / "home"), LUVUS_HOME=str(root / "state"), TMPDIR=str(blocked_tmp),
-               FIXTURE_ROOT=str(root), FIXTURE_OS="Linux", FIXTURE_ARCH="x86_64")
+               FIXTURE_ROOT=str(root), FIXTURE_OS=fixture_platform[0], FIXTURE_ARCH=fixture_platform[1])
     installed = install_dir / "luvus"
 
     def run(ok=True, **extra):
@@ -319,6 +331,9 @@ esac
         return result.stdout + result.stderr
 
     assert "No servers were restarted" in run(LUVUS_INSTALL_DIR="")
+    requests = (root / "requests").read_text().splitlines()
+    assert requests[-2].endswith(f"/luvus-{native_target}.tar.gz"), requests
+    assert requests[-1].endswith(f"/luvus-{native_target}.tar.gz.sha256"), requests
     assert (root / "home/.local/bin/luvus").read_bytes() == payload
     assert not list((root / "home/.local/bin").glob(".luvus-update.*"))
     installed.write_bytes(b"old binary")
@@ -352,13 +367,18 @@ esac
     if len(sys.argv) == 1:
         for transport in ("9", "10", "11", "12", "13", "14", "15", "16", "18"):
             run(FIXTURE_TRANSPORT=transport)
-        run(FIXTURE_OS="Darwin", FIXTURE_ARCH="arm64")
-        run(FIXTURE_OS="Darwin", FIXTURE_ARCH="aarch64")
-    checksum = root / "downloads/luvus-x86_64-unknown-linux-musl.tar.gz.sha256"
+        for (fixture_os, fixture_arch), target in platforms.items():
+            assert target in run(FIXTURE_OS=fixture_os, FIXTURE_ARCH=fixture_arch)
+            assert installed.read_bytes() == payload
+            requests = (root / "requests").read_text().splitlines()
+            assert requests[-2].endswith(f"/luvus-{target}.tar.gz"), requests[-2:]
+            assert requests[-1].endswith(f"/luvus-{target}.tar.gz.sha256"), requests[-2:]
+        print("PASS: Linux x86_64/ARM64 and macOS ARM64 select their own release archive and checksum")
+    checksum = root / "downloads" / f"luvus-{native_target}.tar.gz.sha256"
     checksum.write_text("0" * 64 + "  ignored-path\n")
     assert "SHA-256 mismatch" in run(ok=False)
     assert installed.read_bytes() == payload
-    assert "unsupported" in run(ok=False, FIXTURE_ARCH="aarch64")
+    assert "unsupported" in run(ok=False, FIXTURE_ARCH="riscv64")
     assert "no fork binary" in run(ok=False, FIXTURE_OS="Windows_NT")
     assert "invalid release tag" in run(ok=False, LUVUS_VERSION="../../bad")
     assert "expected a fork release tag" in run(ok=False, LUVUS_VERSION="v0.13.4")
@@ -373,7 +393,7 @@ esac
     # the previous executable is replaced.
     bad_payload = b'#!/bin/sh\nprintf "luvus 0.13.4\\n"\n'
     with tarfile.open(archive, "w:gz") as tar:
-        info = tarfile.TarInfo(f"{package}-x86_64-unknown-linux-musl/luvus")
+        info = tarfile.TarInfo(f"{package}-{native_target}/luvus")
         info.mode, info.size = 0o755, len(bad_payload)
         tar.addfile(info, io.BytesIO(bad_payload))
     checksum.write_text(hashlib.sha256(archive.read_bytes()).hexdigest() + "\n")

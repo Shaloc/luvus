@@ -8,8 +8,6 @@ use std::thread;
 use anyhow::{anyhow, Result};
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::Cell;
-#[cfg(not(windows))]
-use ratatui::crossterm::event::read as read_event;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event,
@@ -116,6 +114,8 @@ where
         DisableMouseCapture,
         DisableBracketedPaste
     );
+    #[cfg(unix)]
+    crate::terminal::clipboard::paste_events::disable();
     ratatui::restore();
     match result? {
         ClientExit::Done => Ok(()),
@@ -235,6 +235,8 @@ where
     // Let the terminal report Shift+Enter et al. as distinct keys, so agents get
     // a real "new line" key instead of a bare CR (see `push_key_protocol`).
     crate::push_key_protocol();
+    #[cfg(unix)]
+    crate::terminal::clipboard::paste_events::enable();
 
     // One terminal input reader lives for the entire client, across local and
     // managed-remote session switches. The event-loop owns the current writer.
@@ -242,10 +244,7 @@ where
     let input_tx = tx.clone();
     thread::spawn(move || {
         input_loop(
-            move |event| {
-                input_message_with_clipboard(event, crate::terminal::clipboard::read_image)
-                    .is_none_or(|message| input_tx.send(ClientEvent::Input(message)).is_ok())
-            },
+            move |message| input_tx.send(ClientEvent::Input(message)).is_ok(),
             pending,
         )
     });
@@ -703,26 +702,23 @@ fn switched_args(raw: &[String], name: &str, remote_host: Option<&str>) -> Vec<S
     out
 }
 
-fn input_loop(send: impl FnMut(Event) -> bool, pending: Vec<Event>) {
+fn input_loop(mut send: impl FnMut(ClientMessage) -> bool, pending: Vec<Event>) {
     #[cfg(windows)]
-    {
-        crate::terminal::host_input::run_input_loop(pending, send);
-    }
-
-    #[cfg(not(windows))]
-    {
-        let mut send = send;
-        for event in pending {
-            if !send(event) {
-                return;
+    crate::terminal::host_input::run_input_loop(pending, |event| {
+        input_message_with_clipboard(event, crate::terminal::clipboard::read_image)
+            .is_none_or(&mut send)
+    });
+    #[cfg(unix)]
+    crate::terminal::clipboard::paste_events::run_input_loop(pending, |input| {
+        use crate::terminal::clipboard::paste_events::Input;
+        let message = match input {
+            Input::Image(image) => Some(ClientMessage::ClipboardImage(image)),
+            Input::Event(event) => {
+                input_message_with_clipboard(event, crate::terminal::clipboard::read_image)
             }
-        }
-        while let Ok(event) = read_event() {
-            if !send(event) {
-                break;
-            }
-        }
-    }
+        };
+        message.is_none_or(&mut send)
+    });
 }
 
 #[cfg(test)]
@@ -1690,7 +1686,16 @@ mod render_tests {
             matches!(protocol::read_message::<_, ClientMessage>(&mut bytes.as_slice()).unwrap(),
             ClientMessage::Key(sent) if sent == key)
         );
-        for event in [Event::Key(key), Event::Paste(String::new())] {
+        let command_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::SUPER);
+        assert!(
+            matches!(input_message_with_clipboard(Event::Key(command_v), || None),
+            Some(ClientMessage::Key(sent)) if sent == command_v)
+        );
+        for event in [
+            Event::Key(key),
+            Event::Key(command_v),
+            Event::Paste(String::new()),
+        ] {
             let mut bytes = vec![];
             assert!(write_input_with_clipboard(&mut bytes, event, || Some(
                 crate::terminal::clipboard::ClipboardImage {

@@ -154,7 +154,7 @@ def main():
         standalone = root / "standalone migration.sh"
         standalone.write_text((REPO / "migrate_from_herdr.sh").read_text())
         payload = ('#!/bin/sh\nprintf "%s\\n" "$*" >> "$MIGRATE_INSTALL_CALLS"\nexec ' + shlex.quote(str(binary)) + ' "$@"\n').encode()
-        for target in ("x86_64-unknown-linux-musl", "aarch64-apple-darwin"):
+        for target in ("x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "aarch64-apple-darwin"):
             archive = root / "downloads" / ("luvus-" + target + ".tar.gz")
             with tarfile.open(str(archive), "w:gz") as tar:
                 info = tarfile.TarInfo("luvus-fixture/luvus")

@@ -83,7 +83,7 @@ default. The CLI asks `[y/N]`; non-interactive execution requires explicit
 so its connection error can be inspected and retried.
 
 Installation runs the bundled fork installer via SSH. It detects the remote
-platform, supports **macOS arm64/aarch64** and **Linux x86_64**, verifies SHA-256,
+platform, supports **macOS arm64/aarch64** and **Linux x86_64 or ARM64**, verifies SHA-256,
 and atomically replaces `~/.local/bin/luvus` with a backup of any previous
 regular file. It downloads only from `Shaloc/luvus` releases, needs remote
 `curl` or `wget`, and does not need `gh`, `sudo`, SCP, or a remote build.
@@ -387,6 +387,22 @@ unchanged. In Kitty, a headless SSH display client can use the optional official
 over [OSC 5522](https://sw.kovidgoyal.net/kitty/clipboard/). Kitty controls access
 and may ask for permission; Luvus does not bypass it. Other headless clients need
 native desktop clipboard access. Clipboard reads happen only on paste.
+
+**Cmd+V** also attaches clipboard images. When the terminal forwards Command as
+the Super modifier, Luvus handles it like Ctrl+V and preserves the original key
+if there is no image. Kitty's default Cmd+V is handled by Kitty itself: with
+Kitty 0.44.1 or newer and the official `kitten` helper available on the display
+client, Luvus enables [paste events](https://sw.kovidgoyal.net/kitty/clipboard/#paste-events).
+The normal shortcut (and Kitty's Paste action) can then deliver an image without
+custom key mappings. Text-only and primary-selection pastes continue to deliver
+text. Control characters are rendered visibly rather than sent as terminal
+commands; tabs and line breaks remain text. The terminal's one-use paste grant
+authorizes just that read; Luvus does not
+change Kitty's clipboard permissions. Older terminals retain their existing
+text-paste behavior; use Ctrl+V for images if they consume Cmd+V without sending
+a paste event. After installing the helper, reattach the display client to enable
+the default Kitty paste shortcut. Remote images use the same owner-side staging
+described above; clipboard access stays on the display side.
 
 Install the optional helper from **Menu → General → Kitty clipboard (client)**,
 or run `luvus kitten install` on the display-client machine (`luvus kitten status`
@@ -1046,13 +1062,22 @@ For an independent client that cannot run through the interactive SSH bridge,
 use the scoped, expiring pairing flow documented in
 [Remote access and transport providers](/docs/uhp/remote-access/).
 
-## Fork macOS build artifacts
+## Fork build artifacts
 
-The `Shaloc/luvus` fork provides a manual **Fork macOS ARM64 artifact** workflow
-for `aarch64-apple-darwin`. It builds the selected commit and uploads a tarball
-and SHA-256 checksum to that workflow run, retained for 30 days. The archive
+The `Shaloc/luvus` fork provides the manual **Fork CLI artifacts** workflow
+(`.github/workflows/fork-macos-build.yml`) for `aarch64-apple-darwin`,
+`x86_64-unknown-linux-musl`, and `aarch64-unknown-linux-musl`. It builds the
+selected commit on native macOS ARM64, Linux x86_64, and Linux ARM64 runners,
+then uploads a tarball and SHA-256 checksum for each target, retained for 30 days. Each archive
 contains `luvus`, its license, and `build-info.txt` identifying the source commit.
-An isolated installation of the archive is smoke-tested on the macOS runner.
+An isolated installation of each archive is smoke-tested on its native runner,
+including remote installation, terminal appearance, and SSH transport fixtures.
+
+When publishing a fork release, require all three build jobs to pass for the
+same commit. Publish each archive as `luvus-<target>.tar.gz` with a matching
+`luvus-<target>.tar.gz.sha256` file whose filename entry uses the public archive
+name. This gives six release assets; do not promote a release missing a target
+to Latest. The fork installer and remote host installer use those stable names.
 
 This workflow does not create releases or tags, publish packages, update
 Homebrew taps, build the website, or dispatch downstream workflows. Existing

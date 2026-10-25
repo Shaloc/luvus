@@ -22,7 +22,8 @@ bundled and virtual themes do not.
 
 ## Appearance and terminal background
 
-**Settings → Theme** has two independent controls above the palette list:
+**Settings → General** starts with two independent appearance controls, so reaching
+them does not preview or change the selected palette:
 
 - **Appearance**: **Auto** (default), **Light**, or **Dark**. A manual choice overrides
   detection for Terminal-derived UI shades and the color-scheme preference reported
@@ -51,7 +52,8 @@ The persisted keys are `theme_appearance` (`auto`, `light`, `dark`) and
 
 ## Connected remote machines
 
-Changing **Settings → Theme**, or running `luvus theme use <id>` against a
+Changing the palette in **Settings → Theme**, adjusting either appearance control in
+**Settings → General**, or running `luvus theme use <id>` against a
 running local server, also sends the theme ID, appearance preference and terminal-background switch together to every running session on
 the currently connected, selected SSH hosts. It updates their live palettes
 and saved theme without restarting servers. Other settings are preserved.

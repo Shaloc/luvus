@@ -14,7 +14,7 @@ pub(super) struct SettingsHits {
     pub ctls: Vec<(usize, Rect)>,
     pub theme_remove: Vec<(String, Rect)>,
     pub arrows: Vec<(usize, i32, Rect)>,
-    pub layout_scroll: usize,
+    pub content_scroll: usize,
 }
 
 fn format_history_budget(bytes: usize) -> String {
@@ -185,14 +185,14 @@ pub(super) fn draw_settings(
             ctls,
             theme_remove: Vec::new(),
             arrows: Vec::new(),
-            layout_scroll: 0,
+            content_scroll: 0,
         };
     }
 
-    let (tab, cursor, layout_scroll) = app
+    let (tab, cursor, content_scroll) = app
         .settings
         .as_ref()
-        .map(|u| (u.tab, u.cursor, u.layout_scroll))
+        .map(|u| (u.tab, u.cursor, u.content_scroll))
         .unwrap_or((SettingsTab::Theme, 0, 0));
 
     // ── title bar ──
@@ -231,7 +231,7 @@ pub(super) fn draw_settings(
             ctls: Vec::new(),
             theme_remove: Vec::new(),
             arrows: Vec::new(),
-            layout_scroll,
+            content_scroll,
         };
     }
 
@@ -304,8 +304,8 @@ pub(super) fn draw_settings(
         inner.width,
         content_bottom.saturating_sub(content_y),
     );
-    let (ctls, theme_remove, arrows, layout_scroll) =
-        draw_content(f, content, tab, cursor, layout_scroll, app, t);
+    let (ctls, theme_remove, arrows, content_scroll) =
+        draw_content(f, content, tab, cursor, content_scroll, app, t);
 
     // ── footer hint (Keys tab gets its own rebind/reset hints) ──
     let footer_y = inner.bottom().saturating_sub(1);
@@ -361,7 +361,7 @@ pub(super) fn draw_settings(
         ctls,
         theme_remove,
         arrows,
-        layout_scroll,
+        content_scroll,
     }
 }
 
@@ -377,14 +377,14 @@ fn draw_content(
     area: Rect,
     tab: SettingsTab,
     cursor: usize,
-    layout_scroll: usize,
+    content_scroll: usize,
     app: &App,
     t: &Theme,
 ) -> Content {
     let mut ctls = Vec::new();
     let mut theme_remove = Vec::new();
     let mut arrows = Vec::new();
-    let mut resolved_layout_scroll = layout_scroll;
+    let mut resolved_content_scroll = content_scroll;
     let cat = app.catalog;
     match tab {
         SettingsTab::Remote => {
@@ -492,8 +492,7 @@ fn draw_content(
             // more palettes than fit a short modal).
             let avail = area.height.max(1) as usize;
             let themes = app.theme_registry.entries();
-            let offset = crate::app::THEME_PREFERENCE_ROWS;
-            let total = offset + themes.len();
+            let total = themes.len();
             let scroll = cursor
                 .saturating_sub(avail.saturating_sub(1))
                 .min(total.saturating_sub(avail));
@@ -506,41 +505,7 @@ fn draw_content(
                 .max()
                 .unwrap_or(9);
             for (vi, i) in (scroll..total).take(avail).enumerate() {
-                if i < offset {
-                    let y = area.y + vi as u16;
-                    if i == 0 {
-                        let value = match app.config.theme_appearance {
-                            crate::config::ThemeAppearance::Auto => cat.settings.appearance_auto,
-                            crate::config::ThemeAppearance::Light => cat.settings.appearance_light,
-                            crate::config::ThemeAppearance::Dark => cat.settings.appearance_dark,
-                        };
-                        let row = slider_row(
-                            f,
-                            area,
-                            y,
-                            i,
-                            cursor == i,
-                            cat.settings.theme_appearance,
-                            value.into(),
-                            t,
-                            &mut arrows,
-                        );
-                        ctls.push((i, row));
-                    } else {
-                        ctls.push(ctl_row(
-                            f,
-                            area,
-                            y,
-                            i,
-                            cursor,
-                            cat.settings.theme_terminal_background,
-                            toggle(app.config.theme_terminal_background, t),
-                            t,
-                        ));
-                    }
-                    continue;
-                }
-                let entry = &themes[i - offset];
+                let entry = &themes[i];
                 let name = entry.id.as_str();
                 let row = Rect::new(area.x, area.y + vi as u16, area.width, 1);
                 let sel = i == cursor;
@@ -686,8 +651,8 @@ fn draw_content(
                 .iter()
                 .position(|v| matches!(v, V::Ctl(i) if *i == cursor))
                 .unwrap_or(0);
-            let scroll = keep_visible_scroll(layout_scroll, cur_vis, avail, vis.len());
-            resolved_layout_scroll = scroll;
+            let scroll = keep_visible_scroll(content_scroll, cur_vis, avail, vis.len());
+            resolved_content_scroll = scroll;
             for (row_i, v) in vis.iter().enumerate().skip(scroll).take(avail) {
                 let y = area.y + (row_i - scroll) as u16;
                 let i = match v {
@@ -1014,37 +979,72 @@ fn draw_content(
             }
         }
         SettingsTab::General => {
-            // The two file choosers (which viewer, then what a click does), then
-            // a blank gap + `── Notifications ──` divider and the sound rows,
-            // mirroring the Layout tab's Docks section.
+            // Independent appearance and file controls, then Notifications.
+            // Reuse Layout's viewport tracking so all controls stay reachable
+            // in short windows without moving a clicked row after selection.
             let rows = app.general_rows();
             let sec = app.general_section_start();
             let n = &app.config.notifications;
             let file_open = app.file_open_label();
             let file_click = app.file_click_label();
-            let mut y = area.y;
+            let avail = area.height.max(1) as usize;
+            let visual_row = |index: usize| index + if index >= sec { 2 } else { 0 };
+            let scroll =
+                keep_visible_scroll(content_scroll, visual_row(cursor), avail, rows.len() + 2);
+            resolved_content_scroll = scroll;
+            let divider = sec + 1;
+            if (scroll..scroll + area.height as usize).contains(&divider) {
+                let y = area.y + (divider - scroll) as u16;
+                hline(f, area.x, y, area.width, t);
+                let label = format!(" {} ", cat.tab_notify);
+                let w = (display_width(&label) as u16).min(area.width);
+                f.render_widget(
+                    Paragraph::new(Span::styled(
+                        label,
+                        Style::new().fg(t.subtext0).bg(t.surface0),
+                    )),
+                    Rect::new(area.x + 2, y, w, 1),
+                );
+            }
             for (i, row) in rows.iter().enumerate() {
-                if i == sec {
-                    y += 1; // blank line before the section
-                    if y >= area.bottom() {
-                        break;
-                    }
-                    hline(f, area.x, y, area.width, t);
-                    let label = format!(" {} ", cat.tab_notify);
-                    let w = (display_width(&label) as u16).min(area.width);
-                    f.render_widget(
-                        Paragraph::new(Span::styled(
-                            label,
-                            Style::new().fg(t.subtext0).bg(t.surface0),
-                        )),
-                        Rect::new(area.x + 2, y, w, 1),
-                    );
-                    y += 1;
+                let visual = visual_row(i);
+                if visual < scroll {
+                    continue;
                 }
-                if y >= area.bottom() {
+                if visual >= scroll + area.height as usize {
                     break;
                 }
+                let y = area.y + (visual - scroll) as u16;
                 match row {
+                    GeneralRow::ThemeAppearance => {
+                        let value = match app.config.theme_appearance {
+                            crate::config::ThemeAppearance::Auto => cat.settings.appearance_auto,
+                            crate::config::ThemeAppearance::Light => cat.settings.appearance_light,
+                            crate::config::ThemeAppearance::Dark => cat.settings.appearance_dark,
+                        };
+                        let rect = slider_row(
+                            f,
+                            area,
+                            y,
+                            i,
+                            cursor == i,
+                            cat.settings.theme_appearance,
+                            value.into(),
+                            t,
+                            &mut arrows,
+                        );
+                        ctls.push((i, rect));
+                    }
+                    GeneralRow::TerminalBackground => ctls.push(ctl_row(
+                        f,
+                        area,
+                        y,
+                        i,
+                        cursor,
+                        cat.settings.theme_terminal_background,
+                        toggle(app.config.theme_terminal_background, t),
+                        t,
+                    )),
                     GeneralRow::ClipboardHelper => {
                         use crate::terminal::clipboard::kitten::Status;
                         let ui = app.settings.as_ref().expect("settings are open");
@@ -1311,7 +1311,6 @@ fn draw_content(
                         t,
                     )),
                 }
-                y += 1;
             }
         }
         SettingsTab::Integrations => {
@@ -1717,7 +1716,7 @@ fn draw_content(
             }
         }
     }
-    (ctls, theme_remove, arrows, resolved_layout_scroll)
+    (ctls, theme_remove, arrows, resolved_content_scroll)
 }
 
 /// Preserve the current viewport whenever the selected row is already visible;

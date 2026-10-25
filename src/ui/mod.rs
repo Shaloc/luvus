@@ -1310,7 +1310,7 @@ fn render_into_mode_impl(
         app.settings_theme_remove_rects = h.theme_remove.clone();
         app.settings_arrow_rects = h.arrows.clone();
         if let Some(settings) = app.settings.as_mut() {
-            settings.layout_scroll = h.layout_scroll;
+            settings.content_scroll = h.content_scroll;
         }
     } else {
         app.settings_modal_rect = None;

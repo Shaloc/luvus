@@ -10,12 +10,23 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 pub mod kitten;
+#[cfg(unix)]
+pub(crate) mod paste_events;
 pub(crate) mod png;
 
 pub(crate) const MAX_WEB_PNG_BYTES: usize = 160 * 1024;
 pub(crate) const MAX_WEB_PNG_BASE64_BYTES: usize = MAX_WEB_PNG_BYTES.div_ceil(3) * 4;
 
 pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(unix)]
+const IMAGE_MIMES: [(&str, &str); 5] = [
+    ("image/png", "png"),
+    ("image/jpeg", "jpg"),
+    ("image/webp", "webp"),
+    ("image/gif", "gif"),
+    ("image/bmp", "bmp"),
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ClipboardImage {
@@ -49,12 +60,33 @@ fn capture(mut command: Command) -> Option<Vec<u8>> {
 }
 
 fn capture_with_timeout(command: &mut Command, timeout: Duration) -> Option<Vec<u8>> {
+    capture_with_input(command, timeout, None)
+}
+
+fn capture_with_input(
+    command: &mut Command,
+    timeout: Duration,
+    input: Option<&[u8]>,
+) -> Option<Vec<u8>> {
     command
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     crate::platform::no_window(command);
     let mut child = command.spawn().ok()?;
+    if let Some(input) = input {
+        // Paste-event passwords are short, one-use tokens. Pass them through a
+        // pipe, never argv, an environment variable, a file or a log.
+        if child.stdin.take()?.write_all(input).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    }
     let stdout = child.stdout.take()?;
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
@@ -113,13 +145,7 @@ pub fn read_image() -> Option<ClipboardImage> {
         }
     }
     #[cfg(target_os = "linux")]
-    for (mime, extension) in [
-        ("image/png", "png"),
-        ("image/jpeg", "jpg"),
-        ("image/webp", "webp"),
-        ("image/gif", "gif"),
-        ("image/bmp", "bmp"),
-    ] {
+    for (mime, extension) in IMAGE_MIMES {
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             let mut command = Command::new("wl-paste");
             command.args(["--no-newline", "--type", mime]);
@@ -232,8 +258,18 @@ pub(crate) fn stage_png(bytes: &[u8]) -> Result<PathBuf, String> {
 /// control frame. Whitespace, URL-safe symbols, misplaced padding, and excess
 /// decoded bytes fail before the staging path is touched.
 pub(crate) fn stage_web_png(encoded: &str) -> io::Result<PathBuf> {
+    let decoded = decode_base64(encoded, MAX_WEB_PNG_BYTES)?;
+    stage(&ClipboardImage {
+        extension: "png".into(),
+        bytes: decoded,
+    })
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+/// Strict bounded base64 shared by clipboard uploads and terminal paste offers.
+fn decode_base64(encoded: &str, limit: usize) -> io::Result<Vec<u8>> {
     if encoded.is_empty()
-        || encoded.len() > MAX_WEB_PNG_BASE64_BYTES
+        || encoded.len() > limit.div_ceil(3) * 4
         || !encoded.len().is_multiple_of(4)
     {
         return Err(io::Error::new(
@@ -273,18 +309,14 @@ pub(crate) fn stage_web_png(encoded: &str) -> io::Result<PathBuf> {
                 decoded.push((c << 6) | d);
             }
         }
-        if decoded.len() > MAX_WEB_PNG_BYTES {
+        if decoded.len() > limit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "browser image exceeds upload limit",
             ));
         }
     }
-    stage(&ClipboardImage {
-        extension: "png".into(),
-        bytes: decoded,
-    })
-    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    Ok(decoded)
 }
 
 fn invalid_web_image() -> io::Error {

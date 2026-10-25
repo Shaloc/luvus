@@ -18,8 +18,13 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+            arch: arm64
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: aarch64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     env:
@@ -27,6 +32,7 @@ jobs:
       CARGO_HTTP_MULTIPLEXING: "false"
       SQLITE3_LIB_DIR: ${{ contains(matrix.target, 'apple-darwin') && '/usr/lib' || '' }}
       TARGET: ${{ matrix.target }}
+      NATIVE_ARCH: ${{ matrix.arch }}
     defaults:
       run:
         shell: bash
@@ -36,11 +42,7 @@ jobs:
           persist-credentials: false
       - name: Set up native Rust toolchain
         run: |
-          if [ "$TARGET" = aarch64-apple-darwin ]; then
-            test "$(uname -m)" = arm64
-          else
-            test "$(uname -m)" = x86_64
-          fi
+          test "$(uname -m)" = "$NATIVE_ARCH"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
           rustup toolchain install stable --profile minimal --no-self-update
           rustup target add --toolchain stable "$TARGET"

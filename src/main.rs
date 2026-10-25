@@ -49,8 +49,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-#[cfg(not(windows))]
-use ratatui::crossterm::event::read as read_event;
 use ratatui::crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
     EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
@@ -277,6 +275,8 @@ pub(crate) fn install_tui_panic_hook() {
             DisableBracketedPaste,
             PopKeyboardEnhancementFlags
         );
+        #[cfg(unix)]
+        crate::terminal::clipboard::paste_events::disable();
         prev(info);
     }));
 }
@@ -653,6 +653,8 @@ fn run_local() -> Result<()> {
         DisableMouseCapture,
         DisableBracketedPaste
     );
+    #[cfg(unix)]
+    crate::terminal::clipboard::paste_events::disable();
     ratatui::restore();
     if result? {
         print_detached_status(i18n::cli::Context::configured());
@@ -1752,6 +1754,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     #[cfg(windows)]
     let _windows_input_mode = terminal::host_input::enable_input_mode();
     push_key_protocol();
+    #[cfg(unix)]
+    terminal::clipboard::paste_events::enable();
     {
         let tx = tx.clone();
         thread::spawn(move || input_loop(tx, pending));
@@ -1924,19 +1928,14 @@ fn input_loop(tx: Sender<AppEvent>, pending: Vec<Event>) {
         crate::terminal::host_input::run_input_loop(pending, |event| send_input_event(&tx, event));
     }
 
-    #[cfg(not(windows))]
-    {
-        for event in pending {
-            if !send_input_event(&tx, event) {
-                return;
-            }
+    #[cfg(unix)]
+    crate::terminal::clipboard::paste_events::run_input_loop(pending, |input| {
+        use crate::terminal::clipboard::paste_events::Input;
+        match input {
+            Input::Event(event) => send_input_event(&tx, event),
+            Input::Image(image) => tx.send(AppEvent::ClipboardImage(image)).is_ok(),
         }
-        while let Ok(event) = read_event() {
-            if !send_input_event(&tx, event) {
-                break;
-            }
-        }
-    }
+    });
 }
 
 fn send_input_event(tx: &Sender<AppEvent>, event: Event) -> bool {
@@ -1958,6 +1957,9 @@ fn app_event_with_image(
         Event::Key(k) => Some(AppEvent::Key(k)),
         Event::Mouse(m) => Some(AppEvent::Mouse(m)),
         Event::Resize(_, _) => Some(AppEvent::Resize),
+        Event::Paste(s) if s.is_empty() => image()
+            .map(AppEvent::ClipboardImage)
+            .or(Some(AppEvent::Paste(s))),
         Event::Paste(s) => Some(AppEvent::Paste(s)),
         // Regained focus: treat like a resize to the current size, which forces
         // a full repaint and clears any stale cells from a move/expose.
@@ -2099,6 +2101,18 @@ mod tests {
             app_event_with_image(Event::Key(key), || None),
             Some(AppEvent::Key(fallback)) if fallback == key
         ));
+        let command_v = ratatui::crossterm::event::KeyEvent::new(
+            key.code,
+            ratatui::crossterm::event::KeyModifiers::SUPER,
+        );
+        assert!(
+            matches!(app_event_with_image(Event::Key(command_v), || Some(image.clone())),
+            Some(AppEvent::ClipboardImage(staged)) if staged.bytes == image.bytes)
+        );
+        assert!(
+            matches!(app_event_with_image(Event::Key(command_v), || None),
+            Some(AppEvent::Key(sent)) if sent == command_v)
+        );
     }
 
     #[test]

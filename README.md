@@ -84,12 +84,13 @@ remain active with this setting off.
 - **Custom interface:** Move and resize two sidebars, remap keys and the prefix,
   use presets and a help view of effective shortcuts, select from 8 languages, and install composable local or
   community themes.
-- **Fork releases:** Download macOS Apple Silicon and Linux x86_64 binaries, and
+- **Fork releases:** Download macOS Apple Silicon and Linux x86_64/ARM64 binaries, and
   inspect the environment with `luvus doctor`.
 
 ## Install
 
-Install or update this fork on **macOS Apple Silicon** or **Linux x86_64**:
+Install or update this fork on **macOS Apple Silicon**, **Linux x86_64**, or
+**Linux ARM64 (aarch64)**:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Shaloc/luvus/main/install.sh | sh
@@ -117,7 +118,8 @@ luvus server restart --all
 Install matching releases on the local and SSH host machines for managed remote
 sessions. To upgrade, rerun the installer above; `luvus update`, the upstream
 website installers, Homebrew tap, and crates.io package still target upstream.
-Prebuilt fork releases currently cover only the two platforms listed above.
+Prebuilt fork releases cover these three platforms. Both Linux builds use musl
+and do not require a particular glibc version.
 
 Kitty graphics are included in stable fork releases and the default installer.
 Installation does not restart servers; load the matching build on the display
@@ -158,7 +160,7 @@ can also preview or migrate using the local files:
 The script requires Python 3.6+ on macOS/Linux and on each saved SSH machine.
 `--install` runs this fork's existing installer locally, permits installation of
 missing or incompatible remote binaries, and migrates the saved sessions.
-The installer offers macOS Apple Silicon and Linux x86_64 binaries. For other
+The installer offers macOS Apple Silicon and Linux x86_64/ARM64 binaries. For other
 architectures, build the fork from source and use `--luvus-bin /path/to/luvus`.
 
 Herdr's default session goes to Luvus's **default** session on each machine.

@@ -68,6 +68,7 @@ jobs:
           cargo build --locked
           python3 tests/server_detach_pty.py --luvus target/debug/luvus
           python3 scripts/test-terminal-colors-pty.py --luvus target/debug/luvus
+          python3 scripts/test-fork-installer.py
           python3 scripts/test-migrate-from-herdr.py target/debug/luvus
       - name: Validate web client and bridge
         run: |

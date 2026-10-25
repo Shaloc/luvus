@@ -314,8 +314,11 @@ details, plus scrollback, are in [Scrollback & Copy](/docs/guides/scrollback/).
 ## Pasting clipboard images
 
 Copy a screenshot or image, focus an agent pane, then use the paste chord your
-terminal sends: `Ctrl+V` or `Ctrl+Shift+V`, plus `Command+V` or
-`Command+Shift+V` on macOS. Luvus reads the clipboard only for that explicit
+terminal sends: `Ctrl+V` or `Ctrl+Shift+V`, plus `Command+V` on macOS.
+In Kitty 0.44.1 or newer, its default Paste shortcut also works when the
+[official clipboard helper](/docs/guides/remote/#worktrees-and-image-paste)
+is available on the display client. No custom Kitty key mapping is needed.
+Luvus reads the clipboard only for that explicit
 gesture. A supported image is staged privately in its supported format and its path is pasted
 into the focused pane without submitting the prompt. Agents that accept image
 paths can then attach or inspect it.
@@ -327,12 +330,14 @@ run in the display client and inherit its `WAYLAND_DISPLAY`, `DISPLAY`, and
 `XDG_RUNTIME_DIR`; install `wl-clipboard` or `xclip` when your desktop does not
 already provide the applicable command.
 
-If the clipboard has text, is unavailable, or contains an unsupported image,
-Luvus forwards the original key unchanged. Image paste is ignored while a Luvus
+For a forwarded key, if the clipboard has text, is unavailable, or contains an
+unsupported image, Luvus forwards the original key unchanged. Kitty paste events
+deliver text-only clipboard contents as text, including primary-selection paste.
+Image paste is ignored while a Luvus
 modal, native file view, dashboard, copy mode, or navigation mode owns input, so
-the private path cannot leak into a pane behind it. The host terminal must pass
-the chord through to Luvus; a terminal-reserved paste binding can still consume
-it before Luvus sees it.
+the private path cannot leak into a pane behind it. Other terminals must pass
+the chord through to Luvus; a terminal-reserved paste binding without paste-event
+support can still consume it before Luvus sees it.
 
 ## Opening links and files
 

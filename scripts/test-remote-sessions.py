@@ -248,12 +248,13 @@ def main():
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
         import pyte
-    clipboard_only = "--clipboard-helper-only" in sys.argv[1:]
+    paste_events_only = "--paste-events-only" in sys.argv[1:]
+    clipboard_only = "--clipboard-helper-only" in sys.argv[1:] or paste_events_only
     dimensions_only = "--dimensions-only" in sys.argv[1:]
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -321,6 +322,11 @@ def main():
         helper = Path(os.environ["LUVUS_TEST_KITTEN"]).resolve()
         assert helper.is_relative_to(repo / "target") and helper.is_file(), helper
         shutil.copyfile(helper, root / "official-kitten")
+        if paste_events_only:
+            installed = root / "local-state/tools/kitten"
+            installed.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(helper, installed)
+            installed.chmod(0o700)
         (root / "bin/curl").symlink_to(Path(__file__).resolve())
         env["TERM"] = "xterm-kitty"
         env.pop("DISPLAY", None)
@@ -1970,13 +1976,11 @@ def main():
 
             os.write(master, b"\x02=")
             settings_screen = drain(master)
-            click(master, *position(settings_screen + repaint(master), "Theme"))
-            drain(master)
-            # Scroll to the two controls above the palette list. Navigation must
-            # not itself toggle either preference.
-            os.write(master, b"\x1b[A" * 32)
+            selected_theme = api("config.get")["config"]["theme"]
+            click(master, *position(settings_screen + repaint(master), "General"))
             drain(master)
             assert api("config.get")["config"]["theme_appearance"] == "auto"
+            assert synced(selected_theme), "opening appearance controls changed the palette"
             for mode in ("light", "dark", "auto"):
                 os.write(master, b"\r")
                 wait_for_settings(lambda: all(api("config.get", remote=True, session=name)["config"]["theme_appearance"] == mode for name in owners))
@@ -1988,7 +1992,10 @@ def main():
                 wait_for_settings(lambda: json.loads((root / "remote-state/config.json").read_text())["theme_terminal_background"] == enabled)
             os.write(master, b"\x1b")
             drain(master)
-            print("PASS: Settings Auto/Light/Dark and terminal background sync live and persist on running owners", flush=True)
+            assert api("config.get")["config"]["theme"] == selected_theme
+            assert synced(selected_theme), "appearance changes overwrote the selected palette"
+            assert json.loads((root / "remote-state/config.json").read_text())["theme"] == selected_theme
+            print("PASS: General appearance/background controls preserve the selected palette and sync live to running owners", flush=True)
 
             # Selecting another local theme must not inherit any remote config.
             run("--session", "api", "theme", "use", "one-dark")
@@ -2654,6 +2661,88 @@ def main():
                 api("workspace.focus", {"workspace": remote_workspace["workspace"]})
             process, master = start_client(["session", "attach", "remote-fake-dev-api"]
                                            if clipboard_mode == "direct-remote" else ["--session", "api"])
+            if paste_events_only:
+                drain(master)
+                remote = clipboard_mode != "local"
+                owner_dir = root / ("remote-state" if remote else "local-state") / "sessions/api/clipboard"
+                other_dir = root / ("local-state" if remote else "remote-state")
+                pane = api("pane.list", remote=remote)["panes"][0]["pane"]
+                def exchange(gesture, content=IMAGE, mime=b"image/png", primary=False, offered=False, fragmented=False):
+                    before = len(list(owner_dir.glob("*")))
+                    if fragmented:
+                        # Split inside OSC 5522's prefix, before metadata. A
+                        # delayed SSH packet must not replay the offer as keys.
+                        os.write(master, gesture[:5])
+                        time.sleep(0.2)
+                        os.write(master, gesture[5:])
+                    else:
+                        os.write(master, gesture)
+                    wire = bytearray()
+                    requests = []
+                    def delivered():
+                        wire.extend(drain(master, 0.03))
+                        if b"\x1b[?5522$p" in wire:
+                            wire[:] = wire.replace(b"\x1b[?5522$p", b"")
+                            os.write(master, b"\x1b[?5522;2$y")
+                        for match in list(re.finditer(rb"\x1b\]5522;([^;\x1b]*);([^\x1b]*)\x1b\\", wire)):
+                            metadata, payload = match.groups()
+                            if b"type=read" not in metadata:
+                                continue
+                            requested = base64.b64decode(payload)
+                            requests.append(requested)
+                            if requested != b".":
+                                assert requested == mime, (metadata, requested)
+                                if offered:
+                                    assert b"pw=dGVzdA==" in metadata, metadata
+                                    assert b"name=UGFzdGUgZXZlbnQ=" in metadata, metadata
+                                assert (b"loc=primary" in metadata) == primary, metadata
+                            data = mime if requested == b"." else content
+                            response = (b"\x1b]5522;type=read:status=OK\x1b\\"
+                                        b"\x1b]5522;type=read:status=DATA:mime=" + base64.b64encode(requested)
+                                        + b";" + base64.b64encode(data) + b"\x1b\\"
+                                        b"\x1b]5522;type=read:status=DONE\x1b\\")
+                            os.write(master, response)
+                        if requests:
+                            wire.clear()
+                        if mime == b"text/plain":
+                            return content.decode() in api("pane.read", {"pane": pane}, remote=remote)["text"]
+                        paths = list(owner_dir.glob("*"))
+                        return len(paths) == before + 1 and all(p.read_bytes() == IMAGE for p in paths)
+                    try:
+                        wait_for(delivered)
+                    except AssertionError as error:
+                        raise AssertionError(f"gesture={gesture!r}, requests={requests!r}, wire={wire!r}") from error
+                    assert process.poll() is None
+                    assert not list(other_dir.glob("**/clipboard/*.png")), "staged on wrong owner"
+                def offer(mime, primary=False):
+                    location = b":loc=primary" if primary else b""
+                    return (b"\x1b]5522;type=read:status=OK:pw=dGVzdA==" + location + b"\x1b\\"
+                            b"\x1b]5522;type=read:status=DATA:pw=dGVzdA==:mime=Lg==;"
+                            + base64.b64encode(mime) + b"\x1b\\"
+                            b"\x1b]5522;type=read:status=DONE:pw=dGVzdA==\x1b\\")
+                exchange(b"\x16")
+                exchange(b"\x1b[118;9u")
+                exchange(offer(b"image/png text/plain"), offered=True, fragmented=True)
+                exchange(offer(b"text/plain", primary=True), "CMD_PASTE_TEXT_hello_中文".encode(), b"text/plain", primary=True, offered=True)
+                if clipboard_mode == "local":
+                    os.write(master, b"\x02d")
+                    cleanup = bytearray()
+                    def detached():
+                        while select.select([master], [], [], 0.05)[0]:
+                            try:
+                                chunk = os.read(master, 65536)
+                            except OSError as error:
+                                if error.errno != 5:  # PTY EOF after detach
+                                    raise
+                                break
+                            if not chunk:
+                                break
+                            cleanup.extend(chunk)
+                        return process.poll() is not None
+                    wait_for(detached)
+                    assert b"\x1b[?5522l" in cleanup, cleanup[-400:]
+                print(f"PASS: {clipboard_mode}: Ctrl+V, Super+V and fragmented Kitty paste event stage exact PNG on owner; primary text paste, one-use grant and protocol consumption" + ("; detach resets paste mode" if clipboard_mode == "local" else ""), flush=True)
+                return
             os.write(master, b"\x00=" if clipboard_mode == "owner-settings" else b"\x02=")
             screen = bytearray()
             def install_row():

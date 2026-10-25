@@ -123,11 +123,22 @@ Pick whichever channel you prefer:
 
 ## Shaloc fork installer
 
-For this fork's macOS ARM64 and Linux x86_64 musl releases, use:
+For this fork's macOS ARM64 and Linux x86_64/ARM64 musl releases, use:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Shaloc/luvus/main/install.sh | sh
 ```
+
+The installer selects the download from the current machine's OS and architecture:
+
+| Platform | Release archive |
+| --- | --- |
+| macOS ARM64 | `luvus-aarch64-apple-darwin.tar.gz` |
+| Linux x86_64 | `luvus-x86_64-unknown-linux-musl.tar.gz` |
+| Linux ARM64 (`aarch64` or `arm64`) | `luvus-aarch64-unknown-linux-musl.tar.gz` |
+
+Each archive has a matching `.tar.gz.sha256` checksum. Both Linux binaries are
+statically linked with musl, so they do not depend on the host's glibc version.
 
 The fork installer uses `~/.local/bin` by default, or `LUVUS_INSTALL_DIR` when
 set. Downloads, extraction and binary validation stay in a private

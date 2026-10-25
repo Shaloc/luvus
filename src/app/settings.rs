@@ -24,8 +24,6 @@ pub enum SettingsTab {
     Remote,
 }
 
-pub(crate) const THEME_PREFERENCE_ROWS: usize = 2;
-
 impl SettingsTab {
     pub const ALL: [SettingsTab; 8] = [
         SettingsTab::General,
@@ -78,10 +76,9 @@ pub struct SettingsUi {
     /// Candidate prefix captured once and waiting for the same chord again.
     /// Nothing is persisted until confirmation succeeds.
     pub prefix_candidate: Option<String>,
-    /// First visual row shown in the Layout tab. Persisting this while the modal
-    /// is open prevents a visible dock/bar button click from re-anchoring the
-    /// list around its newly selected row.
-    pub layout_scroll: usize,
+    /// First visual row shown in General or Layout. Persisting this while the
+    /// modal is open keeps a clicked row from moving after selection.
+    pub content_scroll: usize,
     /// In the Keys tab: capturing the next key press to rebind `cursor`'s command.
     pub capturing: bool,
 }
@@ -118,12 +115,12 @@ pub enum LayoutRow {
     Bar(String),
 }
 
-/// A selectable row in the General tab: the app-wide preferences that are not
-/// about looks or layout. The two file controls come first — which viewer, then
-/// what a click does with it — then a `── Notifications ──` section (same
-/// blank-gap + divider treatment as the Layout tab's Docks section).
+/// A selectable row in the General tab: independent appearance preferences,
+/// file controls, and a separate Notifications section.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GeneralRow {
+    ThemeAppearance,
+    TerminalBackground,
     FileOpen,
     /// What a plain click on a FILES row does: preview, or a whole tab.
     FileClick,
@@ -167,6 +164,8 @@ impl App {
     /// The General tab's ordered selectable rows.
     pub fn general_rows(&self) -> Vec<GeneralRow> {
         vec![
+            GeneralRow::ThemeAppearance,
+            GeneralRow::TerminalBackground,
             GeneralRow::FileOpen,
             GeneralRow::FileClick,
             GeneralRow::FilesShowHidden,
@@ -287,7 +286,7 @@ impl App {
             tab: SettingsTab::General,
             cursor: 0,
             prefix_candidate: None,
-            layout_scroll: 0,
+            content_scroll: 0,
             capturing: false,
         });
         self.request_clipboard_helper(false);
@@ -362,7 +361,7 @@ impl App {
     pub fn settings_rows(&self, tab: SettingsTab) -> usize {
         match tab {
             SettingsTab::General => self.general_rows().len(),
-            SettingsTab::Theme => THEME_PREFERENCE_ROWS + self.theme_registry.entries().len(),
+            SettingsTab::Theme => self.theme_registry.entries().len(),
             SettingsTab::Layout => self.layout_rows().len(),
             // Rebindable commands first, then the read-only reference rows — the
             // cursor steps through both so the whole reference is keyboard-reachable.
@@ -473,8 +472,7 @@ impl App {
             let continuous = match key.code {
                 KeyCode::Up | KeyCode::Down => true,
                 KeyCode::Left | KeyCode::Right => match tab {
-                    SettingsTab::Theme => cursor >= THEME_PREFERENCE_ROWS,
-                    SettingsTab::Language => true,
+                    SettingsTab::Theme | SettingsTab::Language => true,
                     SettingsTab::Layout => matches!(
                         self.layout_rows().get(cursor),
                         Some(
@@ -627,14 +625,14 @@ impl App {
                 // value and persists it, so selecting a row would change it.
                 Some(SettingsTab::General) => matches!(
                     self.general_rows().get(i),
-                    Some(GeneralRow::FileOpen)
+                    Some(GeneralRow::ThemeAppearance)
+                        | Some(GeneralRow::FileOpen)
                         | Some(GeneralRow::FileClick)
                         | Some(GeneralRow::NotificationDisplay)
                         | Some(GeneralRow::SoundStyle)
                 ),
                 // Number/enum module settings likewise only move via `‹ ›`.
                 Some(SettingsTab::Modules) => self.module_row_is_slider(i),
-                Some(SettingsTab::Theme) => i == 0,
                 _ => false,
             };
             if !is_slider {
@@ -645,12 +643,10 @@ impl App {
 
     fn settings_set_tab(&mut self, tab: SettingsTab) {
         let cursor = match tab {
-            SettingsTab::Theme => {
-                self.theme_registry
-                    .index_of(&self.config.theme)
-                    .unwrap_or(0)
-                    + THEME_PREFERENCE_ROWS
-            }
+            SettingsTab::Theme => self
+                .theme_registry
+                .index_of(&self.config.theme)
+                .unwrap_or(0),
             SettingsTab::Language => lang_cursor(&self.config.language),
             _ => 0,
         };
@@ -658,7 +654,7 @@ impl App {
             ui.tab = tab;
             ui.cursor = cursor;
             ui.prefix_candidate = None;
-            ui.layout_scroll = 0;
+            ui.content_scroll = 0;
             ui.capturing = false;
         }
         if tab == SettingsTab::Remote {
@@ -868,11 +864,11 @@ impl App {
             ui.cursor = new;
         }
         // Theme / Language preview live as the selection moves.
-        if tab == SettingsTab::Theme && new >= THEME_PREFERENCE_ROWS {
+        if tab == SettingsTab::Theme {
             if let Some(id) = self
                 .theme_registry
                 .entries()
-                .get(new - THEME_PREFERENCE_ROWS)
+                .get(new)
                 .map(|entry| entry.id.clone())
             {
                 self.apply_theme(&id);
@@ -887,9 +883,6 @@ impl App {
             return;
         };
         match tab {
-            SettingsTab::Theme if cursor < THEME_PREFERENCE_ROWS => {
-                self.adjust_theme_preference(cursor, delta)
-            }
             // radio tabs: ‹ › move the selection like up/down
             SettingsTab::Theme | SettingsTab::Language => self.settings_move(delta),
             SettingsTab::Layout => self.adjust_layout(cursor, delta),
@@ -913,12 +906,8 @@ impl App {
             ui.prefix_candidate = None;
         }
         match tab {
-            SettingsTab::Theme if cursor < THEME_PREFERENCE_ROWS => {
-                self.adjust_theme_preference(cursor, 1)
-            }
             SettingsTab::Theme => {
-                let index = (cursor - THEME_PREFERENCE_ROWS)
-                    .min(self.theme_registry.entries().len().saturating_sub(1));
+                let index = cursor.min(self.theme_registry.entries().len().saturating_sub(1));
                 if let Some(id) = self
                     .theme_registry
                     .entries()
@@ -1183,12 +1172,7 @@ impl App {
     }
 
     fn settings_enter_theme(&mut self, cursor: usize) {
-        if cursor < THEME_PREFERENCE_ROWS {
-            self.adjust_theme_preference(cursor, 1);
-            return;
-        }
-        let index = (cursor - THEME_PREFERENCE_ROWS)
-            .min(self.theme_registry.entries().len().saturating_sub(1));
+        let index = cursor.min(self.theme_registry.entries().len().saturating_sub(1));
         if let Some((id, removable)) = self.theme_registry.entries().get(index).map(|entry| {
             (
                 entry.id.clone(),
@@ -1367,17 +1351,17 @@ impl App {
         serde_json::json!({"theme": self.config.theme, "theme_appearance": self.config.theme_appearance, "theme_terminal_background": self.config.theme_terminal_background})
     }
 
-    fn adjust_theme_preference(&mut self, cursor: usize, delta: i32) {
+    fn adjust_theme_preference(&mut self, row: GeneralRow, delta: i32) {
         use crate::config::ThemeAppearance::{Auto, Dark, Light};
         let mut appearance = self.config.theme_appearance;
         let mut terminal_background = self.config.theme_terminal_background;
-        match cursor {
-            0 => {
+        match row {
+            GeneralRow::ThemeAppearance => {
                 let values = [Auto, Light, Dark];
                 let index = values.iter().position(|v| *v == appearance).unwrap_or(0) as i32;
                 appearance = values[(index + delta).rem_euclid(values.len() as i32) as usize];
             }
-            1 => terminal_background = !terminal_background,
+            GeneralRow::TerminalBackground => terminal_background = !terminal_background,
             _ => return,
         }
         let theme = self.config.theme.clone();
@@ -1775,6 +1759,9 @@ impl App {
     /// sound toggle, or ring the test chime.
     fn adjust_general(&mut self, cursor: usize, delta: i32) {
         match self.general_rows().get(cursor).copied() {
+            Some(row @ (GeneralRow::ThemeAppearance | GeneralRow::TerminalBackground)) => {
+                self.adjust_theme_preference(row, delta)
+            }
             Some(GeneralRow::FileOpen) => self.cycle_file_open(delta),
             Some(GeneralRow::FileClick) => self.cycle_file_click(delta),
             // Flips config *and* the live tree (docs/38), so it applies at once.
@@ -1924,11 +1911,26 @@ mod tests {
         let mut app = App::new(100, 30, tx).unwrap();
         assert_eq!(app.config.theme_appearance, ThemeAppearance::Auto);
         assert!(!app.config.theme_terminal_background);
+        app.apply_theme("one-dark");
         app.open_settings();
-        app.settings_set_tab(SettingsTab::Theme);
-        app.settings.as_mut().unwrap().cursor = 1;
+        app.settings_set_tab(SettingsTab::General);
         let palette = app.config.theme.clone();
-        app.settings_move(-1);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        // Walk to the controls through the real keyboard path. Palette preview
+        // must not be involved in changing these independent preferences.
+        for code in [KeyCode::Down, KeyCode::Up] {
+            for _ in 0..32 {
+                app.handle_settings_key(KeyEvent::new(code, KeyModifiers::NONE));
+                terminal
+                    .draw(|frame| crate::ui::render(frame, &mut app))
+                    .unwrap();
+                let cursor = app.settings.as_ref().unwrap().cursor;
+                assert!(
+                    app.settings_ctl_rects.iter().any(|(i, _)| *i == cursor),
+                    "every selected General row must stay visible in a short window"
+                );
+            }
+        }
         assert_eq!(app.config.theme, palette);
         assert_eq!(app.config.theme_appearance, ThemeAppearance::Auto);
         app.handle_settings_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
@@ -1937,10 +1939,16 @@ mod tests {
             KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::NONE, KeyEventKind::Repeat);
         app.handle_settings_key(repeated);
         assert_eq!(app.config.theme_appearance, ThemeAppearance::Light);
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal
             .draw(|frame| crate::ui::render(frame, &mut app))
             .unwrap();
+        let (_, appearance_row) = app.settings_ctl_rects[0];
+        app.handle_settings_click(appearance_row.x + 2, appearance_row.y);
+        assert_eq!(
+            app.config.theme_appearance,
+            ThemeAppearance::Light,
+            "selecting the slider body must not change its value"
+        );
         let (_, row) = *app
             .settings_ctl_rects
             .iter()
@@ -1951,12 +1959,19 @@ mod tests {
         assert_eq!(app.config.theme, palette);
         app.flush_config_for_test(&rx);
         let saved = crate::config::load();
+        assert_eq!(saved.theme, palette);
         assert_eq!(saved.theme_appearance, ThemeAppearance::Light);
         assert!(saved.theme_terminal_background);
-        app.settings_enter_theme(0);
+        app.settings_activate(0);
         assert_eq!(app.config.theme_appearance, ThemeAppearance::Dark);
-        app.settings_enter_theme(0);
+        app.settings_activate(0);
         assert_eq!(app.config.theme_appearance, ThemeAppearance::Auto);
+        app.settings_set_tab(SettingsTab::Theme);
+        assert_eq!(
+            app.settings.as_ref().unwrap().cursor,
+            app.theme_registry.index_of(&palette).unwrap()
+        );
+        assert_eq!(app.config.theme, palette);
     }
 
     #[test]
@@ -2565,7 +2580,7 @@ mod tests {
         terminal
             .draw(|frame| crate::ui::render(frame, &mut app))
             .unwrap();
-        let before = app.settings.as_ref().unwrap().layout_scroll;
+        let before = app.settings.as_ref().unwrap().content_scroll;
         assert!(before > 0, "the regression requires a scrolled Layout list");
 
         let rows = app.layout_rows();
@@ -2588,7 +2603,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            app.settings.as_ref().unwrap().layout_scroll,
+            app.settings.as_ref().unwrap().content_scroll,
             before,
             "clicking a visible placement button must not re-anchor the modal"
         );
@@ -2840,7 +2855,7 @@ mod tests {
         assert!(app.focused().unwrap().mouse_options.copy_on_select);
     }
 
-    // The General tab is the two file choosers plus the Notifications section:
+    // The General tab includes appearance and file controls plus Notifications:
     // the selected sound style, two persisted event toggles, and separate test
     // rows for the completion and attention cues.
     #[test]
@@ -2852,9 +2867,11 @@ mod tests {
         if let Some(ui) = app.settings.as_mut() {
             ui.tab = SettingsTab::General;
         }
-        assert_eq!(app.settings_rows(SettingsTab::General), 20);
+        assert_eq!(app.settings_rows(SettingsTab::General), 22);
         let rows = app.general_rows();
-        assert_eq!(rows[0], GeneralRow::FileOpen, "file-open leads the tab");
+        assert_eq!(rows[0], GeneralRow::ThemeAppearance);
+        assert_eq!(rows[1], GeneralRow::TerminalBackground);
+        assert_eq!(rows[2], GeneralRow::FileOpen);
         let terminal = rows
             .iter()
             .position(|r| *r == GeneralRow::TerminalAgentNotifications)
@@ -2865,7 +2882,7 @@ mod tests {
         app.flush_config_for_test(&rx);
         assert!(crate::config::load().notifications.terminal_on_agent);
         assert_eq!(
-            rows[1],
+            rows[3],
             GeneralRow::FileClick,
             "click behavior sits next to the viewer it qualifies"
         );
@@ -2979,21 +2996,30 @@ mod tests {
         );
         assert!(all.contains("Notify"), "the notifications section divider");
 
-        // Order: file-open row, the resume switch, then the divider and sounds.
+        // Order: file-open row, the resume switch, then the divider.
         let row_of = |needle: &str| text.iter().position(|l| l.contains(needle));
-        let (fo, res, div, snd) = (
+        let (fo, res, div) = (
             row_of("Open files with"),
             row_of("Remember CLI option"),
             row_of("Notify"),
-            row_of("Test blocked sound"),
         );
-        assert!(
-            fo < res && res < div && div < snd,
-            "file-open → resume switch → divider → sounds"
-        );
+        assert!(fo < res && res < div, "file-open → resume switch → divider");
         // A blank line separates the options from the section header.
         let (res, div) = (res.unwrap(), div.unwrap());
         assert!(div >= res + 2, "a blank gap sits above the section divider");
+
+        // The additional appearance controls need scrolling within the capped
+        // modal height; the final sound control must still render when selected.
+        app.settings.as_mut().unwrap().cursor = app.general_rows().len() - 1;
+        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Test blocked sound"));
     }
 
     #[test]
@@ -3470,8 +3496,8 @@ mod tests {
             "custom-restore".into(),
             Some((previous, app.theme_selection_revision)),
         );
-        app.adjust_theme_preference(0, 1);
-        app.adjust_theme_preference(1, 1);
+        app.adjust_theme_preference(GeneralRow::ThemeAppearance, 1);
+        app.adjust_theme_preference(GeneralRow::TerminalBackground, 1);
         app.finish_theme_uninstall(
             "custom-restore".into(),
             Err("still required by child-theme".into()),
@@ -3503,7 +3529,7 @@ mod tests {
         assert_eq!(crate::config::load().theme, "custom-enter");
         app.open_settings();
         app.settings_set_tab(SettingsTab::Theme);
-        let index = THEME_PREFERENCE_ROWS + app.theme_registry.index_of("custom-enter").unwrap();
+        let index = app.theme_registry.index_of("custom-enter").unwrap();
         app.settings_activate(index);
         assert!(!app.theme_uninstall_pending("custom-enter"));
         app.settings_enter_theme(index);

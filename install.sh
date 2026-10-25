@@ -31,6 +31,7 @@ case "$os" in
   Linux)
     case "$arch" in
       x86_64) target="x86_64-unknown-linux-musl" ;;
+      arm64|aarch64) target="aarch64-unknown-linux-musl" ;;
       *) err "unsupported Linux arch: $arch" ;;
     esac ;;
   *) err "no fork binary for OS: $os; build from source" ;;

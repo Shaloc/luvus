@@ -30,6 +30,7 @@ pub(crate) fn is_image_paste_key(key: &KeyEvent) -> bool {
     key.kind == KeyEventKind::Press
         && matches!(key.code, KeyCode::Char('v' | 'V'))
         && (key.modifiers == KeyModifiers::CONTROL
+            || key.modifiers == KeyModifiers::SUPER
             || key.modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT)
 }
 
@@ -553,6 +554,20 @@ mod tests {
         assert!(is_image_paste_key(&key(
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             KeyEventKind::Press
+        )));
+        assert!(is_image_paste_key(&key(
+            KeyModifiers::SUPER,
+            KeyEventKind::Press
+        )));
+        for modifiers in [
+            KeyModifiers::SUPER | KeyModifiers::ALT,
+            KeyModifiers::SUPER | KeyModifiers::CONTROL,
+        ] {
+            assert!(!is_image_paste_key(&key(modifiers, KeyEventKind::Press)));
+        }
+        assert!(!is_image_paste_key(&key(
+            KeyModifiers::SUPER,
+            KeyEventKind::Repeat
         )));
         assert!(!is_image_paste_key(&key(
             KeyModifiers::CONTROL | KeyModifiers::ALT,

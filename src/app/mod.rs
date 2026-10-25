@@ -72,7 +72,6 @@ pub(crate) use keys::build_direct_keymap;
 pub use keys::{key_reference_rows, presets, Cmd, PrefixSpec};
 pub use modules::ModuleMenuAction;
 pub use picker::{FolderPicker, PickerHit, Row};
-pub(crate) use settings::THEME_PREFERENCE_ROWS;
 pub use settings::{
     GeneralRow, LayoutRow, ModuleRow, SettingsTab, SettingsUi, KEYS_HEADER_ROWS, KEYS_PREFIX_ROW,
     KEYS_PRESET_ROW,
@@ -21826,7 +21825,7 @@ fi
             tab: SettingsTab::Layout,
             cursor: idx,
             prefix_candidate: None,
-            layout_scroll: 0,
+            content_scroll: 0,
             capturing: false,
         });
         app.handle_settings_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
