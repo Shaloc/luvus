@@ -342,12 +342,14 @@ fn new_profile() -> Result<PathBuf, String> {
     getrandom::fill(&mut random).map_err(|e| e.to_string())?;
     let name: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
     let path = root.join(name);
-    let mut builder = std::fs::DirBuilder::new();
+    let builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
+        let mut builder = builder;
         builder.mode(0o700);
-    }
+        builder
+    };
     builder.create(&path).map_err(|e| e.to_string())?;
     Ok(path)
 }
