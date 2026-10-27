@@ -1154,23 +1154,32 @@ def main():
                 ready_marker = "BROWSER_CLICK_READY_" + mode
                 # Keep the previous helper's terminal output visible during startup.
                 # A reused readiness label would click before this helper is ready.
-                fixture.write_text("import os,sys,tty,subprocess,time\n"
+                fixture.write_text("import os,sys,termios,tty,time\n"
                     + ("time.sleep(5)\n" if mode == "merge" else "")
-                    + "tty.setraw(0)\n"
-                    f"sys.stdout.write('\\x1b[?1000h\\x1b[?1006h\\x1b[2J\\x1b[H{ready_marker}');sys.stdout.flush()\n"
-                    "buf=b''\n"
-                    "while True:\n"
-                    " buf+=os.read(0,1)\n"
-                    " if buf.endswith(b'm'):\n"
-                    "  import webbrowser\n"
-                    "  assert webbrowser.open(sys.argv[1]), 'BROWSER failed'\n"
-                    "  break\n"
-                    "sys.stdout.write('\\x1b[?1000l\\x1b[?1006l');sys.stdout.flush()\n")
+                    + "saved=termios.tcgetattr(0)\n"
+                    "try:\n"
+                    " tty.setraw(0)\n"
+                    f" sys.stdout.write('\\x1b[?1000h\\x1b[?1006h\\x1b[2J\\x1b[H{ready_marker}');sys.stdout.flush()\n"
+                    " buf=b''\n"
+                    " while True:\n"
+                    "  buf+=os.read(0,1)\n"
+                    "  if buf.endswith(b'm'):\n"
+                    "   import webbrowser\n"
+                    "   assert webbrowser.open(sys.argv[1]), 'BROWSER failed'\n"
+                    "   break\n"
+                    "finally:\n"
+                    # dash does not restore a child's raw terminal mode itself.
+                    # Leave CR-to-newline input intact for the next pane.run.
+                    " termios.tcsetattr(0,termios.TCSADRAIN,saved)\n"
+                    " sys.stdout.write('\\x1b[?1000l\\x1b[?1006l');sys.stdout.flush()\n")
                 run("--session", "api", "pane", "run", str(pane), shlex.join([sys.executable, str(fixture), url]), remote=remote)
                 def screen():
                     drain(master, .1)
                     return "\n".join(client_terminals[master][0].display)
-                wait_for(lambda: ready_marker in screen())
+                wait_for(lambda: ready_marker in screen(), diagnostics=lambda: {
+                    "mode": mode, "screen": screen(),
+                    "owner": api("pane.read", {"pane":pane}, remote=remote),
+                })
                 y, line = next((y,line) for y,line in enumerate(client_terminals[master][0].display) if ready_marker in line)
                 (root / f"browser-before-click-{mode}.txt").write_text("\n".join(client_terminals[master][0].display))
                 click(master, line.index(ready_marker) + 2, y + 1)
@@ -1331,6 +1340,7 @@ def main():
                 session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
                 for wrapped in (False, True):
                     label = mode + ("-continued" if wrapped else "-parenthesized")
+                    ready_marker = "READY_LINK_FIXTURE_" + label
                     project = root / ("file-links-" + label)
                     head = "docs/adr/0032-" if wrapped else "plan/"
                     tail = ("arkmaster-owns-taskservice-master-placement.md" if wrapped
@@ -1354,7 +1364,7 @@ def main():
                     code = ("import os,sys; w=os.get_terminal_size().columns; "
                             + (f"text=' '*(w-{len(head)}-1)+'({head}\\r\\n  {tail})'; " if wrapped
                                else f"text='({head}{tail})'; ")
-                            + "sys.stdout.write('\\x1b[H\\x1b[2J\\x1b[48;2;214;255;214m'+text+'\\x1b[0m\\r\\nREADY_'+'LINK_FIXTURE'); sys.stdout.flush(); input()")
+                            + f"sys.stdout.write('\\x1b[H\\x1b[2J\\x1b[48;2;214;255;214m'+text+'\\x1b[0m\\r\\nREADY_'+'LINK_FIXTURE_{label}'); sys.stdout.flush(); input()")
                     run("--session", "api", "pane", "run", str(pane),
                         shlex.join([sys.executable, "-c", code]), remote=remote)
 
@@ -1366,9 +1376,15 @@ def main():
                         (root / (label + ".txt")).write_text(text)
                         return text
 
-                    wait_for(lambda: "READY_LINK_FIXTURE" in screen_text())
                     terminal = client_terminals[master][0]
-                    y, line = next((y, line) for y, line in enumerate(terminal.display) if tail in line)
+                    def ready_link():
+                        if ready_marker not in screen_text():
+                            return None
+                        return next(((y, line) for y, line in enumerate(terminal.display) if tail in line), None)
+                    y, line = wait_for(ready_link, diagnostics=lambda: {
+                        "case": label, "screen": screen_text(),
+                        "owner": api("pane.read", {"pane":pane}, remote=remote),
+                    })
                     x = line.index(tail) + 3
                     os.write(master, f"\x1b[<51;{x + 1};{y + 1}M".encode())  # Ctrl + motion, no button held
                     wait_for(lambda: screen_text() and terminal.buffer[y][x].underscore)
