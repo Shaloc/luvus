@@ -11,6 +11,65 @@ struct AgentRowTitleUpdate {
 }
 
 impl App {
+    pub(super) fn api_browser_panel(&mut self, params: &Value) -> DispatchResult {
+        reject_api_fields(params, &["pane", "url"])?;
+        let url = req_str(params, "url")?;
+        if !crate::browser::valid_url(url) {
+            return Err((
+                "invalid_request".into(),
+                "expected an HTTP(S) browser URL".into(),
+            ));
+        }
+        if params.get("pane").is_none_or(Value::is_null) {
+            return Err(("invalid_request".into(), "pane is required".into()));
+        }
+        let pane = self.resolve_pane_or_focus(params)?;
+        let (workspace, tab) = self
+            .pane_location(pane)
+            .ok_or_else(|| ("not_found".into(), "pane not found".into()))?;
+        if self.workspaces[workspace].remote.is_some() {
+            return Err((
+                "invalid_request".into(),
+                "Run browser panel on the owning server".into(),
+            ));
+        }
+        if !self.workspaces[workspace].tabs[tab].is_renameable() {
+            return Err((
+                "invalid_request".into(),
+                "dashboard tabs do not have a mutable pane layout".into(),
+            ));
+        }
+        if !self.panes.contains_key(&pane) && !self.views.contains_key(&pane) {
+            return Err(not_found());
+        }
+        self.workspaces[workspace].tabs[tab].layout.focus = pane;
+        let id = self.insert_browser_view(workspace, Some(tab), url.into());
+        Ok(json!({"type":"browser_panel", "pane":id.0.to_string()}))
+    }
+
+    pub(super) fn api_browser_open(&mut self, p: &Value) -> DispatchResult {
+        reject_api_fields(p, &["pane", "url"])?;
+        if p.get("pane").is_none_or(Value::is_null) {
+            return Err(("invalid_request".into(), "pane is required".into()));
+        }
+        let pane = self.resolve_pane(p)?.ok_or_else(not_found)?;
+        if !self.panes.contains_key(&pane) {
+            return Err(not_found());
+        }
+        let url = req_str(p, "url")?;
+        if url.len() > 8192 || !crate::platform::is_openable_url(url) {
+            return Err((
+                "invalid_request".into(),
+                "expected an HTTP(S) URL of at most 8192 bytes".into(),
+            ));
+        }
+        if self.pending_program_url.is_some() {
+            return Err(("busy".into(), "a browser request is already queued".into()));
+        }
+        self.pending_program_url = Some((pane, url.to_owned()));
+        Ok(json!({"type":"browser_open", "queued":true, "pane":pane.0.to_string()}))
+    }
+
     pub(super) fn api_theme_list(&mut self, method: &str, p: &Value) -> DispatchResult {
         let _ = (method, p);
         Ok(self.theme_registry.list_json(&self.config.theme))

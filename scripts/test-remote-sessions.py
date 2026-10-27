@@ -18,6 +18,7 @@ Use --colors-only for child color queries and composed local/remote backgrounds 
 Use --terminal-notify-only for agent-only terminal system alerts from local and remote owners.
 Use --program-status-only for OSC 7501 lifecycle, read acknowledgement and agent notifications across SSH.
 Use --transpose-only for owner-routed menu, shortcut and CLI split transposition (requires pyte).
+Use --browser-open-only for child link routing, browser panels and middle-click tabs (requires pyte).
 Use --file-links-only for wrapped file references and owner-routed Ctrl-clicks (requires pyte).
 Use --appearance-only for pane mouse controls, None theme, notifications and host diagnostics (requires pyte).
 Use --workspace-close-only for owner-routed workspace close and restart persistence (requires pyte).
@@ -62,11 +63,74 @@ def fixture_root():
     return root
 
 
+def browser_socks(root, port):
+    import threading
+    _, remote_port = json.loads((root / "browser-http.json").read_text())
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", port))
+    listener.listen()
+    def serve(connection):
+        upstream = None
+        try:
+            connection.settimeout(5)
+            header = connection.recv(2)
+            if len(header) != 2: return
+            connection.recv(header[1])
+            connection.sendall(b"\x05\x00")
+            header = connection.recv(4)
+            if len(header) != 4: return  # readiness greeting
+            if header[3] == 3:
+                n = connection.recv(1)[0]
+                host = connection.recv(n).decode()
+            elif header[3] == 1:
+                host = socket.inet_ntoa(connection.recv(4))
+            else: return
+            connection.recv(2)
+            if (root / "browser-proxy-drop").exists() or host not in ("localhost", "127.0.0.1", "remote-only.invalid"):
+                connection.sendall(b"\x05\x04\x00\x01" + bytes(6))
+                return
+            upstream = socket.create_connection(("127.0.0.1", remote_port), timeout=5)
+            connection.sendall(b"\x05\x00\x00\x01" + bytes(6))
+            while True:
+                readable, _, _ = select.select([connection, upstream], [], [], 5)
+                if not readable: return
+                for source in readable:
+                    data = source.recv(65536)
+                    if not data: return
+                    (upstream if source is connection else connection).sendall(data)
+        except (OSError, IndexError): pass
+        finally:
+            connection.close()
+            if upstream: upstream.close()
+    while True:
+        connection, _ = listener.accept()
+        threading.Thread(target=serve, args=(connection,), daemon=True).start()
+
+
+def chrome_substitute():
+    root = fixture_root()
+    args = sys.argv[1:]
+    url = args[-1]
+    with (root / "chrome-calls.jsonl").open("a") as log:
+        log.write(json.dumps({"url":url,"home":os.environ["HOME"],"args":args,"pid":os.getpid()}) + "\n")
+    chrome = os.environ.get("LUVUS_TEST_CHROME")
+    if chrome:
+        helper = Path(__file__).resolve().parent.parent / "web/scripts/test-browser-session.mjs"
+        try:
+            result = subprocess.run(["node", str(helper), chrome, *args], capture_output=True, text=True, timeout=45)
+            output = result.stdout + "\n" + result.stderr
+        except Exception:
+            import traceback
+            output = traceback.format_exc()
+        (root / f"browser-dom-{os.getpid()}").write_text(output)
+    while True: signal.pause()
+
+
 def ssh_substitute():
     original_args = sys.argv[1:]
     args = original_args[:]
     while args and args[0].startswith("-"):
-        args = args[2:] if args[0] in ("-o", "-S") else args[1:]
+        args = args[2:] if args[0] in ("-o", "-S", "-D") else args[1:]
     host, *command = args
     root = fixture_root()
     with (root / "ssh-calls").open("a") as log:
@@ -76,6 +140,23 @@ def ssh_substitute():
         raise SystemExit(0)
     if host != "fake-dev":
         raise SystemExit("unexpected SSH destination: " + host)
+    if "-G" in original_args:
+        (root / "browser-ssh-probe").write_text(json.dumps(original_args))
+        assert "-R" not in original_args
+        print("hostname fake-dev")
+        if (root / "browser-reverse-forward").exists():
+            print("remoteforward 9000 localhost:80")
+        return
+    if "-D" in original_args:
+        (root / "browser-ssh-forward").write_text(json.dumps(original_args))
+        with (root / "browser-ssh-pids").open("a") as log:
+            log.write(str(os.getpid()) + "\n")
+        assert "-R" not in original_args and "-N" in original_args
+        address = original_args[original_args.index("-D") + 1]
+        host, port = address.split(":")
+        assert host == "127.0.0.1", address
+        browser_socks(root, int(port))
+        return
     os.environ["HOME"] = str(root / "remote-home")
     os.environ["LUVUS_HOME"] = str(root / "remote-state")
     for key in SELECTORS:
@@ -241,9 +322,10 @@ def main():
     terminal_notify_only = "--terminal-notify-only" in sys.argv[1:]
     program_status_only = "--program-status-only" in sys.argv[1:]
     transpose_only = "--transpose-only" in sys.argv[1:]
+    browser_open_only = "--browser-open-only" in sys.argv[1:]
     file_links_only = "--file-links-only" in sys.argv[1:]
     workspace_close_only = "--workspace-close-only" in sys.argv[1:]
-    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or transpose_only:
+    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or browser_open_only or transpose_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -254,7 +336,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--browser-open-only", "--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -300,6 +382,35 @@ def main():
                LUVUS_SMOKE_ROOT=str(root), LUVUS_SMOKE_BINARY=str(binary),
                LUVUS_SMOKE_REMOTE_BINARY=str(remote_binary), DISPLAY=":smoke")
     env.pop("WAYLAND_DISPLAY", None)
+    if browser_open_only:
+        env.pop("BROWSER", None)
+        (root / "bin/chrome-smoke").symlink_to(Path(__file__).resolve())
+        env["LUVUS_BROWSER"] = str(root / "bin/chrome-smoke")
+        if os.environ.get("LUVUS_TEST_CHROME"):
+            chrome = Path(os.environ["LUVUS_TEST_CHROME"]).resolve()
+            assert chrome.is_file(), chrome
+            env["LUVUS_TEST_CHROME"] = str(chrome)
+
+        import http.server
+        import threading
+        servers = []
+        for marker in ("LOCAL_BROWSER_MARKER", "REMOTE_BROWSER_MARKER"):
+            class Handler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    body = ("<html><body>" + self.server.marker + "</body></html>").encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                def log_message(self, *args): pass
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            server.marker = marker
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            servers.append(server)
+        (root / "browser-http.json").write_text(json.dumps([server.server_port for server in servers]))
+
+        for name in ("xdg-open", "open", "gio", "wslview"):
+            (root / "bin" / name).symlink_to(Path(__file__).resolve())
     if colors_only or appearance_only or file_links_only:
         env["COLORTERM"] = "truecolor"
         # Tool runners commonly export NO_COLOR. This private display must
@@ -729,7 +840,7 @@ def main():
             if colors_only:
                 color_output.clear()
                 color_output.extend(screen)
-            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or transpose_only:
+            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or browser_open_only or transpose_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -1022,6 +1133,184 @@ def main():
                 assert api("pane.current", remote=remote)["pane"] == sibling
                 detach_client(process, master)
                 print(f"PASS: {mode} transpose menu, prefix and CLI; owner-only layout, preserved focus, ratio and PTYs", flush=True)
+            return
+
+        if browser_open_only:
+            # A real mouse-reporting PTY program invokes BROWSER on an unmodified
+            # link release, matching Codex/webbrowser's owner-side execution path.
+            for mode in ("local", "direct-remote", "merge"):
+                remote = mode != "local"
+                run("session", "merge", "on" if mode == "merge" else "off")
+                session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
+                pane = api("pane.current", remote=remote)["pane"]
+                argv = ["session", "attach", session] if mode == "direct-remote" else ["--session", "api"]
+                process, master = start_client(argv)
+                if remote:
+                    projection = wait_for(lambda: next((w for w in presentation_api(
+                        "workspace.list", session=session)["workspaces"] if w.get("host") == "fake-dev"), None))
+                    presentation_api("workspace.focus", {"workspace_id":projection["workspace_id"]}, session=session)
+                url = f"https://example.invalid/{mode}?one=%20&two=$literal"
+                fixture = root / "browser-click.py"
+                fixture.write_text("import os,sys,tty,subprocess\n"
+                    "tty.setraw(0)\n"
+                    "sys.stdout.write('\\x1b[?1000h\\x1b[?1006h\\x1b[2J\\x1b[HBROWSER_CLICK_READY');sys.stdout.flush()\n"
+                    "buf=b''\n"
+                    "while True:\n"
+                    " buf+=os.read(0,1)\n"
+                    " if buf.endswith(b'm'):\n"
+                    "  import webbrowser\n"
+                    "  assert webbrowser.open(sys.argv[1]), 'BROWSER failed'\n"
+                    "  break\n"
+                    "sys.stdout.write('\\x1b[?1000l\\x1b[?1006l');sys.stdout.flush()\n")
+                run("--session", "api", "pane", "run", str(pane), shlex.join([sys.executable, str(fixture), url]), remote=remote)
+                def screen():
+                    drain(master, .1)
+                    return "\n".join(client_terminals[master][0].display)
+                wait_for(lambda: "BROWSER_CLICK_READY" in screen())
+                y, line = next((y,line) for y,line in enumerate(client_terminals[master][0].display) if "BROWSER_CLICK_READY" in line)
+                click(master, line.index("BROWSER_CLICK_READY") + 2, y + 1)
+                def receipt():
+                    drain(master, .1)
+                    path = root / "browser-opens.jsonl"
+                    rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+                    return next((row for row in rows if row["url"] == url), None)
+                opened = wait_for(receipt)
+                assert opened["home"] == str(root / "local-home"), opened
+                assert opened["url"] == url, opened
+                print(f"PASS: {mode} plain mouse click invokes pane BROWSER and opens the exact URL only on the display host", flush=True)
+                local_port, _ = json.loads((root / "browser-http.json").read_text())
+                panel_url = f"http://localhost:{local_port}/panel-{mode}"
+                result = api("browser.panel", {"pane": pane, "url": panel_url}, remote=remote)
+                wait_for(lambda: panel_url in screen())
+                y, line = [(y,line) for y,line in enumerate(client_terminals[master][0].display) if panel_url in line][-1]
+                if mode == "direct-remote":
+                    rejected = root / "browser-reverse-forward"
+                    rejected.touch()
+                    click(master, line.index(panel_url) + 2, y + 1)
+                    wait_for(lambda: (root / "browser-ssh-probe").exists())
+                    profiles = root / "local-state/browser-sessions"
+                    wait_for(lambda: not any(profiles.iterdir()))
+                    assert not (root / "browser-ssh-forward").exists()
+                    assert panel_url not in (root / "chrome-calls.jsonl").read_text()
+                    rejected.unlink()
+                    print("PASS: configured RemoteForward rejected before opening SSH listener or Chrome", flush=True)
+                click(master, line.index(panel_url) + 2, y + 1)
+                def chrome_receipt():
+                    drain(master, .1)
+                    path = root / "chrome-calls.jsonl"
+                    rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+                    return next((row for row in rows if row["url"] == panel_url), None)
+                try:
+                    launched = wait_for(chrome_receipt)
+                except AssertionError:
+                    print(screen(), file=sys.stderr)
+                    raise
+                assert launched["home"] == str(root / "local-home"), launched
+                args = launched["args"]
+                assert any(a.startswith("--proxy-server=socks5://127.0.0.1:") for a in args) == remote, args
+                if remote: assert "--proxy-bypass-list=<-loopback>" in args
+                if os.environ.get("LUVUS_TEST_CHROME"):
+                    dom = root / f"browser-dom-{launched['pid']}"
+                    wait_for(lambda: dom.exists(), timeout=50)
+                    expected = "REMOTE_BROWSER_MARKER" if remote else "LOCAL_BROWSER_MARKER"
+                    assert expected in dom.read_text(), dom.read_text()[-2000:]
+                print(f"PASS: {mode} browser panel opens dedicated display Chrome; localhost uses {'remote SOCKS' if remote else 'local'} network", flush=True)
+                launches = [launched]
+                browser_tabs = []
+                original_tabs = api("tab.list", remote=remote)["tabs"]
+                def other_tabs():
+                    return {w["workspace_id"]: w["tabs"] for w in api("workspace.list", remote=not remote)["workspaces"] if not w.get("host")}
+                other_before_menu = other_tabs()
+                def row_for_label(label):
+                    wait_for(lambda: label in screen())
+                    y, line = [(y,line) for y,line in enumerate(client_terminals[master][0].display) if label in line][-1]
+                    return line.index(label) + 2, y + 1
+                def open_browser_menu(from_tab=False):
+                    if from_tab:
+                        # The latest browser tab's name is Open browser.
+                        screen()
+                        y, line = next((y,line) for y,line in enumerate(client_terminals[master][0].display) if "Open browser" in line)
+                        click(master, line.rindex("Open browser") + 2, y + 1, button=2)
+                    else:
+                        label = "Open browser" if browser_tabs else panel_url
+                        click(master, *row_for_label(label), button=2)
+                    click(master, *row_for_label("New Browser Tab"))
+                    wait_for(lambda: "URL optional" in screen())
+                # Cancel consumes the modal input without creating a tab.
+                open_browser_menu()
+                os.write(master, b"\x1b")
+                wait_for(lambda: "URL optional" not in screen())
+                assert api("tab.list", remote=remote)["tabs"] == original_tabs
+                for value in ("", f"http://localhost:{local_port}/menu-{mode}"):
+                    open_browser_menu(from_tab=bool(browser_tabs))
+                    if value:
+                        os.write(master, b"\x1b[200~" + value.encode() + b"\x1b[201~")
+                        wait_for(lambda: value in screen())
+                    os.write(master, b"\r")
+                    wait_for(lambda: screen() and len(api("tab.list", remote=remote)["tabs"]) == len(original_tabs) + len(browser_tabs) + 1)
+                    active = next(t for t in api("tab.list", remote=remote)["tabs"] if t["active"])
+                    browser_tabs.append(active["tab_id"])
+                    assert active["name"] == "Open browser", active
+                    expected_url = value or "about:blank"
+                    label = value or "Open browser"
+                    old_pids = {json.loads(line)["pid"] for line in (root / "chrome-calls.jsonl").read_text().splitlines()}
+                    click(master, *row_for_label(label))
+                    def new_launch():
+                        screen()
+                        rows = [json.loads(line) for line in (root / "chrome-calls.jsonl").read_text().splitlines()]
+                        return next((row for row in reversed(rows) if row["url"] == expected_url and row["pid"] not in old_pids), None)
+                    menu_launch = wait_for(new_launch)
+                    launches.append(menu_launch)
+                    assert menu_launch["home"] == str(root / "local-home")
+                    assert any(a.startswith("--proxy-server=") for a in menu_launch["args"]) == remote
+                    if os.environ.get("LUVUS_TEST_CHROME"):
+                        dom = root / f"browser-dom-{menu_launch['pid']}"
+                        wait_for(lambda: dom.exists(), timeout=50)
+                        assert ("REMOTE_BROWSER_MARKER" if remote else "LOCAL_BROWSER_MARKER") in dom.read_text(), dom.read_text()[-2000:]
+                assert other_tabs() == other_before_menu
+                print(f"PASS: {mode} pane and tab right-click create separate browser tabs; cancel, empty URL, pasted URL and owner routing", flush=True)
+                before = api("tab.list", remote=remote)["tabs"]
+                other_before = other_tabs()
+                run("--session", "api", "tab", "new", remote=remote)
+                tab_number = len(before) + 1
+                run("--session", "api", "tab", "rename", str(tab_number), "middle-close-check", remote=remote)
+                wait_for(lambda: "middle-close-check" in screen())
+                y, line = next((y,line) for y,line in enumerate(client_terminals[master][0].display) if "middle-close-check" in line)
+                title_x = line.index("middle-close-check") + 2
+                # Same x below the tab row is a pane header, never a close hit.
+                for x, row in [(title_x, y + 2), (60, 15), (line.rindex("+") + 1, y + 1)]:
+                    click(master, x, row, button=1)
+                    screen()
+                    assert len(api("tab.list", remote=remote)["tabs"]) == len(before) + 1
+                click(master, title_x, y + 1, button=1)
+                wait_for(lambda: screen() and len(api("tab.list", remote=remote)["tabs"]) == len(before))
+                assert other_tabs() == other_before
+                detach_client(process, master)
+                def pid_gone(pid):
+                    try: os.kill(pid, 0)
+                    except ProcessLookupError: return True
+                    return False
+                for launch in launches:
+                    wait_for(lambda: pid_gone(launch["pid"]))
+                    profile = Path(next(a.split("=",1)[1] for a in launch["args"] if a.startswith("--user-data-dir=")))
+                    wait_for(lambda: not profile.exists())
+                    if remote:
+                        proxy = next(a.split("=",1)[1] for a in launch["args"] if a.startswith("--proxy-server="))
+                        port = int(proxy.rsplit(":",1)[1])
+                        def listener_closed():
+                            with socket.socket() as probe:
+                                probe.settimeout(.1)
+                                return probe.connect_ex(("127.0.0.1", port)) != 0
+                        wait_for(listener_closed)
+                if remote:
+                    for pid in (root / "browser-ssh-pids").read_text().splitlines():
+                        wait_for(lambda: pid_gone(int(pid)))
+                for tab in reversed(browser_tabs):
+                    api("tab.close", {"tab_id":tab}, remote=remote)
+                api("pane.close", {"pane": result["pane"]}, remote=remote)
+                print(f"PASS: {mode} middle-click closes only the owner's tab title; detach reaps Chrome/SSH, closes listeners and removes profiles", flush=True)
+            rows = [json.loads(line) for line in (root / "browser-opens.jsonl").read_text().splitlines()]
+            assert len(rows) == 3, rows
             return
 
         if file_links_only:
@@ -3552,7 +3841,7 @@ def main():
                 run("--session", name, "remote-server-command", "stop", remote=remote, okay=False)
         # Graphics and appearance checkpoints can be inspected after teardown.
         # Other successful fixtures are disposable; failures retain evidence.
-        if sys.exc_info()[0] is None and not graphics_only and not appearance_only and not workspace_close_only and not ssh_admission_only and not file_links_only:
+        if sys.exc_info()[0] is None and not graphics_only and not appearance_only and not workspace_close_only and not ssh_admission_only and not file_links_only and not browser_open_only:
             assert_isolated(env)
             assert_isolated(remote_env)
             shutil.rmtree(root)
@@ -3566,6 +3855,12 @@ if __name__ == "__main__":
         raise SystemExit(0)
     if Path(sys.argv[0]).name == "ssh":
         ssh_substitute()
+    elif Path(sys.argv[0]).name == "chrome-smoke":
+        chrome_substitute()
+    elif Path(sys.argv[0]).name in ("xdg-open", "open", "gio", "wslview"):
+        root = fixture_root()
+        with (root / "browser-opens.jsonl").open("a") as log:
+            log.write(json.dumps({"url":sys.argv[-1], "home":os.environ["HOME"]}) + "\n")
     elif Path(sys.argv[0]).name == "curl":
         root = fixture_root()
         args = sys.argv[1:]

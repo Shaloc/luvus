@@ -59,3 +59,5 @@
 {"id":"task-guard-invalid-6","method":"task.update","params":{"id":"t1","status":"failed","output":"launch failed","if_running":{"pane":false,"attempt":1}}}
 {"id":"task-guard-invalid-7","method":"task.update","params":{"id":"t1","status":"failed","output":"launch failed","if_running":{"pane":4294967296,"attempt":1}}}
 {"id":"task-guard-invalid-8","method":"task.update","params":{"id":"t1","status":"failed","output":"launch failed","if_running":{"pane":7,"attempt":1,"extra":true}}}
+{"id": "browser-missing-pane", "method": "browser.open", "params": {"url": "https://example.com"}}
+{"id": "browser-host", "method": "browser.panel", "params": {"pane": 7, "url": "http://localhost:3000", "host": "other"}}

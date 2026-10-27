@@ -462,7 +462,7 @@ by menus are excluded from the projected frame.
 ### Kitty graphics
 
 Stable fork releases include Kitty graphics from transport 11 onward. Current
-builds report `transport=18` with `luvus --version --remote-session-protocol`
+builds report `transport=19` with `luvus --version --remote-session-protocol`
 and separately negotiate physical cell dimensions for automatic split direction.
 Plain terminals can report cell dimensions without enabling Kitty graphics. Use Kitty 0.28 or newer on the display
 machine and matching graphics builds on remote owners. An older managed owner
@@ -1114,3 +1114,62 @@ layout ownership. Transport 9–11 owners retain their existing compatible displ
 behavior; upgrade both ends to transport 12 for independent cell-size negotiation.
 Module-provided agent titles appear in remote live and history rows, while operator
 aliases remain separate snapshot fields.
+
+## Browser sessions
+
+Right-click a tab title or a pane and choose **New Browser Tab**. The address is
+optional: press Enter with the field empty to create a blank browser tab, or
+enter an HTTP(S) URL. Click **Open browser** (or the supplied URL) in the new tab
+to launch Chrome. You can then type any URL into Chrome's address bar; remote
+network routing continues to use the selected owner. Esc cancels without creating
+a tab. The new tab contains a native browser panel, not a shell.
+
+To use a local Chrome/Chromium window through the selected SSH owner, run this
+inside that owner's pane:
+
+```sh
+luvus browser panel http://localhost:3000
+```
+
+The new native pane contains a link. Click it, or focus it and press Enter, to
+open a dedicated local Chrome/Chromium window. The URL can then be changed in
+Chrome's address bar. In a remote session, `localhost` refers to the owner host.
+The panel itself owns no terminal process and restores without launching a browser.
+
+The display starts a **forward SOCKS5 proxy** using SSH `-D 127.0.0.1:<port>`.
+It does not use `ssh -R`, a reverse proxy, or a remote proxy listener. Chrome
+uses an independent profile, remote DNS and an explicit loopback proxy override.
+HTTP(S) and WebSocket TCP traffic use the SSH connection; there is no DIRECT
+fallback. QUIC and non-proxied WebRTC UDP are disabled in this window. This is
+not a general VPN for other applications. Ordinary browser windows are unaffected.
+
+Both Luvus ends need transport 19. The display must have Chrome/Chromium and an
+SSH alias for the owner; `ProxyJump` may be configured on that alias. Aliases
+with configured `RemoteForward`, `LocalForward` or `DynamicForward` entries are
+rejected. The feature never changes SSH config, approves host keys, or starts or
+restarts a remote Luvus server. Nested Luvus projections and raw `--remote` with
+extra SSH arguments must be replaced by a direct display-side alias so the
+route cannot silently point at the wrong host. Browser parameters cannot select
+an SSH host. Whether forward SSH tunnelling is permitted remains an internal
+network-policy decision.
+
+On macOS, Chrome and Chromium are discovered in `/Applications` and
+`~/Applications`; on Linux they are found through PATH. Set `LUVUS_BROWSER` on
+the **display client** to an executable path if needed (not a shell command).
+A maximum of eight dedicated sessions may be open per display. Closing Chrome,
+losing the tunnel, switching Luvus sessions, or detaching the display terminates
+that session's browser and forwarding connection. Private temporary profiles
+under the display's Luvus home are removed after their processes exit; cookies
+in that profile are not retained. Files saved to the usual Downloads folder remain.
+
+### Program-initiated links
+
+New Unix PTYs set `BROWSER="luvus browser open %s"` unless a custom `BROWSER` is
+already configured. Programs that honor this convention, including the Linux
+Codex CLI browser launcher, can open links by an ordinary mouse click: the
+request is forwarded to the owner pane's active display. Codex keeps control of
+its mouse handling. Existing panes need a new shell/pane, or an explicit export
+of this variable; restarting only Codex inside an older shell does not change
+the shell environment. This opens the normal local browser, without the proxy;
+use the browser panel when remote-localhost routing is wanted. macOS programs
+that bypass `BROWSER` and call the OS opener directly are not intercepted.

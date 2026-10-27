@@ -1410,6 +1410,16 @@ fn apply_pane_env(
     cmd.env("TERM", "xterm-256color");
     cmd.env("LUVUS_ENV", "1");
     cmd.env("LUVUS_PANE_ID", id.0.to_string());
+    // Unix browser libraries (including Codex's webbrowser crate) consult
+    // BROWSER before trying a desktop on the owner server. Use PATH rather
+    // than quoting an executable path: BROWSER consumers split whitespace and
+    // colon-delimited alternatives differently. PATH below selects this binary.
+    // The %s template is required by Python and also accepted by Rust browser
+    // libraries. Preserve an explicitly configured browser command.
+    #[cfg(unix)]
+    if cmd.get_env("BROWSER").is_none() {
+        cmd.env("BROWSER", "luvus browser open %s");
+    }
     if let Some(sock) = crate::ipc::api::socket_path_env() {
         cmd.env("LUVUS_SOCKET_PATH", &sock);
     }
@@ -1518,6 +1528,30 @@ fn read_loop(
 #[cfg(test)]
 mod clipboard_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_command_is_pane_local_and_preserves_explicit_configuration() {
+        let _env = crate::persist::test_env("pane-browser");
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.env_remove("BROWSER");
+        apply_pane_env(&mut cmd, PaneId(23), Path::new("/"), &[]);
+        assert_eq!(
+            cmd.get_env("BROWSER"),
+            Some(std::ffi::OsStr::new("luvus browser open %s"))
+        );
+        assert_eq!(
+            cmd.get_env("LUVUS_PANE_ID"),
+            Some(std::ffi::OsStr::new("23"))
+        );
+        let mut configured = CommandBuilder::new("sh");
+        configured.env("BROWSER", "custom-browser");
+        apply_pane_env(&mut configured, PaneId(24), Path::new("/"), &[]);
+        assert_eq!(
+            configured.get_env("BROWSER"),
+            Some(std::ffi::OsStr::new("custom-browser"))
+        );
+    }
 
     #[test]
     fn graphics_fragments_do_not_announce_split_reader_output_until_complete() {

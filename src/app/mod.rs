@@ -27,6 +27,7 @@ mod automation;
 mod automation_persistence;
 mod backend;
 mod board;
+mod browser;
 #[cfg(test)]
 mod commander_tests;
 mod config_persistence;
@@ -174,6 +175,7 @@ impl DockKind {
 /// this holds what to draw there. Deliberately an enum so the diff viewer
 /// (docs/30) can add its own variant later without another seam.
 pub enum ViewKind {
+    Browser(String),
     File(crate::files::FileView),
     Diff(Box<crate::diff::DiffView>),
     Preview(crate::files::preview::DocumentView),
@@ -710,6 +712,7 @@ pub struct TabMenu {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TabMenuItem {
+    NewBrowserTab,
     Rename,
     MoveLeft,
     MoveRight,
@@ -1130,6 +1133,7 @@ pub struct AgentForkResult {
 /// horizontal divider, like `s`). `Divider` is a non-interactive separator.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PaneMenuItem {
+    NewBrowserTab,
     NewPane,
     SplitVertical,
     SplitHorizontal,
@@ -1163,6 +1167,7 @@ impl PaneMenuItem {
     /// divider by [`App::pane_menu_items`].
     pub const ALL: &'static [PaneMenuItem] = &[
         PaneMenuItem::NewPane,
+        PaneMenuItem::NewBrowserTab,
         PaneMenuItem::SplitVertical,
         PaneMenuItem::SplitHorizontal,
         PaneMenuItem::Transpose,
@@ -2628,6 +2633,7 @@ enum UiRepeatContext {
     WorktreePrompt,
     WorktreeList,
     TabRename,
+    BrowserPrompt,
     TabMenu,
     WorkspaceMenu,
     PaneMenu,
@@ -2841,6 +2847,7 @@ pub struct App {
     pub worktree_open_rects: Vec<(PickerHit, Rect)>,
     /// Active tab-rename modal (docs/28); `None` when closed.
     pub tab_rename: Option<TabRename>,
+    pub browser_prompt: Option<browser::BrowserPrompt>,
     /// Active tab context menu; `None` when closed.
     pub tab_menu: Option<TabMenu>,
     /// The workspace right-click context menu, and the workspace-rename modal.
@@ -3081,6 +3088,9 @@ pub struct App {
     /// A URL to open in the client's browser (docs/58) — set by a Ctrl+click on a
     /// link in a pane, drained + broadcast by the loop like `pending_clipboard`.
     pub pending_open_url: Option<String>,
+    /// A child program's browser request belongs to its pane's display.
+    pub(crate) pending_program_url: Option<(PaneId, String)>,
+    pub(crate) pending_browser: Option<(PaneId, Option<u64>, crate::browser::Request)>,
     /// The cell `hover_link` was resolved for, so holding `Ctrl` while resting on a
     /// cell does not rescan. Cleared when `Ctrl` is released, so pointing at a
     /// link *first* and pressing `Ctrl` after still lights it up.
@@ -3684,6 +3694,7 @@ impl App {
             picker_go_to_rescan: None,
             worktree_open_rects: Vec::new(),
             tab_rename: None,
+            browser_prompt: None,
             tab_menu: None,
             ws_menu: None,
             worktree_delete: None,
@@ -3790,6 +3801,8 @@ impl App {
             pending_client_clipboard: None,
             remote_clipboard_helpers: HashMap::new(),
             pending_open_url: None,
+            pending_program_url: None,
+            pending_browser: None,
             link_scan_at: None,
             hover_link: None,
             link_press: None,
@@ -4098,6 +4111,13 @@ impl App {
                     // pane-keyed and pane ids are reallocated each run).
                     if let Some(nm) = &ps.name {
                         restored_names.push((nm.clone(), id));
+                    }
+                    if let Some(url) = ps.browser.as_ref().filter(|url| {
+                        crate::browser::valid_url(url) || url.as_str() == crate::browser::BLANK_URL
+                    }) {
+                        views.insert(id, ViewKind::Browser(url.clone()));
+                        remap.insert(*raw, id);
+                        continue;
                     }
                     // A file-view leaf (docs/38 FILE-3): rebuild the view and
                     // re-read the file off-loop; no PTY is spawned.
@@ -4463,6 +4483,7 @@ impl App {
             picker_go_to_rescan: None,
             worktree_open_rects: Vec::new(),
             tab_rename: None,
+            browser_prompt: None,
             tab_menu: None,
             ws_menu: None,
             worktree_delete: None,
@@ -4569,6 +4590,8 @@ impl App {
             pending_client_clipboard: None,
             remote_clipboard_helpers: HashMap::new(),
             pending_open_url: None,
+            pending_program_url: None,
+            pending_browser: None,
             link_scan_at: None,
             hover_link: None,
             link_press: None,
@@ -7336,7 +7359,7 @@ impl App {
         let Some(menu) = self.tab_menu.as_ref() else {
             return Vec::new();
         };
-        let mut items = Vec::new();
+        let mut items = vec![TabMenuItem::NewBrowserTab];
         if menu.can_rename {
             items.push(TabMenuItem::Rename);
         }
@@ -7415,6 +7438,7 @@ impl App {
             return;
         };
         match item {
+            TabMenuItem::NewBrowserTab => self.open_browser_prompt(workspace),
             TabMenuItem::Rename => {
                 if workspace == self.active_ws {
                     self.open_tab_rename(index);
@@ -8408,7 +8432,12 @@ impl App {
         let document_preview = match self.views.get(&pane) {
             Some(ViewKind::File(view)) => crate::files::preview::PreviewKind::for_path(&view.path)
                 .map(|kind| (view.path.clone(), kind)),
-            Some(ViewKind::Preview(_) | ViewKind::Diff(_) | ViewKind::Remote(_)) => None,
+            Some(
+                ViewKind::Preview(_)
+                | ViewKind::Diff(_)
+                | ViewKind::Remote(_)
+                | ViewKind::Browser(_),
+            ) => None,
             None => self.editor_files.get(&pane).and_then(|editor| {
                 crate::files::preview::PreviewKind::for_path(&editor.path)
                     .map(|kind| (editor.path.clone(), kind))
@@ -8777,6 +8806,12 @@ impl App {
             self.transpose_pane(pane);
             return;
         }
+        if item == PaneMenuItem::NewBrowserTab {
+            if let Some((workspace, _)) = self.pane_location(pane) {
+                self.open_browser_prompt(workspace);
+            }
+            return;
+        }
         // Act on the right-clicked pane, not whatever was focused before.
         self.layout_mut().focus = pane;
         match item {
@@ -8791,7 +8826,7 @@ impl App {
             PaneMenuItem::NewPane => self.split_auto(),
             PaneMenuItem::SplitVertical => self.split(Axis::Col), // side by side
             PaneMenuItem::SplitHorizontal => self.split(Axis::Row), // stacked
-            PaneMenuItem::Transpose => {} // handled above without changing focus
+            PaneMenuItem::Transpose | PaneMenuItem::NewBrowserTab => {} // handled above without changing focus
             PaneMenuItem::ForkPane => {
                 self.fork_pane(pane);
             }
@@ -19662,6 +19697,7 @@ fi
         assert_eq!(
             app.tab_menu_items(),
             [
+                TabMenuItem::NewBrowserTab,
                 TabMenuItem::Rename,
                 TabMenuItem::MoveLeft,
                 TabMenuItem::MoveRight,

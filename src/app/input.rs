@@ -627,6 +627,16 @@ impl App {
     }
 
     fn handle_event_inner(&mut self, ev: AppEvent) -> bool {
+        if let AppEvent::BrowserStatus(text) = ev {
+            self.show_toast(
+                text.chars()
+                    .filter(|c| !c.is_control())
+                    .take(500)
+                    .collect::<String>(),
+            );
+            return true;
+        }
+
         // A pending owner-menu focus may not follow the user after they leave
         // its source workspace. This is an O(1) pane/generation check only.
         self.discard_stale_remote_navigation();
@@ -1176,6 +1186,7 @@ impl App {
                 }
                 changed
             }
+            AppEvent::BrowserStatus(_) => unreachable!("handled before remote routing"),
             AppEvent::ClientCommand(command) => {
                 if command == "send_prefix" {
                     return self.handle_event(AppEvent::PrefixKey(self.prefix.key_event()));
@@ -1272,7 +1283,7 @@ impl App {
                         ViewKind::File(view) => view.search.as_mut(),
                         ViewKind::Preview(view) => view.search.as_mut(),
                         ViewKind::Diff(view) => view.search.as_mut(),
-                        ViewKind::Remote(_) => None,
+                        ViewKind::Remote(_) | ViewKind::Browser(_) => None,
                     };
                     if let Some(search) = search {
                         if search.editing {
@@ -1930,6 +1941,8 @@ impl App {
         }
         let handler: fn(&mut Self, KeyEvent) = if self.worktree_prompt.is_some() {
             Self::handle_worktree_prompt_key
+        } else if self.browser_prompt.is_some() {
+            Self::handle_browser_prompt_key
         } else if self.tab_rename.is_some() {
             Self::handle_tab_rename_key
         } else if self.file_prompt.is_some() {
@@ -2318,6 +2331,7 @@ impl App {
             || self.file_delete.is_some()
             || self.worktree_delete.is_some()
             || self.worktree_prompt.is_some()
+            || self.browser_prompt.is_some()
             || self.tab_rename.is_some()
             || self.ws_rename.is_some()
             || self.pane_rename.is_some();
@@ -2869,6 +2883,12 @@ impl App {
         }
         // Text-input modals: only the ⏎/esc footer buttons respond to the mouse;
         // any other click is swallowed (the centered modal owns the screen).
+        if self.browser_prompt.is_some() {
+            if let Some(k) = self.modal_button_key(&m) {
+                self.handle_browser_prompt_key(k);
+            }
+            return;
+        }
         if self.tab_rename.is_some() {
             if let Some(k) = self.modal_button_key(&m) {
                 self.handle_tab_rename_key(k);
@@ -3155,6 +3175,14 @@ impl App {
                 if self.begin_sidebar_resize(m.column, m.row) {
                     return;
                 }
+                if let Some(pane) = self.pane_content_rects.iter().find_map(|(pane, rect)| {
+                    (matches!(self.views.get(pane), Some(ViewKind::Browser(_)))
+                        && crate::browser::link_rect(*rect).contains((m.column, m.row).into()))
+                    .then_some(*pane)
+                }) {
+                    self.activate_browser_panel(pane);
+                    return;
+                }
                 // Then the horizontal rule between two stacked docks. Checked
                 // after the edge seam so a corner press still resizes the
                 // sidebar, and before pane resize because this target lives
@@ -3261,8 +3289,16 @@ impl App {
                     });
             }
             MouseEventKind::Down(MouseButton::Middle) => {
-                // Middle click has no luvus meaning — forward it to a
-                // mouse-tracking app (button 1), otherwise ignore it.
+                // Only a real tab's rendered title owns middle-click close.
+                // The add button shares tab_rects with index == tabs.len().
+                if let Some(index) = self.tab_rects.iter().find_map(|(index, rect)| {
+                    (*index < self.ws().tabs.len() && rect.contains((m.column, m.row).into()))
+                        .then_some(*index)
+                }) {
+                    self.close_tab(index);
+                    return;
+                }
+                // Pane content retains the application's normal middle button.
                 self.begin_mouse_forward(&m, 1);
                 return;
             }
@@ -3524,7 +3560,7 @@ impl App {
                         };
                         v.scroll_by(scroll, viewport, key);
                     }
-                    Some(crate::app::ViewKind::Remote(_)) => {}
+                    Some(crate::app::ViewKind::Remote(_) | crate::app::ViewKind::Browser(_)) => {}
                     None => {}
                 }
                 return;
@@ -4739,7 +4775,9 @@ impl App {
             // DIFF owns its source-cell clicks for review and note selection.
             // Do not route it through generic word copying.
             Some(crate::app::ViewKind::Diff(_)) => return false,
-            Some(crate::app::ViewKind::Remote(_)) => return false,
+            Some(crate::app::ViewKind::Remote(_) | crate::app::ViewKind::Browser(_)) => {
+                return false
+            }
             None => {
                 let Some(p) = self.panes.get(&pane) else {
                     return false;
@@ -5220,6 +5258,7 @@ impl App {
             && self.picker.is_none()
             && self.worktree_prompt.is_none()
             && self.worktree_open.is_none()
+            && self.browser_prompt.is_none()
             && self.tab_rename.is_none()
             && self.tab_menu.is_none()
             && self.ws_menu.is_none()
@@ -5525,6 +5564,9 @@ impl App {
         if self.worktree_open.is_some() {
             return C::WorktreeList;
         }
+        if self.browser_prompt.is_some() {
+            return C::BrowserPrompt;
+        }
         if self.tab_rename.is_some() {
             return C::TabRename;
         }
@@ -5669,7 +5711,7 @@ impl App {
                     C::Preview(focus)
                 }
             }
-            Some(ViewKind::Remote(_)) | None => C::Pane(focus),
+            Some(ViewKind::Remote(_) | ViewKind::Browser(_)) | None => C::Pane(focus),
         }
     }
 
@@ -5855,6 +5897,10 @@ impl App {
         // The open-worktree list modal captures all input while open.
         if self.worktree_open.is_some() {
             self.handle_worktree_open_key(key);
+            return true;
+        }
+        if self.browser_prompt.is_some() {
+            self.handle_browser_prompt_key(key);
             return true;
         }
         // The tab-rename modal (docs/28) captures all input while open.
@@ -6116,6 +6162,13 @@ impl App {
                     Some(crate::app::ViewKind::Diff(_)) => return self.handle_diff_key(focus, key),
                     Some(crate::app::ViewKind::Preview(_)) => {
                         return self.handle_preview_key(focus, key)
+                    }
+                    Some(crate::app::ViewKind::Browser(_)) => {
+                        if key.code == KeyCode::Enter {
+                            self.activate_browser_panel(focus);
+                            return true;
+                        }
+                        return false;
                     }
                     Some(crate::app::ViewKind::Remote(_)) => return false,
                     None => {}
@@ -8204,7 +8257,7 @@ mod tests {
                 ViewKind::File(view) => &mut view.search,
                 ViewKind::Preview(view) => &mut view.search,
                 ViewKind::Diff(view) => &mut view.search,
-                ViewKind::Remote(_) => unreachable!("native view fixture"),
+                ViewKind::Remote(_) | ViewKind::Browser(_) => unreachable!("native view fixture"),
             };
             *search = Some(crate::search::local::LocalSearch::editing());
             app.views.insert(pane, view);
@@ -8214,7 +8267,7 @@ mod tests {
                 ViewKind::File(view) => view.search.as_mut().unwrap(),
                 ViewKind::Preview(view) => view.search.as_mut().unwrap(),
                 ViewKind::Diff(view) => view.search.as_mut().unwrap(),
-                ViewKind::Remote(_) => unreachable!("native view fixture"),
+                ViewKind::Remote(_) | ViewKind::Browser(_) => unreachable!("native view fixture"),
             };
             assert_eq!(search.query, "pasted");
             assert!(search.commit());
@@ -8224,7 +8277,7 @@ mod tests {
                 ViewKind::File(view) => &view.search.as_ref().unwrap().query,
                 ViewKind::Preview(view) => &view.search.as_ref().unwrap().query,
                 ViewKind::Diff(view) => &view.search.as_ref().unwrap().query,
-                ViewKind::Remote(_) => unreachable!("native view fixture"),
+                ViewKind::Remote(_) | ViewKind::Browser(_) => unreachable!("native view fixture"),
             };
             assert_eq!(query, "pasted");
         }
@@ -10655,6 +10708,56 @@ mod link_click_tests {
         )));
         assert!(app.tab_menu.is_some());
         assert!(app.tab_rename.is_none());
+    }
+
+    #[test]
+    fn middle_click_closes_only_a_real_tab_title() {
+        let _env = crate::persist::test_env("tab-middle-click-close");
+        let Fixture {
+            mut app,
+            pane,
+            off_link,
+            ..
+        } = fixture();
+        let other = PaneId::alloc();
+        app.views
+            .insert(other, ViewKind::Browser("http://localhost:3000".into()));
+        app.workspaces[app.active_ws]
+            .tabs
+            .push(crate::app::Tab::panes(crate::layout::TileLayout::new(
+                other,
+            )));
+        let title = Rect::new(4, 0, 10, 1);
+        let add = Rect::new(28, 0, 3, 1);
+        app.tab_rects = vec![(0, Rect::new(16, 0, 10, 1)), (1, title), (2, add)];
+        for at in [(add.x, add.y), (title.x, title.y + 1), off_link] {
+            app.handle_event(mouse(
+                MouseEventKind::Down(MouseButton::Middle),
+                at,
+                KeyModifiers::NONE,
+            ));
+            app.handle_event(mouse(
+                MouseEventKind::Up(MouseButton::Middle),
+                at,
+                KeyModifiers::NONE,
+            ));
+            assert_eq!(app.ws().tabs.len(), 2);
+        }
+        app.handle_event(mouse(
+            MouseEventKind::Down(MouseButton::Middle),
+            (title.x + 1, title.y),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.ws().tabs.len(), 1);
+        assert!(app.panes.contains_key(&pane));
+        assert!(!app.views.contains_key(&other));
+        assert!(app.session_dirty);
+        app.handle_event(mouse(
+            MouseEventKind::Up(MouseButton::Middle),
+            (title.x + 1, title.y),
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(app.ws().tabs.len(), 1);
     }
 
     #[test]

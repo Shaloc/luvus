@@ -343,6 +343,7 @@ impl ClientState {
                     protocol::WorkspaceEffect::ScopedClipboard { origin, text }
                 }
                 ServerMessage::OpenUrl(url) => protocol::WorkspaceEffect::OpenUrl(url),
+                ServerMessage::Browser(request) => protocol::WorkspaceEffect::Browser(request),
                 ServerMessage::ForwardedClipboardHelper { origin, request } => {
                     protocol::WorkspaceEffect::ClipboardHelper { origin, request }
                 }
@@ -705,6 +706,8 @@ pub fn run() -> Result<()> {
         if let Some(url) = app.pending_open_url.take() {
             broadcast(&mut clients, ServerMessage::OpenUrl(url));
         }
+        dispatch_program_url(&mut app, &clients, foreground);
+        dispatch_browser(&mut app, &clients, foreground);
         if let Some(text) = app.pending_clipboard.take() {
             dispatch_clipboard(&mut clients, foreground, &mut next_activity, text);
         }
@@ -1647,6 +1650,46 @@ fn latest_client(clients: &Clients) -> Option<u64> {
         .filter(|(_, client)| client.workspace_id.is_none() && client.projection.is_none())
         .max_by_key(|(_, client)| client.last_activity)
         .map(|(&id, _)| id)
+}
+
+/// Use the requesting pane's owner workspace, not whichever workspace happens
+/// to be focused when its child calls BROWSER. Never wake a passive projection.
+fn dispatch_browser(app: &mut App, clients: &Clients, foreground: Option<u64>) {
+    let Some((pane, origin, request)) = app.pending_browser.take() else {
+        return;
+    };
+    let owner = app
+        .pane_location(pane)
+        .and_then(|(wi, _)| workspace_size_owner(app, clients, foreground, &app.workspaces[wi].id));
+    let client = origin.or(owner).and_then(|id| clients.get(&id));
+    if let Some(client) = client.filter(|client| client.version >= 19 && client.surface_active()) {
+        let _ = client.send_control(ServerMessage::Browser(request));
+    } else {
+        app.show_toast("Browser sessions need an active display with transport 19");
+    }
+}
+
+fn dispatch_program_url(app: &mut App, clients: &Clients, foreground: Option<u64>) {
+    let Some((pane, url)) = app.pending_program_url.take() else {
+        return;
+    };
+    let client = app
+        .pane_location(pane)
+        .and_then(|(wi, _)| workspace_size_owner(app, clients, foreground, &app.workspaces[wi].id))
+        .and_then(|id| clients.get(&id));
+    if let Some(client) = client {
+        let message = if client.version >= 19 {
+            ServerMessage::Browser(crate::browser::Request {
+                url,
+                proxied: false,
+                hosts: Vec::new(),
+                origin: client.render_origin,
+            })
+        } else {
+            ServerMessage::OpenUrl(url)
+        };
+        let _ = client.send_control(message);
+    }
 }
 
 /// Only one viewport may resize a workspace's shared PTYs. Whole-session
@@ -2801,6 +2844,15 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                     break;
                 }
             }
+            Ok(ClientMessage::BrowserStatus(text)) => {
+                if version < 19 {
+                    break;
+                }
+                if text.len() > 2048 {
+                    break;
+                }
+                let _ = app_tx.send(AppEvent::BrowserStatus(text));
+            }
             Ok(ClientMessage::Command(command)) => {
                 if command.len() > 64
                     || app_tx
@@ -3061,19 +3113,20 @@ mod shutdown {
 
 #[cfg(test)]
 mod tests {
-    use super::ServerMessage;
     use super::{
         apply, broadcast, frame_cadence_ready, frame_wait, pty_rearm_interval,
         record_event_render_request, render_clients, visible_terminal_panes, ClientSender,
         ClientState, EventRenderSource, FrameSendError, RenderCause, RenderRequest, RenderScratch,
         FRAME_INTERVAL,
     };
+    use super::{dispatch_program_url, ServerMessage};
     use crate::app::App;
     use crate::event::{AppEvent, ClientInput};
     use crate::ipc::protocol::FrameDiff;
     use crate::terminal::appearance::PaneAppearance;
     use crate::terminal::vt::{create_engine, VtEngineKind};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use serde_json::json;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -3297,6 +3350,79 @@ mod tests {
             ServerMessage::ClipboardHelper(request) if request.install
         ));
         assert!(first_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn program_browser_requests_follow_the_owner_workspace_display() {
+        let _env = crate::persist::test_env("browser-display-owner");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let workspace = app.workspaces[app.active_ws].id.clone();
+        let (owner, owner_rx) = projection_client(workspace, 2);
+        let (other, other_rx) = projection_client("other-workspace".into(), 99);
+        let clients = HashMap::from([(1, owner), (2, other)]);
+        let url = "https://example.com/browser";
+        app.dispatch("browser.open", &json!({"pane":pane.0, "url":url}))
+            .unwrap();
+        assert!(app
+            .dispatch("browser.open", &json!({"pane":pane.0, "url":url}))
+            .is_err());
+        dispatch_program_url(&mut app, &clients, Some(2));
+        assert!(
+            matches!(owner_rx.try_recv(), Ok(ServerMessage::Browser(request)) if request.url == url && !request.proxied)
+        );
+        assert!(other_rx.try_recv().is_err());
+        assert!(app.pending_program_url.is_none());
+        for params in [
+            json!({"url":url}),
+            json!({"pane":999999,"url":url}),
+            json!({"pane":pane.0,"url":"file:///etc/passwd"}),
+            json!({"pane":pane.0,"url":"https://example.com/\n"}),
+            json!({"pane":pane.0,"url":url,"host":"other"}),
+        ] {
+            assert!(app.dispatch("browser.open", &params).is_err(), "{params}");
+            assert!(app.pending_program_url.is_none());
+        }
+        // A disconnected display never redirects a request to another owner.
+        app.dispatch("browser.open", &json!({"pane":pane.0,"url":url}))
+            .unwrap();
+        dispatch_program_url(&mut app, &HashMap::new(), None);
+        assert!(app.pending_program_url.is_none());
+    }
+
+    #[test]
+    fn browser_session_is_scoped_to_requester_and_negotiated_version() {
+        let _env = crate::persist::test_env("browser-session-origin");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let pane = app.layout().focus;
+        let (mut first, first_rx) = display_client(100, 30, 1);
+        let (mut other, other_rx) = display_client(100, 30, 2);
+        first.version = 19;
+        other.version = 19;
+        let mut clients = HashMap::from([(1, first), (2, other)]);
+        let request = crate::browser::Request {
+            proxied: true,
+            url: "http://localhost:3000".into(),
+            hosts: Vec::new(),
+            origin: None,
+        };
+        app.pending_browser = Some((pane, Some(1), request.clone()));
+        super::dispatch_browser(&mut app, &clients, Some(2));
+        assert!(matches!(first_rx.try_recv(), Ok(ServerMessage::Browser(_))));
+        assert!(other_rx.try_recv().is_err());
+        clients.get_mut(&1).unwrap().version = 18;
+        app.pending_browser = Some((pane, Some(1), request.clone()));
+        super::dispatch_browser(&mut app, &clients, Some(2));
+        assert!(first_rx.try_recv().is_err());
+        assert!(other_rx.try_recv().is_err());
+        app.pending_browser = Some((pane, Some(99), request));
+        super::dispatch_browser(&mut app, &clients, Some(2));
+        assert!(
+            other_rx.try_recv().is_err(),
+            "closed origin must not launch on another display"
+        );
     }
 
     fn projection_client(

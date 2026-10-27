@@ -812,3 +812,15 @@ is false: restarting an owner is a separate explicit lifecycle action that ends
 its live PTYs. Do not substitute upstream `luvus update` or infer restart
 authority from binary-update authorization. Settings → Remote offers the same
 action with `u` on an enabled host row.
+
+
+### Display browser actions
+
+Use `luvus browser open <http(s)-url> --pane <id>` to queue a normal display-side
+browser open. `queued:true` is admission, not browser completion. Use
+`luvus browser panel <http(s)-url> --pane <id>` to create a native link pane;
+only its explicit click/Enter opens an isolated Chrome/Chromium session. Run on
+the pane's owning server. The display derives the SSH alias from the existing
+remote projection, uses loopback-only forward SOCKS5 (`ssh -D`, never `-R`), and
+requires transport 19 at both ends. Never supply a host or executable in these
+API requests; no remote server is started or restarted. See `luvus help browser`.

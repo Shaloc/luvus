@@ -84,6 +84,7 @@ Luvus release number.
 | host / sessions | `host.capabilities` · `host.info` · `host.doctor` · `host.update.check` · `host.update.install` · `session.list` · `session.status` · `session.start` · `session.stop` · `session.restart` · `session.delete` · `skill.status` · `skill.enable` · `skill.disable` · `integration.status` · `integration.install` · `integration.uninstall` |
 | discovery / config | `uhp.capabilities` · `uhp.stats` · `uhp.token.create` · `uhp.token.list` · `uhp.token.revoke` · `config.get` · `config.patch` · `server.reload_config` · `server.agent_manifests` · `server.reload_agent_manifests` |
 | workspaces | `workspace.list` · `workspace.get` · `workspace.open` · `workspace.focus` · `workspace.rename` · `workspace.pin` · `workspace.move` · `workspace.move_block` · `workspace.report_metadata` · `workspace.close` |
+| browser | `browser.open` · `browser.panel` |
 | tabs | `tab.list` · `tab.get` · `tab.new` · `tab.focus` · `tab.move` · `tab.swap` · `tab.rename` · `tab.close` |
 | runtime and agents | `session.snapshot` · `agent.start` · `agent.prompt` · `agent.wait` · `events.subscribe` |
 | panes | `pane.list` · `pane.get` · `pane.current` · `pane.layout` · `pane.neighbor` · `pane.edges` · `pane.split` · `pane.move` · `pane.swap` · `pane.transpose` · `pane.focus` · `pane.focus_direction` · `pane.resize` · `pane.zoom` · `pane.rename` · `pane.run` · `pane.send_input` · `pane.read` · `pane.status` · `pane.processes` · `pane.restart` · `pane.close` · `attach.pane` |
@@ -1514,3 +1515,20 @@ The result is `{"type":"pane","pane":"NEW","previous_pane":"OLD",` plus
 precedes asynchronous PTY startup, as for `pane.split`. Consumers must use the new
 pane ID; the old terminal lifetime is closed. Existing `pane.closed` and
 `pane.created` events announce the replacement. Native session IDs stay private.
+
+## Display browser actions
+
+`browser.open` requires `{pane, url}` with an explicit live owner-local terminal
+pane and an HTTP(S) URL of at most 8192 bytes. It returns
+`{type:"browser_open", queued:true, pane}`. Queue acceptance does not prove an
+OS browser opened. No active display means no launch; it never falls back to
+running a browser on the owner. Another pending request returns `busy`.
+
+`browser.panel` requires the same fields and creates a native layout leaf beside
+the specified terminal/native pane. It returns `{type:"browser_panel", pane}`
+with the new ID. Creation does not launch a browser; the human clicks the link
+or presses Enter. Both methods require control authority. Unknown parameters,
+including `host` or executable arguments, are rejected. Only the selected
+projection supplies the SSH owner to the display. See the
+[browser session guide](/docs/guides/remote/#browser-sessions) for transport and
+lifecycle requirements.

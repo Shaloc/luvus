@@ -7,6 +7,7 @@ mod api;
 mod app;
 mod automation;
 mod bar;
+mod browser;
 mod changelog;
 mod cli;
 mod clipboard;
@@ -930,14 +931,14 @@ fn attach_cmd(args: &[String]) -> Result<()> {
 /// socket through plain ssh and attach to it locally. No port-forwarding, no
 /// `~/.ssh/config` edits — keepalive options are passed on argv only.
 fn remote_attach(args: &[String]) -> Result<()> {
-    let (result, status) = remote_attach_attempt(remote_ssh_command(args)?);
+    let (result, status) = remote_attach_attempt(remote_ssh_command(args)?, args);
     if result
         .as_ref()
         .is_err_and(ipc::client::is_handshake_io_error)
         && status.as_ref().and_then(std::process::ExitStatus::code) == Some(127)
     {
         let (fallback_result, fallback_status) =
-            remote_attach_attempt(remote_fallback_ssh_command(args)?);
+            remote_attach_attempt(remote_fallback_ssh_command(args)?, args);
         if fallback_result
             .as_ref()
             .is_err_and(ipc::client::is_handshake_io_error)
@@ -964,7 +965,10 @@ fn remote_attach(args: &[String]) -> Result<()> {
     result
 }
 
-fn remote_attach_attempt(mut cmd: Command) -> (Result<()>, Option<std::process::ExitStatus>) {
+fn remote_attach_attempt(
+    mut cmd: Command,
+    args: &[String],
+) -> (Result<()>, Option<std::process::ExitStatus>) {
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()); // stderr inherited so ssh can prompt for auth
     let mut child = cmd
         .spawn()
@@ -982,7 +986,12 @@ fn remote_attach_attempt(mut cmd: Command) -> (Result<()>, Option<std::process::
         let status = child.wait().ok();
         return (Err(anyhow!("no ssh stdin")), status);
     };
-    let result = ipc::client::attach(stdout, stdin);
+    let route = if args.len() == 3 {
+        Ok(args.get(2).cloned())
+    } else {
+        Err("Browser sessions with custom SSH arguments need a configured SSH alias".into())
+    };
+    let result = ipc::client::attach(stdout, stdin, route);
     let status = wait_for_remote_child(child);
     (result, status)
 }
@@ -1773,6 +1782,7 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
     let mut last_draw = Instant::now();
     let mut last_save = Instant::now();
     let mut immediate_save_attempted = false;
+    let mut browser_sessions = browser::Sessions::default();
     loop {
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(ev) => {
@@ -1824,6 +1834,25 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
         }
         if let Some(url) = app.pending_open_url.take() {
             crate::platform::open_url(&url);
+        }
+        if let Some((pane, url)) = app.pending_program_url.take() {
+            if app.panes.contains_key(&pane) {
+                crate::platform::open_url(&url);
+            }
+        }
+        if let Some((_, _, request)) = app.pending_browser.take() {
+            if !request.proxied {
+                platform::open_url(&request.url);
+            } else {
+                let notify = tx.clone();
+                browser_sessions.open(request, move |result| {
+                    let _ = notify.send(AppEvent::BrowserStatus(
+                        result
+                            .err()
+                            .unwrap_or_else(|| "Chrome / Chromium opened".into()),
+                    ));
+                });
+            }
         }
         if let Some(text) = app.pending_clipboard.take() {
             let notify = tx.clone();

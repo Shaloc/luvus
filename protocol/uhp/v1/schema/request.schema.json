@@ -224,6 +224,8 @@
         "ui.notification.push",
         "ui.notification.clear",
         "ui.toast",
+        "browser.open",
+        "browser.panel",
         "terminal.backend.inventory",
         "terminal.backend.snapshot",
         "terminal.backend.validate",
@@ -1561,9 +1563,60 @@
           "minimum": 0
         }
       }
+    },
+    "browserParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pane",
+        "url"
+      ],
+      "properties": {
+        "pane": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9]+$"
+            },
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            }
+          ]
+        },
+        "url": {
+          "type": "string",
+          "maxLength": 8192,
+          "pattern": "^https?://[^/\\s][^\\s]*$"
+        },
+        "if_revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
     }
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "enum": [
+              "browser.open",
+              "browser.panel"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/browserParams"
+          }
+        }
+      }
+    },
     {
       "if": {
         "properties": {

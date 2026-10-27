@@ -132,6 +132,9 @@ macro_rules! tr {
 /// Entries are matched only as a complete line or a whitespace-delimited line
 /// suffix, so canonical syntax at the start of a row is never rewritten.
 static HELP: &[Translation] = &[
+    tr!("Open a Chrome / Chromium session panel", "Abrir un panel de sesión de Chrome / Chromium", "Abrir um painel de sessão do Chrome / Chromium", "Ouvrir un panneau de session Chrome / Chromium", "Chrome- / Chromium-Sitzungsbereich öffnen", "Buka panel sesi Chrome / Chromium", "打开 Chrome / Chromium 会话面板", "Chrome / Chromium セッションパネルを開く", "Chrome / Chromium 세션 패널 열기"),
+    tr!("Open links on the display client", "Abrir enlaces en el cliente de pantalla", "Abrir links no cliente de exibição", "Ouvrir les liens sur le client d’affichage", "Links auf dem Anzeigeclient öffnen", "Buka tautan pada klien tampilan", "在显示端打开链接", "表示クライアントでリンクを開く", "표시 클라이언트에서 링크 열기"),
+    tr!("browser:", "navegador:", "navegador:", "navigateur :", "Browser:", "peramban:", "浏览器：", "ブラウザー：", "브라우저:"),
     tr!("update an installed module", "actualizar un módulo instalado", "atualizar um módulo instalado", "mettre à jour un module installé", "ein installiertes Modul aktualisieren", "perbarui modul terpasang", "更新已安装的模块", "インストール済みモジュールを更新", "설치된 모듈 업데이트"),
     tr!(
         "Pairing links work once and expire after five minutes.",

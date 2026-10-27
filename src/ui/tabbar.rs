@@ -347,6 +347,7 @@ fn file_tab_name(tab: &crate::app::Tab, app: &App) -> Option<String> {
             Some(format!("◇ {name}"))
         }
         Some(crate::app::ViewKind::Remote(_)) => Some("remote".to_string()),
+        Some(crate::app::ViewKind::Browser(_)) => Some("↗ Chrome".into()),
         None => {
             let name = app
                 .editor_files

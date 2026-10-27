@@ -70,6 +70,7 @@ pub fn is_cli(args: &[String]) -> bool {
                 | "logs"
                 | "uhp"
                 | "web"
+                | "browser"
                 | "socket"
                 | "module"
                 | "theme"
@@ -131,6 +132,7 @@ Commands:
   search       Search across pane scrollback
   events       Stream live status changes
   uhp          Discover and use Universal Harness Protocol 1.0
+  browser      Open links on the display client
   web          Serve the optional browser client
   attach       Open the TUI focused on one pane
   doctor       Check optional external tools
@@ -263,6 +265,10 @@ bars:
                              --content-file, --compact-content, --text and --state supported
   bar move --id <id> --region top-right|bottom-right|off
   bar remove --id <id>       clear live widget content, preserving placement
+
+browser:
+  browser open <url> [--pane <id>]  Open links on the display client
+  browser panel <url> [--pane <id>]  Open a Chrome / Chromium session panel
 
 appearance:
   ui sidebar [--side left|right] --width <n>     set a sidebar's width (columns)
@@ -713,6 +719,7 @@ fn help_topic_has_subcommands(topic: &str) -> bool {
             | "integration"
             | "skill"
             | "kitten"
+            | "browser"
             | "wait"
             | "uhp"
     )
@@ -723,7 +730,9 @@ fn normalize_help_topic(topic: &str) -> Option<&str> {
         "workspace" | "tab" | "pane" | "agent" | "files" | "git" | "mission" | "worktree"
         | "task" | "lease" | "automation" | "module" | "theme" | "bar" | "ui" | "session"
         | "host" | "server" | "integration" | "diff" | "skill" | "wait" | "search" | "events"
-        | "web" | "uhp" | "ping" | "doctor" | "kitten" | "update" | "attach" => Some(topic),
+        | "browser" | "web" | "uhp" | "ping" | "doctor" | "kitten" | "update" | "attach" => {
+            Some(topic)
+        }
         "node" => Some("pane"),
         "remote" | "--remote" => Some("remote"),
         _ => None,
@@ -853,7 +862,11 @@ fn write_topic_help_english(
         ),
         "bar" => (
             "luvus bar <list|push|move|remove> [args]",
-            detailed_section("bars:\n", "\nappearance:\n"),
+            detailed_section("bars:\n", "\nbrowser:\n"),
+        ),
+        "browser" => (
+            "luvus browser <open|panel> <url> [--pane <id>]",
+            detailed_section("browser:\n", "\nappearance:\n"),
         ),
         "ui" => (
             "luvus ui <sidebar|dock|agent-title|notification|toast> [args]",
@@ -3038,6 +3051,29 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
     let noun = args.get(1).map(String::as_str).unwrap_or("");
     let verb = args.get(2).map(String::as_str).unwrap_or("");
     let rest = &args[3.min(args.len())..];
+    if noun == "browser" {
+        let usage = "usage: luvus browser <open|panel> <url> [--pane <id>]";
+        if !matches!(verb, "open" | "panel") || !matches!(rest.len(), 1 | 3) {
+            return Err(anyhow!(usage));
+        }
+        let url = &rest[0];
+        if url.len() > 8192 || !crate::platform::is_openable_url(url) {
+            return Err(anyhow!("expected an HTTP(S) URL of at most 8192 bytes"));
+        }
+        let pane = if rest.len() == 3 {
+            if rest[1] != "--pane" {
+                return Err(anyhow!(usage));
+            }
+            rest[2].clone()
+        } else {
+            std::env::var("LUVUS_PANE_ID")
+                .map_err(|_| anyhow!("browser needs --pane or LUVUS_PANE_ID"))?
+        };
+        if pane.parse::<u32>().is_err() {
+            return Err(anyhow!("invalid pane id"));
+        }
+        return Ok((format!("browser.{verb}"), json!({"pane":pane,"url":url})));
+    }
     if noun == "uhp" {
         if !rest.is_empty() {
             return Err(anyhow!(
@@ -5056,6 +5092,33 @@ mod tests {
             write_topic_help(&mut output, topic, command, crate::i18n::cli::Language::En,).unwrap()
         );
         String::from_utf8(output).unwrap()
+    }
+
+    #[test]
+    fn browser_open_parsing_and_help_preserve_one_url_argument() {
+        let args = [
+            "luvus",
+            "browser",
+            "open",
+            "https://example.com/a?x=1&y=%20;z=$value",
+            "--pane",
+            "42",
+        ]
+        .map(str::to_owned);
+        let (method, params) = parse(&args).unwrap();
+        assert_eq!(method, "browser.open");
+        assert_eq!(params["url"], args[3]);
+        assert_eq!(params["pane"], "42");
+        for command in [
+            "luvus browser open file:///etc/passwd --pane 42",
+            "luvus browser open https://example.com --pane x",
+            "luvus browser open https://example.com --unknown 42",
+            "luvus browser open https://example.com --pane 42 extra",
+        ] {
+            assert!(parse(&argv(command)).is_err(), "{command}");
+        }
+        assert!(is_cli(&args));
+        assert!(rendered_topic_help("browser", Some("open")).contains("browser open <url>"));
     }
 
     #[test]

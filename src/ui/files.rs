@@ -171,7 +171,11 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
             Some(crate::app::ViewKind::Preview(view)) => Some(view.path.as_path()),
             // Remote files are rendered by their owner, never inferred from
             // the local workspace's paths or editor map.
-            Some(crate::app::ViewKind::Diff(_) | crate::app::ViewKind::Remote(_)) => None,
+            Some(
+                crate::app::ViewKind::Diff(_)
+                | crate::app::ViewKind::Remote(_)
+                | crate::app::ViewKind::Browser(_),
+            ) => None,
             None => app
                 .editor_files
                 .get(&tab.layout.focus)

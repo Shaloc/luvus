@@ -564,7 +564,18 @@ pub(super) fn draw_tab_rename(
     cat: &Catalog,
     t: &Theme,
 ) -> (Option<Rect>, Option<Rect>) {
-    draw_rename(f, area, cat.rename_tab, buf, cursor, hover, cat, t)
+    draw_text_prompt(
+        f,
+        area,
+        cat.rename_tab,
+        buf,
+        cursor,
+        None,
+        cat.act_save,
+        hover,
+        cat,
+        t,
+    )
 }
 
 /// The workspace-rename modal: titled for a node. The on-disk folder is never
@@ -578,7 +589,18 @@ pub(super) fn draw_ws_rename(
     cat: &Catalog,
     t: &Theme,
 ) -> (Option<Rect>, Option<Rect>) {
-    draw_rename(f, area, cat.menu_rename, buf, cursor, hover, cat, t)
+    draw_text_prompt(
+        f,
+        area,
+        cat.menu_rename,
+        buf,
+        cursor,
+        None,
+        cat.act_save,
+        hover,
+        cat,
+        t,
+    )
 }
 
 /// The pane-rename modal (same look as the workspace/tab rename).
@@ -591,18 +613,31 @@ pub(super) fn draw_pane_rename(
     cat: &Catalog,
     t: &Theme,
 ) -> (Option<Rect>, Option<Rect>) {
-    draw_rename(f, area, cat.menu_rename, buf, cursor, hover, cat, t)
+    draw_text_prompt(
+        f,
+        area,
+        cat.menu_rename,
+        buf,
+        cursor,
+        None,
+        cat.act_save,
+        hover,
+        cat,
+        t,
+    )
 }
 
 /// Shared single-field rename modal (tab / workspace): a title, an editable
 /// buffer, and the clickable ⏎/esc footer hints. Returns each hint's rect.
 #[allow(clippy::too_many_arguments)]
-fn draw_rename(
+pub(super) fn draw_text_prompt(
     f: &mut RenderTarget,
     area: Rect,
     title: &str,
     buf: &str,
     cursor: usize,
+    hint: Option<&str>,
+    confirm: &str,
     hover: Option<(u16, u16)>,
     cat: &Catalog,
     t: &Theme,
@@ -625,7 +660,25 @@ fn draw_rename(
         )),
         Rect::new(inner.x, inner.y, inner.width, 1),
     );
+    if let Some(hint) = hint {
+        f.render_widget(
+            Paragraph::new(hint).style(Style::new().fg(t.subtext0)),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
     let (before, after) = crate::app::line_edit::split_at_caret(buf, cursor);
+    // URLs can exceed the modal width; keep the caret visible while editing.
+    let available = inner.width.saturating_sub(3) as usize;
+    let mut start = before.len();
+    let mut width = 0;
+    for (index, c) in before.char_indices().rev() {
+        width += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if width > available {
+            break;
+        }
+        start = index;
+    }
+    let before = &before[start..];
     f.render_widget(
         Paragraph::new(Line::from(vec![
             Span::raw(" "),
@@ -636,7 +689,7 @@ fn draw_rename(
         Rect::new(inner.x, inner.y + 2, inner.width, 1),
     );
     let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
-    let (c, x) = footer_hints(f, footer, cat.act_save, cat.act_cancel, hover, t);
+    let (c, x) = footer_hints(f, footer, confirm, cat.act_cancel, hover, t);
     (Some(c), Some(x))
 }
 

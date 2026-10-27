@@ -15,6 +15,7 @@ like, and luvus tiles them automatically.
 
 | Do this | Mouse | Key |
 |---|---|---|
+| Create a browser tab (optional URL) | right-click a pane or tab title → **New Browser Tab** | n/a |
 | Create a pane with automatic direction | right-click a pane → **New Pane** | `Ctrl+Space +` |
 | Split side by side | right-click a pane → **Split Vertical** | `Ctrl+Space v` |
 | Split top / bottom | right-click a pane → **Split Horizontal** | `Ctrl+Space s` |
@@ -116,7 +117,7 @@ special dashboard, such as the `⎇ git` tab or the `◇ orch` board).
 |---|---|---|
 | New tab | the `+` on the tab bar | `Ctrl+Space c` |
 | Next / previous tab | click a tab | `Ctrl+Space n` / `p` / `⇥` |
-| Close a tab | the `×` on the tab | `Ctrl+Space x` (on a dashboard) |
+| Close a tab | the `×` on the tab, or middle-click its title | `Ctrl+Space x` (on a dashboard) |
 | Rename a tab | right-click the tab → **Rename**, type a name, `⏎` | `luvus tab rename <name>` |
 | Move a tab one position | right-click the tab → **Move Left** / **Move Right** | `luvus tab move left` / `right` |
 | Swap two tab positions | right-click a tab → **Swap With**, choose the other tab | `luvus tab swap <first> <second>` |
@@ -446,3 +447,7 @@ a link only opens when you release without moving.
 Closing your terminal never loses work, because the server keeps every pane alive. Run
 `luvus` again to reattach, or `Ctrl+Space d` to detach on purpose. See
 [Your First Session](/docs/getting-started/first-session/#4-detach--this-is-the-magic).
+
+Middle-click closes a tab only within its rendered title. The add button, pane
+headers and terminal content do not close tabs; applications retain middle-click
+inside their terminal content. Remote tabs are closed on their owning server.

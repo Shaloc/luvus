@@ -185,6 +185,8 @@ pub const METHODS: &[&str] = &[
     "ui.notification.push",
     "ui.notification.clear",
     "ui.toast",
+    "browser.open",
+    "browser.panel",
     "terminal.backend.inventory",
     "terminal.backend.snapshot",
     "terminal.backend.validate",

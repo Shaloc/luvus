@@ -655,6 +655,7 @@ pub(crate) fn chrome_uncovered(app: &App) -> bool {
         && app.cmd_inspect.is_none()
         && app.worktree_prompt.is_none()
         && app.worktree_open.is_none()
+        && app.browser_prompt.is_none()
         && app.tab_rename.is_none()
         && app.tab_menu.is_none()
         && app.ws_rename.is_none()
@@ -1381,6 +1382,26 @@ fn render_into_mode_impl(
         worktree_open_rects = rects;
     }
     app.worktree_open_rects = worktree_open_rects;
+    if let Some(prompt) = app.browser_prompt.as_ref() {
+        let (c, x) = picker::draw_text_prompt(
+            f,
+            area,
+            cat.menu_new_browser_tab,
+            &prompt.buffer,
+            prompt.cursor,
+            Some(if prompt.invalid {
+                cat.browser_url_invalid
+            } else {
+                cat.browser_url_optional
+            }),
+            cat.act_open,
+            hover,
+            cat,
+            &t,
+        );
+        app.modal_commit_rect = c;
+        app.modal_cancel_rect = x;
+    }
     // The tab-rename modal (docs/28).
     if let Some((buf, cursor)) = app
         .tab_rename
@@ -1577,6 +1598,7 @@ fn render_into_mode_impl(
         || app.named_session_menu.is_some()
         || app.worktree_prompt.is_some()
         || app.worktree_open.is_some()
+        || app.browser_prompt.is_some()
         || app.tab_rename.is_some()
         || app.tab_menu.is_some()
         || app.ws_rename.is_some()

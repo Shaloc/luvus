@@ -737,6 +737,7 @@ fn ws_label(
 
 fn pane_label(it: PaneMenuItem, cat: &Catalog, extras: &[ModuleMenuAction]) -> String {
     match it {
+        PaneMenuItem::NewBrowserTab => cat.menu_new_browser_tab.to_string(),
         PaneMenuItem::NewPane => cat.menu_new_pane.to_string(),
         PaneMenuItem::SplitVertical => cat.menu_split_vertical.to_string(),
         PaneMenuItem::SplitHorizontal => cat.menu_split_horizontal.to_string(),
@@ -758,6 +759,7 @@ fn pane_label(it: PaneMenuItem, cat: &Catalog, extras: &[ModuleMenuAction]) -> S
 
 fn tab_label(it: TabMenuItem, cat: &Catalog, extras: &[ModuleMenuAction]) -> String {
     match it {
+        TabMenuItem::NewBrowserTab => cat.menu_new_browser_tab.to_string(),
         TabMenuItem::Rename => cat.menu_rename.to_string(),
         TabMenuItem::MoveLeft => format!("{} {}", cap_first(cat.act_move), cat.side_left),
         TabMenuItem::MoveRight => format!("{} {}", cap_first(cat.act_move), cat.side_right),

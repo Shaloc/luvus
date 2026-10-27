@@ -234,7 +234,8 @@ fn fixed_guidance(app: &App, t: &Theme, budget: u16) -> (Line<'static>, bool) {
             Some(
                 crate::app::ViewKind::Preview(_)
                 | crate::app::ViewKind::Diff(_)
-                | crate::app::ViewKind::Remote(_),
+                | crate::app::ViewKind::Remote(_)
+                | crate::app::ViewKind::Browser(_),
             )
             | None => None,
         };
@@ -718,7 +719,9 @@ mod tests {
                 crate::app::ViewKind::File(view) => &mut view.search,
                 crate::app::ViewKind::Preview(view) => &mut view.search,
                 crate::app::ViewKind::Diff(view) => &mut view.search,
-                crate::app::ViewKind::Remote(_) => unreachable!("native view fixture"),
+                crate::app::ViewKind::Remote(_) | crate::app::ViewKind::Browser(_) => {
+                    unreachable!("native view fixture")
+                }
             };
             *search = Some(crate::search::local::LocalSearch {
                 query: "Needle".into(),

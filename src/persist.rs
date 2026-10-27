@@ -126,6 +126,8 @@ pub struct PaneSnap {
     /// An explicit derived document preview. Source is always re-read.
     #[serde(default)]
     pub preview: Option<PreviewSnap>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<String>,
     /// A scheduled automation worker. It restores as a plain shell and never
     /// takes a native session for resume, in this or any later server lifetime.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -884,7 +886,12 @@ fn snapshot_layout(
                     // A file-view leaf (docs/38 FILE-3) is saved by its path and
                     // rebuilt on restore; it has no PTY.
                     if let Some(view) = app.views.get(&id) {
+                        let browser = match view {
+                            crate::app::ViewKind::Browser(url) => Some(url.clone()),
+                            _ => None,
+                        };
                         let (file, diff, preview) = match view {
+                            crate::app::ViewKind::Browser(_) => (None, None, None),
                             crate::app::ViewKind::File(v) => (Some(v.path.clone()), None, None),
                             crate::app::ViewKind::Diff(v) => {
                                 let status = app
@@ -940,6 +947,7 @@ fn snapshot_layout(
                                 file,
                                 diff,
                                 preview,
+                                browser,
                                 automation_worker: false,
                             },
                         ));
@@ -1002,6 +1010,7 @@ fn snapshot_layout(
                                 file: None,
                                 diff: None,
                                 preview: None,
+                                browser: None,
                                 automation_worker: app.automation_worker_panes.contains(&id),
                             },
                         )

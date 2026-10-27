@@ -710,6 +710,16 @@ def valid_global_request(value, methods):
         return integer(after) and after >= 0
     if value["method"] == "pane.report_session":
         return valid_session_report_params(value["params"])
+    if value["method"] in {"browser.open", "browser.panel"}:
+        params = value["params"]
+        pane = params.get("pane")
+        revision = params.get("if_revision", 0)
+        return (integer(revision) and revision >= 0
+                and set(params) <= {"pane", "url", "if_revision"}
+                and ((isinstance(pane, str) and re.fullmatch(r"[0-9]+", pane))
+                     or (type(pane) is int and 0 <= pane <= 4294967295))
+                and isinstance(params.get("url"), str) and len(params["url"].encode()) <= 8192
+                and re.fullmatch(r"https?://[^/\s][^\s]*", params["url"]) is not None)
     if value["method"] == "pane.transpose":
         params = value["params"]
         target = params.get("pane")

@@ -1330,7 +1330,7 @@ impl App {
             Some(ViewKind::Preview(view)) => {
                 view.document().map(|document| document.source.to_string())
             }
-            Some(ViewKind::Remote(_)) => None,
+            Some(ViewKind::Remote(_) | ViewKind::Browser(_)) => None,
             None => return,
         };
         match text {
@@ -3189,7 +3189,10 @@ mod tests {
         assert_eq!(
             app.views.get(&vid).and_then(|view| match view {
                 ViewKind::File(view) => Some(view.line_count()),
-                ViewKind::Diff(_) | ViewKind::Preview(_) | ViewKind::Remote(_) => None,
+                ViewKind::Diff(_)
+                | ViewKind::Preview(_)
+                | ViewKind::Remote(_)
+                | ViewKind::Browser(_) => None,
             }),
             Some(1),
             "initial content is one line"
@@ -3419,7 +3422,10 @@ mod tests {
             .values()
             .filter_map(|view| match view {
                 ViewKind::File(view) => Some(view.path.clone()),
-                ViewKind::Diff(_) | ViewKind::Preview(_) | ViewKind::Remote(_) => None,
+                ViewKind::Diff(_)
+                | ViewKind::Preview(_)
+                | ViewKind::Remote(_)
+                | ViewKind::Browser(_) => None,
             })
             .collect();
         assert_eq!(paths, vec![file], "the file view was rebuilt on restore");

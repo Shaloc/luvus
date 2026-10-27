@@ -63,3 +63,5 @@
 {"id":"transpose-current","method":"pane.transpose","params":{}}
 {"id":"task-guard-valid-0","method":"task.update","params":{"id":"t1","status":"failed","output":"launch failed","if_running":{"pane":7,"attempt":1}}}
 {"id":"task-guard-valid-1","method":"task.update","params":{"id":"t1","status":"failed","output":"launch failed","if_running":{"pane":"7","attempt":2}}}
+{"id": "browser-open", "method": "browser.open", "params": {"pane": "7", "url": "https://example.com"}}
+{"id": "browser-panel", "method": "browser.panel", "params": {"pane": 7, "url": "http://localhost:3000"}}

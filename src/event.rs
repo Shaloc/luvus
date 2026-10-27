@@ -60,6 +60,7 @@ pub enum ClientInput {
 }
 
 pub enum AppEvent {
+    BrowserStatus(String),
     #[cfg(test)]
     PasteImage(std::path::PathBuf),
     IoCompleted(crate::app::io_jobs::Completion),

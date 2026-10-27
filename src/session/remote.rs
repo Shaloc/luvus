@@ -1011,9 +1011,9 @@ fn inspect_remote_build(host: &str) -> Result<RemoteBuild, String> {
     ))))
 }
 
-struct VersionOutput {
-    status: ExitStatus,
-    stdout: Vec<u8>,
+pub(crate) struct VersionOutput {
+    pub(crate) status: ExitStatus,
+    pub(crate) stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
 
@@ -1034,7 +1034,7 @@ fn run_ssh_command(command: Command, host: &str, limit: usize) -> Result<Version
 
 // Installation uses this executor directly: downloads must not hold the probe
 // admission needed by healthy owners' discovery, control and reconnection.
-fn run_ssh_command_with_timeout(
+pub(crate) fn run_ssh_command_with_timeout(
     mut command: Command,
     host: &str,
     limit: usize,
@@ -1164,6 +1164,10 @@ fn remote_version_probe_failed(host: &str, output: &VersionOutput) -> String {
 }
 
 fn ssh_base(host: &str) -> Command {
+    ssh_base_with_options(host, &[])
+}
+
+pub(crate) fn ssh_base_with_options(host: &str, options: &[String]) -> Command {
     let mut command = Command::new("ssh");
     command
         .arg("-T")
@@ -1179,6 +1183,7 @@ fn ssh_base(host: &str) -> Command {
         .arg("ServerAliveInterval=15")
         .arg("-o")
         .arg("ServerAliveCountMax=3")
+        .args(options)
         .arg(host);
     command
 }

@@ -48,6 +48,7 @@ pub(super) fn draw_pane_titles(
             let btn_w = title_buttons_w(focused, rect.width, false);
             let title_w = inner_w.saturating_sub(btn_w);
             let (marker, name) = match view {
+                crate::app::ViewKind::Browser(url) => ("↗", url.clone()),
                 crate::app::ViewKind::File(v) => (
                     "■",
                     v.path
@@ -577,6 +578,23 @@ fn draw_one_pane(
             lone_header && !matches!(view, crate::app::ViewKind::Remote(_)),
         )?;
         match view {
+            crate::app::ViewKind::Browser(url) => {
+                let row = crate::browser::link_rect(content);
+                f.render_widget(
+                    Paragraph::new(if url == crate::browser::BLANK_URL {
+                        app.catalog.browser_open
+                    } else {
+                        url.as_str()
+                    })
+                    .alignment(Alignment::Center)
+                    .style(
+                        Style::new()
+                            .fg(t.accent)
+                            .add_modifier(ratatui::style::Modifier::UNDERLINED),
+                    ),
+                    row,
+                );
+            }
             crate::app::ViewKind::File(v) => {
                 let sel = app.selection.filter(|s| s.pane == id);
                 super::files::draw_file_view(f, content, v, sel.as_ref(), app.compact, t);

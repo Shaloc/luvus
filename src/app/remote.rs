@@ -246,6 +246,7 @@ pub struct RemoteSessionSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RemoteDisplay {
+    pub browser_session: bool,
     pub terminal_colors: bool,
     pub notifications: bool,
     pub scoped_frames: bool,
@@ -257,6 +258,30 @@ pub struct RemoteDisplay {
     pub projection: bool,
     pub graphics: bool,
     pub cell_pixels: bool,
+}
+
+impl RemoteDisplay {
+    fn projection_version(&self) -> u32 {
+        if self.browser_session {
+            19
+        } else if self.notifications {
+            18
+        } else if self.scoped_frames {
+            16
+        } else if self.hyperlinks {
+            15
+        } else if self.clipboard_helper_relay {
+            14
+        } else if self.session_display {
+            13
+        } else if self.cell_pixels {
+            12
+        } else if self.graphics {
+            11
+        } else {
+            protocol::PROJECTION_PROTOCOL_VERSION
+        }
+    }
 }
 
 #[derive(Default)]
@@ -314,6 +339,11 @@ pub enum RemoteEffect {
         text: String,
     },
     OpenUrl(String),
+    Browser {
+        pane: PaneId,
+        generation: u64,
+        request: crate::browser::Request,
+    },
     Workspace {
         pane: PaneId,
         generation: u64,
@@ -1784,6 +1814,20 @@ impl App {
                 }
             }
             RemoteEffect::OpenUrl(url) => self.pending_open_url = Some(url),
+            RemoteEffect::Browser {
+                pane,
+                generation,
+                mut request,
+            } => {
+                if let Some(source) = self.remote_navigation_source(pane, generation) {
+                    if request.proxied {
+                        request.hosts.insert(0, source.host.clone());
+                    }
+                    let origin = request.origin.take();
+                    self.pending_browser = Some((pane, origin, request));
+                }
+            }
+
             RemoteEffect::Workspace {
                 pane,
                 generation,
@@ -2584,6 +2628,14 @@ fn remote_snapshot_at(
     parse_remote_snapshot(&response, location)
 }
 
+fn remote_transport_at_least(display: &Value, minimum: u32) -> bool {
+    display
+        .get("transport")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .is_some_and(|version| version >= minimum && protocol::supports_version(version))
+}
+
 pub(super) fn parse_remote_snapshot(
     response: &Value,
     location: RemoteBinaryLocation,
@@ -2687,11 +2739,23 @@ pub(super) fn parse_remote_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let snapshot = RemoteSessionSnapshot {
         display: RemoteDisplay {
+            browser_session: response
+                .get("result")
+                .and_then(|r| r.get("remote_display"))
+                .is_some_and(|d| {
+                    remote_transport_at_least(d, 19)
+                        && d.get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter()
+                                    .any(|c| c.as_str() == Some("browser_session.v1"))
+                            })
+                }),
             terminal_colors: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    d.get("transport").and_then(Value::as_u64) == Some(18)
+                    remote_transport_at_least(d, 18)
                         && d.get("capabilities")
                             .and_then(Value::as_array)
                             .is_some_and(|caps| {
@@ -2703,7 +2767,7 @@ pub(super) fn parse_remote_snapshot(
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    d.get("transport").and_then(Value::as_u64) == Some(18)
+                    remote_transport_at_least(d, 18)
                         && d.get("capabilities")
                             .and_then(Value::as_array)
                             .is_some_and(|caps| {
@@ -2714,9 +2778,7 @@ pub(super) fn parse_remote_snapshot(
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    d.get("transport")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|v| matches!(v, 16 | 18))
+                    remote_transport_at_least(d, 16)
                         && d.get("capabilities")
                             .and_then(Value::as_array)
                             .is_some_and(|caps| {
@@ -2727,68 +2789,53 @@ pub(super) fn parse_remote_snapshot(
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    matches!(
-                        d.get("transport").and_then(Value::as_u64),
-                        Some(15..=16 | 18)
-                    ) && d
-                        .get("capabilities")
-                        .and_then(Value::as_array)
-                        .is_some_and(|caps| {
-                            caps.iter().any(|c| c.as_str() == Some("hyperlinks.v1"))
-                        })
+                    remote_transport_at_least(d, 15)
+                        && d.get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter().any(|c| c.as_str() == Some("hyperlinks.v1"))
+                            })
                 }),
             clipboard_helper_relay: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    matches!(
-                        d.get("transport").and_then(Value::as_u64),
-                        Some(14..=16 | 18)
-                    ) && d
-                        .get("capabilities")
-                        .and_then(Value::as_array)
-                        .is_some_and(|caps| {
-                            caps.iter()
-                                .any(|c| c.as_str() == Some("clipboard_helper_relay.v1"))
-                        })
+                    remote_transport_at_least(d, 14)
+                        && d.get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter()
+                                    .any(|c| c.as_str() == Some("clipboard_helper_relay.v1"))
+                            })
                 }),
             session_display: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|d| {
-                    matches!(
-                        d.get("transport").and_then(Value::as_u64),
-                        Some(13..=16 | 18)
-                    ) && d
-                        .get("capabilities")
-                        .and_then(Value::as_array)
-                        .is_some_and(|caps| {
-                            caps.iter()
-                                .any(|c| c.as_str() == Some(protocol::SESSION_DISPLAY_CAPABILITY))
-                        })
+                    remote_transport_at_least(d, 13)
+                        && d.get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter().any(|c| {
+                                    c.as_str() == Some(protocol::SESSION_DISPLAY_CAPABILITY)
+                                })
+                            })
                 }),
             cell_pixels: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
-                .is_some_and(|display| {
-                    display
-                        .get("transport")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|v| matches!(v, 12..=16 | 18))
-                }),
+                .is_some_and(|display| remote_transport_at_least(display, 12)),
             graphics: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
                 .is_some_and(|display| {
-                    matches!(
-                        display.get("transport").and_then(Value::as_u64),
-                        Some(11..=16 | 18)
-                    ) && display
-                        .get("capabilities")
-                        .and_then(Value::as_array)
-                        .is_some_and(|caps| {
-                            caps.iter().any(|cap| cap.as_str() == Some("graphics.v1"))
-                        })
+                    remote_transport_at_least(display, 11)
+                        && display
+                            .get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter().any(|cap| cap.as_str() == Some("graphics.v1"))
+                            })
                 }),
             location,
             server_generation: response
@@ -2800,16 +2847,15 @@ pub(super) fn parse_remote_snapshot(
                 .get("result")
                 .and_then(|result| result.get("remote_display"))
                 .is_some_and(|display| {
-                    matches!(
-                        display.get("transport").and_then(Value::as_u64),
-                        Some(10..=16 | 18)
-                    ) && display
-                        .get("capabilities")
-                        .and_then(Value::as_array)
-                        .is_some_and(|caps| {
-                            caps.iter()
-                                .any(|cap| cap.as_str() == Some(protocol::PROJECTION_CAPABILITY))
-                        })
+                    remote_transport_at_least(display, 10)
+                        && display
+                            .get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter().any(|cap| {
+                                    cap.as_str() == Some(protocol::PROJECTION_CAPABILITY)
+                                })
+                            })
                 }),
         },
         event_sequence,
@@ -2914,23 +2960,7 @@ fn run_projection(
             &mut input,
             &if display.projection {
                 ClientMessage::HelloProjection {
-                    version: if display.notifications {
-                        18
-                    } else if display.scoped_frames {
-                        16
-                    } else if display.hyperlinks {
-                        15
-                    } else if display.clipboard_helper_relay {
-                        14
-                    } else if display.session_display {
-                        13
-                    } else if display.cell_pixels {
-                        12
-                    } else if display.graphics {
-                        11
-                    } else {
-                        protocol::PROJECTION_PROTOCOL_VERSION
-                    },
+                    version: display.projection_version(),
                     workspace_id: target.workspace_id.clone(),
                 }
             } else if target.workspace_id.is_empty() {
@@ -3184,6 +3214,17 @@ fn run_projection(
                             text,
                         },
                     });
+                }
+                Ok(ServerMessage::Browser(request)) => {
+                    if effect_leader.load(Ordering::Acquire) {
+                        let _ = app_tx.send(AppEvent::RemoteEffect {
+                            effect: RemoteEffect::Browser {
+                                pane,
+                                generation,
+                                request,
+                            },
+                        });
+                    }
                 }
                 Ok(ServerMessage::OpenUrl(url)) => {
                     if effect_leader.load(Ordering::Acquire) {
@@ -3530,7 +3571,7 @@ pub(crate) mod tests {
 
     #[test]
     fn remote_link_capability_keeps_older_projection_features() {
-        for version in (9..=16).chain([18]) {
+        for version in (9..=16).chain([18, 19]) {
             let mut capabilities = protocol::remote_display_capabilities();
             capabilities["transport"] = json!(version);
             let response = json!({"result":{"workspaces":[], "event_sequence":0,
@@ -3538,6 +3579,10 @@ pub(crate) mod tests {
             let display = parse_remote_snapshot(&response, RemoteBinaryLocation::Path)
                 .unwrap()
                 .display;
+            assert_eq!(display.browser_session, version >= 19);
+            if display.projection {
+                assert_eq!(display.projection_version(), version);
+            }
             assert_eq!(display.notifications, version >= 18);
             assert_eq!(display.terminal_colors, version >= 18);
             assert_eq!(display.scoped_frames, version >= 16);

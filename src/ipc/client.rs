@@ -76,27 +76,32 @@ pub fn run(sock: &Path) -> Result<()> {
     };
     crate::logging::event(crate::logging::EventKind::ClientConnect, &[]);
     // `Conn` is a cloneable duplex handle: one clone reads, the other writes.
-    attach_inner(stream.clone(), stream, true)
+    attach_inner(stream.clone(), stream, true, Ok(None))
 }
 
 /// Attach a thin client over **any** reader/writer carrying the binary frame
 /// protocol. The local path passes the two halves of a `Conn`; remote attach
 /// (docs/18 RA) passes an `ssh` child's stdout/stdin — the protocol is the same.
-pub fn attach<R, W>(reader: R, writer: W) -> Result<()>
-where
-    R: Read + Send + 'static,
-    W: Write + Send + 'static,
-{
+pub fn attach<R: Read + Send + 'static, W: Write + Send + 'static>(
+    reader: R,
+    writer: W,
+    route: Result<Option<String>, String>,
+) -> Result<()> {
     let _logging = crate::logging::init(crate::logging::Role::Client);
     crate::logging::event(
         crate::logging::EventKind::ClientStart,
         &[crate::logging::Field::Role(crate::logging::Role::Client)],
     );
     crate::logging::event(crate::logging::EventKind::ClientConnect, &[]);
-    attach_inner(reader, writer, false)
+    attach_inner(reader, writer, false, route)
 }
 
-fn attach_inner<R, W>(reader: R, writer: W, local: bool) -> Result<()>
+fn attach_inner<R, W>(
+    reader: R,
+    writer: W,
+    local: bool,
+    browser_route: Result<Option<String>, String>,
+) -> Result<()>
 where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
@@ -104,7 +109,14 @@ where
     let mut terminal = ratatui::init();
     crate::install_tui_panic_hook();
     let mut graphics = crate::terminal::graphics::ClientGraphics::default();
-    let result = run_inner(reader, writer, &mut terminal, local, &mut graphics);
+    let result = run_inner(
+        reader,
+        writer,
+        &mut terminal,
+        local,
+        &mut graphics,
+        browser_route,
+    );
     // Also release terminal-owned resources after an early I/O/decode failure.
     let _ = graphics.apply(Vec::new(), &mut std::io::stdout());
     let _ = execute!(
@@ -150,6 +162,7 @@ fn run_inner<R, W>(
     terminal: &mut DefaultTerminal,
     local: bool,
     graphics: &mut crate::terminal::graphics::ClientGraphics,
+    browser_route: Result<Option<String>, String>,
 ) -> Result<ClientExit>
 where
     R: Read + Send + 'static,
@@ -248,6 +261,7 @@ where
             pending,
         )
     });
+    let mut browser_sessions = crate::browser::Sessions::default();
     let mut generation = 0;
     let mut clipboard = ClipboardCompletion::new(generation, tx.clone());
     spawn_frame_reader(reader, generation, tx.clone());
@@ -271,6 +285,13 @@ where
             crate::emit_notification(message);
         }
         let message = match event {
+            Ok(ClientEvent::BrowserStatus(epoch, result)) if epoch == generation => {
+                let text = result
+                    .err()
+                    .unwrap_or_else(|| "Chrome / Chromium opened".into());
+                let _ = protocol::write_message(&mut writer, &ClientMessage::BrowserStatus(text));
+                continue;
+            }
             Ok(ClientEvent::Clipboard(epoch)) if epoch == generation => continue,
             Ok(ClientEvent::ClipboardSucceeded(epoch, receipt)) if epoch == generation => {
                 let _ = protocol::write_message(
@@ -444,6 +465,30 @@ where
                 crate::emit_clipboard_to(&text, clipboard.0.clone());
             }
             Ok(ServerMessage::OpenUrl(url)) => crate::platform::open_url(&url),
+            Ok(ServerMessage::Browser(request)) if !request.proxied => {
+                if crate::browser::valid_url(&request.url) {
+                    crate::platform::open_url(&request.url);
+                }
+            }
+            Ok(ServerMessage::Browser(mut request)) => {
+                let sender = tx.clone();
+                match &browser_route {
+                    Ok(host) => {
+                        if let Some(host) = host {
+                            request.hosts.insert(0, host.clone());
+                        }
+                        browser_sessions.open(request, move |result| {
+                            let _ = sender.try_send(ClientEvent::BrowserStatus(generation, result));
+                        });
+                    }
+                    Err(error) => {
+                        let _ = protocol::write_message(
+                            &mut writer,
+                            &ClientMessage::BrowserStatus(error.clone()),
+                        );
+                    }
+                }
+            }
             Ok(ServerMessage::ClipboardHelper(request)) => {
                 let sender = tx.clone();
                 thread::spawn(move || {
@@ -466,6 +511,7 @@ where
                     }
                 };
                 generation += 1;
+                browser_sessions = crate::browser::Sessions::default();
                 clipboard = ClipboardCompletion::new(generation, tx.clone());
                 let (reader, next_writer) = connection;
                 writer = Box::new(next_writer);
@@ -550,6 +596,7 @@ impl Drop for ClipboardCompletion {
 }
 
 enum ClientEvent {
+    BrowserStatus(u64, Result<(), String>),
     ClipboardSucceeded(u64, u64),
     Clipboard(u64),
     Input(ClientMessage),

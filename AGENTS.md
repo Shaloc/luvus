@@ -120,6 +120,10 @@ boundaries are:
   Transport 18 adds session notification delivery and active-display terminal
   colors; transport 17 is reserved for an incompatible historical upstream wire
   layout and must remain rejected. Passive displays must not change child colors.
+  Transport 19 adds display-owned browser requests and launch feedback. Preserve
+  requesting-client, owner-workspace, generation, and projection-epoch fences.
+  Browser sessions use only display-loopback SSH dynamic forwarding; never
+  introduce reverse forwarding or a proxy listener on the owner.
 - `src/ipc/api.rs` and `src/ipc/transport.rs`: bounded local API handling plus
   Unix-socket and Windows-named-pipe transport.
 - `src/ui/`: Ratatui rendering, panes, sidebars, docks, tab bar, settings,

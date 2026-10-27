@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { Cdp } from "./cdp.mjs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import readline from "node:readline";
@@ -300,29 +300,4 @@ function exited(child) {
     const timer = setTimeout(() => reject(new Error("Test process did not exit")), 10_000);
     child.once("exit", () => { clearTimeout(timer); resolve(); });
   });
-}
-
-function Cdp(socket) {
-    this.events = new EventEmitter();
-    this.counter = 0;
-    this.pending = new Map();
-    this.socket = socket;
-    socket.on("message", (data) => {
-      const frame = JSON.parse(data.toString());
-      if (frame.id) {
-        const pending = this.pending.get(frame.id);
-        if (!pending) return;
-        this.pending.delete(frame.id);
-        clearTimeout(pending.timer);
-        if (frame.error) pending.reject(new Error(frame.error.message)); else pending.resolve(frame.result);
-      } else this.events.emit(frame.method, frame);
-    });
-  this.call = (method, params = {}, sessionId) => {
-    const id = ++this.counter;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`CDP timeout: ${method}`)); }, 8_000);
-      this.pending.set(id, { resolve, reject, timer });
-      this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
-    });
-  };
 }

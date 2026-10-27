@@ -151,6 +151,10 @@ bars:
   bar move --id <id> --region top-right|bottom-right|off
   bar remove --id <id>       clear live widget content, preserving placement
 
+browser:
+  browser open <url> [--pane <id>]  Open links on the display client
+  browser panel <url> [--pane <id>]  Open a Chrome / Chromium session panel
+
 appearance:
   ui sidebar [--side left|right] --width <n>     set a sidebar's width (columns)
   ui sidebar [--side left|right] --hide|--show   toggle a sidebar
@@ -433,3 +437,15 @@ their live input composers are detected. `--strict` requires positive composer e
 agent; agents without a detector return `agent_not_ready`. Without it, other
 agents keep the existing fallback. Inspect the screen with `agent read`; use
 `agent keys` only for an intentional interaction.
+
+## Browser links and sessions
+
+```sh
+luvus browser open https://example.com --pane 7
+luvus browser panel http://localhost:3000 --pane 7
+```
+
+`open` forwards one HTTP(S) URL to the owning pane's active display browser.
+`panel` splits beside the specified owner-local pane and shows a clickable link.
+Pane IDs are opaque, not tab positions. Inside a Luvus terminal `--pane` defaults
+to `LUVUS_PANE_ID`. See [browser sessions](/docs/guides/remote/#browser-sessions).

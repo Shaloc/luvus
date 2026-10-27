@@ -100,6 +100,8 @@ jobs:
           python3 -m venv target/ui-appearance-test-env
           target/ui-appearance-test-env/bin/pip install pyte==0.8.2
           target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --appearance-only
+      - name: Isolated browser routing and tab middle-click smoke
+        run: target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --browser-open-only
       - name: Isolated local and remote Kitty transport smoke
         run: |
           # Same checkout binary, private homes and fake SSH only; no real hosts.

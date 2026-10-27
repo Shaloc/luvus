@@ -521,6 +521,11 @@ impl App {
                 }
             }
             protocol::WorkspaceEffect::OpenUrl(url) => RemoteEffect::OpenUrl(url),
+            protocol::WorkspaceEffect::Browser(request) => RemoteEffect::Browser {
+                pane,
+                generation,
+                request,
+            },
             protocol::WorkspaceEffect::ClipboardHelper { origin, request } => {
                 RemoteEffect::ClipboardHelper {
                     pane,
