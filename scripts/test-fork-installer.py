@@ -351,7 +351,7 @@ esac
         lines = detailed.splitlines()
         assert len(lines) == 4, detailed
         assert version("--version", "--remote-session-protocol") == lines[0] + "\n"
-        assert re.fullmatch(r"luvus \S+ remote-session=2 transport=19", lines[0]), detailed
+        assert re.fullmatch(r"luvus \S+ remote-session=2 transport=20", lines[0]), detailed
         assert re.fullmatch(r"build-id=[A-Za-z0-9._-]+", lines[1]), detailed
         assert re.fullmatch(r"commit=(?:[A-Fa-f0-9]{40,64}|unknown) source=(?:clean|dirty|unknown)", lines[2]), detailed
         assert re.fullmatch(r"target=\S+ profile=\S+", lines[3]), detailed
@@ -365,9 +365,9 @@ esac
                                     FIXTURE_REDIRECT="https://github.com/other/luvus/releases/tag/fork-bad")
     assert installed.read_bytes() == payload
     if len(sys.argv) == 1:
-        for transport in ("9", "10", "11", "12", "13", "14", "15", "16", "18", "19"):
+        for transport in ("9", "10", "11", "12", "13", "14", "15", "16", "18", "19", "20"):
             run(FIXTURE_TRANSPORT=transport)
-        for transport in ("17", "20"):
+        for transport in ("17", "21"):
             assert "not a compatible modified" in run(ok=False, FIXTURE_TRANSPORT=transport)
         for (fixture_os, fixture_arch), target in platforms.items():
             assert target in run(FIXTURE_OS=fixture_os, FIXTURE_ARCH=fixture_arch)

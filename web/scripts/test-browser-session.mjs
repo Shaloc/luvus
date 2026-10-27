@@ -46,8 +46,19 @@ try {
   const result = await cdp.call("Page.navigate", { url: initialUrl }, sessionId);
   assert.equal(result.errorText, undefined, JSON.stringify(result));
   const read = async () => (await cdp.call("Runtime.evaluate", { expression: "document.body?.textContent", returnByValue: true }, sessionId)).result.value;
-  const marker = args.some(a => a.startsWith("--proxy-server=")) ? "REMOTE_BROWSER_MARKER" : "LOCAL_BROWSER_MARKER";
+  const marker = process.env.LUVUS_TEST_BROWSER_OWNER === "local" ? "LOCAL_BROWSER_MARKER" : "REMOTE_BROWSER_MARKER";
   await until(async () => (await read())?.includes(marker));
+  if (process.env.LUVUS_TEST_BROWSER_PROXY) {
+    const result = await cdp.call("Page.navigate", { url: "http://proxy-only.invalid/from-chrome" }, sessionId);
+    assert.equal(result.errorText, undefined);
+    await until(async () => (await read())?.includes(marker.startsWith("REMOTE") ? "remote-http" : "local-http"));
+    // Trust only the isolated self-signed fixture via CDP, never production argv.
+    await cdp.call("Security.setIgnoreCertificateErrors", { ignore: true }, sessionId);
+    const tlsPort = JSON.parse(await readFile(path.join(process.env.LUVUS_SMOKE_ROOT, "browser-https.json"), "utf8"));
+    const secure = await cdp.call("Page.navigate", { url: `https://https-proxy-only.invalid:${tlsPort}/tls` }, sessionId);
+    assert.equal(secure.errorText, undefined);
+    await until(async () => (await read())?.includes("HTTPS_BROWSER_MARKER"));
+  }
   if (marker.startsWith("REMOTE")) {
     const url = new URL(initialUrl);
     url.hostname = "remote-only.invalid";
@@ -61,7 +72,9 @@ try {
     try {
       url.hostname = "127.0.0.1";
       const failed = await cdp.call("Page.navigate", { url: url.toString() }, sessionId);
-      assert.ok(failed.errorText, "proxy failure must fail the navigation");
+      if (process.env.LUVUS_TEST_BROWSER_PROXY) {
+        assert.ok(failed.errorText || (await read())?.includes("Owner browser proxy connection failed"));
+      } else assert.ok(failed.errorText, "proxy failure must fail the navigation");
       assert.ok(!(await read())?.includes("LOCAL_BROWSER_MARKER"));
     } finally { await unlink(blocked); }
   }

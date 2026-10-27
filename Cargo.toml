@@ -92,6 +92,10 @@ getrandom = "0.3"
 # constructed only for that command; normal TUI, CLI, and server processes do
 # not start an async runtime or bind a network listener.
 axum = { version = "0.8", default-features = false, features = ["http1", "original-uri", "tokio", "ws"] }
+# Browser sessions reuse the Web stack's HTTP parser/streaming implementation
+# for a display-loopback forward proxy; no HTTP runtime starts until requested.
+hyper = { version = "1", features = ["http1", "client", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 futures-util = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
 # Calendar-safe IANA timezone conversion for daily and weekly automations.

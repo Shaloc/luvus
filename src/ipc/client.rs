@@ -465,29 +465,25 @@ where
                 crate::emit_clipboard_to(&text, clipboard.0.clone());
             }
             Ok(ServerMessage::OpenUrl(url)) => crate::platform::open_url(&url),
-            Ok(ServerMessage::Browser(request)) if !request.proxied => {
-                if crate::browser::valid_url(&request.url) {
-                    crate::platform::open_url(&request.url);
-                }
+            Ok(ServerMessage::Browser(request)) => {
+                launch_browser(
+                    request.into(),
+                    &browser_route,
+                    &mut browser_sessions,
+                    &tx,
+                    generation,
+                    &mut writer,
+                );
             }
-            Ok(ServerMessage::Browser(mut request)) => {
-                let sender = tx.clone();
-                match &browser_route {
-                    Ok(host) => {
-                        if let Some(host) = host {
-                            request.hosts.insert(0, host.clone());
-                        }
-                        browser_sessions.open(request, move |result| {
-                            let _ = sender.try_send(ClientEvent::BrowserStatus(generation, result));
-                        });
-                    }
-                    Err(error) => {
-                        let _ = protocol::write_message(
-                            &mut writer,
-                            &ClientMessage::BrowserStatus(error.clone()),
-                        );
-                    }
-                }
+            Ok(ServerMessage::BrowserWithProxy(request)) => {
+                launch_browser(
+                    request,
+                    &browser_route,
+                    &mut browser_sessions,
+                    &tx,
+                    generation,
+                    &mut writer,
+                );
             }
             Ok(ServerMessage::ClipboardHelper(request)) => {
                 let sender = tx.clone();
@@ -592,6 +588,36 @@ impl ClipboardCompletion {
 impl Drop for ClipboardCompletion {
     fn drop(&mut self) {
         self.0.close();
+    }
+}
+
+fn launch_browser<W: Write>(
+    mut launch: crate::browser::LaunchRequest,
+    route: &Result<Option<String>, String>,
+    sessions: &mut crate::browser::Sessions,
+    sender: &std::sync::mpsc::SyncSender<ClientEvent>,
+    generation: u64,
+    writer: &mut W,
+) {
+    if !launch.request.proxied {
+        if crate::browser::valid_url(&launch.request.url) {
+            crate::platform::open_url(&launch.request.url);
+        }
+        return;
+    }
+    match route {
+        Ok(host) => {
+            if let Some(host) = host {
+                launch.request.hosts.insert(0, host.clone());
+            }
+            let sender = sender.clone();
+            sessions.open(launch, move |result| {
+                let _ = sender.try_send(ClientEvent::BrowserStatus(generation, result));
+            });
+        }
+        Err(error) => {
+            let _ = protocol::write_message(writer, &ClientMessage::BrowserStatus(error.clone()));
+        }
     }
 }
 

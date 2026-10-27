@@ -166,6 +166,9 @@ pub struct Config {
     /// Active AGENTS presentation, independent of All/history and scope.
     #[serde(default)]
     pub agents_group_by_workspace: bool,
+    /// Group live agents by the owner-observed start date of this run.
+    #[serde(default)]
+    pub agents_group_by_date: bool,
     #[serde(default)]
     pub agents_status_filter: AgentStatusFilter,
     /// Explicitly enabled SSH config aliases for managed remote sessions.
@@ -676,6 +679,7 @@ impl Default for Config {
             agents_active_only: false,
             agents_this_workspace: false,
             agents_group_by_workspace: false,
+            agents_group_by_date: false,
             agents_status_filter: AgentStatusFilter::default(),
             remote_hosts: Vec::new(),
             remote_auto_install: false,

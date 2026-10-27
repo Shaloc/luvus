@@ -58,6 +58,7 @@ pub struct RemoteWorkspaceRef {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteAgentMeta {
+    pub agent_started_at: Option<u64>,
     pub pane: String,
     pub agent: String,
     pub display_agent: Option<String>,
@@ -108,6 +109,7 @@ fn parse_remote_agents(workspace: &Value) -> Vec<RemoteAgentMeta> {
                 _ => crate::ui::theme::State::Unknown,
             };
             Some(RemoteAgentMeta {
+                agent_started_at: pane.get("agent_started_at").and_then(Value::as_u64),
                 pane: pane.get("pane_id")?.as_str()?.into(),
                 agent: pane.get("agent")?.as_str()?.into(),
                 display_agent: pane
@@ -246,6 +248,7 @@ pub struct RemoteSessionSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RemoteDisplay {
+    pub browser_proxy_environment: bool,
     pub browser_session: bool,
     pub terminal_colors: bool,
     pub notifications: bool,
@@ -262,7 +265,9 @@ pub struct RemoteDisplay {
 
 impl RemoteDisplay {
     fn projection_version(&self) -> u32 {
-        if self.browser_session {
+        if self.browser_proxy_environment {
+            20
+        } else if self.browser_session {
             19
         } else if self.notifications {
             18
@@ -342,7 +347,7 @@ pub enum RemoteEffect {
     Browser {
         pane: PaneId,
         generation: u64,
-        request: crate::browser::Request,
+        request: crate::browser::LaunchRequest,
     },
     Workspace {
         pane: PaneId,
@@ -1820,10 +1825,10 @@ impl App {
                 mut request,
             } => {
                 if let Some(source) = self.remote_navigation_source(pane, generation) {
-                    if request.proxied {
-                        request.hosts.insert(0, source.host.clone());
+                    if request.request.proxied {
+                        request.request.hosts.insert(0, source.host.clone());
                     }
-                    let origin = request.origin.take();
+                    let origin = request.request.origin.take();
                     self.pending_browser = Some((pane, origin, request));
                 }
             }
@@ -2739,6 +2744,18 @@ pub(super) fn parse_remote_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let snapshot = RemoteSessionSnapshot {
         display: RemoteDisplay {
+            browser_proxy_environment: response
+                .get("result")
+                .and_then(|r| r.get("remote_display"))
+                .is_some_and(|d| {
+                    remote_transport_at_least(d, 20)
+                        && d.get("capabilities")
+                            .and_then(Value::as_array)
+                            .is_some_and(|caps| {
+                                caps.iter()
+                                    .any(|c| c.as_str() == Some("browser_proxy_environment.v1"))
+                            })
+                }),
             browser_session: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
@@ -3221,6 +3238,17 @@ fn run_projection(
                             effect: RemoteEffect::Browser {
                                 pane,
                                 generation,
+                                request: request.into(),
+                            },
+                        });
+                    }
+                }
+                Ok(ServerMessage::BrowserWithProxy(request)) => {
+                    if effect_leader.load(Ordering::Acquire) {
+                        let _ = app_tx.send(AppEvent::RemoteEffect {
+                            effect: RemoteEffect::Browser {
+                                pane,
+                                generation,
                                 request,
                             },
                         });
@@ -3571,7 +3599,7 @@ pub(crate) mod tests {
 
     #[test]
     fn remote_link_capability_keeps_older_projection_features() {
-        for version in (9..=16).chain([18, 19]) {
+        for version in (9..=16).chain([18, 19, 20]) {
             let mut capabilities = protocol::remote_display_capabilities();
             capabilities["transport"] = json!(version);
             let response = json!({"result":{"workspaces":[], "event_sequence":0,
@@ -3580,6 +3608,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .display;
             assert_eq!(display.browser_session, version >= 19);
+            assert_eq!(display.browser_proxy_environment, version >= 20);
             if display.projection {
                 assert_eq!(display.projection_version(), version);
             }

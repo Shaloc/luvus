@@ -344,6 +344,9 @@ impl ClientState {
                 }
                 ServerMessage::OpenUrl(url) => protocol::WorkspaceEffect::OpenUrl(url),
                 ServerMessage::Browser(request) => protocol::WorkspaceEffect::Browser(request),
+                ServerMessage::BrowserWithProxy(request) => {
+                    protocol::WorkspaceEffect::BrowserWithProxy(request)
+                }
                 ServerMessage::ForwardedClipboardHelper { origin, request } => {
                     protocol::WorkspaceEffect::ClipboardHelper { origin, request }
                 }
@@ -1663,7 +1666,15 @@ fn dispatch_browser(app: &mut App, clients: &Clients, foreground: Option<u64>) {
         .and_then(|(wi, _)| workspace_size_owner(app, clients, foreground, &app.workspaces[wi].id));
     let client = origin.or(owner).and_then(|id| clients.get(&id));
     if let Some(client) = client.filter(|client| client.version >= 19 && client.surface_active()) {
-        let _ = client.send_control(ServerMessage::Browser(request));
+        if client.version >= 20 {
+            let _ = client.send_control(ServerMessage::BrowserWithProxy(request));
+        } else if request.proxy.as_ref().is_some_and(|env| !env.is_empty()) {
+            app.show_toast(
+                "Owner browser proxy environment needs transport 20 on every display hop",
+            );
+        } else {
+            let _ = client.send_control(ServerMessage::Browser(request.request));
+        }
     } else {
         app.show_toast("Browser sessions need an active display with transport 19");
     }
@@ -3408,16 +3419,37 @@ mod tests {
             hosts: Vec::new(),
             origin: None,
         };
-        app.pending_browser = Some((pane, Some(1), request.clone()));
+        app.pending_browser = Some((pane, Some(1), request.clone().into()));
         super::dispatch_browser(&mut app, &clients, Some(2));
         assert!(matches!(first_rx.try_recv(), Ok(ServerMessage::Browser(_))));
         assert!(other_rx.try_recv().is_err());
+        let launch = crate::browser::LaunchRequest {
+            request: request.clone(),
+            proxy: Some(crate::browser::proxy::Environment {
+                http: Some("http://owner-proxy:8123".into()),
+                ..Default::default()
+            }),
+        };
+        app.pending_browser = Some((pane, Some(1), launch.clone()));
+        super::dispatch_browser(&mut app, &clients, Some(2));
+        assert!(
+            first_rx.try_recv().is_err(),
+            "legacy peers must not discard owner policy"
+        );
+        clients.get_mut(&1).unwrap().version = 20;
+        app.pending_browser = Some((pane, Some(1), launch));
+        super::dispatch_browser(&mut app, &clients, Some(2));
+        assert!(
+            matches!(first_rx.try_recv(), Ok(ServerMessage::BrowserWithProxy(r))
+            if r.proxy.as_ref().unwrap().http.as_deref() == Some("http://owner-proxy:8123"))
+        );
+        assert!(other_rx.try_recv().is_err());
         clients.get_mut(&1).unwrap().version = 18;
-        app.pending_browser = Some((pane, Some(1), request.clone()));
+        app.pending_browser = Some((pane, Some(1), request.clone().into()));
         super::dispatch_browser(&mut app, &clients, Some(2));
         assert!(first_rx.try_recv().is_err());
         assert!(other_rx.try_recv().is_err());
-        app.pending_browser = Some((pane, Some(99), request));
+        app.pending_browser = Some((pane, Some(99), request.into()));
         super::dispatch_browser(&mut app, &clients, Some(2));
         assert!(
             other_rx.try_recv().is_err(),

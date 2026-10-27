@@ -171,6 +171,7 @@ impl App {
                                 "agent_name":agent_names.get(&pane_id).copied(),
                                 "agent":status.map(|status| status.agent.clone()),
                                 "is_agent":self.is_agent_pane(pane_id),
+                                "agent_started_at":status.and_then(|s| s.agent_started_at),
                                 "is_status_reporter":self.is_status_reporter_pane(pane_id),
                                 "display_agent":self.status_reporter_label(pane_id),
                                 "program_status_progress":status.filter(|s| s.state_source == "osc7501")
@@ -332,7 +333,8 @@ impl App {
         self.file_tree.scroll = 0;
         self.apply_agents_filter(next.agents_active_only);
         self.apply_agents_scope(next.agents_this_workspace);
-        if self.config.agents_group_by_workspace != next.agents_group_by_workspace
+        if self.config.agents_group_by_date != next.agents_group_by_date
+            || self.config.agents_group_by_workspace != next.agents_group_by_workspace
             || self.config.agents_status_filter != next.agents_status_filter
         {
             self.agents_scroll = 0;

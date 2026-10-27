@@ -524,6 +524,11 @@ impl App {
             protocol::WorkspaceEffect::Browser(request) => RemoteEffect::Browser {
                 pane,
                 generation,
+                request: request.into(),
+            },
+            protocol::WorkspaceEffect::BrowserWithProxy(request) => RemoteEffect::Browser {
+                pane,
+                generation,
                 request,
             },
             protocol::WorkspaceEffect::ClipboardHelper { origin, request } => {

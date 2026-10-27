@@ -380,6 +380,75 @@ fn logical_line(rows: &[String], row: u16, allow_indent: bool) -> Vec<(char, u16
     cells
 }
 
+/// Markdown renderers can break a parenthesized path at `/` before reaching
+/// the pane edge. Reconstruct only an explicitly delimited reference, retaining
+/// the original cell coordinates and requiring the file resolver to validate it.
+/// Ordinary hard line breaks and URL detection keep their existing semantics.
+fn delimited_file_line(rows: &[String], row: u16) -> Vec<(char, u16, u16)> {
+    let row = usize::from(row);
+    if row >= rows.len() {
+        return Vec::new();
+    }
+    for start in (row.saturating_sub(MAX_WRAP)..=row).rev() {
+        let first: Vec<_> = rows[start].chars().collect();
+        let Some(last) = first.iter().rposition(|c| !c.is_whitespace()) else {
+            continue;
+        };
+        let mut begin = last;
+        while begin > 0 && is_token_char(first[begin - 1]) {
+            begin -= 1;
+        }
+        if !matches!(first[begin], '(' | '[' | '\'') {
+            continue;
+        }
+        let mut cells: Vec<_> = first[begin..=last]
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (c, start as u16, (begin + i) as u16))
+            .collect();
+        let end = trim_trailing_marks(&cells, 0, cells.len(), true);
+        if enclosing_pair(&cells[..end]) {
+            continue;
+        }
+        for (next, line) in rows
+            .iter()
+            .enumerate()
+            .take(rows.len().min(start + MAX_WRAP + 1))
+            .skip(start + 1)
+        {
+            let chars: Vec<_> = line.chars().collect();
+            let indent = chars.iter().take_while(|&&c| c == ' ').count();
+            if indent > MAX_CONTINUATION_INDENT {
+                break;
+            }
+            let len = chars[indent..]
+                .iter()
+                .take_while(|&&c| is_token_char(c))
+                .count();
+            if len == 0 {
+                break;
+            }
+            cells.extend(
+                chars[indent..indent + len]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &c)| (c, next as u16, (indent + i) as u16)),
+            );
+            let end = trim_trailing_marks(&cells, 0, cells.len(), true);
+            if enclosing_pair(&cells[..end]) {
+                if next >= row {
+                    return cells;
+                }
+                break;
+            }
+            if chars[indent + len..].iter().any(|c| !c.is_whitespace()) {
+                break;
+            }
+        }
+    }
+    Vec::new()
+}
+
 /// Count occurrences of `ch` in `cells[lo..hi]`.
 fn count(cells: &[(char, u16, u16)], ch: char) -> usize {
     cells.iter().filter(|(c, _, _)| *c == ch).count()
@@ -496,7 +565,7 @@ fn link_with_spans(hit: Hit, cells: &[(char, u16, u16)]) -> Link {
 }
 
 /// Find a real file, trying the original spelling before removing prose
-/// delimiters, then trying a bounded indented continuation. The supplied
+/// delimiters, then trying bounded indented or explicitly delimited continuations. The supplied
 /// resolver belongs to the pane's owner; this module performs no IO. Unlike
 /// ordinary link/copy detection, speculative joins must never become URLs or
 /// clickable paths without that validation.
@@ -506,8 +575,12 @@ pub fn file_link_at<T>(
     row: u16,
     mut resolve: impl FnMut(&str) -> Option<T>,
 ) -> Option<(Link, T)> {
-    for allow_indent in [false, true] {
-        let cells = logical_line(rows, row, allow_indent);
+    for continuation in 0..3 {
+        let cells = match continuation {
+            0 => logical_line(rows, row, false),
+            1 => logical_line(rows, row, true),
+            _ => delimited_file_line(rows, row),
+        };
         let Some((idx, mut lo, mut hi)) = token_at(&cells, col, row) else {
             continue;
         };
@@ -517,7 +590,8 @@ pub fn file_link_at<T>(
         let shape = token.trim_matches(['(', ')', '[', ']', '\'', '.', ',', ';', '!', '?']);
         if token.contains("://")
             || !looks_like_path(split_line_suffix(shape).0)
-            || (allow_indent
+            || (continuation == 2 && !token.contains(['/', '\\']))
+            || (continuation == 1
                 && (!token.contains(['/', '\\'])
                     || !cells[lo..hi]
                         .windows(2)
@@ -852,6 +926,118 @@ mod tests {
             .is_none(),
             "wrapper is not a link"
         );
+    }
+
+    #[test]
+    fn delimited_file_reference_can_wrap_before_the_terminal_edge() {
+        let path = "target/browser-proxy-20261027/verification.md";
+        for indent in [0, 2, 4] {
+            let tail = format!("{}verification.md) after", " ".repeat(indent));
+            let rows = grid(&["See (target/browser-proxy-20261027/", &tail], 90);
+            for (col, row) in [(10, 0), (indent as u16 + 3, 1)] {
+                let (link, resolved) = file_link_at(&rows, col, row, |text| {
+                    (text == path).then_some(text.to_string())
+                })
+                .expect("restore the complete parenthesized path from either row");
+                assert_eq!(resolved, path);
+                assert_eq!(
+                    link.spans,
+                    [(0, 5, 35), (1, indent as u16, indent as u16 + 15)]
+                );
+                assert!(link.covers(col, row));
+                assert!(!link.covers(70, 0), "padding is not part of the link");
+                assert!(
+                    !link.covers(4, 0),
+                    "opening parenthesis is not part of the link"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn early_file_continuations_keep_delimiters_bounds_and_file_authority() {
+        let path = "target/browser-proxy-20261027/verification.md";
+        let rows = grid(
+            &[
+                "(target/browser-",
+                "  proxy-20261027/",
+                " verification.md:7:2).",
+            ],
+            90,
+        );
+        for (col, row) in [(4, 0), (6, 1), (3, 2)] {
+            let (link, _) = file_link_at(&rows, col, row, |s| (s == path).then_some(())).unwrap();
+            assert!(matches!(link.hit, Hit::Path { line: Some(7), .. }));
+            assert_eq!(link.spans.len(), 3);
+        }
+        for rows in [
+            grid(&["target/browser-proxy-20261027/", "verification.md"], 90),
+            grid(&["(target/browser-proxy-20261027/", "verification.md"], 90),
+            grid(
+                &["(target/browser-proxy-20261027/", "", "verification.md)"],
+                90,
+            ),
+            grid(
+                &["(target/browser-proxy-20261027/", "     verification.md)"],
+                90,
+            ),
+            grid(
+                &[
+                    "(target/browser-proxy-20261027/",
+                    "this is prose",
+                    "verification.md)",
+                ],
+                90,
+            ),
+        ] {
+            for row in 0..rows.len() {
+                assert!(
+                    file_link_at(&rows, 4, row as u16, |s| (s == path).then_some(())).is_none()
+                );
+            }
+        }
+        let rows = grid(&["(target/browser-proxy-20261027/", "verification.md)"], 90);
+        assert!(file_link_at(&rows, 4, 0, |_| None::<()>).is_none());
+        let (_, resolved) = file_link_at(&rows, 4, 1, |s| {
+            [path, "verification.md"]
+                .contains(&s)
+                .then_some(s.to_string())
+        })
+        .unwrap();
+        assert_eq!(
+            resolved, "verification.md",
+            "a real standalone file still wins"
+        );
+        for opener in ["'", "["] {
+            let closer = if opener == "[" { "]" } else { "'" };
+            let rows = grid(
+                &[
+                    &format!("{opener}target/browser-proxy-20261027/"),
+                    &format!("verification.md{closer}"),
+                ],
+                90,
+            );
+            assert!(file_link_at(&rows, 4, 1, |s| (s == path).then_some(())).is_some());
+        }
+        let mut calls = 0;
+        let rows = grid(&["(https://example.com/", "verification.md)"], 90);
+        assert!(file_link_at(&rows, 4, 0, |_| {
+            calls += 1;
+            Some(())
+        })
+        .is_none());
+        assert_eq!(calls, 0, "speculative URLs never reach file resolution");
+        let mut overlong = vec!["(target/".to_string()];
+        overlong.extend((0..MAX_WRAP).map(|_| "browser/".to_string()));
+        overlong.push("verification.md)".into());
+        let path = format!("target/{}verification.md", "browser/".repeat(MAX_WRAP));
+        assert!(file_link_at(
+            &grid(&overlong.iter().map(String::as_str).collect::<Vec<_>>(), 90),
+            4,
+            0,
+            |s| (s == path).then_some(())
+        )
+        .is_none());
     }
 
     #[test]

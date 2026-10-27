@@ -512,6 +512,9 @@ impl App {
             let (changed, cwd, project, branch) = {
                 let status = self.status.get_mut(&id).ok_or_else(not_found)?;
                 let changed = status.state != state || status.agent != agent;
+                if status.agent != agent {
+                    status.agent_started_at = None;
+                }
                 status.agent = agent.to_string();
                 status.state = state;
                 // Reports can change admission without any new terminal bytes.

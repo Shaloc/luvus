@@ -1865,10 +1865,16 @@ mod tests {
         app.flush_config_for_test(&_rx);
         assert!(crate::config::load().agents_active_only);
 
-        app.agents_scroll = 5;
-        app.handle_agents_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        assert!(!app.agents_active_only);
-        assert_eq!(app.agents_scroll, 0);
+        for expected in [
+            super::super::AgentTab::Workspace,
+            super::super::AgentTab::Date,
+            super::super::AgentTab::All,
+        ] {
+            app.agents_scroll = 5;
+            app.handle_agents_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+            assert_eq!(app.agents_tab(), expected);
+            assert_eq!(app.agents_scroll, 0);
+        }
         app.flush_config_for_test(&_rx);
         assert!(!crate::config::load().agents_active_only);
     }

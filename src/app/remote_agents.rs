@@ -45,6 +45,7 @@ mod tests {
 
     fn agent(pane: u32, pinned: bool) -> RemoteAgentMeta {
         RemoteAgentMeta {
+            agent_started_at: None,
             title: None,
             pane: pane.to_string(),
             agent: "codex".into(),
@@ -75,6 +76,144 @@ mod tests {
         let mut buffer = ratatui::buffer::Buffer::empty(area);
         crate::ui::render_into(&mut crate::ui::RenderTarget::new(&mut buffer, area), app);
         buffer
+    }
+
+    #[test]
+    fn agent_start_date_tracks_runs_instead_of_activity_or_resume_metadata() {
+        let mut status = crate::app::PaneStatus::new("codex".into());
+        assert!(status.observe_agent_start(true, false));
+        status.agent_started_at = Some(100); // An earlier run, still active.
+        status.last_activity = std::time::Instant::now();
+        assert!(!status.observe_agent_start(true, false));
+        assert_eq!(status.agent_started_at, Some(100));
+        assert!(status.observe_agent_start(false, true));
+        assert_eq!(status.agent_started_at, None);
+        assert!(status.observe_agent_start(true, true));
+        assert!(status.agent_started_at.unwrap() > 100);
+    }
+
+    #[test]
+    fn agent_start_date_resets_when_report_or_session_changes_identity() {
+        let _env = crate::persist::test_env("agent-start-identity");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let status = app.status.get_mut(&pane).unwrap();
+        status.agent = "codex".into();
+        status.agent_started_at = Some(100);
+        app.dispatch("agent.report", &json!({"pane":pane.0.to_string(), "source":"test/start", "agent":"pi", "status":"idle"})).unwrap();
+        assert_eq!(app.status[&pane].agent_started_at, None);
+        app.detect_tick(std::time::Instant::now());
+        let started = app.status[&pane].agent_started_at.unwrap();
+        app.dispatch("agent.report", &json!({"pane":pane.0.to_string(), "source":"test/start", "agent":"pi", "status":"working"})).unwrap();
+        assert_eq!(app.status[&pane].agent_started_at, Some(started));
+        app.dispatch(
+            "pane.report_session",
+            &json!({"pane":pane.0.to_string(), "agent":"codex", "session_id":"new-run"}),
+        )
+        .unwrap();
+        assert_eq!(app.status[&pane].agent_started_at, None);
+    }
+
+    #[test]
+    fn agents_date_tabs_keep_owner_order_actions_and_preferences() {
+        use crate::app::{AgentDockTarget, AgentTab, SidebarListFocus};
+        let key_event = |code| crate::event::AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE));
+        let _env = crate::persist::test_env("agents-date-tabs");
+        let mut app = remote_ui_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.app_tx = tx;
+        let local = app.layout().focus;
+        let (view, input, _) = add_remote_workspace(&mut app);
+        let old = 1_700_000_000;
+        let new = old + 86400 * 10;
+        app.status
+            .insert(local, crate::app::PaneStatus::new("codex".into()));
+        app.status.get_mut(&local).unwrap().agent_started_at = Some(old);
+        let mut first = agent(7, false);
+        first.agent_started_at = Some(new);
+        let mut second = agent(8, true);
+        second.agent_started_at = Some(new);
+        remote_view(&mut app, view).agents = vec![first, second, agent(9, false)];
+        app.config.layout.agent_paths = false;
+        app.sidebars.left.width = 48;
+        app.set_agents_tab(AgentTab::Date);
+        app.flush_config_for_test(&rx);
+        assert!(crate::config::load().agents_group_by_date);
+        assert!(!crate::config::load().agents_group_by_workspace);
+        assert!(
+            input.try_recv().is_err(),
+            "tabs are display-only preferences"
+        );
+        let rows = app.agent_dock_targets();
+        assert!(matches!(rows[0], AgentDockTarget::Date(Some(_))));
+        assert_eq!(
+            rows[1],
+            AgentDockTarget::RemoteLive {
+                view,
+                pane: "8".into()
+            }
+        );
+        assert_eq!(
+            rows[2],
+            AgentDockTarget::RemoteLive {
+                view,
+                pane: "7".into()
+            }
+        );
+        assert!(matches!(rows[3], AgentDockTarget::Date(Some(_))));
+        assert_eq!(rows[4], AgentDockTarget::Live(local));
+        assert_eq!(rows[5], AgentDockTarget::Date(None));
+        assert_eq!(
+            rows[6],
+            AgentDockTarget::RemoteLive {
+                view,
+                pane: "9".into()
+            }
+        );
+        render(&mut app);
+        assert_eq!(
+            app.remote_agent_rects
+                .iter()
+                .map(|(_, pane, _)| pane.as_str())
+                .collect::<Vec<_>>(),
+            ["8", "7", "9"]
+        );
+        assert_eq!(
+            app.remote_agent_rects[1].2.y,
+            app.remote_agent_rects[0].2.y + 1
+        );
+        assert_eq!(
+            app.agent_rects[0].1.y,
+            app.remote_agent_rects[1].2.y + 2,
+            "date heading is one row"
+        );
+        app.focus_agents_dock();
+        app.handle_event(key_event(KeyCode::Home));
+        assert_eq!(app.agent_cursor, 1, "skip date heading");
+        app.handle_event(key_event(KeyCode::Down));
+        app.handle_event(key_event(KeyCode::Down));
+        assert_eq!(app.agent_cursor, 4);
+        app.handle_event(key_event(KeyCode::Up));
+        assert_eq!(app.agent_cursor, 2);
+        app.handle_event(key_event(KeyCode::Home));
+        app.handle_event(key_event(KeyCode::Enter));
+        assert_eq!(app.sidebar_focus, None);
+        assert!(
+            matches!(input.try_recv().unwrap(), ClientMessage::Command(c) if c == "remote_agent_focus 8")
+        );
+        app.sidebar_focus = Some(SidebarListFocus::Agents);
+        for tab in [
+            AgentTab::All,
+            AgentTab::Active,
+            AgentTab::Workspace,
+            AgentTab::Date,
+        ] {
+            app.handle_event(key_event(KeyCode::Char('f')));
+            assert_eq!(app.agents_tab(), tab);
+        }
+        app.flush_config_for_test(&rx);
+        assert!(crate::config::load().agents_group_by_date);
     }
 
     #[test]
@@ -1122,15 +1261,13 @@ mod tests {
         app.set_agents_filter(false);
         app.sidebar_focus = Some(SidebarListFocus::Agents);
         app.handle_agents_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        assert_eq!(app.agent_cursor, 1);
+        assert_eq!(app.agent_cursor, 0, "Active is flat");
+        app.handle_agents_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.agent_cursor, 1, "Workspace skips its expanded heading");
         app.handle_agents_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(app.layout().focus, local);
         assert!(app.sidebar_focus.is_none());
-        app.handle_agents_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        assert_eq!(
-            app.agent_cursor, 0,
-            "All starts at its first selectable row"
-        );
+        assert_eq!(app.agent_cursor, 1, "Workspace skips its expanded heading");
         app.set_agents_filter(true);
         for paths in [true, false] {
             app.config.layout.agent_paths = paths;

@@ -1143,7 +1143,28 @@ HTTP(S) and WebSocket TCP traffic use the SSH connection; there is no DIRECT
 fallback. QUIC and non-proxied WebRTC UDP are disabled in this window. This is
 not a general VPN for other applications. Ordinary browser windows are unaffected.
 
-Both Luvus ends need transport 19. The display must have Chrome/Chromium and an
+Dedicated browser sessions also honor the **owner server process's**
+`http_proxy`/`HTTP_PROXY`, `https_proxy`/`HTTPS_PROXY`, `all_proxy`/`ALL_PROXY` and
+`no_proxy`/`NO_PROXY`. A nonempty lowercase value takes precedence. HTTP and WS
+use HTTP_PROXY, HTTPS and WSS use HTTPS_PROXY, with ALL_PROXY as fallback.
+Supported upstream endpoints are `http://` (including HTTPS CONNECT) and
+`socks5://`/`socks5h://`, with optional username/password authentication.
+TLS-encrypted proxy endpoints (`https://proxy`) are currently rejected explicitly.
+Unsupported or invalid settings never silently fall back to a direct connection.
+NO_PROXY supports `*`, host/domain suffixes, optional ports, IP addresses and CIDRs.
+
+With owner proxy settings, a temporary forwarding adapter runs only on the
+**display's loopback**. On a remote workspace, connections to upstream proxies
+and NO_PROXY destinations still traverse the existing SSH dynamic forward.
+Therefore `localhost` in either a proxy address or a bypassed URL refers to the
+owner. Proxy credentials are not placed in Chrome arguments or the profile.
+No reverse forwarding or listener is created on the owner. Changing variables
+in a pane shell does not change the already-running server's environment.
+
+Owner proxy forwarding requires transport **20** on every Luvus hop. A version-19
+display can still open sessions from an owner with no proxy settings, but refuses
+to discard a nonempty owner policy. Both ends otherwise need at least transport
+19 for browser sessions. The display must have Chrome/Chromium and an
 SSH alias for the owner; `ProxyJump` may be configured on that alias. Aliases
 with configured `RemoteForward`, `LocalForward` or `DynamicForward` entries are
 rejected. The feature never changes SSH config, approves host keys, or starts or

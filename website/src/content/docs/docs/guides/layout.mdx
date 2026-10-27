@@ -265,11 +265,11 @@ and your project list on the other. If you hide the left sidebar entirely, the
 **Menu** button moves to the right sidebar so Settings is always reachable.
 
 :::tip
-The **Agents** dock has two independent filters. **All / Active** controls
-lifecycle: *Active* shows only running agents, while *All* also lists resumable
-sessions found on disk (click one to reopen it). Workspace scope filters both
+The **Agents** dock has four tabs. **All** includes resumable sessions found on
+disk (click one to reopen it); **Active** lists live agents, **Workspace** groups
+them by workspace, and **Date** groups them by their current run's start date. Workspace scope filters both
 live agents and resumable sessions to the active workspace. Both choices are
-remembered across restarts; use prefix `a` for All/Active and prefix `A` for All
+remembered across restarts; use prefix `a` to focus Agents and `f` to cycle tabs and prefix `A` for All
 workspaces/this workspace. You can also right-click any agent or resumable
 session row and choose **Show Workspace Only** or **Show All Workspaces**.
 
@@ -361,7 +361,11 @@ File references enclosed in parentheses, brackets, or quotes work too. Luvus
 checks the original filename first, then tries removing surrounding punctuation.
 Paths containing a directory separator can also continue at the pane's right
 edge with up to four leading spaces on the next row, provided the complete path
-names an existing file relative to that pane's working directory. Remote file
+names an existing file relative to that pane's working directory. Explicitly
+parenthesized, bracketed or single-quoted paths can also wrap before the right
+edge, as Markdown renderers do at a `/`. These candidates stay bounded to four
+continuations, require matching delimiters and an existing owner file, and do
+not join ordinary hard-wrapped prose or URLs. Remote file
 checks and opens run on the pane's owner. Only the path characters are underlined.
 
 ### Files

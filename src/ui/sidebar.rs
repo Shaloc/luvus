@@ -5,7 +5,7 @@
 //! single-purpose left sidebar.
 
 use super::*;
-use crate::app::SidebarListFocus;
+use crate::app::{AgentTab, SidebarListFocus};
 
 fn attention(s: State) -> u8 {
     match s {
@@ -69,6 +69,7 @@ type ScheduledDockRow = (
 );
 
 enum AgentDockRow {
+    Date(Option<jiff::civil::Date>),
     Local(PaneId, usize),
     Remote(usize, usize),
     Scheduled(usize),
@@ -726,42 +727,53 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
 
     let aheader = area.y;
     line_at(f, aheader, header(cat.agents, t));
-    // All/Active filter toggle, right-aligned in the header row. "All" shows the
-    // session history too; "Active" shows only live agents.
+    // Four display tabs. Narrow docks wrap controls below the title rather
+    // than clipping either labels or hit targets into the list.
     app.agents_filter_rects.clear();
     let active_only = app.agents_active_only;
-    if area.width >= 22 {
-        let segs = [
-            (format!(" {} ", cat.all), false),
-            (format!(" {} ", cat.active), true),
-        ];
-        let total: u16 = segs
-            .iter()
-            .map(|(l, _)| crate::ui::display_width(l) as u16)
-            .sum();
-        let mut x = area.right().saturating_sub(1 + total);
-        for (label, val) in &segs {
-            let (label, val) = (label.as_str(), *val);
-            let w = crate::ui::display_width(label) as u16;
-            let rect = Rect::new(x, aheader, w, 1);
-            let style = if active_only == val {
+    let tabs = [
+        (cat.all, AgentTab::All),
+        (cat.active, AgentTab::Active),
+        (cat.agents_workspace_tab, AgentTab::Workspace),
+        (cat.agents_date_tab, AgentTab::Date),
+    ];
+    let total: u16 = tabs
+        .iter()
+        .map(|(label, _)| display_width(label) as u16 + 2)
+        .sum();
+    let right = area.right().saturating_sub(1);
+    let inline = total + display_width(cat.agents) as u16 + 4 <= area.width;
+    let mut y = aheader;
+    let mut x = if inline {
+        right.saturating_sub(total)
+    } else {
+        cx + display_width(cat.agents) as u16 + 1
+    };
+    for (label, tab) in tabs {
+        let width = (display_width(label) as u16 + 2).min(cw);
+        if x + width > right && x > cx {
+            x = cx;
+            y += 1;
+        }
+        if width > 0 && y < area.bottom() {
+            let rect = Rect::new(x, y, width, 1);
+            let style = if app.agents_tab() == tab {
                 Style::new().fg(t.on_color(t.accent)).bg(t.accent).bold()
             } else {
                 Style::new().fg(t.overlay1).bg(t.surface1)
             };
+            let label = format!(" {} ", truncate(label, width.saturating_sub(2) as usize));
             f.render_widget(Paragraph::new(Span::styled(label, style)), rect);
             f.pill_caps(rect, style.bg.unwrap_or(t.base), t.base);
-            app.agents_filter_rects.push((val, rect));
-            x = x.saturating_add(w);
+            app.agents_filter_rects.push((tab, rect));
         }
+        x = x.saturating_add(width);
     }
-    // Workspace scope is controlled by prefix `A`, Settings → Keys, or an
-    // agent/session row's context menu. It consumes no extra dock row.
     let scoped = app.agents_scope_active();
-    let alist_top = aheader + DOCK_HEADER_ROWS;
+    let alist_top = (y + 1).min(area.bottom());
     let arows = area.bottom().saturating_sub(alist_top);
     let paths_visible = app.config.layout.agent_paths;
-    let grouped = active_only && app.config.agents_group_by_workspace;
+    let grouped = app.agents_tab() == AgentTab::Workspace;
     let title_first = app.config.layout.agent_title_first;
     let status_names = app.config.layout.agent_status_names;
     let row_stride = dock_row_stride(paths_visible);
@@ -931,7 +943,27 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
             .enumerate()
             .map(|(i, row)| (row.7, AgentDockRow::Scheduled(i))),
     );
-    let live = app.group_agent_dock_rows(owned, AgentDockRow::Workspace);
+    let live = if app.agents_tab() == AgentTab::Date {
+        let dated = owned
+            .into_iter()
+            .map(|(_, row)| {
+                let started = match &row {
+                    AgentDockRow::Local(id, _) => {
+                        app.status.get(id).and_then(|s| s.agent_started_at)
+                    }
+                    AgentDockRow::Remote(wi, i) => app
+                        .remote_workspace_view(*wi)
+                        .and_then(|remote| remote.agents.get(*i))
+                        .and_then(|a| a.agent_started_at),
+                    _ => None,
+                };
+                (started, row)
+            })
+            .collect();
+        app.group_agent_rows_by_date(dated, AgentDockRow::Date)
+    } else {
+        app.group_agent_dock_rows(owned, AgentDockRow::Workspace)
+    };
     let atotal = live.len() + resumable_total + remote_history.len();
     // The overflow line is always visible while attention is hidden, even if no
     // local rows exist. Reserve exactly one terminal row for it.
@@ -940,7 +972,8 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let keyboard_focused = app.sidebar_focus == Some(SidebarListFocus::Agents);
     let keyboard_total = atotal + usize::from(has_elsewhere);
     app.agent_cursor = app.agent_cursor.min(keyboard_total.saturating_sub(1));
-    while matches!(live.get(app.agent_cursor), Some(AgentDockRow::Workspace(ws, _)) if !app.agent_workspace_collapsed(*ws))
+    while (matches!(live.get(app.agent_cursor), Some(AgentDockRow::Date(_)))
+        || matches!(live.get(app.agent_cursor), Some(AgentDockRow::Workspace(ws, _)) if !app.agent_workspace_collapsed(*ws)))
         && app.agent_cursor + 1 < keyboard_total
     {
         app.agent_cursor = (app.agent_cursor + 1).min(keyboard_total.saturating_sub(1));
@@ -948,7 +981,10 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     app.agents_elsewhere_rect = None;
     let viewport_height = arows.saturating_sub(u16::from(has_elsewhere));
     let row_height = |k| {
-        if matches!(live.get(k), Some(AgentDockRow::Workspace(..))) {
+        if matches!(
+            live.get(k),
+            Some(AgentDockRow::Date(_) | AgentDockRow::Workspace(..))
+        ) {
             1
         } else {
             usize::from(row_stride)
@@ -1013,6 +1049,17 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     Rect::new(area.x, y, area.width.saturating_sub(1), height),
                     Style::new().bg(t.surface1),
                 );
+            }
+            if let Some(AgentDockRow::Date(date)) = live.get(k) {
+                let label = date
+                    .map(|date| date.to_string())
+                    .unwrap_or_else(|| cat.agents_date_unknown.to_string());
+                line_at(
+                    f,
+                    y,
+                    Line::from(Span::styled(label, Style::new().fg(t.subtext0).bold())),
+                );
+                continue;
             }
             if let Some(AgentDockRow::Workspace(wi, child)) = live.get(k) {
                 group_child = *child;
@@ -1632,7 +1679,7 @@ mod tests {
         assert_eq!(used, body.height);
     }
 
-    use crate::app::App;
+    use crate::app::{AgentTab, App};
     use crate::event::AppEvent;
     use crate::ui::theme::State;
     use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -1681,6 +1728,7 @@ mod tests {
                 .into_iter()
                 .enumerate()
                 .map(|(index, state)| RemoteAgentMeta {
+                    agent_started_at: None,
                     title: None,
                     pane: (index + 1).to_string(),
                     agent: "codex".into(),
@@ -2056,6 +2104,50 @@ mod tests {
     }
 
     #[test]
+    fn agents_four_tabs_fit_narrow_localized_docks_and_remain_clickable() {
+        let _env = crate::persist::test_env("agents-tabs-narrow");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut app = App::new(120, 40, tx).unwrap();
+        let pane = app.layout().focus;
+        app.status.get_mut(&pane).unwrap().agent = "codex".into();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        for language in ["en", "zh", "ja"] {
+            app.catalog = crate::i18n::by_code(language);
+            for width in [22, 32, 52] {
+                app.sidebars.left.width = width;
+                for selected in [
+                    AgentTab::All,
+                    AgentTab::Active,
+                    AgentTab::Workspace,
+                    AgentTab::Date,
+                ] {
+                    term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+                    let rects = app.agents_filter_rects.clone();
+                    assert_eq!(rects.len(), 4);
+                    for (i, (_, rect)) in rects.iter().enumerate() {
+                        assert!(rect.right() < app.sidebars.left.width);
+                        for (_, other) in &rects[i + 1..] {
+                            assert!(!rect.intersects(*other));
+                        }
+                        assert!(app.agent_rects[0].1.y > rect.y);
+                    }
+                    let rect = rects.iter().find(|(tab, _)| *tab == selected).unwrap().1;
+                    app.handle_event(AppEvent::Mouse(MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: rect.x + 1,
+                        row: rect.y,
+                        modifiers: KeyModifiers::NONE,
+                    }));
+                    assert_eq!(app.agents_tab(), selected);
+                }
+            }
+        }
+        app.flush_config_for_test(&rx);
+        let config = crate::config::load();
+        assert!(config.agents_active_only && config.agents_group_by_date);
+    }
+
+    #[test]
     fn agents_all_active_toggle_filters_history() {
         // Isolate config so a concurrent test's saved sidebar layout can't leak in
         // via the shared `LUVUS_HOME` env var (fresh temp → default docks).
@@ -2075,7 +2167,7 @@ mod tests {
         // snapshot restore, so history never appears to have been lost.
         assert!(!app.agents_active_only);
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.agents_filter_rects.len(), 2, "All/Active toggle drawn");
+        assert_eq!(app.agents_filter_rects.len(), 4, "All four tabs drawn");
         assert!(buffer_contains(&term, "Active"), "toggle label present");
         assert!(
             buffer_contains(&term, "resume"),
@@ -2087,7 +2179,7 @@ mod tests {
         let active = app
             .agents_filter_rects
             .iter()
-            .find(|(active, _)| *active)
+            .find(|(tab, _)| *tab == AgentTab::Active)
             .map(|(_, rect)| *rect)
             .expect("Active filter target");
         app.handle_event(AppEvent::Mouse(MouseEvent {
@@ -2120,7 +2212,7 @@ mod tests {
         let all = app
             .agents_filter_rects
             .iter()
-            .find(|(active, _)| !*active)
+            .find(|(tab, _)| *tab == AgentTab::All)
             .map(|(_, rect)| *rect)
             .expect("All filter target");
         app.handle_event(AppEvent::Mouse(MouseEvent {
@@ -2210,7 +2302,7 @@ mod tests {
         // All workspaces is the default. Workspace scope is not a third member
         // of the All/Active segmented control and consumes no extra row.
         term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        assert_eq!(app.agents_filter_rects.len(), 2);
+        assert_eq!(app.agents_filter_rects.len(), 4);
         assert!(!buffer_contains(&term, "Here"));
         for visible in ["claude", "codex", "kimi", "hermes"] {
             assert!(

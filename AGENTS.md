@@ -122,6 +122,8 @@ boundaries are:
   layout and must remain rejected. Passive displays must not change child colors.
   Transport 19 adds display-owned browser requests and launch feedback. Preserve
   requesting-client, owner-workspace, generation, and projection-epoch fences.
+  Transport 20 appends owner proxy environment to browser launches without changing
+  transport-19 encoding. Relays preserve it; they never recapture their own environment.
   Browser sessions use only display-loopback SSH dynamic forwarding; never
   introduce reverse forwarding or a proxy listener on the owner.
 - `src/ipc/api.rs` and `src/ipc/transport.rs`: bounded local API handling plus

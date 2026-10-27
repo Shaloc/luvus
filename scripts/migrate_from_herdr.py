@@ -177,7 +177,7 @@ def compatible_binary(binary, home):
         raise ValueError("Luvus not found; install this fork first, or pass --luvus-bin")
     resolved = str(Path(resolved).resolve())
     version = run([resolved, "--version", "--remote-session-protocol"], clean_env(home)).strip()
-    if not re.fullmatch(r"luvus \S+ remote-session=2 transport=(?:9|1[0-6]|18|19)", version):
+    if not re.fullmatch(r"luvus \S+ remote-session=2 transport=(?:9|1[0-6]|18|19|20)", version):
         raise ValueError("not a compatible fork binary: " + version)
     return resolved
 

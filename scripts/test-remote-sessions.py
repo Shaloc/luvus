@@ -19,6 +19,7 @@ Use --terminal-notify-only for agent-only terminal system alerts from local and 
 Use --program-status-only for OSC 7501 lifecycle, read acknowledgement and agent notifications across SSH.
 Use --transpose-only for owner-routed menu, shortcut and CLI split transposition (requires pyte).
 Use --browser-open-only for child link routing, browser panels and middle-click tabs (requires pyte).
+Use --browser-proxy-only for owner proxy environment, NO_PROXY and forwarding failures (requires pyte).
 Use --file-links-only for wrapped file references and owner-routed Ctrl-clicks (requires pyte).
 Use --appearance-only for pane mouse controls, None theme, notifications and host diagnostics (requires pyte).
 Use --workspace-close-only for owner-routed workspace close and restart persistence (requires pyte).
@@ -85,11 +86,14 @@ def browser_socks(root, port):
             elif header[3] == 1:
                 host = socket.inet_ntoa(connection.recv(4))
             else: return
-            connection.recv(2)
-            if (root / "browser-proxy-drop").exists() or host not in ("localhost", "127.0.0.1", "remote-only.invalid"):
+            destination_port = int.from_bytes(connection.recv(2), "big")
+            proxy_ports = json.loads((root / "browser-proxy-ports.json").read_text()) if (root / "browser-proxy-ports.json").exists() else {}
+            if (root / "browser-proxy-drop").exists() or host not in ("localhost", "127.0.0.1", "remote-only.invalid", *proxy_ports):
                 connection.sendall(b"\x05\x04\x00\x01" + bytes(6))
                 return
-            upstream = socket.create_connection(("127.0.0.1", remote_port), timeout=5)
+            upstream = socket.create_connection(("127.0.0.1", proxy_ports.get(host, remote_port)), timeout=5)
+            if host in proxy_ports:
+                assert destination_port == proxy_ports[host], (host, destination_port)
             connection.sendall(b"\x05\x00\x00\x01" + bytes(6))
             while True:
                 readable, _, _ = select.select([connection, upstream], [], [], 5)
@@ -117,7 +121,8 @@ def chrome_substitute():
     if chrome:
         helper = Path(__file__).resolve().parent.parent / "web/scripts/test-browser-session.mjs"
         try:
-            result = subprocess.run(["node", str(helper), chrome, *args], capture_output=True, text=True, timeout=45)
+            result = subprocess.run(["node", str(helper), chrome, *args], capture_output=True, text=True, timeout=45,
+                env=dict(os.environ, LUVUS_TEST_BROWSER_OWNER=(root / "browser-mode").read_text()))
             output = result.stdout + "\n" + result.stderr
         except Exception:
             import traceback
@@ -322,7 +327,8 @@ def main():
     terminal_notify_only = "--terminal-notify-only" in sys.argv[1:]
     program_status_only = "--program-status-only" in sys.argv[1:]
     transpose_only = "--transpose-only" in sys.argv[1:]
-    browser_open_only = "--browser-open-only" in sys.argv[1:]
+    browser_proxy_only = "--browser-proxy-only" in sys.argv[1:]
+    browser_open_only = "--browser-open-only" in sys.argv[1:] or browser_proxy_only
     file_links_only = "--file-links-only" in sys.argv[1:]
     workspace_close_only = "--workspace-close-only" in sys.argv[1:]
     if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or browser_open_only or transpose_only:
@@ -336,7 +342,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--browser-open-only", "--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--browser-proxy-only", "--browser-open-only", "--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -383,6 +389,8 @@ def main():
                LUVUS_SMOKE_REMOTE_BINARY=str(remote_binary), DISPLAY=":smoke")
     env.pop("WAYLAND_DISPLAY", None)
     if browser_open_only:
+        for key in ("http_proxy", "https_proxy", "all_proxy", "no_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY"):
+            env.pop(key, None)
         env.pop("BROWSER", None)
         (root / "bin/chrome-smoke").symlink_to(Path(__file__).resolve())
         env["LUVUS_BROWSER"] = str(root / "bin/chrome-smoke")
@@ -408,6 +416,80 @@ def main():
             threading.Thread(target=server.serve_forever, daemon=True).start()
             servers.append(server)
         (root / "browser-http.json").write_text(json.dumps([server.server_port for server in servers]))
+
+        if browser_proxy_only:
+            tls_port = None
+            if os.environ.get("LUVUS_TEST_CHROME"):
+                import ssl
+                subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                                "-subj", "/CN=https-proxy-only.invalid", "-keyout", str(root / "tls.key"),
+                                "-out", str(root / "tls.crt")], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                tls_server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+                tls_server.marker = "HTTPS_BROWSER_MARKER"
+                context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                context.load_cert_chain(root / "tls.crt", root / "tls.key")
+                tls_server.socket = context.wrap_socket(tls_server.socket, server_side=True)
+                tls_port = tls_server.server_port
+                (root / "browser-https.json").write_text(json.dumps(tls_port))
+                threading.Thread(target=tls_server.serve_forever, daemon=True).start()
+                servers.append(tls_server)
+            proxy_ports = {}
+            for name in ("local-http", "local-https", "remote-http", "remote-https"):
+                class ProxyHandler(http.server.BaseHTTPRequestHandler):
+                    protocol_version = "HTTP/1.1"
+                    def record(self):
+                        with (root / "owner-proxy-requests.jsonl").open("a") as log:
+                            log.write(json.dumps({"proxy":self.server.marker, "method":self.command, "target":self.path,
+                                "authorization":self.headers.get("Proxy-Authorization")}) + "\n")
+                    def do_GET(self):
+                        self.record()
+                        body = self.server.marker.encode()
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                    def do_CONNECT(self):
+                        self.record()
+                        if tls_port and self.path == f"https-proxy-only.invalid:{tls_port}":
+                            import select
+                            with socket.create_connection(("127.0.0.1", tls_port), timeout=10) as upstream:
+                                self.send_response(200)
+                                self.end_headers()
+                                self.wfile.flush()
+                                while True:
+                                    ready, _, _ = select.select([self.connection, upstream], [], [], 10)
+                                    if not ready: break
+                                    for source in ready:
+                                        data = source.recv(65536)
+                                        if not data:
+                                            self.close_connection = True
+                                            return
+                                        (upstream if source is self.connection else self.connection).sendall(data)
+                        elif self.path == "proxy-only.invalid:8443":
+                            self.send_response(200)
+                            self.end_headers()
+                            self.wfile.flush()
+                            data = self.rfile.read(4)
+                            self.wfile.write(self.server.marker.encode() + b":" + data)
+                            self.wfile.flush()
+                        else:
+                            self.send_response(502)
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                        self.close_connection = True
+                    def log_message(self, *args): pass
+                server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+                server.daemon_threads = True
+                server.marker = name
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                servers.append(server)
+                proxy_ports[name + "-proxy.invalid"] = server.server_port
+            (root / "browser-proxy-ports.json").write_text(json.dumps(proxy_ports))
+            env["http_proxy"] = f"http://fixture:secret@127.0.0.1:{proxy_ports['local-http-proxy.invalid']}"
+            env["HTTP_PROXY"] = "http://127.0.0.1:1"  # lowercase wins
+            env["HTTPS_PROXY"] = f"http://127.0.0.1:{proxy_ports['local-https-proxy.invalid']}"
+            env["NO_PROXY"] = "localhost,127.0.0.1,remote-only.invalid"
+            env["LUVUS_TEST_BROWSER_PROXY"] = "1"
 
         for name in ("xdg-open", "open", "gio", "wslview"):
             (root / "bin" / name).symlink_to(Path(__file__).resolve())
@@ -447,6 +529,9 @@ def main():
     if os.environ.get("LUVUS_TEST_SSH_POOL_CONFIG"):
         env["LUVUS_TEST_SSH_POOL_CONFIG"] = os.environ["LUVUS_TEST_SSH_POOL_CONFIG"]
     remote_env = dict(env, HOME=str(root / "remote-home"), LUVUS_HOME=str(root / "remote-state"))
+    if browser_proxy_only:
+        remote_env["http_proxy"] = f"http://fixture:secret@remote-http-proxy.invalid:{proxy_ports['remote-http-proxy.invalid']}"
+        remote_env["HTTPS_PROXY"] = f"http://remote-https-proxy.invalid:{proxy_ports['remote-https-proxy.invalid']}"
     for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
         remote_env[key] = remote_env[key].replace("local-home", "remote-home")
 
@@ -1139,6 +1224,7 @@ def main():
             # A real mouse-reporting PTY program invokes BROWSER on an unmodified
             # link release, matching Codex/webbrowser's owner-side execution path.
             for mode in ("local", "direct-remote", "merge"):
+                (root / "browser-mode").write_text(mode)
                 remote = mode != "local"
                 run("session", "merge", "on" if mode == "merge" else "off")
                 session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
@@ -1226,8 +1312,46 @@ def main():
                     raise
                 assert launched["home"] == str(root / "local-home"), launched
                 args = launched["args"]
-                assert any(a.startswith("--proxy-server=socks5://127.0.0.1:") for a in args) == remote, args
-                if remote: assert "--proxy-bypass-list=<-loopback>" in args
+                assert any(a.startswith("--proxy-server=socks5://127.0.0.1:") for a in args) == (remote and not browser_proxy_only), args
+                if remote or browser_proxy_only: assert "--proxy-bypass-list=<-loopback>" in args
+                if browser_proxy_only:
+                    import http.client
+                    from urllib.parse import urlsplit
+                    proxy_url = next(a.split("=", 1)[1] for a in args if a.startswith("--proxy-server="))
+                    assert proxy_url.startswith("http://127.0.0.1:"), args
+                    assert "secret" not in json.dumps(args)
+                    adapter_port = urlsplit(proxy_url).port
+                    expected_proxy = "remote" if remote else "local"
+                    connection = http.client.HTTPConnection("127.0.0.1", adapter_port, timeout=5)
+                    connection.request("GET", "http://proxy-only.invalid/resource")
+                    response = connection.getresponse()
+                    assert response.status == 200 and response.read() == (expected_proxy + "-http").encode()
+                    connection.close()
+                    connection = http.client.HTTPConnection("127.0.0.1", adapter_port, timeout=5)
+                    connection.set_tunnel("proxy-only.invalid", 8443)
+                    connection.connect()
+                    connection.sock.sendall(b"PING")
+                    assert connection.sock.recv(100) == (expected_proxy + "-https:PING").encode()
+                    connection.close()
+                    requests = [json.loads(line) for line in (root / "owner-proxy-requests.jsonl").read_text().splitlines()]
+                    assert any(r["proxy"] == expected_proxy + "-http" and r["authorization"] == "Basic Zml4dHVyZTpzZWNyZXQ=" for r in requests)
+                    bypass = http.client.HTTPConnection("127.0.0.1", adapter_port, timeout=5)
+                    bypass.request("GET", panel_url)
+                    response = bypass.getresponse()
+                    assert response.status == 200 and (("REMOTE" if remote else "LOCAL") + "_BROWSER_MARKER").encode() in response.read()
+                    bypass.close()
+                    if remote:
+                        blocked = root / "browser-proxy-drop"
+                        blocked.touch()
+                        try:
+                            failed = http.client.HTTPConnection("127.0.0.1", adapter_port, timeout=5)
+                            failed.request("GET", "http://proxy-only.invalid/no-fallback")
+                            response = failed.getresponse()
+                            assert response.status == 502
+                            response.read()
+                            failed.close()
+                        finally: blocked.unlink()
+                    print(f"PASS: {mode} owner HTTP_PROXY/HTTPS_PROXY, auth, NO_PROXY owner localhost and failure without fallback", flush=True)
                 if os.environ.get("LUVUS_TEST_CHROME"):
                     dom = root / f"browser-dom-{launched['pid']}"
                     wait_for(lambda: dom.exists(), timeout=50)
@@ -1281,7 +1405,7 @@ def main():
                     menu_launch = wait_for(new_launch)
                     launches.append(menu_launch)
                     assert menu_launch["home"] == str(root / "local-home")
-                    assert any(a.startswith("--proxy-server=") for a in menu_launch["args"]) == remote
+                    assert any(a.startswith("--proxy-server=") for a in menu_launch["args"]) == (remote or browser_proxy_only)
                     if os.environ.get("LUVUS_TEST_CHROME"):
                         dom = root / f"browser-dom-{menu_launch['pid']}"
                         wait_for(lambda: dom.exists(), timeout=50)
@@ -1338,16 +1462,18 @@ def main():
                 merged = mode == "merge"
                 run("session", "merge", "on" if merged else "off")
                 session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
-                for wrapped in (False, True):
-                    label = mode + ("-continued" if wrapped else "-parenthesized")
+                for wrapping in ("parenthesized", "continued", "early"):
+                    label = mode + "-" + wrapping
                     ready_marker = "READY_LINK_FIXTURE_" + label
                     project = root / ("file-links-" + label)
-                    head = "docs/adr/0032-" if wrapped else "plan/"
-                    tail = ("arkmaster-owns-taskservice-master-placement.md" if wrapped
-                            else "task-service-master-arkmaster-plan.md")
+                    head, tail = {
+                        "parenthesized": ("plan/", "task-service-master-arkmaster-plan.md"),
+                        "continued": ("docs/adr/0032-", "arkmaster-owns-taskservice-master-placement.md"),
+                        "early": ("target/browser-proxy-20261027/", "verification.md"),
+                    }[wrapping]
                     path = project / (head + tail)
                     path.parent.mkdir(parents=True)
-                    marker = f"FILE_OPEN_{mode}_{int(wrapped)}"
+                    marker = f"FILE_OPEN_{label}"
                     path.write_text(marker + "\n")
                     api("workspace.open", {"path": str(project)}, remote=remote)
                     pane = api("pane.current", remote=remote)["pane"]
@@ -1362,7 +1488,8 @@ def main():
                     drain(master)
                     # Render the same paragraph shapes into a real owner PTY.
                     code = ("import os,sys; w=os.get_terminal_size().columns; "
-                            + (f"text=' '*(w-{len(head)}-1)+'({head}\\r\\n  {tail})'; " if wrapped
+                            + (f"text=' '*(w-{len(head)}-1)+'({head}\\r\\n  {tail})'; " if wrapping == "continued"
+                               else f"text='报告 ({head}\\r\\n{tail})'; " if wrapping == "early"
                                else f"text='({head}{tail})'; ")
                             + f"sys.stdout.write('\\x1b[H\\x1b[2J\\x1b[48;2;214;255;214m'+text+'\\x1b[0m\\r\\nREADY_'+'LINK_FIXTURE_{label}'); sys.stdout.flush(); input()")
                     run("--session", "api", "pane", "run", str(pane),
@@ -2723,15 +2850,15 @@ def main():
                 process, master = start_client(["--session", "api"] if merged else
                                                ["session", "attach", session])
                 presentation_api("config.patch", {"patch": {
-                    "agents_active_only": True, "agents_group_by_workspace": True,
+                    "agents_active_only": True, "agents_group_by_workspace": True, "sidebar_width": 48,
                     "layout": {"agent_title_first": False, "agent_title": True,
                                "agent_paths": True, "agent_status_names": False}}}, session=session)
                 def sidebar():
                     drain(master, .12)
                     lines = client_terminals[master][0].display
                     (root / f"agent-title-{mode}.txt").write_text("\n".join(lines))
-                    # The fixture uses the default 32-column sidebar.
-                    return [line[:31] for line in lines]
+                    # Keep titles and owner badges visible while switching grouping modes.
+                    return [line[:47] for line in lines]
                 def row_for(label):
                     for y, line in enumerate(client_terminals[master][0].display):
                         if label in line[:50]:
@@ -2753,6 +2880,32 @@ def main():
                 lines = sidebar()
                 agent_row = next(i for i, line in enumerate(lines) if "Q Remote title" in line)
                 assert "▾" in lines[agent_row - 1], ("group heading must directly precede its agent", lines)
+                # Grouping tabs are display preferences; timestamps come from
+                # the owner snapshot and survive projection reconnects.
+                def remote_started():
+                    snapshot = api("session.snapshot", remote=True)
+                    return next((p.get("agent_started_at") for w in snapshot["workspaces"]
+                                 for t in w["tabs"] for p in t["panes"]
+                                 if p["pane_id"] == str(pane)), None)
+                started = wait_for(remote_started)
+                from datetime import datetime
+                date_label = datetime.fromtimestamp(started).strftime("%Y-%m-%d")
+                for tab in ("Date", "All", "Active", "Workspace"):
+                    click(master, *row_for(tab))
+                    def selected_tab():
+                        config = presentation_api("config.get", session=session)["config"]
+                        return (config["agents_active_only"] == (tab != "All")
+                                and config["agents_group_by_workspace"] == (tab == "Workspace")
+                                and config["agents_group_by_date"] == (tab == "Date"))
+                    wait_for(selected_tab)
+                    wait_for(lambda: any("Q" in line and "Remote title" in line for line in sidebar()))
+                    if tab == "Date":
+                        wait_for(lambda: any(date_label in line for line in sidebar()))
+                        assert remote_started() == started
+                        assert not api("config.get", remote=True)["config"]["agents_group_by_date"]
+                    elif tab == "Workspace":
+                        wait_for(lambda: any("▾" in line for line in sidebar()))
+                print(f"PASS: {mode}: four agent tabs, owner start date and display-local grouping", flush=True)
                 # Detail visibility remains independent of the new mode.
                 presentation_api("config.patch", {"patch": {"layout": {"agent_paths": False}}}, session=session)
                 wait_for(lambda: any("Q Remote title" in line for line in sidebar()))

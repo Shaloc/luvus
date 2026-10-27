@@ -33,7 +33,7 @@ agent does not hide another agent that is still working.
 Click a row to jump to that agent's pane from anywhere, across workspaces. For
 keyboard navigation, press `Ctrl+Space a` to focus AGENTS, move with arrows or
 `j` / `k`, and press `Enter` to open the selected live or resumable agent. Press
-`a` for the selected row's right-click actions, `f` to switch All / Active, `s`
+`a` for the selected row's right-click actions, `f` to cycle All / Active / Workspace / Date, `s`
 to switch all workspaces / this workspace, and `Esc` or `q` to return input to
 the pane. Choose **Hide Path** in any agent row's menu for a compact one-row
 list, then **Show Path** to restore the workspace and session detail rows. The
@@ -54,11 +54,21 @@ of those dots and whitespace do not count as screen spinners; spinners with
 activity text and interrupt hints still indicate work. Remote agent rows also
 refresh when an agent appears or exits without changing its activity state.
 
-The **All / Active** toggle in the header switches between the full resumable
-history and live agents only. A new configuration starts with **All**, then
-luvus remembers whichever view you select across restarts.
+The header has four tabs: **All** includes resumable history, **Active** lists
+live agents, **Workspace** groups live agents using the existing workspace tree,
+and **Date** groups them by the start date of their current run, newest first.
+A new configuration starts with **All**; the selected tab persists across restarts.
+Narrow docks wrap the tabs below the heading. Workspace scope and status filters
+also apply to Workspace and Date.
 
-In **Active**, right-click an agent row, the header tabs, or the empty list to
+The owner records the start time when it first detects an agent run. Activity,
+SSH reconnection and display attachment do not reset it. Resuming an agent into
+a new process starts a new run. Dates use the displaying server's local timezone.
+Older owners without this metadata and unstarted scheduled rows appear under
+**Unknown start date**; history modification times are never used as start times.
+Pins remain first within each date, and keyboard navigation skips date headings.
+
+In **Active**, **Workspace** or **Date**, right-click an agent row, the header tabs, or the empty list to
 choose **Group by Workspace** and status checkboxes (**Working**, **Waiting for
 Input**, **Idle**, **Done**). Multiple checked states are combined with OR.
 **All Statuses** restores the complete list; unchecking every state shows an

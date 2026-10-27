@@ -261,7 +261,7 @@ use those owner selectors for follow-up commands, not the qualified local row ID
 `terminal_id` identify the owner workspace and terminal lifetime for automation
 sent with `--host` and `--session`.
 
-The local Settings window and Agents All/Active, workspace-scope and Next
+The local Settings window and Agents All/Active/Workspace/Date, workspace-scope and Next
 Attention controls remain local across merged owners. Remote workspace menus
 have explicit owner **Settings** and **Module actions** entries. Tabs, panes,
 FILES/DIFF, Git, TaskBoard, Mission Control and owner module docks/bars operate

@@ -134,9 +134,19 @@ pub enum SidebarListFocus {
     Agents,
 }
 
+/// Local display selection; workspace scope and status filters remain independent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AgentTab {
+    All,
+    Active,
+    Workspace,
+    Date,
+}
+
 /// One row in the AGENTS dock's keyboard projection, in rendered order.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum AgentDockTarget {
+    Date(Option<jiff::civil::Date>),
     Workspace(usize),
     Live(PaneId),
     Automation(String),
@@ -1946,6 +1956,8 @@ pub struct AgentReport {
 
 /// Per-pane detection state (the runtime side of agent awareness).
 pub struct PaneStatus {
+    /// Unix seconds when this owner first observed the current agent run.
+    pub agent_started_at: Option<u64>,
     pub state: State,
     pub agent: String,
     pub last_activity: Instant,
@@ -2056,8 +2068,22 @@ impl PaneStatus {
         presentation_changed
     }
 
+    fn observe_agent_start(&mut self, visible: bool, identity_changed: bool) -> bool {
+        let previous = self.agent_started_at;
+        if !visible {
+            self.agent_started_at = None;
+        } else if identity_changed || previous.is_none() {
+            self.agent_started_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_secs());
+        }
+        previous != self.agent_started_at
+    }
+
     fn new(agent: String) -> Self {
         PaneStatus {
+            agent_started_at: None,
             state: State::Idle,
             agent,
             last_activity: Instant::now(),
@@ -3090,7 +3116,7 @@ pub struct App {
     pub pending_open_url: Option<String>,
     /// A child program's browser request belongs to its pane's display.
     pub(crate) pending_program_url: Option<(PaneId, String)>,
-    pub(crate) pending_browser: Option<(PaneId, Option<u64>, crate::browser::Request)>,
+    pub(crate) pending_browser: Option<(PaneId, Option<u64>, crate::browser::LaunchRequest)>,
     /// The cell `hover_link` was resolved for, so holding `Ctrl` while resting on a
     /// cell does not rescan. Cleared when `Ctrl` is released, so pointing at a
     /// link *first* and pressing `Ctrl` after still lights it up.
@@ -3407,8 +3433,10 @@ pub struct App {
     pub(crate) workspace_machine_rects: Vec<(Option<String>, Rect)>,
     /// Clickable view-selector tabs in the active git tab (Commits/Flow/…).
     pub git_section_rects: Vec<(crate::git::Section, Rect)>,
-    /// The All/Active filter toggle in the AGENTS header (`bool` = active_only).
-    pub agents_filter_rects: Vec<(bool, Rect)>,
+    /// The four view tabs in the AGENTS header.
+    pub agents_filter_rects: Vec<(AgentTab, Rect)>,
+    /// Resolve once during App startup, never read timezone files while rendering.
+    agent_date_timezone: jiff::tz::TimeZone,
     /// The "blocked in other workspaces" overflow line, paired with the first
     /// hidden blocked pane so clicking jumps to an agent the view actually hid.
     pub agents_elsewhere_rect: Option<(PaneId, Rect)>,
@@ -3955,6 +3983,7 @@ impl App {
             workspace_machine_rects: Vec::new(),
             git_section_rects: Vec::new(),
             agents_filter_rects: Vec::new(),
+            agent_date_timezone: jiff::tz::TimeZone::system(),
             agents_elsewhere_rect: None,
             agent_rects: Vec::new(),
             automation_rects: Vec::new(),
@@ -4744,6 +4773,7 @@ impl App {
             workspace_machine_rects: Vec::new(),
             git_section_rects: Vec::new(),
             agents_filter_rects: Vec::new(),
+            agent_date_timezone: jiff::tz::TimeZone::system(),
             agents_elsewhere_rect: None,
             agent_rects: Vec::new(),
             automation_rects: Vec::new(),
@@ -4932,6 +4962,7 @@ impl App {
 
     /// Persist a direct All / Active selection. This is an infrequent user
     /// interaction, never a render-, detection-, or refresh-path write.
+    #[cfg(test)]
     pub(crate) fn set_agents_filter(&mut self, active_only: bool) -> bool {
         let runtime_changed = self.apply_agents_filter(active_only);
         let config_changed = self.config.agents_active_only != active_only;
@@ -4940,6 +4971,58 @@ impl App {
             self.persist_config();
         }
         runtime_changed || config_changed
+    }
+
+    pub(crate) fn agents_tab(&self) -> AgentTab {
+        if !self.agents_active_only {
+            AgentTab::All
+        } else if self.config.agents_group_by_date {
+            AgentTab::Date
+        } else if self.config.agents_group_by_workspace {
+            AgentTab::Workspace
+        } else {
+            AgentTab::Active
+        }
+    }
+
+    pub(crate) fn set_agents_tab(&mut self, tab: AgentTab) {
+        if self.agents_tab() == tab {
+            return;
+        }
+        self.apply_agents_filter(tab != AgentTab::All);
+        self.config.agents_active_only = self.agents_active_only;
+        self.config.agents_group_by_workspace = tab == AgentTab::Workspace;
+        self.config.agents_group_by_date = tab == AgentTab::Date;
+        self.agents_scroll = 0;
+        self.agent_cursor = 0;
+        self.persist_config();
+    }
+
+    /// Shared grouping for rendered rows and keyboard targets. Dates use the
+    /// displaying server's timezone; missing owner metadata sorts last.
+    pub(crate) fn group_agent_rows_by_date<T>(
+        &self,
+        rows: Vec<(Option<u64>, T)>,
+        header: impl Fn(Option<jiff::civil::Date>) -> T,
+    ) -> Vec<T> {
+        let zone = &self.agent_date_timezone;
+        let mut buckets = std::collections::BTreeMap::<_, Vec<T>>::new();
+        for (started, row) in rows {
+            let date = started
+                .and_then(|seconds| i64::try_from(seconds).ok())
+                .and_then(|seconds| jiff::Timestamp::from_second(seconds).ok())
+                .map(|time| time.to_zoned(zone.clone()).date());
+            buckets
+                .entry(std::cmp::Reverse(date))
+                .or_default()
+                .push(row);
+        }
+        let mut result = Vec::new();
+        for (std::cmp::Reverse(date), mut rows) in buckets {
+            result.push(header(date));
+            result.append(&mut rows);
+        }
+        result
     }
 
     /// Whether the AGENTS dock is scoped to the active workspace. Rendering may
@@ -4977,7 +5060,7 @@ impl App {
         rows: Vec<(usize, T)>,
         header: impl Fn(usize, bool) -> T,
     ) -> Vec<T> {
-        if !self.agents_active_only || !self.config.agents_group_by_workspace {
+        if self.agents_tab() != AgentTab::Workspace {
             return rows.into_iter().map(|(_, row)| row).collect();
         }
         let mut grouped = Vec::with_capacity(rows.len() + self.workspaces.len());
@@ -5245,7 +5328,7 @@ impl App {
         scheduled.sort_by_key(|item| item.0);
         rows.extend(scheduled.into_iter().map(|(_, target)| target));
 
-        if self.agents_active_only && self.config.agents_group_by_workspace {
+        if self.agents_tab() == AgentTab::Workspace {
             let scheduled = self.scheduled_agent_rows();
             let owned = rows
                 .into_iter()
@@ -5269,6 +5352,30 @@ impl App {
                 })
                 .collect();
             rows = self.group_agent_dock_rows(owned, |ws, _| AgentDockTarget::Workspace(ws));
+        }
+
+        if self.agents_tab() == AgentTab::Date {
+            let dated = rows
+                .into_iter()
+                .map(|row| {
+                    let started = match &row {
+                        AgentDockTarget::Live(pane) => {
+                            self.status.get(pane).and_then(|s| s.agent_started_at)
+                        }
+                        AgentDockTarget::RemoteLive { view, pane } => match self.views.get(view) {
+                            Some(ViewKind::Remote(remote)) => remote
+                                .agents
+                                .iter()
+                                .find(|a| &a.pane == pane)
+                                .and_then(|a| a.agent_started_at),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    (started, row)
+                })
+                .collect();
+            rows = self.group_agent_rows_by_date(dated, AgentDockTarget::Date);
         }
 
         if !self.agents_active_only {
@@ -5415,7 +5522,7 @@ impl App {
         true
     }
 
-    /// Keyboard navigation for AGENTS. `f` changes All/Active and `s` changes
+    /// Keyboard navigation for AGENTS. `f` cycles the four tabs and `s` changes
     /// workspace scope; row activation matches the existing mouse behavior.
     pub fn handle_agents_key(&mut self, key: KeyEvent) -> bool {
         // Filters, scope, and the row menu act once per press.
@@ -5432,7 +5539,8 @@ impl App {
         let row_height = |row: &AgentDockTarget| {
             if matches!(
                 row,
-                AgentDockTarget::Workspace(_)
+                AgentDockTarget::Date(_)
+                    | AgentDockTarget::Workspace(_)
                     | AgentDockTarget::Elsewhere(_)
                     | AgentDockTarget::RemoteElsewhere { .. }
             ) || !self.config.layout.agent_paths
@@ -5469,7 +5577,12 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.agent_cursor = 0,
             KeyCode::End | KeyCode::Char('G') => self.agent_cursor = rows.len().saturating_sub(1),
             KeyCode::Char('f') => {
-                self.set_agents_filter(!self.agents_active_only);
+                self.set_agents_tab(match self.agents_tab() {
+                    AgentTab::All => AgentTab::Active,
+                    AgentTab::Active => AgentTab::Workspace,
+                    AgentTab::Workspace => AgentTab::Date,
+                    AgentTab::Date => AgentTab::All,
+                });
                 self.agent_cursor = 0;
                 rows = self.agent_dock_targets();
             }
@@ -5543,27 +5656,25 @@ impl App {
 
     fn normalize_agent_cursor(&mut self, rows: &[AgentDockTarget], backwards: bool) {
         self.agent_cursor = self.agent_cursor.min(rows.len().saturating_sub(1));
-        if matches!(
-            rows.get(self.agent_cursor),
-            Some(AgentDockTarget::Workspace(ws)) if !self.agent_workspace_collapsed(*ws)
-        ) {
+        let heading = |row: &AgentDockTarget| match row {
+            AgentDockTarget::Date(_) => true,
+            AgentDockTarget::Workspace(ws) => !self.agent_workspace_collapsed(*ws),
+            _ => false,
+        };
+        if rows.get(self.agent_cursor).is_some_and(heading) {
             self.agent_cursor = if backwards {
-                (0..self.agent_cursor)
-                    .rev()
-                    .find(|i| !matches!(rows[*i], AgentDockTarget::Workspace(ws) if !self.agent_workspace_collapsed(ws)))
+                (0..self.agent_cursor).rev().find(|&i| !heading(&rows[i]))
             } else {
                 None
             }
-            .or_else(|| {
-                (self.agent_cursor..rows.len())
-                    .find(|i| !matches!(rows[*i], AgentDockTarget::Workspace(ws) if !self.agent_workspace_collapsed(ws)))
-            })
+            .or_else(|| (self.agent_cursor..rows.len()).find(|&i| !heading(&rows[i])))
             .unwrap_or(0);
         }
     }
 
     fn activate_agent_dock_target(&mut self, target: AgentDockTarget) {
         match target {
+            AgentDockTarget::Date(_) => {}
             AgentDockTarget::Workspace(workspace) => self.toggle_agent_workspace(workspace),
             AgentDockTarget::Live(pane) | AgentDockTarget::Elsewhere(pane) => {
                 self.focus_pane_global(pane)
@@ -5591,6 +5702,7 @@ impl App {
 
     fn open_agent_dock_action(&mut self, target: AgentDockTarget) {
         match target {
+            AgentDockTarget::Date(_) => {}
             AgentDockTarget::Workspace(workspace) => {
                 self.open_agent_menu(
                     AgentTarget::Workspace(self.workspaces[workspace].id.clone()),
@@ -8932,7 +9044,8 @@ impl App {
             }
             match item {
                 AgentMenuItem::ToggleWorkspaceGrouping => {
-                    self.config.agents_group_by_workspace = !self.config.agents_group_by_workspace
+                    self.config.agents_group_by_workspace = !self.config.agents_group_by_workspace;
+                    self.config.agents_group_by_date = false;
                 }
                 AgentMenuItem::ToggleStatus(state) => {
                     self.config.agents_status_filter.toggle(state)
@@ -9577,6 +9690,7 @@ impl App {
             // already running, publish that identity while its own session hook
             // catches up; otherwise this is now a plain shell pane.
             st.agent_session = None;
+            st.agent_started_at = None;
             st.program_status_agent = None;
             st.agent_absent_scans = 0;
             st.agent = self.manifests.agent_in_processes(cmds).unwrap_or(base);
@@ -19123,7 +19237,7 @@ fi
         app.agents_area = junk;
         app.files_area = junk;
         app.file_tree_rects = vec![(0, junk)];
-        app.agents_filter_rects = vec![(true, junk)];
+        app.agents_filter_rects = vec![(AgentTab::Active, junk)];
         app.agents_elsewhere_rect = Some((app.layout().focus, junk));
         app.module_dock_rects = vec![("example.buzz".into(), 0, junk)]; // a user module dock
 

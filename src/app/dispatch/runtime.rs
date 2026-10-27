@@ -958,6 +958,7 @@ impl App {
                     || s.program_status
                         .as_ref()
                         .is_some_and(|store| !store.is_empty());
+                visible_identity_changed |= s.observe_agent_start(is_visible_agent, agent_changed);
                 s.agent = detected;
                 if agent_changed && !s.agent.eq_ignore_ascii_case("claude") {
                     s.claude_prompt_semantic_ready = false;

@@ -105,12 +105,12 @@ impl App {
         self.pending_browser = Some((
             pane,
             client,
-            crate::browser::Request {
+            crate::browser::LaunchRequest::owner(crate::browser::Request {
                 proxied: true,
                 url: url.clone(),
                 hosts: Vec::new(),
                 origin,
-            },
+            }),
         ));
     }
 }
@@ -118,6 +118,24 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_launch_captures_owner_proxy_environment() {
+        let _env = persist::test_env("browser-owner-proxy");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let pane = app.insert_browser_view(0, None, "about:blank".into());
+        let previous = std::env::var_os("http_proxy");
+        std::env::set_var("http_proxy", "http://owner-proxy.invalid:8123");
+        app.activate_browser_panel(pane);
+        match previous {
+            Some(value) => std::env::set_var("http_proxy", value),
+            None => std::env::remove_var("http_proxy"),
+        }
+        let (_, _, launch) = app.pending_browser.take().unwrap();
+        let encoded = serde_json::to_value(launch).unwrap();
+        assert_eq!(encoded["proxy"]["http"], "http://owner-proxy.invalid:8123");
+    }
 
     #[test]
     fn browser_menu_creates_blank_tab_without_pty_and_restores_it() {
@@ -306,8 +324,8 @@ mod tests {
         let (target, client, request) = app.pending_browser.take().unwrap();
         assert_eq!(target, id);
         assert_eq!(client, Some(3));
-        assert_eq!(request.origin, Some(17));
-        assert!(request.hosts.is_empty());
+        assert_eq!(request.request.origin, Some(17));
+        assert!(request.request.hosts.is_empty());
         let snapshot = persist::snapshot(&app);
         drop(app);
         let (tx, _rx) = std::sync::mpsc::channel();

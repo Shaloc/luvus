@@ -19,7 +19,7 @@ pub fn local_cell_pixels() -> (u16, u16) {
 
 // 17 belongs to the incompatible released v0.14.1 wire layout.
 // Keep rejecting it; fork notification delivery starts at 18.
-pub const PROTOCOL_VERSION: u32 = 19;
+pub const PROTOCOL_VERSION: u32 = 20;
 pub const PROJECTION_PROTOCOL_VERSION: u32 = 10;
 pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 
@@ -37,6 +37,7 @@ pub fn supports_version(version: u32) -> bool {
             | 15
             | 16
             | 18
+            | 19
             | PROTOCOL_VERSION
     )
 }
@@ -251,6 +252,8 @@ pub enum ServerMessage {
     },
     /// Transport 19: an explicit display-owned browser session.
     Browser(crate::browser::Request),
+    /// Transport 20: owner proxy environment, never recaptured by a relay.
+    BrowserWithProxy(crate::browser::LaunchRequest),
 }
 
 /// Only a peer that negotiated transport 15 receives the appended variant.
@@ -457,6 +460,8 @@ pub enum WorkspaceEffect {
         text: String,
     },
     Browser(crate::browser::Request),
+    /// Transport 20: owner proxy environment, never recaptured by a relay.
+    BrowserWithProxy(crate::browser::LaunchRequest),
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -480,8 +485,8 @@ pub const PROJECTION_CAPABILITY: &str = "projection.v1";
 pub const SESSION_DISPLAY_CAPABILITY: &str = "session_display.v1";
 
 pub fn remote_display_capabilities() -> serde_json::Value {
-    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, 14, 15, 16, 18, PROTOCOL_VERSION],
-        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1", "hyperlinks.v1", "scoped_frames.v1", "scoped_clipboard.v1", "notifications.v1", "terminal_colors.v1", "browser_session.v1"]})
+    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, 14, 15, 16, 18, 19, PROTOCOL_VERSION],
+        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1", "hyperlinks.v1", "scoped_frames.v1", "scoped_clipboard.v1", "notifications.v1", "terminal_colors.v1", "browser_session.v1", "browser_proxy_environment.v1"]})
 }
 
 #[derive(Clone, PartialEq)]
@@ -914,6 +919,68 @@ mod tests {
             uri: "https://example.com/owner".into(),
         });
         frame
+    }
+
+    #[test]
+    fn browser_proxy_extension_preserves_transport_19_wire_and_origin() {
+        let request = crate::browser::Request {
+            url: "http://localhost:3000".into(),
+            proxied: true,
+            hosts: vec!["owner".into()],
+            origin: Some(42),
+        };
+        let config = bincode::config::standard();
+        // Transport 19 used these discriminants followed by four request fields.
+        let frozen = (
+            &request.url,
+            request.proxied,
+            &request.hosts,
+            request.origin,
+        );
+        assert_eq!(
+            bincode::serde::encode_to_vec(ServerMessage::Browser(request.clone()), config).unwrap(),
+            bincode::serde::encode_to_vec((25_u32, frozen), config).unwrap()
+        );
+        assert_eq!(
+            bincode::serde::encode_to_vec(WorkspaceEffect::Browser(request.clone()), config)
+                .unwrap(),
+            bincode::serde::encode_to_vec((7_u32, frozen), config).unwrap()
+        );
+        let launch = crate::browser::LaunchRequest {
+            request,
+            proxy: Some(crate::browser::proxy::Environment {
+                http: Some("http://owner:8123".into()),
+                no_proxy: Some("localhost".into()),
+                ..Default::default()
+            }),
+        };
+        let bytes =
+            bincode::serde::encode_to_vec(ServerMessage::BrowserWithProxy(launch.clone()), config)
+                .unwrap();
+        let (message, used): (ServerMessage, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        assert_eq!(used, bytes.len());
+        let ServerMessage::BrowserWithProxy(decoded) = message else {
+            panic!("wrong variant")
+        };
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(&launch).unwrap()
+        );
+        let bytes = bincode::serde::encode_to_vec(
+            WorkspaceEffect::BrowserWithProxy(launch.clone()),
+            config,
+        )
+        .unwrap();
+        let (message, _): (WorkspaceEffect, _) =
+            bincode::serde::decode_from_slice(&bytes, config).unwrap();
+        let WorkspaceEffect::BrowserWithProxy(decoded) = message else {
+            panic!("wrong variant")
+        };
+        assert_eq!(
+            serde_json::to_value(decoded).unwrap(),
+            serde_json::to_value(launch).unwrap()
+        );
     }
 
     #[test]
@@ -1598,7 +1665,8 @@ mod tests {
         assert!(!supports_version(17));
         assert!(supports_version(18));
         assert!(supports_version(19));
-        assert!(!supports_version(20));
+        assert!(supports_version(20));
+        assert!(!supports_version(21));
     }
 
     #[test]

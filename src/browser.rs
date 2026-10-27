@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
+pub mod proxy;
+
 const MAX_SSH_CONFIG_BYTES: usize = 64 * 1024;
 pub const BLANK_URL: &str = "about:blank";
 
@@ -19,6 +21,32 @@ pub struct Request {
     /// Added only by an accepted remote projection, never by browser.open/panel.
     pub hosts: Vec<String>,
     pub origin: Option<u64>,
+}
+
+/// Transport 20 extends the frozen transport-19 request without changing its
+/// encoding. Only the owning server captures the environment; relays preserve it.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct LaunchRequest {
+    pub request: Request,
+    pub proxy: Option<proxy::Environment>,
+}
+
+impl LaunchRequest {
+    pub fn owner(request: Request) -> Self {
+        Self {
+            request,
+            proxy: Some(proxy::Environment::capture()),
+        }
+    }
+}
+
+impl From<Request> for LaunchRequest {
+    fn from(request: Request) -> Self {
+        Self {
+            request,
+            proxy: None,
+        }
+    }
 }
 
 pub fn valid_url(url: &str) -> bool {
@@ -65,7 +93,7 @@ impl Sessions {
     /// All discovery, SSH and process work happens on a user-triggered worker.
     pub fn open(
         &mut self,
-        request: Request,
+        request: LaunchRequest,
         report: impl FnOnce(Result<(), String>) + Send + 'static,
     ) {
         self.0.retain(|s| !s.finished.load(Ordering::Acquire));
@@ -101,10 +129,12 @@ impl Sessions {
 struct Resources {
     children: Vec<(crate::platform::ChildTreeGuard, mpsc::Receiver<()>)>,
     profile: PathBuf,
+    forwarder: Option<proxy::Forwarder>,
 }
 
 impl Drop for Resources {
     fn drop(&mut self) {
+        drop(self.forwarder.take());
         for (child, _) in &mut self.children {
             child.refresh_descendants();
             child.terminate();
@@ -151,16 +181,21 @@ fn watch_child(
 }
 
 fn launch(
-    request: &Request,
+    launch: &LaunchRequest,
     done: &mpsc::Sender<()>,
     cancelled: &mpsc::Receiver<()>,
 ) -> Result<Resources, String> {
+    let request = &launch.request;
     request.validate()?;
+    if let Some(env) = &launch.proxy {
+        env.validate()?;
+    }
     let browser = find_chrome()?;
     let profile = new_profile()?;
     let mut resources = Resources {
         children: Vec::new(),
         profile,
+        forwarder: None,
     };
     let proxy = if let Some(host) = request.hosts.first() {
         // Check the same effective options before opening the connection. A
@@ -220,8 +255,21 @@ fn launch(
     if cancelled.try_recv().is_ok() {
         return Err("Browser request cancelled".into());
     }
+    if let Some(env) = launch.proxy.as_ref().filter(|env| !env.is_empty()) {
+        resources.forwarder = Some(proxy::Forwarder::start(env, proxy)?);
+    }
+    let chrome_proxy = resources
+        .forwarder
+        .as_ref()
+        .map(|f| ("http", f.port))
+        .or_else(|| proxy.map(|port| ("socks5", port)));
     let mut chrome = Command::new(browser);
-    chrome.args(chrome_args(&resources.profile, proxy, &request.url));
+    chrome.args(chrome_args(
+        &resources.profile,
+        chrome_proxy,
+        launch.proxy.is_some(),
+        &request.url,
+    ));
     watch_child(chrome, &mut resources, done)?;
     Ok(resources)
 }
@@ -274,21 +322,28 @@ fn validate_ssh_config(config: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn chrome_args(profile: &Path, proxy: Option<u16>, url: &str) -> Vec<String> {
+fn chrome_args(
+    profile: &Path,
+    proxy: Option<(&str, u16)>,
+    owner_environment: bool,
+    url: &str,
+) -> Vec<String> {
     let mut args = vec![
         format!("--user-data-dir={}", profile.display()),
         "--no-first-run".into(),
         "--no-default-browser-check".into(),
         "--new-window".into(),
     ];
-    if let Some(port) = proxy {
+    if let Some((scheme, port)) = proxy {
         args.extend([
-            format!("--proxy-server=socks5://127.0.0.1:{port}"),
+            format!("--proxy-server={scheme}://127.0.0.1:{port}"),
             "--proxy-bypass-list=<-loopback>".into(),
             "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1".into(),
             "--disable-quic".into(),
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".into(),
         ]);
+    } else if owner_environment {
+        args.push("--no-proxy-server".into());
     }
     args.push(url.into());
     args
@@ -400,6 +455,7 @@ mod tests {
         let mut resources = Resources {
             children: Vec::new(),
             profile: profile.clone(),
+            forwarder: None,
         };
         let (done, exited) = mpsc::channel();
         let mut command = Command::new("/bin/sh");
@@ -466,7 +522,8 @@ mod tests {
     fn browser_chrome_localhost_uses_proxy_without_direct_fallback() {
         let args = chrome_args(
             Path::new("/profile with spaces"),
-            Some(1081),
+            Some(("socks5", 1081)),
+            false,
             "http://localhost:3000/a?q=hello world",
         );
         assert!(args.contains(&"--proxy-bypass-list=<-loopback>".into()));

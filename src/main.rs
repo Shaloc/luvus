@@ -1841,8 +1841,8 @@ fn run(terminal: &mut DefaultTerminal) -> Result<bool> {
             }
         }
         if let Some((_, _, request)) = app.pending_browser.take() {
-            if !request.proxied {
-                platform::open_url(&request.url);
+            if !request.request.proxied {
+                platform::open_url(&request.request.url);
             } else {
                 let notify = tx.clone();
                 browser_sessions.open(request, move |result| {

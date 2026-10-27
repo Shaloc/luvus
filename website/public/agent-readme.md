@@ -338,7 +338,7 @@ reject local remote projections with `remote_workspace`. The interactive remote
 workspace Close action forwards to the owner, closes its panes, and preserves
 the closure across restart.
 
-Local Settings and the Agents All/Active, workspace-scope and Next Attention
+Local Settings and the Agents All/Active/Workspace/Date, workspace-scope and Next Attention
 controls remain local in managed remote and merge mode. A remote workspace's
 context menu offers explicit owner Settings and Module actions. Its tabs,
 panes, FILES/DIFF, Git, TaskBoard, Mission Control and owner module docks/bars

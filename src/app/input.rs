@@ -3750,7 +3750,7 @@ impl App {
         // The AGENTS All/Active filter toggle.
         if let Some((val, _)) = self.agents_filter_rects.iter().find(|(_, rect)| hit(*rect)) {
             let val = *val;
-            self.set_agents_filter(val);
+            self.set_agents_tab(val);
             return;
         }
         // The "blocked in other workspaces" line jumps to a pane this scope hid,
@@ -11490,79 +11490,99 @@ mod link_click_tests {
     }
 
     #[test]
-    fn file_reference_indented_continuation_click_opens_owner_file() {
+    fn file_reference_continuation_click_opens_owner_file() {
         let _env = crate::persist::test_env("link-file-continuation");
-        let cwd = crate::persist::config_dir().join("project");
-        let head = "docs/adr/0032-";
-        let tail = "arkmaster-owns-taskservice-master-placement.md";
-        let path = cwd.join(format!("{head}{tail}"));
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, "# Owner document\n").unwrap();
-        let (mut app, mut term, at) = fixture_showing("", 0);
-        let pane = app.layout().focus;
-        app.panes.get_mut(&pane).unwrap().cwd = cwd;
-        let content = app
-            .pane_content_rects
-            .iter()
-            .find(|(id, _)| *id == pane)
-            .unwrap()
-            .1;
-        let prefix = " ".repeat(content.width as usize - head.len() - 1);
-        app.panes[&pane]
-            .engine
-            .lock()
-            .unwrap()
-            .advance(format!("\x1b[H\x1b[2J{prefix}({head}\r\n  {tail})").as_bytes());
-        let first = (at.0 + prefix.len() as u16 + 2, at.1);
-        let continuation = (at.0 + 4, at.1 + 1);
-        for cell in [first, continuation] {
-            let hover = app
-                .link_at_screen(cell.0, cell.1)
-                .expect("full file reference");
-            assert_eq!(
-                hover.target,
-                LinkTarget::File {
-                    path: path.clone(),
-                    line: None
-                }
-            );
-            assert_eq!(
-                hover.link.spans,
-                vec![
-                    (0, prefix.len() as u16 + 1, content.width),
-                    (1, 2, 2 + tail.len() as u16)
-                ]
+        for (head, tail, early) in [
+            (
+                "docs/adr/0032-",
+                "arkmaster-owns-taskservice-master-placement.md",
+                false,
+            ),
+            ("target/browser-proxy-20261027/", "verification.md", true),
+        ] {
+            let cwd = crate::persist::config_dir().join("project");
+            let path = cwd.join(format!("{head}{tail}"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "# Owner document\n").unwrap();
+            let (mut app, mut term, at) = fixture_showing("", 0);
+            let pane = app.layout().focus;
+            app.panes.get_mut(&pane).unwrap().cwd = cwd;
+            let content = app
+                .pane_content_rects
+                .iter()
+                .find(|(id, _)| *id == pane)
+                .unwrap()
+                .1;
+            let prefix = if early {
+                "报告 ".to_string()
+            } else {
+                " ".repeat(content.width as usize - head.len() - 1)
+            };
+            let prefix_width = crate::ui::display_width(&prefix) as u16;
+            app.panes[&pane]
+                .engine
+                .lock()
+                .unwrap()
+                .advance(format!("\x1b[H\x1b[2J{prefix}({head}\r\n  {tail})").as_bytes());
+            let first = (at.0 + prefix_width + 2, at.1);
+            let continuation = (at.0 + 4, at.1 + 1);
+            for cell in [first, continuation] {
+                let hover = app
+                    .link_at_screen(cell.0, cell.1)
+                    .expect("full file reference");
+                assert_eq!(
+                    hover.target,
+                    LinkTarget::File {
+                        path: path.clone(),
+                        line: None
+                    }
+                );
+                assert_eq!(
+                    hover.link.spans,
+                    vec![
+                        (0, prefix_width + 1, prefix_width + 1 + head.len() as u16),
+                        (1, 2, 2 + tail.len() as u16)
+                    ]
+                );
+            }
+            app.handle_event(mouse(
+                MouseEventKind::Moved,
+                continuation,
+                KeyModifiers::CONTROL,
+            ));
+            term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+            let buffer = term.backend().buffer();
+            assert!(buffer[first]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED));
+            assert!(buffer[continuation]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED));
+            assert!(!buffer[(at.0, at.1 + 1)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED));
+            if early {
+                assert!(
+                    !buffer[(at.0 + content.width - 1, at.1)]
+                        .modifier
+                        .contains(ratatui::style::Modifier::UNDERLINED),
+                    "padding must not underline"
+                );
+            }
+            app.handle_event(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                continuation,
+                KeyModifiers::CONTROL,
+            ));
+            app.handle_event(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                continuation,
+                KeyModifiers::CONTROL,
+            ));
+            assert!(
+                matches!(app.views.get(&app.layout().focus), Some(crate::app::ViewKind::File(view)) if view.path == path)
             );
         }
-        app.handle_event(mouse(
-            MouseEventKind::Moved,
-            continuation,
-            KeyModifiers::CONTROL,
-        ));
-        term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
-        let buffer = term.backend().buffer();
-        assert!(buffer[first]
-            .modifier
-            .contains(ratatui::style::Modifier::UNDERLINED));
-        assert!(buffer[continuation]
-            .modifier
-            .contains(ratatui::style::Modifier::UNDERLINED));
-        assert!(!buffer[(at.0, at.1 + 1)]
-            .modifier
-            .contains(ratatui::style::Modifier::UNDERLINED));
-        app.handle_event(mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            continuation,
-            KeyModifiers::CONTROL,
-        ));
-        app.handle_event(mouse(
-            MouseEventKind::Up(MouseButton::Left),
-            continuation,
-            KeyModifiers::CONTROL,
-        ));
-        assert!(
-            matches!(app.views.get(&app.layout().focus), Some(crate::app::ViewKind::File(view)) if view.path == path)
-        );
     }
 
     /// A bare domain is as clickable as a written-out URL, and gets `https://`.
