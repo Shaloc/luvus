@@ -1151,9 +1151,13 @@ def main():
                     presentation_api("workspace.focus", {"workspace_id":projection["workspace_id"]}, session=session)
                 url = f"https://example.invalid/{mode}?one=%20&two=$literal"
                 fixture = root / "browser-click.py"
-                fixture.write_text("import os,sys,tty,subprocess\n"
-                    "tty.setraw(0)\n"
-                    "sys.stdout.write('\\x1b[?1000h\\x1b[?1006h\\x1b[2J\\x1b[HBROWSER_CLICK_READY');sys.stdout.flush()\n"
+                ready_marker = "BROWSER_CLICK_READY_" + mode
+                # Keep the previous helper's terminal output visible during startup.
+                # A reused readiness label would click before this helper is ready.
+                fixture.write_text("import os,sys,tty,subprocess,time\n"
+                    + ("time.sleep(5)\n" if mode == "merge" else "")
+                    + "tty.setraw(0)\n"
+                    f"sys.stdout.write('\\x1b[?1000h\\x1b[?1006h\\x1b[2J\\x1b[H{ready_marker}');sys.stdout.flush()\n"
                     "buf=b''\n"
                     "while True:\n"
                     " buf+=os.read(0,1)\n"
@@ -1166,15 +1170,21 @@ def main():
                 def screen():
                     drain(master, .1)
                     return "\n".join(client_terminals[master][0].display)
-                wait_for(lambda: "BROWSER_CLICK_READY" in screen())
-                y, line = next((y,line) for y,line in enumerate(client_terminals[master][0].display) if "BROWSER_CLICK_READY" in line)
-                click(master, line.index("BROWSER_CLICK_READY") + 2, y + 1)
+                wait_for(lambda: ready_marker in screen())
+                y, line = next((y,line) for y,line in enumerate(client_terminals[master][0].display) if ready_marker in line)
+                (root / f"browser-before-click-{mode}.txt").write_text("\n".join(client_terminals[master][0].display))
+                click(master, line.index(ready_marker) + 2, y + 1)
                 def receipt():
                     drain(master, .1)
                     path = root / "browser-opens.jsonl"
                     rows = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
                     return next((row for row in rows if row["url"] == url), None)
-                opened = wait_for(receipt)
+                try:
+                    opened = wait_for(receipt)
+                except AssertionError:
+                    print("Browser link failure screen:", screen(), file=sys.stderr)
+                    print("Browser link failure owner:", json.dumps(api("pane.read", {"pane":pane}, remote=remote)), file=sys.stderr)
+                    raise
                 assert opened["home"] == str(root / "local-home"), opened
                 assert opened["url"] == url, opened
                 print(f"PASS: {mode} plain mouse click invokes pane BROWSER and opens the exact URL only on the display host", flush=True)
