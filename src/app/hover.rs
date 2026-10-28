@@ -1,6 +1,6 @@
 //! Delayed, read-only labels over existing hit geometry. The existing runtime
 //! deadline wakes once after hover-enter; shown labels need no idle timer.
-use super::{App, State};
+use super::{AgentDockTarget, App, State};
 use ratatui::layout::Rect;
 use std::time::{Duration, Instant};
 
@@ -60,7 +60,19 @@ impl App {
                 return Some((rect, label.to_owned()));
             }
         }
-        for &(index, rect) in self.ws_rects.iter().chain(self.agent_group_rects.iter()) {
+        for (index, rect) in
+            self.ws_rects
+                .iter()
+                .copied()
+                .chain(
+                    self.agent_group_rects
+                        .iter()
+                        .filter_map(|(target, rect)| match target {
+                            AgentDockTarget::Workspace(index) => Some((*index, *rect)),
+                            _ => None,
+                        }),
+                )
+        {
             if hit(rect) {
                 let ws = self.workspaces.get(index)?;
                 let source = ws

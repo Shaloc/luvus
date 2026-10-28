@@ -120,6 +120,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_menu_uses_clicked_url_and_keeps_owner_workspace() {
+        let _env = persist::test_env("browser-menu-link");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 30, tx).unwrap();
+        let pane = app.layout().focus;
+        let url = "https://example.test/review?x=1&y=2#patch";
+        app.open_pane_menu(pane, 20, 5);
+        app.pane_menu.as_mut().unwrap().link = Some(LinkTarget::Url(url.into()));
+        let other = persist::config_dir().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        app.dispatch("workspace.open", &json!({"path":other}))
+            .unwrap();
+        let focus = app.layout().focus;
+        let ptys = app.panes.len();
+        app.pane_menu_action(PaneMenuItem::NewBrowserTab);
+        assert!(
+            app.browser_prompt.is_none(),
+            "a clicked URL needs no address prompt"
+        );
+        assert_eq!(app.workspaces[0].tabs.len(), 2);
+        assert_eq!(app.layout().focus, focus);
+        assert_eq!(app.panes.len(), ptys);
+        let browser = app.workspaces[0].tabs[1].layout.focus;
+        assert!(matches!(app.views.get(&browser), Some(ViewKind::Browser(value)) if value == url));
+        app.activate_browser_panel(browser);
+        let (_, _, launch) = app.pending_browser.take().unwrap();
+        assert_eq!(launch.request.url, url);
+    }
+
+    #[test]
     fn browser_launch_captures_owner_proxy_environment() {
         let _env = persist::test_env("browser-owner-proxy");
         let (tx, _rx) = std::sync::mpsc::channel();

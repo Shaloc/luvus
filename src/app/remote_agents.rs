@@ -79,6 +79,167 @@ mod tests {
     }
 
     #[test]
+    fn agent_start_date_detection_requests_native_session_save() {
+        let _env = crate::persist::test_env("agent-start-dirty");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.dispatch(
+            "pane.report_session",
+            &json!({"pane":pane.0.to_string(), "agent":"codex", "session_id":"start-dirty"}),
+        )
+        .unwrap();
+        app.session_dirty = false;
+        app.detect_tick(std::time::Instant::now());
+        assert!(app.status[&pane].agent_started_at.is_some());
+        assert!(
+            app.session_dirty,
+            "first observation saves even when identity is already bound"
+        );
+    }
+
+    #[test]
+    fn agent_start_date_survives_snapshot_and_repeated_restore() {
+        let _env = crate::persist::test_env("agent-start-restore");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.dispatch(
+            "pane.report_session",
+            &json!({"pane":pane.0.to_string(), "agent":"codex", "session_id":"persisted-date"}),
+        )
+        .unwrap();
+        app.status.get_mut(&pane).unwrap().agent_started_at = Some(1_700_000_000);
+        for _ in 0..2 {
+            let snapshot = crate::persist::snapshot(&app);
+            drop(app);
+            let (tx, _rx) = std::sync::mpsc::channel();
+            app = App::from_snapshot(snapshot, tx).unwrap();
+            let pane = app.layout().focus;
+            let status = app.status.get_mut(&pane).unwrap();
+            assert_eq!(status.agent_started_at, Some(1_700_000_000));
+            assert!(!status.observe_agent_start(true, false));
+            assert_eq!(status.agent_started_at, Some(1_700_000_000));
+        }
+    }
+
+    #[test]
+    fn agent_start_date_legacy_restore_stays_unknown_until_new_session() {
+        let _env = crate::persist::test_env("agent-start-legacy");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        app.dispatch(
+            "pane.report_session",
+            &json!({"pane":pane.0.to_string(), "agent":"codex", "session_id":"legacy-session"}),
+        )
+        .unwrap();
+        let snapshot = crate::persist::snapshot(&app);
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            !encoded.contains("agent_started_at"),
+            "legacy wire shape has no start date"
+        );
+        drop(app);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::from_snapshot(serde_json::from_str(&encoded).unwrap(), tx).unwrap();
+        let pane = app.layout().focus;
+        app.dispatch(
+            "pane.report_session",
+            &json!({"pane":pane.0.to_string(), "agent":"codex", "session_id":"legacy-session"}),
+        )
+        .unwrap();
+        let status = app.status.get_mut(&pane).unwrap();
+        assert!(!status.observe_agent_start(true, false));
+        assert_eq!(status.agent_started_at, None);
+        app.dispatch(
+            "pane.report_session",
+            &json!({"pane":pane.0.to_string(), "agent":"codex", "session_id":"new-session"}),
+        )
+        .unwrap();
+        let status = app.status.get_mut(&pane).unwrap();
+        assert!(status.observe_agent_start(true, false));
+        let started = status.agent_started_at;
+        app.dispatch(
+            "pane.report_session",
+            &json!({"pane":pane.0.to_string(), "agent":"codex", "session_id":"new-session"}),
+        )
+        .unwrap();
+        assert_eq!(
+            app.status[&pane].agent_started_at, started,
+            "repeat report keeps the session date"
+        );
+    }
+
+    #[test]
+    fn agent_start_date_is_not_attached_to_unresumable_or_duplicate_panes() {
+        let _env = crate::persist::test_env("agent-start-unbound");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let first = app.layout().focus;
+        app.status.get_mut(&first).unwrap().agent_started_at = Some(100);
+        let snapshot = crate::persist::snapshot(&app);
+        assert!(snapshot.workspaces[0].tabs[0]
+            .panes
+            .iter()
+            .all(|(_, pane)| pane.agent_started_at.is_none()));
+        app.split(crate::layout::Axis::Col);
+        let second = app.layout().focus;
+        for pane in [first, second] {
+            let status = app.status.get_mut(&pane).unwrap();
+            status.agent = "codex".into();
+            status.agent_started_at = Some(100);
+            status.agent_session = Some(crate::app::AgentSession {
+                agent: "codex".into(),
+                session_id: "one-owner".into(),
+            });
+        }
+        let snapshot = crate::persist::snapshot(&app);
+        let panes = &snapshot.workspaces[0].tabs[0].panes;
+        assert_eq!(
+            panes
+                .iter()
+                .filter(|(_, pane)| pane.agent_started_at == Some(100))
+                .count(),
+            1
+        );
+        assert!(panes
+            .iter()
+            .all(|(_, pane)| pane.agent_session.is_some() == pane.agent_started_at.is_some()));
+    }
+
+    #[test]
+    fn agents_date_heading_collapses_and_retains_count() {
+        use crate::app::{AgentDockTarget, AgentTab};
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let _env = crate::persist::test_env("agents-date-fold");
+        let mut app = remote_ui_app();
+        let (view, input, _) = add_remote_workspace(&mut app);
+        remote_view(&mut app, view).agents = vec![agent(7, false), agent(8, false)];
+        app.set_agents_tab(AgentTab::Date);
+        let expanded = render(&mut app);
+        assert!(expanded.contains("(2)"));
+        assert_eq!(app.agent_group_rects.len(), 1);
+        let rect = app.agent_group_rects[0].1;
+        let click = crate::event::AppEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_event(click);
+        let folded = render(&mut app);
+        assert!(folded.contains("(2)"));
+        assert!(app.remote_agent_rects.is_empty());
+        assert_eq!(app.agent_dock_targets(), vec![AgentDockTarget::Date(None)]);
+        app.focus_agents_dock();
+        app.handle_agents_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        render(&mut app);
+        assert_eq!(app.remote_agent_rects.len(), 2);
+        assert!(input.try_recv().is_err(), "folding is display-only");
+    }
+
+    #[test]
     fn agent_start_date_tracks_runs_instead_of_activity_or_resume_metadata() {
         let mut status = crate::app::PaneStatus::new("codex".into());
         assert!(status.observe_agent_start(true, false));
@@ -1061,9 +1222,12 @@ mod tests {
             assert_eq!(
                 app.agent_group_rects
                     .iter()
-                    .map(|r| r.0)
+                    .map(|r| r.0.clone())
                     .collect::<Vec<_>>(),
-                vec![2, 1]
+                vec![
+                    crate::app::AgentDockTarget::Workspace(2),
+                    crate::app::AgentDockTarget::Workspace(1)
+                ]
             );
             let line = |rect: Rect| {
                 (rect.x..rect.right())

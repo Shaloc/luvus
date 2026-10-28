@@ -5,7 +5,7 @@
 //! single-purpose left sidebar.
 
 use super::*;
-use crate::app::{AgentTab, SidebarListFocus};
+use crate::app::{AgentDockTarget, AgentTab, SidebarListFocus};
 
 fn attention(s: State) -> u8 {
     match s {
@@ -69,7 +69,7 @@ type ScheduledDockRow = (
 );
 
 enum AgentDockRow {
-    Date(Option<jiff::civil::Date>),
+    Date(Option<jiff::civil::Date>, usize),
     Local(PaneId, usize),
     Remote(usize, usize),
     Scheduled(usize),
@@ -972,7 +972,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let keyboard_focused = app.sidebar_focus == Some(SidebarListFocus::Agents);
     let keyboard_total = atotal + usize::from(has_elsewhere);
     app.agent_cursor = app.agent_cursor.min(keyboard_total.saturating_sub(1));
-    while (matches!(live.get(app.agent_cursor), Some(AgentDockRow::Date(_)))
+    while (matches!(live.get(app.agent_cursor), Some(AgentDockRow::Date(date, _)) if !app.collapsed_agent_dates.contains(date))
         || matches!(live.get(app.agent_cursor), Some(AgentDockRow::Workspace(ws, _)) if !app.agent_workspace_collapsed(*ws)))
         && app.agent_cursor + 1 < keyboard_total
     {
@@ -983,7 +983,7 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
     let row_height = |k| {
         if matches!(
             live.get(k),
-            Some(AgentDockRow::Date(_) | AgentDockRow::Workspace(..))
+            Some(AgentDockRow::Date(..) | AgentDockRow::Workspace(..))
         ) {
             1
         } else {
@@ -1050,15 +1050,36 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                     Style::new().bg(t.surface1),
                 );
             }
-            if let Some(AgentDockRow::Date(date)) = live.get(k) {
+            if let Some(AgentDockRow::Date(date, count)) = live.get(k) {
                 let label = date
                     .map(|date| date.to_string())
                     .unwrap_or_else(|| cat.agents_date_unknown.to_string());
+                let count = format!(" ({count})");
+                let label = truncate(
+                    &label,
+                    (cw as usize).saturating_sub(2 + display_width(&count)),
+                );
                 line_at(
                     f,
                     y,
-                    Line::from(Span::styled(label, Style::new().fg(t.subtext0).bold())),
+                    Line::from(Span::styled(
+                        format!(
+                            "{} {label}{count}",
+                            if app.collapsed_agent_dates.contains(date) {
+                                "▸"
+                            } else {
+                                "▾"
+                            }
+                        ),
+                        Style::new()
+                            .fg(if selected { t.accent } else { t.subtext0 })
+                            .bold(),
+                    )),
                 );
+                app.agent_group_rects.push((
+                    AgentDockTarget::Date(*date),
+                    Rect::new(area.x, y, area.width, height),
+                ));
                 continue;
             }
             if let Some(AgentDockRow::Workspace(wi, child)) = live.get(k) {
@@ -1092,8 +1113,10 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
                         t,
                     ),
                 );
-                app.agent_group_rects
-                    .push((*wi, Rect::new(area.x, y, area.width, height)));
+                app.agent_group_rects.push((
+                    AgentDockTarget::Workspace(*wi),
+                    Rect::new(area.x, y, area.width, height),
+                ));
                 continue;
             }
             let indent = if !grouped {

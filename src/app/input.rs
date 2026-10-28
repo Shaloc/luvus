@@ -3032,13 +3032,16 @@ impl App {
                 .find(|(_, rect)| hit(*rect))
             {
                 self.open_host_menu(host.clone(), c, r);
-            } else if let Some((ws, _)) = self.agent_group_rects.iter().find(|(_, rect)| hit(*rect))
+            } else if let Some((group, _)) =
+                self.agent_group_rects.iter().find(|(_, rect)| hit(*rect))
             {
-                self.open_agent_menu(
-                    AgentTarget::Workspace(self.workspaces[*ws].id.clone()),
-                    c,
-                    r,
-                );
+                let target = match group {
+                    AgentDockTarget::Workspace(ws) => {
+                        AgentTarget::Workspace(self.workspaces[*ws].id.clone())
+                    }
+                    _ => AgentTarget::Dock,
+                };
+                self.open_agent_menu(target, c, r);
             } else if let Some((target, pane, _)) = self
                 .remote_agent_rects
                 .iter()
@@ -3742,9 +3745,9 @@ impl App {
             }
             return;
         }
-        if let Some((ws, _)) = self.agent_group_rects.iter().find(|(_, rect)| hit(*rect)) {
-            let ws = *ws;
-            self.toggle_agent_workspace(ws);
+        if let Some((group, _)) = self.agent_group_rects.iter().find(|(_, rect)| hit(*rect)) {
+            let group = group.clone();
+            self.activate_agent_dock_target(group);
             return;
         }
         // The AGENTS All/Active filter toggle.

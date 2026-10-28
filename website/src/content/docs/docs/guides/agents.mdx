@@ -56,17 +56,25 @@ refresh when an agent appears or exits without changing its activity state.
 
 The header has four tabs: **All** includes resumable history, **Active** lists
 live agents, **Workspace** groups live agents using the existing workspace tree,
-and **Date** groups them by the start date of their current run, newest first.
+and **Date** groups them by the recorded session start date, newest first.
 A new configuration starts with **All**; the selected tab persists across restarts.
 Narrow docks wrap the tabs below the heading. Workspace scope and status filters
 also apply to Workspace and Date.
 
-The owner records the start time when it first detects an agent run. Activity,
-SSH reconnection and display attachment do not reset it. Resuming an agent into
-a new process starts a new run. Dates use the displaying server's local timezone.
-Older owners without this metadata and unstarted scheduled rows appear under
+The owner records the start time when it first detects an agent. It persists
+that time with the exact resumable native session, so restoring the same session
+after a server restart keeps its date. Activity, SSH reconnection and display
+attachment do not reset it; reporting a different native session starts a new
+date. Dates use the displaying server's local timezone. Legacy snapshots without
+a recorded date, older owners and unstarted scheduled rows appear under
 **Unknown start date**; history modification times are never used as start times.
-Pins remain first within each date, and keyboard navigation skips date headings.
+
+Each date heading shows the number of agents matching the current scope and
+status filters, including while collapsed. Click a heading to collapse or expand
+it; Left collapses the current date and Right expands it. Enter or Space also
+expands a selected collapsed heading. Folding is a local display preference, like
+workspace folding, and is reset when the displaying server restarts. Pins remain
+first within each date; keyboard navigation skips expanded headings.
 
 In **Active**, **Workspace** or **Date**, right-click an agent row, the header tabs, or the empty list to
 choose **Group by Workspace** and status checkboxes (**Working**, **Waiting for

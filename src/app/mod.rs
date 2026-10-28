@@ -1956,8 +1956,12 @@ pub struct AgentReport {
 
 /// Per-pane detection state (the runtime side of agent awareness).
 pub struct PaneStatus {
-    /// Unix seconds when this owner first observed the current agent run.
+    /// Unix seconds when this owner first observed the agent session. Preserved
+    /// with its exact native identity when the owning server restores it.
     pub agent_started_at: Option<u64>,
+    /// A restored legacy session may have no recorded date. Do not turn that
+    /// absence into the server's restart time on its first detection tick.
+    agent_start_restored: bool,
     pub state: State,
     pub agent: String,
     pub last_activity: Instant,
@@ -2071,8 +2075,9 @@ impl PaneStatus {
     fn observe_agent_start(&mut self, visible: bool, identity_changed: bool) -> bool {
         let previous = self.agent_started_at;
         if !visible {
-            self.agent_started_at = None;
-        } else if identity_changed || previous.is_none() {
+            self.reset_agent_start();
+        } else if identity_changed || (previous.is_none() && !self.agent_start_restored) {
+            self.agent_start_restored = false;
             self.agent_started_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .ok()
@@ -2081,9 +2086,15 @@ impl PaneStatus {
         previous != self.agent_started_at
     }
 
+    fn reset_agent_start(&mut self) {
+        self.agent_started_at = None;
+        self.agent_start_restored = false;
+    }
+
     fn new(agent: String) -> Self {
         PaneStatus {
             agent_started_at: None,
+            agent_start_restored: false,
             state: State::Idle,
             agent,
             last_activity: Instant::now(),
@@ -3263,7 +3274,8 @@ pub struct App {
     pub agent_cursor: usize,
     /// Folds follow stable workspace identities, not shifting row indices.
     pub(crate) collapsed_agent_workspaces: HashSet<String>,
-    pub(crate) agent_group_rects: Vec<(usize, Rect)>,
+    pub(crate) collapsed_agent_dates: HashSet<Option<jiff::civil::Date>>,
+    pub(crate) agent_group_rects: Vec<(AgentDockTarget, Rect)>,
     /// The FILES dock (docs/38): the tree model, its scroll region, and the
     /// clickable rect per visible row (`(row index, rect)`), re-set each frame.
     pub file_tree: crate::files::FileTree,
@@ -3899,6 +3911,7 @@ impl App {
             collapsed_workspace_machines: HashSet::new(),
             agent_cursor: 0,
             collapsed_agent_workspaces: HashSet::new(),
+            collapsed_agent_dates: HashSet::new(),
             agent_group_rects: Vec::new(),
             // Rooted at nothing; the first detect tick re-roots it to the active
             // node (set_root is a no-op when already correct).
@@ -4341,6 +4354,10 @@ impl App {
                     let mut st = PaneStatus::new(cmd);
                     if let Some((agent, sid)) = agent_session {
                         st.agent = agent.clone();
+                        if resume.is_some() {
+                            st.agent_started_at = ps.agent_started_at;
+                            st.agent_start_restored = true;
+                        }
                         st.agent_session = Some(AgentSession {
                             agent: agent.clone(),
                             session_id: sid.clone(),
@@ -4689,6 +4706,7 @@ impl App {
             collapsed_workspace_machines: HashSet::new(),
             agent_cursor: 0,
             collapsed_agent_workspaces: HashSet::new(),
+            collapsed_agent_dates: HashSet::new(),
             agent_group_rects: Vec::new(),
             // Rooted at nothing; the first detect tick re-roots it to the active
             // node (set_root is a no-op when already correct).
@@ -5003,7 +5021,7 @@ impl App {
     pub(crate) fn group_agent_rows_by_date<T>(
         &self,
         rows: Vec<(Option<u64>, T)>,
-        header: impl Fn(Option<jiff::civil::Date>) -> T,
+        header: impl Fn(Option<jiff::civil::Date>, usize) -> T,
     ) -> Vec<T> {
         let zone = &self.agent_date_timezone;
         let mut buckets = std::collections::BTreeMap::<_, Vec<T>>::new();
@@ -5019,10 +5037,25 @@ impl App {
         }
         let mut result = Vec::new();
         for (std::cmp::Reverse(date), mut rows) in buckets {
-            result.push(header(date));
-            result.append(&mut rows);
+            result.push(header(date, rows.len()));
+            if !self.collapsed_agent_dates.contains(&date) {
+                result.append(&mut rows);
+            }
         }
         result
+    }
+
+    pub(crate) fn toggle_agent_date(&mut self, date: Option<jiff::civil::Date>) {
+        if !self.collapsed_agent_dates.remove(&date) {
+            self.collapsed_agent_dates.insert(date);
+        }
+        if let Some(index) = self
+            .agent_dock_targets()
+            .iter()
+            .position(|row| *row == AgentDockTarget::Date(date))
+        {
+            self.agent_cursor = index;
+        }
     }
 
     /// Whether the AGENTS dock is scoped to the active workspace. Rendering may
@@ -5375,7 +5408,7 @@ impl App {
                     (started, row)
                 })
                 .collect();
-            rows = self.group_agent_rows_by_date(dated, AgentDockTarget::Date);
+            rows = self.group_agent_rows_by_date(dated, |date, _| AgentDockTarget::Date(date));
         }
 
         if !self.agents_active_only {
@@ -5592,6 +5625,19 @@ impl App {
                 rows = self.agent_dock_targets();
             }
             KeyCode::Left | KeyCode::Right => {
+                let date = rows[..rows.len().min(self.agent_cursor + 1)]
+                    .iter()
+                    .rev()
+                    .find_map(|row| match row {
+                        AgentDockTarget::Date(date) => Some(*date),
+                        _ => None,
+                    });
+                if let Some(date) = date {
+                    if (key.code == KeyCode::Left) != self.collapsed_agent_dates.contains(&date) {
+                        self.toggle_agent_date(date);
+                        rows = self.agent_dock_targets();
+                    }
+                }
                 let workspace = rows[..rows.len().min(self.agent_cursor + 1)]
                     .iter()
                     .rev()
@@ -5629,7 +5675,10 @@ impl App {
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 if let Some(target) = rows.get(self.agent_cursor).cloned() {
-                    if !matches!(target, AgentDockTarget::Workspace(_)) {
+                    if !matches!(
+                        target,
+                        AgentDockTarget::Workspace(_) | AgentDockTarget::Date(_)
+                    ) {
                         self.sidebar_focus = None;
                     }
                     self.activate_agent_dock_target(target);
@@ -5657,7 +5706,7 @@ impl App {
     fn normalize_agent_cursor(&mut self, rows: &[AgentDockTarget], backwards: bool) {
         self.agent_cursor = self.agent_cursor.min(rows.len().saturating_sub(1));
         let heading = |row: &AgentDockTarget| match row {
-            AgentDockTarget::Date(_) => true,
+            AgentDockTarget::Date(date) => !self.collapsed_agent_dates.contains(date),
             AgentDockTarget::Workspace(ws) => !self.agent_workspace_collapsed(*ws),
             _ => false,
         };
@@ -5674,7 +5723,7 @@ impl App {
 
     fn activate_agent_dock_target(&mut self, target: AgentDockTarget) {
         match target {
-            AgentDockTarget::Date(_) => {}
+            AgentDockTarget::Date(date) => self.toggle_agent_date(date),
             AgentDockTarget::Workspace(workspace) => self.toggle_agent_workspace(workspace),
             AgentDockTarget::Live(pane) | AgentDockTarget::Elsewhere(pane) => {
                 self.focus_pane_global(pane)
@@ -5702,7 +5751,11 @@ impl App {
 
     fn open_agent_dock_action(&mut self, target: AgentDockTarget) {
         match target {
-            AgentDockTarget::Date(_) => {}
+            AgentDockTarget::Date(_) => self.open_agent_menu(
+                AgentTarget::Dock,
+                self.agents_area.x + 2,
+                self.agents_area.y,
+            ),
             AgentDockTarget::Workspace(workspace) => {
                 self.open_agent_menu(
                     AgentTarget::Workspace(self.workspaces[workspace].id.clone()),
@@ -8920,7 +8973,14 @@ impl App {
         }
         if item == PaneMenuItem::NewBrowserTab {
             if let Some((workspace, _)) = self.pane_location(pane) {
-                self.open_browser_prompt(workspace);
+                if self.workspaces[workspace].remote.is_none() {
+                    match link {
+                        Some(LinkTarget::Url(url)) if crate::browser::valid_url(&url) => {
+                            self.insert_browser_view(workspace, None, url);
+                        }
+                        _ => self.open_browser_prompt(workspace),
+                    }
+                }
             }
             return;
         }
@@ -9690,7 +9750,7 @@ impl App {
             // already running, publish that identity while its own session hook
             // catches up; otherwise this is now a plain shell pane.
             st.agent_session = None;
-            st.agent_started_at = None;
+            st.reset_agent_start();
             st.program_status_agent = None;
             st.agent_absent_scans = 0;
             st.agent = self.manifests.agent_in_processes(cmds).unwrap_or(base);

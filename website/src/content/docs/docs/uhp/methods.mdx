@@ -641,9 +641,11 @@ Every snapshot terminal row includes `pane_id` and nullable `agent_name`.
 The boolean `is_agent` distinguishes detected or bound agents from plain shells,
 independently of whether the agent is working, idle, or waiting.
 Terminal snapshot rows may include nullable `agent_started_at`, the Unix timestamp
-in seconds when the owner first detected the current agent run. It survives
-SSH/display reattachment, changes for a new run, and is not a session-history
-modification time. Older owners may omit it.
+in seconds when the owner first detected the agent session. It survives
+SSH/display reattachment and owner restart when the same native session is
+restored. A different native session resets it. Legacy restored sessions without
+a recorded date remain null; this is not a session-history modification time.
+Older owners may omit it.
 
 It also includes nullable `agent_session_title`: the bounded, single-line title
 used by the AGENTS sidebar for a live agent pane (OSC title first, then a

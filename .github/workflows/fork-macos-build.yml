@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             arch: arm64
           - os: ubuntu-24.04
@@ -102,6 +102,8 @@ jobs:
           target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --appearance-only
       - name: Isolated browser routing and tab middle-click smoke
         run: target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --browser-open-only
+      - name: Isolated agent date folding and owner restart smoke
+        run: target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --agent-date-only
       - name: Isolated local and remote Kitty transport smoke
         run: |
           # Same checkout binary, private homes and fake SSH only; no real hosts.

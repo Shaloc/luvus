@@ -1122,7 +1122,10 @@ optional: press Enter with the field empty to create a blank browser tab, or
 enter an HTTP(S) URL. Click **Open browser** (or the supplied URL) in the new tab
 to launch Chrome. You can then type any URL into Chrome's address bar; remote
 network routing continues to use the selected owner. Esc cancels without creating
-a tab. The new tab contains a native browser panel, not a shell.
+a tab. Right-clicking an HTTP(S) link in a pane and choosing **New Browser Tab**
+uses that exact link immediately, without an address prompt. The new tab belongs
+to the clicked pane's workspace, including over SSH. The new tab contains a native
+browser panel, not a shell.
 
 To use a local Chrome/Chromium window through the selected SSH owner, run this
 inside that owner's pane:

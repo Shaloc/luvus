@@ -958,7 +958,11 @@ impl App {
                     || s.program_status
                         .as_ref()
                         .is_some_and(|store| !store.is_empty());
-                visible_identity_changed |= s.observe_agent_start(is_visible_agent, agent_changed);
+                if s.observe_agent_start(is_visible_agent, agent_changed) {
+                    visible_identity_changed = true;
+                    self.session_dirty |=
+                        s.agent_session.is_some() || crate::agent::is_resumable(&detected);
+                }
                 s.agent = detected;
                 if agent_changed && !s.agent.eq_ignore_ascii_case("claude") {
                     s.claude_prompt_semantic_ready = false;
@@ -1083,7 +1087,7 @@ impl App {
                 || self.active_is_mission()
         });
         // State and visible identity transitions both change the sidebar. Session
-        // persistence remains limited to resumable agents via `agent_appeared`.
+        // persistence remains limited to resumable identities and their dates.
         if presentation_metadata_changed || visible_identity_changed {
             self.emit_event("agent.history_changed", json!({}));
         }

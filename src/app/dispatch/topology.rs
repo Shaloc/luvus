@@ -569,8 +569,12 @@ impl App {
             }
 
             let status = self.status.get_mut(&id).ok_or_else(not_found)?;
-            if status.agent != agent {
-                status.agent_started_at = None;
+            if status.agent != agent
+                || status.agent_session.as_ref().is_some_and(|session| {
+                    session.agent != agent || session.session_id != session_id
+                })
+            {
+                status.reset_agent_start();
             }
             status.agent = agent.to_string();
             status.agent_session = Some(AgentSession {
@@ -695,6 +699,7 @@ impl App {
         }
         let status = self.status.get_mut(&id).ok_or_else(not_found)?;
         status.agent_session = None;
+        status.reset_agent_start();
         status.force_detect = true;
         self.session_dirty = true;
         self.reconcile_durable_active_targets(Some(id));

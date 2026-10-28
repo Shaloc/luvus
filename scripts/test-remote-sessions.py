@@ -11,6 +11,7 @@ Use --session-discovery-only for owner inventory and session deletion regression
 Use --remote-only-open-only for merge routing without implicit local owners.
 Use --agent-focus-only for Agents highlight and owner focus synchronization.
 Use --agent-title-only for agent title initials, compact groups and display-local toggles (requires pyte).
+Use --agent-date-only for date folding/counts and native session restart persistence (requires pyte).
 Use --agent-seen-only for native Done acknowledgement after remote owner restart.
 Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
 Use --theme-sync-only for local Settings/CLI theme fanout and owner isolation.
@@ -315,7 +316,8 @@ def main():
     restart_only = "--restart-only" in sys.argv[1:]
     agent_state_only = "--agent-state-only" in sys.argv[1:]
     agent_focus_only = "--agent-focus-only" in sys.argv[1:]
-    agent_title_only = "--agent-title-only" in sys.argv[1:]
+    agent_date_only = "--agent-date-only" in sys.argv[1:]
+    agent_title_only = "--agent-title-only" in sys.argv[1:] or agent_date_only
     agent_seen_only = "--agent-seen-only" in sys.argv[1:]
     reconnect_only = "--reconnect-only" in sys.argv[1:]
     network_reconnect_only = "--network-reconnect-only" in sys.argv[1:]
@@ -342,7 +344,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--browser-proxy-only", "--browser-open-only", "--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--agent-date-only", "--browser-proxy-only", "--browser-open-only", "--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -1262,6 +1264,16 @@ def main():
                 def screen():
                     drain(master, .1)
                     return "\n".join(client_terminals[master][0].display)
+                def browser_link_position(label):
+                    # Remote view titles can arrive before their content frame.
+                    # Only the link in the pane body launches the browser; the
+                    # first three rows of this fixed viewport are tabs/headers.
+                    def body_link():
+                        screen()
+                        return next(((line.index(label) + 2, y + 1) for y, line in
+                                     reversed(list(enumerate(client_terminals[master][0].display)))
+                                     if y > 2 and label in line), None)
+                    return wait_for(body_link, diagnostics=lambda: {"mode": mode, "screen": screen()})
                 wait_for(lambda: ready_marker in screen(), diagnostics=lambda: {
                     "mode": mode, "screen": screen(),
                     "owner": api("pane.read", {"pane":pane}, remote=remote),
@@ -1285,21 +1297,53 @@ def main():
                 print(f"PASS: {mode} plain mouse click invokes pane BROWSER and opens the exact URL only on the display host", flush=True)
                 local_port, _ = json.loads((root / "browser-http.json").read_text())
                 panel_url = f"http://localhost:{local_port}/panel-{mode}"
+                link_launches = []
+                for osc8 in (False, True):
+                    linked_url = f"http://localhost:{local_port}/clicked-{mode}-{osc8}?one=1&two=2#section"
+                    label = "CLICKED_BROWSER_LINK" if osc8 else linked_url
+                    payload = (f"\\033]8;;{linked_url}\\033\\\\{label}\\033]8;;\\033\\\\" if osc8 else label)
+                    command = "printf '%b\\n' " + shlex.quote(payload)
+                    api("pane.run", {"pane": pane, "command": command}, remote=remote)
+                    wait_for(lambda: label in screen())
+                    # The last matching row is the output, not the echoed command.
+                    y, line = [(y, line) for y, line in enumerate(client_terminals[master][0].display) if label in line][-1]
+                    before_tabs = api("tab.list", remote=remote)["tabs"]
+                    click(master, line.index(label) + 2, y + 1, button=2)
+                    wait_for(lambda: "New Browser Tab" in screen())
+                    y, line = next((y, line) for y, line in enumerate(client_terminals[master][0].display) if "New Browser Tab" in line)
+                    click(master, line.index("New Browser Tab") + 2, y + 1)
+                    wait_for(lambda: screen() and len(api("tab.list", remote=remote)["tabs"]) == len(before_tabs) + 1)
+                    assert "URL optional" not in screen()
+                    active = next(t for t in api("tab.list", remote=remote)["tabs"] if t["active"])
+                    click(master, *browser_link_position(linked_url))
+                    def clicked_launch():
+                        screen()
+                        path = root / "chrome-calls.jsonl"
+                        return next((row for row in (json.loads(line) for line in path.read_text().splitlines()) if row["url"] == linked_url), None) if path.exists() else None
+                    launched_link = wait_for(clicked_launch)
+                    link_launches.append(launched_link)
+                    assert launched_link["home"] == str(root / "local-home")
+                    assert any(a.startswith("--proxy-server=") for a in launched_link["args"]) == (remote or browser_proxy_only)
+                    api("tab.close", {"tab_id": active["tab_id"]}, remote=remote)
+                    wait_for(lambda: api("tab.list", remote=remote)["tabs"] == before_tabs)
+                print(f"PASS: {mode} raw URL and OSC 8 pane menus create browser tabs with the clicked target and owner routing", flush=True)
                 result = api("browser.panel", {"pane": pane, "url": panel_url}, remote=remote)
-                wait_for(lambda: panel_url in screen())
-                y, line = [(y,line) for y,line in enumerate(client_terminals[master][0].display) if panel_url in line][-1]
+                browser_link = browser_link_position(panel_url)
                 if mode == "direct-remote":
                     rejected = root / "browser-reverse-forward"
                     rejected.touch()
-                    click(master, line.index(panel_url) + 2, y + 1)
-                    wait_for(lambda: (root / "browser-ssh-probe").exists())
                     profiles = root / "local-state/browser-sessions"
-                    wait_for(lambda: not any(profiles.iterdir()))
+                    existing_profiles = set(profiles.iterdir())
+                    (root / "browser-ssh-probe").unlink(missing_ok=True)
+                    (root / "browser-ssh-forward").unlink(missing_ok=True)
+                    click(master, *browser_link)
+                    wait_for(lambda: (root / "browser-ssh-probe").exists())
+                    wait_for(lambda: set(profiles.iterdir()) == existing_profiles)
                     assert not (root / "browser-ssh-forward").exists()
                     assert panel_url not in (root / "chrome-calls.jsonl").read_text()
                     rejected.unlink()
                     print("PASS: configured RemoteForward rejected before opening SSH listener or Chrome", flush=True)
-                click(master, line.index(panel_url) + 2, y + 1)
+                click(master, *browser_link)
                 def chrome_receipt():
                     drain(master, .1)
                     path = root / "chrome-calls.jsonl"
@@ -1358,7 +1402,7 @@ def main():
                     expected = "REMOTE_BROWSER_MARKER" if remote else "LOCAL_BROWSER_MARKER"
                     assert expected in dom.read_text(), dom.read_text()[-2000:]
                 print(f"PASS: {mode} browser panel opens dedicated display Chrome; localhost uses {'remote SOCKS' if remote else 'local'} network", flush=True)
-                launches = [launched]
+                launches = [*link_launches, launched]
                 browser_tabs = []
                 original_tabs = api("tab.list", remote=remote)["tabs"]
                 def other_tabs():
@@ -1397,7 +1441,7 @@ def main():
                     expected_url = value or "about:blank"
                     label = value or "Open browser"
                     old_pids = {json.loads(line)["pid"] for line in (root / "chrome-calls.jsonl").read_text().splitlines()}
-                    click(master, *row_for_label(label))
+                    click(master, *browser_link_position(label))
                     def new_launch():
                         screen()
                         rows = [json.loads(line) for line in (root / "chrome-calls.jsonl").read_text().splitlines()]
@@ -2901,6 +2945,15 @@ def main():
                     wait_for(lambda: any("Q" in line and "Remote title" in line for line in sidebar()))
                     if tab == "Date":
                         wait_for(lambda: any(date_label in line for line in sidebar()))
+                        expected_count = 2 if merged else 1
+                        heading = next(line for line in sidebar() if date_label in line)
+                        assert f"({expected_count})" in heading, heading
+                        click(master, *row_for(date_label))
+                        wait_for(lambda: not any("Remote title" in line for line in sidebar()))
+                        heading = next(line for line in sidebar() if date_label in line)
+                        assert "▸" in heading and f"({expected_count})" in heading, heading
+                        click(master, *row_for(date_label))
+                        wait_for(lambda: any("Remote title" in line for line in sidebar()))
                         assert remote_started() == started
                         assert not api("config.get", remote=True)["config"]["agents_group_by_date"]
                     elif tab == "Workspace":
@@ -2931,6 +2984,66 @@ def main():
                 clients.remove((process, master))
                 api("ui.agent_title.push", {"titles": [{"pane": pane, "title": "Remote title"}]}, remote=True)
                 print(f"PASS: {mode}: title initials, independent details, single-row groups and live title refresh", flush=True)
+            if agent_date_only:
+                # A private native agent executable supports resume after each
+                # isolated owner restart; no installed agent is ever invoked.
+                command = agent_fixture_command("codex")
+                executable = root / "bin/codex"
+                executable.write_text("#!/bin/sh\nexec " + command + "\n")
+                executable.chmod(0o755)
+                api("pane.run", {"pane": pane, "command": "codex"}, remote=True)
+                wait_for(lambda: "CODEX_FIXTURE_READY" in api("pane.read", {"pane": pane}, remote=True)["text"])
+                api("agent.report", {"pane": pane, "source": "smoke/title", "agent": "codex",
+                                     "status": "idle", "ttl_s": 300}, remote=True)
+                api("pane.report_session", {"pane": pane, "agent": "codex", "session_id": "date-persist-fixture"}, remote=True)
+                def date_row(remote=True):
+                    snapshot = api("session.snapshot", remote=remote)
+                    return next((p for w in snapshot["workspaces"] for t in w["tabs"] for p in t["panes"]
+                                 if p.get("agent") == "codex" and p.get("agent_started_at")), None)
+                started = wait_for(date_row)["agent_started_at"]
+                # Simulate a session created last week. Editing only the stopped
+                # fixture snapshot makes a reset to today's date observable.
+                run("--session", "api", "server", "stop", remote=True)
+                saved = root / "remote-state/sessions/api/session.json"
+                snapshot = json.loads(saved.read_text())
+                for workspace in snapshot["workspaces"]:
+                    for tab in workspace["tabs"]:
+                        for _, saved_pane in tab["panes"]:
+                            if saved_pane.get("agent_session") == ["codex", "date-persist-fixture"]:
+                                assert saved_pane["agent_started_at"] == started
+                                saved_pane["agent_started_at"] = started - 86400 * 7
+                started -= 86400 * 7
+                saved.write_text(json.dumps(snapshot))
+                run("session", "merge", "on")
+                process, master = start_client(["--session", "api"])
+                presentation_api("config.patch", {"patch": {"agents_active_only": True,
+                    "agents_group_by_workspace": False, "agents_group_by_date": True}}, session="api")
+                from datetime import datetime
+                saved_date = datetime.fromtimestamp(started).strftime("%Y-%m-%d")
+                for _ in range(2):
+                    run("--session", "api", "server", "restart", remote=True)
+                    restored = wait_for(date_row)
+                    assert restored["agent_started_at"] == started, (started, restored)
+                    pane = restored["pane_id"]
+                    wait_for(lambda: "CODEX_FIXTURE_READY" in api("pane.read", {"pane": pane}, remote=True)["text"])
+                    # The saved screen can contain yesterday's ready marker.
+                    # Require a fresh response from this restored pane instead
+                    # of relying on platform-dependent Python process names.
+                    challenge = str(time.monotonic_ns())
+                    api("pane.run", {"pane": pane, "command": "CODEX_FIXTURE_PING:" + challenge}, remote=True)
+                    wait_for(lambda: "CODEX_FIXTURE_PONG:" + challenge in
+                             api("pane.read", {"pane": pane}, remote=True)["text"],
+                             diagnostics=lambda: pane_diagnostics(pane, remote=True))
+                    wait_for(projected)
+                    def projected_date():
+                        drain(master, .1)
+                        lines = client_terminals[master][0].display
+                        (root / "agent-date-restored.txt").write_text("\n".join(lines))
+                        return any(saved_date in line[:47] and "(1)" in line[:47] for line in lines)
+                    wait_for(projected_date)
+                    print(f"PASS: owner restart retains {started} and remote sidebar shows {saved_date}", flush=True)
+                detach_client(process, master)
+                print("PASS: native session creation date survives two owner restarts and remote reprojection", flush=True)
             return
 
         if agent_focus_only:
@@ -4020,7 +4133,7 @@ def main():
                 run("--session", name, "remote-server-command", "stop", remote=remote, okay=False)
         # Graphics and appearance checkpoints can be inspected after teardown.
         # Other successful fixtures are disposable; failures retain evidence.
-        if sys.exc_info()[0] is None and not graphics_only and not appearance_only and not workspace_close_only and not ssh_admission_only and not file_links_only and not browser_open_only:
+        if sys.exc_info()[0] is None and not graphics_only and not appearance_only and not workspace_close_only and not ssh_admission_only and not file_links_only and not browser_open_only and not agent_date_only:
             assert_isolated(env)
             assert_isolated(remote_env)
             shutil.rmtree(root)
@@ -4059,6 +4172,9 @@ if __name__ == "__main__":
         print("PROGRAM_FIXTURE_READY" if program else "CODEX_FIXTURE_READY" if codex else "QODER_FIXTURE_READY", flush=True)
         for line in sys.stdin:
             text = line.strip()
+            if codex and text.startswith("CODEX_FIXTURE_PING:"):
+                print("CODEX_FIXTURE_PONG:" + text.split(":", 1)[1], flush=True)
+                continue
             if text == "OSC_BOUNDARY":
                 print("\033]7501;state=done:id=old\007\033]133;A\007\033]7501;state=working:id=fresh\007\033]133;C\007", end="", flush=True)
                 continue

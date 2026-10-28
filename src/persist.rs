@@ -105,6 +105,10 @@ pub struct PaneSnap {
     /// (agent, session_id) for native resume, if reported.
     #[serde(default)]
     pub agent_session: Option<(String, String)>,
+    /// Owner-observed creation time, attached only to the exact resumable
+    /// session selected by the existing ownership evidence resolver.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_started_at: Option<u64>,
     /// The launch flags the agent pane was started with (argv after the agent
     /// token, docs/62), replayed after the resume reference on restore. Session
     /// selection flags are filtered at replay, so the stored list stays faithful.
@@ -748,6 +752,7 @@ pub(crate) struct SessionCapture {
     snapshot: SessionSnapshot,
     evidence: SessionEvidence,
     launch_args: HashMap<PaneId, Vec<String>>,
+    agent_starts: HashMap<PaneId, (String, u64)>,
     path: PathBuf,
 }
 
@@ -759,6 +764,12 @@ impl SessionCapture {
                 for (id, pane) in &mut tab.panes {
                     let id = PaneId(*id);
                     pane.agent_session = sessions.get(&id).cloned().flatten();
+                    pane.agent_started_at = pane.agent_session.as_ref().and_then(|(agent, _)| {
+                        self.agent_starts
+                            .get(&id)
+                            .filter(|(observed_agent, _)| observed_agent == agent)
+                            .map(|(_, started)| *started)
+                    });
                     if pane.agent_session.is_some() {
                         pane.agent_launch = self.launch_args.remove(&id);
                     }
@@ -808,6 +819,15 @@ pub(crate) fn capture_session(app: &App) -> SessionCapture {
         snapshot: snapshot_layout(app, &evidence.out),
         evidence,
         launch_args,
+        agent_starts: app
+            .status
+            .iter()
+            .filter_map(|(id, status)| {
+                status
+                    .agent_started_at
+                    .map(|started| (*id, (status.agent.clone(), started)))
+            })
+            .collect(),
         path: session_path(),
     }
 }
@@ -941,6 +961,7 @@ fn snapshot_layout(
                                 backend_label: None,
                                 name: app.agent_name_for(id).map(|s| s.to_string()),
                                 agent_session: None,
+                                agent_started_at: None,
                                 agent_launch: None,
                                 screen: None,
                                 module: None,
@@ -1004,6 +1025,7 @@ fn snapshot_layout(
                                 backend_label: app.backend_labels.get(&id).cloned(),
                                 name: app.agent_name_for(id).map(|s| s.to_string()),
                                 agent_session,
+                                agent_started_at: None,
                                 agent_launch,
                                 screen,
                                 module,

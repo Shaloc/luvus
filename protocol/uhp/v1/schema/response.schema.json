@@ -527,7 +527,7 @@
               "agent_started_at": {
                 "type": ["integer", "null"],
                 "minimum": 0,
-                "description": "Owner-observed start of the current agent run, in Unix seconds. Older owners may omit it."
+                "description": "Owner-observed session start in Unix seconds, persisted with the exact native session across owner restart. Legacy sessions may be null; older owners may omit it."
               },
               "agent_session_title": {
                 "$ref": "#/$defs/agentSessionTitle"
