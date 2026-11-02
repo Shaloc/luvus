@@ -6767,12 +6767,34 @@ pub(crate) mod tests {
         let local_pane = app.layout().focus;
         let (remote_pane, _receiver, _) = add_remote_workspace(&mut app);
         let before = app.workspaces.len();
-        for method in ["pane.split", "tab.new", "worktree.create", "files.tree"] {
+        for method in ["pane.split", "tab.new", "files.tree"] {
             assert_eq!(
                 app.dispatch(method, &json!({})).unwrap_err().0,
                 "remote_workspace"
             );
         }
+        assert_eq!(
+            app.dispatch("worktree.create", &json!({"branch":"topic"}))
+                .unwrap_err()
+                .0,
+            "invalid_request"
+        );
+        assert_eq!(
+            app.dispatch(
+                "worktree.create",
+                &json!({"branch":"topic", "workspace_id":app.ws().id})
+            )
+            .unwrap_err()
+            .0,
+            "remote_workspace"
+        );
+        // A local selector must be honored even while a remote projection has focus.
+        assert!(app
+            .check_remote_workspace_request(
+                "worktree.create",
+                &json!({"workspace_id":app.workspaces[0].id})
+            )
+            .is_ok());
         assert_eq!(
             app.dispatch("pane.close", &json!({"pane":remote_pane.0.to_string()}))
                 .unwrap_err()

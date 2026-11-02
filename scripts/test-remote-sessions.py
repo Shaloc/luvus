@@ -333,6 +333,7 @@ def main():
     browser_open_only = "--browser-open-only" in sys.argv[1:] or browser_proxy_only
     file_links_only = "--file-links-only" in sys.argv[1:]
     workspace_close_only = "--workspace-close-only" in sys.argv[1:]
+    worktree_target_only = "--worktree-target-only" in sys.argv[1:]
     if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or browser_open_only or transpose_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
@@ -344,7 +345,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--agent-date-only", "--browser-proxy-only", "--browser-open-only", "--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--worktree-target-only", "--agent-date-only", "--browser-proxy-only", "--browser-open-only", "--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -786,6 +787,56 @@ def main():
                 print(f"PASS: one killed display channel reconnects; {expected_channels - 1} healthy SSH display processes survive", flush=True)
             return
         select_hosts(["fake-dev", "fake-old"])
+        if worktree_target_only:
+            select_hosts(["fake-dev"])
+            assert "--workspace-id" in run("help", "worktree").stdout
+            for remote in (False, True):
+                mode = "remote" if remote else "local"
+                selectors = ("--host", "fake-dev", "--session", "api") if remote else ("--session", "api")
+
+                def request(method, params):
+                    return json.loads(run(*selectors, "uhp", "proxy", okay=False, input_text=json.dumps(
+                        {"id": "parent", "method": method, "params": params}) + "\n").stdout)
+
+                assert request("uhp.capabilities", {})["result"]["worktree"]["create_requires_workspace"]
+                parent = next(w for w in request("workspace.list", {})["result"]["workspaces"]
+                              if w["cwd"] == str(root / "project"))
+                # Give the focused repository its own commit, so both Git
+                # identity and the selected base can be checked after creation.
+                other = root / ("other-" + mode)
+                subprocess.run(["git", "init", "--quiet", str(other)], env=git_env, check=True)
+                subprocess.run(["git", "-C", str(other), "-c", "user.name=Smoke", "-c",
+                                "user.email=smoke@example.invalid", "commit", "--quiet", "--allow-empty",
+                                "-m", "unrelated"], env=git_env, check=True)
+                assert "result" in request("workspace.open", {"path": str(other)})
+                before = request("workspace.list", {})["result"]["workspaces"]
+                assert next(w for w in before if w["active"])["cwd"] == str(other)
+                branch = "parent-" + mode
+                for args in ((branch,), (branch, "--workspace-id"),
+                             (branch, "--workspace-id", parent["workspace_id"], "--typo")):
+                    assert run(*selectors, "worktree", "create", *args, okay=False).returncode
+                for params, code in (({"branch": branch}, "invalid_request"),
+                                     ({"branch": branch, "workspace_id": "absent"}, "not_found"),
+                                     ({"branch": branch, "workspace_id": parent["workspace_id"], "workspace": 0}, "invalid_request")):
+                    assert request("worktree.create", params)["error"]["code"] == code
+                after = request("workspace.list", {})["result"]["workspaces"]
+                identity = lambda rows: [(w["workspace_id"], w["cwd"], w["active"]) for w in rows]
+                assert identity(after) == identity(before)
+                made = json.loads(run(*selectors, "worktree", "create", branch,
+                                      "--workspace-id", parent["workspace_id"]).stdout)["result"]
+                path = Path(made["path"])
+                assert path.is_relative_to(root / ("remote-state" if remote else "local-state")), path
+
+                def git(cwd, *args):
+                    return subprocess.check_output(["git", "-C", str(cwd), *args], env=git_env, text=True).strip()
+
+                common = lambda cwd: (cwd / git(cwd, "rev-parse", "--git-common-dir")).resolve()
+                assert common(path) == common(root / "project") != common(other)
+                assert git(path, "branch", "--show-current") == branch
+                assert git(path, "rev-parse", "HEAD") == git(root / "project", "rev-parse", "HEAD")
+                assert git(other, "branch", "--list", branch) == ""
+                print(f"PASS: {mode} explicit parent wins over focus; missing/invalid CLI and API targets are non-mutating; Git owner, branch and HEAD verified", flush=True)
+            return
         if upstream_only:
             for remote in (False, True):
                 pane = api("pane.list", remote=remote)["panes"][0]["pane"]
@@ -3640,7 +3691,8 @@ def main():
 
             def worktrees():
                 branch = "parity-" + mode
-                made = cli("worktree", "create", branch)
+                parent = next(w for w in owner("workspace.list")["workspaces"] if w["active"])
+                made = cli("worktree", "create", branch, "--workspace-id", parent["workspace_id"])
                 path = Path(made["path"])
                 assert path.is_relative_to(root / ("remote-state" if remote else "local-state")), path
                 assert path.is_dir()

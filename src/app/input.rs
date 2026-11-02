@@ -306,7 +306,7 @@ fn copy_link_at_grid(
 }
 
 impl App {
-    fn handle_api_request(&mut self, req: crate::ipc::api::ApiRequest) -> bool {
+    fn handle_api_request(&mut self, mut req: crate::ipc::api::ApiRequest) -> bool {
         if let Err((code, message)) = self.check_remote_workspace_request(&req.method, &req.params)
         {
             let _ = req.reply.send(
@@ -314,6 +314,17 @@ impl App {
                     .to_string(),
             );
             return false;
+        }
+        // Provider completion retries the request after other UI/API operations.
+        // Bind positional selectors once so workspace reordering cannot retarget it.
+        if req.method == "worktree.create" {
+            if let Ok(workspace) = self.required_socket_workspace(&req.params) {
+                if let Some(params) = req.params.as_object_mut() {
+                    params.remove("workspace");
+                    params.remove("node");
+                    params.insert("workspace_id".into(), json!(self.workspaces[workspace].id));
+                }
+            }
         }
         // Input-only requests do not mutate projected application state. Their
         // resulting PTY bytes will schedule the real frame, so rendering here

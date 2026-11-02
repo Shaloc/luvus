@@ -61,3 +61,12 @@
 {"id":"task-guard-invalid-8","method":"task.update","params":{"id":"t1","status":"failed","output":"launch failed","if_running":{"pane":7,"attempt":1,"extra":true}}}
 {"id": "browser-missing-pane", "method": "browser.open", "params": {"url": "https://example.com"}}
 {"id": "browser-host", "method": "browser.panel", "params": {"pane": 7, "url": "http://localhost:3000", "host": "other"}}
+{"id":"invalid-worktree-create-0","method":"worktree.create","params":{"branch":"topic"}}
+{"id":"invalid-worktree-create-1","method":"worktree.create","params":{"branch":"topic","workspace_id":""}}
+{"id":"invalid-worktree-create-2","method":"worktree.create","params":{"branch":"topic","workspace_id":1}}
+{"id":"invalid-worktree-create-3","method":"worktree.create","params":{"branch":"topic","workspace_id":"workspace_example","workspace":0}}
+{"id":"invalid-worktree-create-4","method":"worktree.create","params":{"branch":"topic","workspace":0,"node":0}}
+{"id":"invalid-worktree-create-5","method":"worktree.create","params":{"branch":"topic","workspace":-1}}
+{"id":"invalid-worktree-create-6","method":"worktree.create","params":{"branch":"topic","workspace_id":"workspace_example","typo":true}}
+{"id":"invalid-worktree-create-7","method":"worktree.create","params":{"branch":"  ","workspace_id":"workspace_example"}}
+{"id":"invalid-worktree-create-8","method":"worktree.create","params":{"workspace_id":"workspace_example"}}

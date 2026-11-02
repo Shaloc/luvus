@@ -806,6 +806,21 @@ def valid_global_request(value, methods):
             set(params) == {"id"}
             and bounded_string(params["id"], 128, allow_empty=False)
         )
+    if value["method"] == "worktree.create":
+        params = value["params"]
+        selectors = {"workspace_id", "workspace", "node"} & set(params)
+        if (len(selectors) != 1
+                or set(params) - {"branch", "workspace_id", "workspace", "node", "if_revision"}
+                or not isinstance(params.get("branch"), str)
+                or not params["branch"].strip()):
+            return False
+        selector = next(iter(selectors))
+        target = params[selector]
+        valid_target = (isinstance(target, str) and bool(target)) if selector == "workspace_id" else (
+            (integer(target) and target >= 0)
+            or (isinstance(target, str) and re.fullmatch(r"[0-9]+", target) is not None))
+        revision = params.get("if_revision", 0)
+        return valid_target and integer(revision) and revision >= 0
     if value["method"] == "worktree.remove":
         params = value["params"]
         return (

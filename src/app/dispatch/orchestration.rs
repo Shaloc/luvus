@@ -25,13 +25,24 @@ impl App {
     }
 
     pub(super) fn api_worktree_create(&mut self, method: &str, p: &Value) -> DispatchResult {
-        let _ = (method, p);
-        {
-            let branch = p.get("branch").and_then(|v| v.as_str()).unwrap_or("");
-            let repo = self.git_workspace_cwd(p)?;
-            let path = self.create_worktree(&repo, branch).map_err(git_err)?;
-            Ok(json!({"type":"ok","path": path.display().to_string()}))
+        let _ = method;
+        reject_api_fields(p, &["branch", "workspace_id", "workspace", "node"])?;
+        let workspace = self.required_socket_workspace(p)?;
+        self.require_local_workspace(workspace)?;
+        let branch = req_str(p, "branch")?.trim();
+        if branch.is_empty() {
+            return Err(("invalid_request".into(), "branch is required".into()));
         }
+        let repo = self.workspaces[workspace].cwd.clone();
+        let context = crate::module::context::build_for(
+            self,
+            "worktree.provider",
+            &crate::module::context::Target::workspace(workspace),
+        );
+        let path = self
+            .create_worktree_with_context(&repo, branch, context)
+            .map_err(git_err)?;
+        Ok(json!({"type":"ok","path": path.display().to_string()}))
     }
 
     pub(super) fn api_worktree_open(&mut self, method: &str, p: &Value) -> DispatchResult {

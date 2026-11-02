@@ -135,6 +135,20 @@ Branch-backed dependencies unblock only after they are merged into the shared
 integration history.
 `task release` requeues active work and releases its path leases, but it does
 not stop the worker pane or discard its worktree.
+Use `luvus worktree create <branch> --workspace-id <parent-workspace-id>`.
+Resolve the parent by its full repository CWD in `workspace list`; never use
+UI focus, the CLI's CWD, or the caller pane as an implicit repository selector.
+For SSH, query and create on the same `--host` and `--session` using the owner's
+workspace ID, not the display projection ID. Check CLI help for the flag and
+`uhp capabilities` for `worktree.create_requires_workspace: true`; older CLIs
+can silently ignore unknown flags. If unsupported, report the required upgrade
+instead of falling back to focus-then-create or restarting a server.
+
+The result's `path` is the created checkout. Verify its Git common directory,
+branch, and HEAD against the intended repository before starting an agent.
+There is no `--base`; create the branch at the desired base in that repository
+first when needed. Existing branches must be verified, never overwritten.
+
 `worktree remove <path>` refuses to delete a worktree that still owns a working
 or blocked agent pane, unfinished task, or lease. Report the returned
 `worktree_in_use` blockers. Use `--force` only with explicit approval to stop

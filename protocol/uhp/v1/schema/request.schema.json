@@ -1595,6 +1595,69 @@
           "minimum": 0
         }
       }
+    },
+    "worktreeCreateParams": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "branch"
+      ],
+      "properties": {
+        "branch": {
+          "type": "string",
+          "minLength": 1,
+          "pattern": "\\S"
+        },
+        "workspace_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "workspace": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]+$"
+            }
+          ]
+        },
+        "node": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]+$"
+            }
+          ]
+        },
+        "if_revision": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "workspace_id"
+          ]
+        },
+        {
+          "required": [
+            "workspace"
+          ]
+        },
+        {
+          "required": [
+            "node"
+          ]
+        }
+      ]
     }
   },
   "allOf": [
@@ -2506,6 +2569,25 @@
         "properties": {
           "params": {
             "$ref": "#/$defs/moduleUpdateParams"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "method": {
+            "const": "worktree.create"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "params"
+        ],
+        "properties": {
+          "params": {
+            "$ref": "#/$defs/worktreeCreateParams"
           }
         }
       }

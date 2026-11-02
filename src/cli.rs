@@ -335,7 +335,7 @@ diff review:
 
 worktrees:
   worktree list              list the current repo's worktrees
-  worktree create <branch>   create a worktree + workspace for <branch>
+  worktree create <branch> --workspace-id <id>  create a worktree + workspace for <branch>
   worktree open <path>       open an existing worktree as a workspace
   worktree remove <path> [--force]   remove a worktree (its branch is kept)
 
@@ -4349,7 +4349,37 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
         ("files", _) => ("files.tree".into(), json!({})),
         ("git", _) => ("git.status".into(), json!({})),
 
-        ("worktree", "create") => ("worktree.create".into(), one("branch", arg0())),
+        ("worktree", "create") => {
+            let usage = "usage: luvus worktree create <branch> --workspace-id <id>";
+            let mut branch = None;
+            let mut workspace_id = None;
+            let mut values = rest.iter();
+            while let Some(value) = values.next() {
+                match value.as_str() {
+                    "--workspace-id" if workspace_id.is_none() => {
+                        workspace_id = Some(
+                            values
+                                .next()
+                                .filter(|id| !id.trim().is_empty() && !id.starts_with('-'))
+                                .ok_or_else(|| anyhow!(usage))?
+                                .clone(),
+                        );
+                    }
+                    value if !value.starts_with('-') && branch.is_none() => {
+                        branch = Some(value.to_string());
+                    }
+                    _ => return Err(anyhow!(usage)),
+                }
+            }
+            let branch = branch
+                .filter(|branch| !branch.trim().is_empty())
+                .ok_or_else(|| anyhow!(usage))?;
+            let workspace_id = workspace_id.ok_or_else(|| anyhow!(usage))?;
+            (
+                "worktree.create".into(),
+                json!({"branch":branch,"workspace_id":workspace_id}),
+            )
+        }
         ("worktree", "open") => ("worktree.open".into(), one("path", arg0())),
         ("worktree", "remove") => {
             let usage = "usage: luvus worktree remove <path> [--force]";
@@ -7016,9 +7046,21 @@ mod tests {
     fn maps_worktree_commands() {
         let (m, _) = parse(&argv("luvus worktree list")).unwrap();
         assert_eq!(m, "worktree.list");
-        let (m, p) = parse(&argv("luvus worktree create feature/x")).unwrap();
+        let (m, p) = parse(&argv(
+            "luvus worktree create feature/x --workspace-id ws-source",
+        ))
+        .unwrap();
         assert_eq!(m, "worktree.create");
         assert_eq!(p.get("branch").and_then(|v| v.as_str()), Some("feature/x"));
+        assert_eq!(p["workspace_id"], "ws-source");
+        assert_eq!(
+            parse(&argv(
+                "luvus worktree create --workspace-id ws-source feature/x"
+            ))
+            .unwrap()
+            .1,
+            p
+        );
         let (m, p) = parse(&argv("luvus worktree open /tmp/wt")).unwrap();
         assert_eq!(m, "worktree.open");
         assert_eq!(p.get("path").and_then(|v| v.as_str()), Some("/tmp/wt"));
@@ -7033,6 +7075,40 @@ mod tests {
         assert!(parse(&argv("luvus worktree remove")).is_err());
         assert!(parse(&argv("luvus worktree remove /tmp/a /tmp/b")).is_err());
         assert!(parse(&argv("luvus worktree remove /tmp/wt --unknown")).is_err());
+    }
+
+    #[test]
+    fn worktree_create_requires_an_explicit_parent_and_rejects_ignored_arguments() {
+        for args in [
+            "luvus worktree create",
+            "luvus worktree create feature/x",
+            "luvus worktree create feature/x --workspace-id",
+            "luvus worktree create --workspace-id ws-source",
+            "luvus worktree create feature/x --workspace-id --other",
+            "luvus worktree create feature/x --workspace-id ws-source --workspace-id ws-other",
+            "luvus worktree create feature/x --workspace-id ws-source extra",
+            "luvus worktree create feature/x --workspace-id ws-source --typo",
+            "luvus worktree create feature/x --workspace ws-source",
+        ] {
+            assert!(parse(&argv(args)).is_err(), "{args}");
+        }
+        for (branch, workspace) in [
+            ("", "ws-source"),
+            ("  ", "ws-source"),
+            ("topic", ""),
+            ("topic", "  "),
+        ] {
+            let args = [
+                "luvus",
+                "worktree",
+                "create",
+                branch,
+                "--workspace-id",
+                workspace,
+            ]
+            .map(str::to_owned);
+            assert!(parse(&args).is_err(), "{args:?}");
+        }
     }
 
     #[test]

@@ -6978,6 +6978,16 @@ impl App {
         repo: &std::path::Path,
         branch: &str,
     ) -> Result<PathBuf, String> {
+        let context = crate::module::context::build(self, "worktree.provider");
+        self.create_worktree_with_context(repo, branch, context)
+    }
+
+    fn create_worktree_with_context(
+        &mut self,
+        repo: &std::path::Path,
+        branch: &str,
+        context: serde_json::Value,
+    ) -> Result<PathBuf, String> {
         let branch = branch.trim();
         if branch.is_empty() {
             return Err("a branch name is required".into());
@@ -7022,7 +7032,7 @@ impl App {
             &self.config.worktree,
             &self.modules,
             &self.module_tokens,
-            crate::module::context::build(self, "worktree.provider"),
+            context,
             repo,
             branch,
         )? {
@@ -14566,6 +14576,87 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    #[test]
+    fn api_worktree_create_requires_parent_and_ignores_focus() {
+        use serde_json::json;
+
+        let _env = crate::persist::test_env("worktree-explicit-parent");
+        let (base, repo, _) = repo_with_sibling_worktree("worktree-explicit-parent");
+        let (other_base, other_repo, _) = repo_with_sibling_worktree("worktree-other-parent");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.workspaces[0].cwd = repo.clone();
+        let parent_id = app.workspaces[0].id.clone();
+        assert!(app.create_workspace_at(other_repo.clone()));
+        let focused_id = app.ws().id.clone();
+        // Stable identity survives a position change as well as unrelated focus.
+        app.workspaces.swap(0, 1);
+        app.active_ws = 0;
+        let before = app.workspaces.len();
+        for (params, code) in [
+            (json!({"branch":"topic"}), "invalid_request"),
+            (
+                json!({"branch":"topic","workspace_id":"missing"}),
+                "not_found",
+            ),
+            (
+                json!({"branch":"topic","workspace_id":""}),
+                "invalid_request",
+            ),
+            (
+                json!({"branch":"topic","workspace_id":42}),
+                "invalid_request",
+            ),
+            (json!({"branch":"topic","workspace":-1}), "invalid_request"),
+            (json!({"branch":"topic","workspace":999}), "not_found"),
+            (
+                json!({"branch":"topic","workspace_id":parent_id,"workspace":1}),
+                "invalid_request",
+            ),
+            (
+                json!({"branch":"topic","workspace":1,"node":1}),
+                "invalid_request",
+            ),
+            (
+                json!({"branch":"topic","workspace_id":parent_id,"typo":true}),
+                "invalid_request",
+            ),
+            (json!({"workspace_id":parent_id}), "invalid_request"),
+            (
+                json!({"branch":"  ","workspace_id":parent_id}),
+                "invalid_request",
+            ),
+        ] {
+            let response = api_call(&mut app, "worktree.create", params.clone());
+            assert_eq!(response["error"]["code"], code, "{params}: {response}");
+            assert_eq!(app.workspaces.len(), before);
+            assert_eq!(app.ws().id, focused_id);
+            assert!(!crate::git::local::branch_exists(&repo, "topic"));
+            assert!(!crate::git::local::branch_exists(&other_repo, "topic"));
+        }
+        for (branch, selector) in [
+            ("by-id", json!({"workspace_id":parent_id})),
+            ("by-index", json!({"workspace":1})),
+            ("by-node", json!({"node":"1"})),
+        ] {
+            app.active_ws = 0;
+            let mut params = selector;
+            params["branch"] = json!(branch);
+            let response = api_call(&mut app, "worktree.create", params);
+            let path = PathBuf::from(response["result"]["path"].as_str().expect("created path"));
+            assert_eq!(
+                crate::git::local::common_dir(&path),
+                crate::git::local::common_dir(&repo)
+            );
+            assert!(crate::git::local::branch_exists(&repo, branch));
+            assert!(!crate::git::local::branch_exists(&other_repo, branch));
+            assert!(crate::platform::same_path(&app.ws().cwd, &path));
+        }
+        drop(app);
+        std::fs::remove_dir_all(base).unwrap();
+        std::fs::remove_dir_all(other_base).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn api_worktree_create_uses_configured_module_provider() {
@@ -14586,6 +14677,7 @@ if env | grep -q '^LUVUS_WORKTREE_'; then
 fi
 request="$LUVUS_MODULE_STATE_DIR/request.json"
 cat > "$request"
+printf '%s\n' "$LUVUS_MODULE_CONTEXT_JSON" > "$LUVUS_MODULE_STATE_DIR/create-context.json"
 repo=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$request")
 branch=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["branch"])' "$request")
 branch_exists=$(python3 -c 'import json,sys; print(str(json.load(open(sys.argv[1]))["branch_exists"]).lower())' "$request")
@@ -14680,6 +14772,8 @@ fi
         assert_eq!(info["result"]["worktree_provider"], true);
         assert_eq!(info["result"]["worktree_remove_provider"], true);
         app.workspaces[0].cwd = repo.clone();
+        let parent_workspace_id = app.workspaces[0].id.clone();
+        assert!(app.create_workspace_at(base.clone()));
         app.config.worktree = crate::config::WorktreeConfig {
             provider: "example.worktree".into(),
         };
@@ -14687,10 +14781,14 @@ fi
         app.handle_event(AppEvent::Api(ApiRequest {
             id: "create".into(),
             method: "worktree.create".into(),
-            params: serde_json::json!({"branch":"topic"}),
+            params: serde_json::json!({"branch":"topic", "workspace":0}),
             reply,
         }));
         assert!(response.try_recv().is_err(), "provider request is parked");
+        // A positional parent is bound before parking. Reordering and changing
+        // focus must not send the retry to another workspace.
+        app.workspaces.swap(0, 1);
+        app.active_ws = 0;
         let ping = api_call(&mut app, "ping", serde_json::json!({}));
         assert_eq!(ping["result"]["type"], "pong");
         let response = loop {
@@ -14721,6 +14819,17 @@ fi
         assert_eq!(request["repository"], repo.display().to_string());
         assert_eq!(request["branch"], "topic");
         assert_eq!(request["branch_exists"], false);
+        let context: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                crate::module::paths::state_dir("example.worktree").join("create-context.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        // Module context keeps its existing positional ID contract, captured
+        // when the provider starts; the parked API request uses the stable ID.
+        assert_eq!(context["workspace"]["id"], "0");
+        assert_eq!(context["workspace"]["cwd"], repo.display().to_string());
 
         app.orch
             .add_task("module worker".into(), vec![], vec![], None)
@@ -14996,7 +15105,7 @@ fi
         let disabled = api_call(
             &mut app,
             "worktree.create",
-            serde_json::json!({"branch":"disabled-topic"}),
+            serde_json::json!({"branch":"disabled-topic", "workspace_id":parent_workspace_id}),
         );
         assert!(
             disabled["error"]["message"]
@@ -15011,7 +15120,7 @@ fi
             &mut app,
             &events,
             "worktree.create",
-            serde_json::json!({"branch":"hook-error"}),
+            serde_json::json!({"branch":"hook-error", "workspace_id":parent_workspace_id}),
         );
         assert_eq!(
             failed["error"]["message"],
@@ -15023,7 +15132,7 @@ fi
                 &mut app,
                 &events,
                 "worktree.create",
-                serde_json::json!({"branch":branch}),
+                serde_json::json!({"branch":branch, "workspace_id":parent_workspace_id}),
             );
             let message = failed["error"]["message"].as_str().unwrap();
             assert!(
@@ -15048,6 +15157,7 @@ fi
             method: "worktree.create".into(),
             params: serde_json::json!({
                 "branch":"revision-topic",
+                "workspace_id":parent_workspace_id,
                 "if_revision":expected_revision
             }),
             reply,
@@ -15072,7 +15182,7 @@ fi
         let rejected = api_call(
             &mut app,
             "worktree.create",
-            serde_json::json!({"branch":"another-topic"}),
+            serde_json::json!({"branch":"another-topic", "workspace_id":parent_workspace_id}),
         );
         assert!(rejected["error"]["message"]
             .as_str()

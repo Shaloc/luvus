@@ -1642,7 +1642,7 @@ impl App {
         Ok(indexed.or(by_id))
     }
 
-    pub(in crate::app::dispatch) fn required_socket_workspace(
+    pub(in crate::app) fn required_socket_workspace(
         &self,
         p: &Value,
     ) -> Result<usize, (String, String)> {
@@ -1926,7 +1926,9 @@ impl App {
                 ));
             }
         }
-        let workspace = if pane_scoped {
+        let workspace = if method == "worktree.create" {
+            Some(self.required_socket_workspace(p)?)
+        } else if pane_scoped {
             match p.get("pane") {
                 None | Some(Value::Null) if self.workspaces.is_empty() => None,
                 None | Some(Value::Null) => Some(self.active_ws),

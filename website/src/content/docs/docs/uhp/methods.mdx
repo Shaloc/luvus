@@ -253,6 +253,16 @@ only in worktree mode, and `task.merge` returns
 `focus: false` to create and start the worker without changing the operator's
 current workspace, tab, pane focus, or zoom state.
 
+`worktree.create` requires a non-blank `branch` and exactly one explicit parent
+selector: stable `workspace_id` (recommended), 0-based `workspace`, or its legacy
+`node` alias. It never defaults to the active workspace. Unknown fields and
+invalid or missing selectors fail before creation. Positional selectors are
+bound to a stable ID before an asynchronous provider starts. Requests to a
+remote projection return `remote_workspace`; call the owner host/session with
+its own workspace ID. The response remains `{"type":"ok","path":"..."}`.
+Capabilities advertise `worktree.create_requires_workspace: true`. CLI callers
+use `worktree create <branch> --workspace-id <id>`.
+
 `worktree.remove` accepts an exact `path` and optional boolean `force`. Without
 force, Luvus returns `worktree_in_use` before deletion when the worktree owns a
 working or blocked agent pane, an unfinished bound task, or a related lease.

@@ -104,6 +104,8 @@ jobs:
         run: target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --browser-open-only
       - name: Isolated agent date folding and owner restart smoke
         run: target/ui-appearance-test-env/bin/python scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --agent-date-only
+      - name: Isolated explicit worktree parent and owner routing smoke
+        run: python3 scripts/test-remote-sessions.py "target/$TARGET/release/luvus" --worktree-target-only
       - name: Isolated local and remote Kitty transport smoke
         run: |
           # Same checkout binary, private homes and fake SSH only; no real hosts.

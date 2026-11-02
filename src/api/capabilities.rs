@@ -423,6 +423,7 @@ pub fn capabilities(event_sequence: u64) -> Value {
             "automation_min_interval_s":crate::automation::MIN_INTERVAL_SECONDS,
         },
         "identity":{"workspace":"stable","tab":"stable","terminal":"pty_lifetime"},
+        "worktree":{"create_requires_workspace":true},
         "events":{"resume":"after_sequence","loss":"resync_required"},
         "agent_authorities":["integration_report","osc7501","process_tree","launch_command","osc_title","screen_text","prior_identity","command_fallback"],
         "agent_states":["idle","working","blocked","done"],
@@ -475,6 +476,7 @@ mod tests {
                 && contract["idempotent"].is_boolean()
         }));
         let capabilities = capabilities(0);
+        assert_eq!(capabilities["worktree"]["create_requires_workspace"], true);
         assert_eq!(
             capabilities["concurrency"]["agent_prompt_terminal_id"],
             true

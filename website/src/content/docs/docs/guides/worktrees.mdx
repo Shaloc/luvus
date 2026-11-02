@@ -94,8 +94,30 @@ the requested branch checked out. This provider applies uniformly to
   a click outside the prompt cancels it.
 - **The folder picker** (`Ctrl+Space N`): when browsing a git repo, an *Open
   with new worktree* row (or the `w` key) does the same for that repo.
-- **CLI**: `luvus worktree create <branch>` · `open <path>` · `list` ·
+- **CLI**: `luvus worktree create <branch> --workspace-id <id>` · `open <path>` · `list` ·
   `remove <path>` (the branch is kept).
+
+CLI creation requires the source workspace's stable `workspace_id` from
+`luvus workspace list`; it never chooses a repository from the current focus,
+command CWD, or caller pane. Match the full repository path before creating:
+
+```bash
+luvus workspace list
+luvus worktree create feature/topic --workspace-id <source-workspace-id>
+```
+
+An unknown or missing selector fails before creation. For SSH workspaces, query
+the owner with `luvus --host <host> --session <session> workspace list`, then use
+the same host/session and the owner's ID for creation. A local projection ID
+cannot select its remote repository. TUI shortcuts and menus continue to use
+the repository selected by that UI action.
+
+New branches start at the selected checkout's HEAD. To choose a different base,
+create the branch in that repository first. After creation, use the returned
+`path` and verify its Git common directory, branch, and HEAD before starting an
+agent. `uhp capabilities` advertises `worktree.create_requires_workspace: true`;
+older CLIs may silently ignore the new flag, so check both CLI help and server
+capabilities before automating this workflow.
 
 ## Open one
 
