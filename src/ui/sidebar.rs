@@ -5,7 +5,7 @@
 //! single-purpose left sidebar.
 
 use super::*;
-use crate::app::{AgentDockTarget, AgentTab, SidebarListFocus};
+use crate::app::{AgentDockTarget, AgentTab, BarDrag, SidebarBar, SidebarListFocus};
 
 fn attention(s: State) -> u8 {
     match s {
@@ -99,32 +99,64 @@ fn dock_row_stride(paths_visible: bool) -> u16 {
 /// A scrollbar on the sidebar's right edge, shown only when the list overflows
 /// its area. Thin block glyphs keep the indicator lighter than a full-cell
 /// background strip while remaining terminal-native: a faint one-eighth-cell
-/// track carries a brighter thumb of the same narrow width, sized to the
-/// visible fraction.
-fn draw_scrollbar(
+/// track carries a brighter half-cell thumb, sized to the visible fraction.
+/// Record only visible bars so clicks cannot target hidden or fitting lists.
+pub(crate) fn draw_scrollbar(
     f: &mut RenderTarget,
-    track: Rect,
-    total: usize,
-    cap: usize,
+    bars: &mut Vec<SidebarBar>,
+    bar: SidebarBar,
     scroll: usize,
     t: &Theme,
 ) {
-    if total <= cap || track.height == 0 {
+    let SidebarBar {
+        track,
+        total,
+        cap,
+        max_scroll,
+        ..
+    } = bar;
+    if max_scroll == 0 || track.height == 0 {
         return;
     }
+    bars.push(bar);
     let len = track.height as usize;
-    let thumb = (len * cap / total).clamp(1, len);
-    let span = total - cap;
+    let thumb = (len * cap / total.max(1)).clamp(1, len);
+    let span = max_scroll;
     let pos = ((len - thumb) * scroll.min(span))
         .checked_div(span)
         .unwrap_or(0);
-    let buf = f.buffer_mut();
     for i in 0..len {
         let on = i >= pos && i < pos + thumb;
-        let cell = &mut buf[(track.x, track.y + i as u16)];
-        cell.set_symbol("▕");
+        let row = track.y + i as u16;
+        let style = f.buffer_mut()[(track.x, row)].style();
+        // A filename can leave a wide glyph crossing this column. Clear its
+        // head too, or frame encoding would hide the bar as a continuation.
+        f.clear_overlay(Rect::new(track.x, row, 1, 1));
+        let cell = &mut f.buffer_mut()[(track.x, row)];
+        cell.set_style(style);
+        cell.set_symbol(if on { "▐" } else { "▕" });
         cell.set_fg(if on { t.overlay1 } else { t.surface1 });
     }
+}
+
+/// Include the column left of the glyph, keeping the resize seam separate.
+pub(crate) fn scrollbar_hit(track: Rect, c: u16, r: u16) -> bool {
+    (track.x.saturating_sub(1)..=track.x).contains(&c) && r >= track.y && r < track.bottom()
+}
+
+/// Invert thumb placement and clamp a drag that leaves the track. `max_scroll`
+/// comes from the same row-height calculation that clamps the rendered list.
+pub(crate) fn bar_offset(bar: SidebarBar, r: u16) -> usize {
+    let len = usize::from(bar.track.height);
+    if len == 0 {
+        return 0;
+    }
+    let thumb = (len * bar.cap / bar.total.max(1)).clamp(1, len);
+    let r = r.clamp(bar.track.y, bar.track.bottom().saturating_sub(1));
+    (usize::from(r - bar.track.y) * bar.max_scroll)
+        .checked_div(len.saturating_sub(thumb))
+        .unwrap_or(bar.max_scroll)
+        .min(bar.max_scroll)
 }
 
 /// Split a sidebar `body` rect into `n` stacked dock slots with a one-row
@@ -540,9 +572,8 @@ fn draw_workspaces_dock(
     if active_changed {
         app.last_active_ws_id_shown = app.workspaces.get(app.active_ws).map(|ws| ws.id.clone());
     }
-    app.workspaces_scroll =
-        app.workspaces_scroll
-            .min(last_scroll(&order, nrows as usize, paths_visible));
+    let max_scroll = last_scroll(&order, nrows as usize, paths_visible);
+    app.workspaces_scroll = app.workspaces_scroll.min(max_scroll);
     if let Some(position) = reveal {
         app.workspaces_scroll = app.workspaces_scroll.min(position);
         while nrows > 0
@@ -698,9 +729,14 @@ fn draw_workspaces_dock(
     }
     draw_scrollbar(
         f,
-        Rect::new(bar_col, nlist_top, 1, nrows),
-        ntotal,
-        ncap,
+        &mut app.sidebar_bars,
+        SidebarBar {
+            list: BarDrag::Workspaces,
+            track: Rect::new(bar_col, nlist_top, 1, nrows),
+            total: ntotal,
+            cap: ncap,
+            max_scroll,
+        },
         nscroll,
         t,
     );
@@ -1448,14 +1484,14 @@ fn draw_agents_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t: &Theme) 
         }
         draw_scrollbar(
             f,
-            Rect::new(
-                bar_col,
-                alist_top,
-                1,
-                arows.saturating_sub(u16::from(has_elsewhere)),
-            ),
-            atotal,
-            acap,
+            &mut app.sidebar_bars,
+            SidebarBar {
+                list: BarDrag::Agents,
+                track: Rect::new(bar_col, alist_top, 1, viewport_height),
+                total: atotal,
+                cap: acap,
+                max_scroll: last_scroll,
+            },
             ascroll,
             t,
         );
@@ -1779,7 +1815,21 @@ mod tests {
         let theme = crate::ui::theme::by_name("quattro-rally");
         {
             let mut target = crate::ui::RenderTarget::new(&mut buffer, area);
-            super::draw_scrollbar(&mut target, area, 6, 2, 0, &theme);
+            let mut bars = Vec::new();
+            super::draw_scrollbar(
+                &mut target,
+                &mut bars,
+                crate::app::SidebarBar {
+                    list: crate::app::BarDrag::Agents,
+                    track: area,
+                    total: 6,
+                    cap: 2,
+                    max_scroll: 4,
+                },
+                0,
+                &theme,
+            );
+            assert_eq!(bars.len(), 1);
         }
 
         let symbols: Vec<&str> = (0..area.height)
@@ -1787,8 +1837,8 @@ mod tests {
             .collect();
         assert_eq!(
             symbols,
-            vec!["▕", "▕", "▕", "▕", "▕", "▕"],
-            "the proportional thumb and track stay one-eighth of a cell wide"
+            vec!["▐", "▐", "▕", "▕", "▕", "▕"],
+            "a half-cell proportional thumb on a one-eighth-cell track"
         );
         assert_eq!(buffer.cell((0, 0)).expect("thumb cell").fg, theme.overlay1);
         assert_eq!(buffer.cell((0, 2)).expect("track cell").fg, theme.surface1);
@@ -1797,6 +1847,84 @@ mod tests {
                 .cell((0, row))
                 .is_some_and(|cell| cell.style().bg == Some(ratatui::style::Color::Reset))),
             "the scrollbar must not paint a full-cell background strip"
+        );
+    }
+
+    #[test]
+    fn scrollbar_offsets_handle_variable_row_heights_and_track_edges() {
+        use crate::app::{BarDrag, SidebarBar};
+        let bar = SidebarBar {
+            list: BarDrag::Workspaces,
+            track: Rect::new(28, 3, 1, 20),
+            total: 25,
+            cap: 12,
+            max_scroll: 15, // headings at the top use fewer cells than path rows
+        };
+        assert_eq!(super::bar_offset(bar, 0), 0);
+        assert_eq!(super::bar_offset(bar, 22), 15);
+        assert_eq!(super::bar_offset(bar, 90), 15);
+        assert!(super::scrollbar_hit(bar.track, 27, 3));
+        assert!(
+            !super::scrollbar_hit(bar.track, 29, 3),
+            "resize seam stays independent"
+        );
+        assert!(!super::scrollbar_hit(bar.track, 28, 23));
+        assert_eq!(
+            super::bar_offset(
+                SidebarBar {
+                    track: Rect::ZERO,
+                    ..bar
+                },
+                0
+            ),
+            0
+        );
+        assert_eq!(
+            super::bar_offset(
+                SidebarBar {
+                    max_scroll: 0,
+                    ..bar
+                },
+                8
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn scrollbar_clears_crossing_wide_text_before_frame_encoding() {
+        use crate::app::{BarDrag, SidebarBar};
+        use ratatui::style::{Color, Style};
+        let area = Rect::new(0, 0, 8, 2);
+        let mut buffer = Buffer::empty(area);
+        let theme = crate::ui::theme::by_name("quattro-rally");
+        buffer.set_string(5, 0, "中", Style::new().bg(Color::Rgb(1, 2, 3)));
+        // set_string resets wide-glyph continuation cells; give the track its
+        // own row highlight to verify that clearing it preserves that style.
+        buffer[(6, 0)].set_bg(Color::Rgb(1, 2, 3));
+        let mut bars = Vec::new();
+        super::draw_scrollbar(
+            &mut crate::ui::RenderTarget::new(&mut buffer, area),
+            &mut bars,
+            SidebarBar {
+                list: BarDrag::Files,
+                track: Rect::new(6, 0, 1, 2),
+                total: 10,
+                cap: 2,
+                max_scroll: 8,
+            },
+            0,
+            &theme,
+        );
+        let frame = crate::ipc::protocol::frame_from_buffer(&buffer, None, false);
+        assert_eq!(
+            frame.cells[6].symbol, "▐",
+            "wide filename must not swallow the bar on the wire"
+        );
+        assert_eq!(
+            buffer[(6, 0)].bg,
+            Color::Rgb(1, 2, 3),
+            "keep the row background"
         );
     }
 

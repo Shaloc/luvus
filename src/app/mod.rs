@@ -200,6 +200,25 @@ pub enum Side {
     Right,
 }
 
+/// The sidebar list whose scrollbar owns the pointer gesture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BarDrag {
+    Workspaces,
+    Agents,
+    Files,
+}
+
+/// Geometry from the last interactive frame. Group headings and path rows can
+/// have different heights, so the last scroll offset is independent of `cap`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SidebarBar {
+    pub list: BarDrag,
+    pub track: Rect,
+    pub total: usize,
+    pub cap: usize,
+    pub max_scroll: usize,
+}
+
 /// One row a module pushes into its dock (docs/29, DOCK-4). `dot` is an optional
 /// state name (`working`/`blocked`/`done`/`idle`) rendered as a coloured dot;
 /// `action` is a module action id invoked when the row is clicked.
@@ -3265,6 +3284,9 @@ pub struct App {
     pub agents_scroll: usize,
     pub workspaces_area: Rect,
     pub agents_area: Rect,
+    /// Scrollbars rendered by the active client, rebuilt each frame.
+    pub sidebar_bars: Vec<SidebarBar>,
+    pub bar_drag: Option<BarDrag>,
     /// Explicit keyboard ownership for WORKSPACES or AGENTS.
     pub sidebar_focus: Option<SidebarListFocus>,
     /// Display-order cursors for the two built-in sidebar lists.
@@ -3906,6 +3928,8 @@ impl App {
             agents_this_workspace,
             workspaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
+            sidebar_bars: Vec::new(),
+            bar_drag: None,
             sidebar_focus: None,
             workspace_cursor: 0,
             collapsed_workspace_machines: HashSet::new(),
@@ -4701,6 +4725,8 @@ impl App {
             agents_this_workspace,
             workspaces_area: Rect::ZERO,
             agents_area: Rect::ZERO,
+            sidebar_bars: Vec::new(),
+            bar_drag: None,
             sidebar_focus: None,
             workspace_cursor: 0,
             collapsed_workspace_machines: HashSet::new(),
@@ -21144,6 +21170,240 @@ fi
         assert!(
             app.workspaces_scroll > 0,
             "the active workspace was scrolled into view"
+        );
+    }
+
+    /// The WORKSPACES/AGENTS scrollbar is interactive: a press jumps the list to
+    /// the clicked position (instead of selecting the row under the bar) and the
+    /// drag that follows keeps the list glued to the pointer until release.
+    #[test]
+    fn sidebar_scrollbars_cover_grouped_rows_and_keep_interactive_geometry() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{backend::TestBackend, buffer::Buffer, layout::Rect, Terminal};
+        let _env = crate::persist::test_env("sidebar-scroll-groups");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 18, tx).unwrap();
+        for i in 0..12 {
+            if i != 0 {
+                app.new_workspace();
+            }
+            let pane = app.layout().focus;
+            let status = app.status.get_mut(&pane).unwrap();
+            status.agent = "codex".into();
+            status.agent_started_at = Some(1_790_000_000 + (i / 3) * 86400);
+        }
+        app.active_ws = 0;
+        let mut term = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        let mouse = |kind, column, row| {
+            AppEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        for paths in [false, true] {
+            app.config.layout.workspace_paths = paths;
+            app.config.layout.agent_paths = paths;
+            for tab in [AgentTab::Active, AgentTab::Workspace, AgentTab::Date] {
+                app.set_agents_tab(tab);
+                term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+                let bars = app.sidebar_bars.clone();
+                assert!(bars.iter().any(|bar| bar.list == BarDrag::Agents));
+                // A passive client can have a completely different viewport.
+                let area = Rect::new(0, 0, 20, 4);
+                let mut buffer = Buffer::empty(area);
+                crate::ui::render_projection(
+                    &mut crate::ui::RenderTarget::new(&mut buffer, area),
+                    &mut app,
+                );
+                assert_eq!(app.sidebar_bars, bars);
+                for bar in bars {
+                    app.sidebar_focus = Some(match bar.list {
+                        BarDrag::Workspaces => SidebarListFocus::Workspaces,
+                        BarDrag::Agents => SidebarListFocus::Agents,
+                        BarDrag::Files => unreachable!(),
+                    });
+                    let workspace = app.active_ws;
+                    let groups = app.collapsed_agent_dates.clone();
+                    app.handle_event(mouse(
+                        MouseEventKind::Down(MouseButton::Left),
+                        bar.track.x - 1,
+                        bar.track.bottom() - 1,
+                    ));
+                    term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+                    let scroll = if bar.list == BarDrag::Workspaces {
+                        app.workspaces_scroll
+                    } else {
+                        app.agents_scroll
+                    };
+                    assert_eq!(
+                        scroll, bar.max_scroll,
+                        "{tab:?} paths={paths} {:?}",
+                        bar.list
+                    );
+                    assert_eq!(
+                        app.active_ws, workspace,
+                        "bar presses never select a workspace"
+                    );
+                    assert_eq!(
+                        app.collapsed_agent_dates, groups,
+                        "bar presses never fold groups"
+                    );
+                    assert!(app.sidebar_focus.is_none());
+                    app.toast = Some(("Copied".into(), Instant::now()));
+                    app.handle_event(mouse(MouseEventKind::Drag(MouseButton::Left), 70, 0));
+                    term.draw(|f| crate::ui::render(f, &mut app)).unwrap();
+                    let scroll = if bar.list == BarDrag::Workspaces {
+                        app.workspaces_scroll
+                    } else {
+                        app.agents_scroll
+                    };
+                    assert_eq!(scroll, 0, "a drag outside the sidebar reaches the start");
+                    app.toast = None;
+                    // A popup opened during the gesture must receive no click or
+                    // selection from its release, and must not leave a stale grab.
+                    app.open_pane_menu(app.layout().focus, 40, 4);
+                    app.handle_event(mouse(MouseEventKind::Up(MouseButton::Left), 70, 0));
+                    assert!(app.bar_drag.is_none());
+                    assert!(app.pane_menu.is_some());
+                    app.pane_menu = None;
+                }
+            }
+        }
+        // Interactive early-return frames must discard old hit targets.
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buffer = Buffer::empty(area);
+        crate::ui::render_into(
+            &mut crate::ui::RenderTarget::new(&mut buffer, area),
+            &mut app,
+        );
+        assert!(app.sidebar_bars.is_empty());
+    }
+
+    #[test]
+    fn sidebar_scrollbar_drag_crosses_remote_files_and_header() {
+        let _env = crate::persist::test_env("sidebar-bar-remote-files");
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.sidebar_bars.push(SidebarBar {
+            list: BarDrag::Workspaces,
+            track: Rect::new(20, 2, 1, 10),
+            total: 100,
+            cap: 10,
+            max_scroll: 90,
+        });
+        app.bar_drag = Some(BarDrag::Workspaces);
+        app.workspaces[0].remote = Some(remote::RemoteWorkspaceRef {
+            host: "test-host".into(),
+            session: "default".into(),
+            workspace_id: "owner-ws".into(),
+        });
+        app.sidebars.left.docks.push(DockKind::Files);
+        app.files_area = Rect::new(0, 14, 22, 10);
+        let drag = |column, row| {
+            AppEvent::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        app.handle_event(drag(10, 20));
+        assert_eq!(
+            app.workspaces_scroll, 90,
+            "remote FILES must not swallow a captured drag"
+        );
+        app.workspaces[0].remote = None;
+        app.compact = true;
+        app.last_pane_area = Rect::new(0, 2, 80, 22);
+        app.handle_event(drag(60, 0));
+        assert_eq!(
+            app.workspaces_scroll, 0,
+            "header must not swallow a captured drag"
+        );
+        app.notification_inbox.open = true;
+        app.handle_event(drag(60, 23));
+        assert_eq!(
+            app.workspaces_scroll, 0,
+            "open inbox keeps modal precedence"
+        );
+    }
+
+    #[test]
+    fn sidebar_scrollbar_can_be_clicked_and_dragged() {
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::Terminal;
+
+        // The bar's geometry depends on how many docks share the sidebar, so this
+        // needs the default layout, not whatever the machine running the tests has
+        // in its real config. Without it the test passes or fails on run order.
+        let _env = crate::persist::test_env("scrollbar-drag");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        for _ in 0..9 {
+            app.new_workspace(); // 10 workspaces — more than fit in a short sidebar
+        }
+        app.active_ws = 0;
+        app.last_active_ws_shown = 0;
+
+        let mut term = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        let mut draw = |app: &mut App| {
+            term.draw(|f| crate::ui::render(f, app))
+                .map(|_| ())
+                .unwrap()
+        };
+        draw(&mut app);
+        let na = app.workspaces_area;
+        let bar = na.right() - 2;
+        let at = |app: &mut App, kind, column, row| {
+            app.handle_event(AppEvent::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
+
+        // Keyboard focus keeps the cursor (top row) in view on every draw; the bar
+        // must still scroll, so grabbing it hands input back to the pane.
+        app.sidebar_focus = Some(SidebarListFocus::Workspaces);
+        app.workspace_cursor = 0;
+
+        // Press at the bottom of the track → jump to the end of the list.
+        at(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            bar,
+            na.bottom() - 1,
+        );
+        draw(&mut app);
+        let end = app.workspaces_scroll;
+        assert!(end > 0, "clicking the bar scrolled the list, got {end}");
+        assert_eq!(app.active_ws, 0, "the bar is not a workspace row");
+        assert!(
+            app.sidebar_focus.is_none(),
+            "grabbing the bar ends keyboard focus"
+        );
+
+        // Drag back to the top of the track → the list follows, then release drops
+        // the grab so later motion over the sidebar scrolls nothing.
+        at(&mut app, MouseEventKind::Drag(MouseButton::Left), bar, na.y);
+        draw(&mut app);
+        assert_eq!(app.workspaces_scroll, 0, "the drag followed the pointer");
+        at(&mut app, MouseEventKind::Up(MouseButton::Left), bar, na.y);
+        at(
+            &mut app,
+            MouseEventKind::Drag(MouseButton::Left),
+            bar,
+            na.bottom() - 1,
+        );
+        draw(&mut app);
+        assert_eq!(
+            app.workspaces_scroll, 0,
+            "a drag that never grabbed the bar scrolls nothing"
         );
     }
 

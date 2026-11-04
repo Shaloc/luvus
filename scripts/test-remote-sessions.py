@@ -11,6 +11,7 @@ Use --session-discovery-only for owner inventory and session deletion regression
 Use --remote-only-open-only for merge routing without implicit local owners.
 Use --agent-focus-only for Agents highlight and owner focus synchronization.
 Use --agent-title-only for agent title initials, compact groups and display-local toggles (requires pyte).
+Use --sidebar-scroll-only for real local, direct-remote and merged scrollbar gestures (requires pyte).
 Use --agent-date-only for date folding/counts and native session restart persistence (requires pyte).
 Use --agent-seen-only for native Done acknowledgement after remote owner restart.
 Use --agent-state-only for native state changes and Ctrl+C exit synchronization.
@@ -334,7 +335,8 @@ def main():
     file_links_only = "--file-links-only" in sys.argv[1:]
     workspace_close_only = "--workspace-close-only" in sys.argv[1:]
     worktree_target_only = "--worktree-target-only" in sys.argv[1:]
-    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or browser_open_only or transpose_only:
+    sidebar_scroll_only = "--sidebar-scroll-only" in sys.argv[1:]
+    if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or browser_open_only or transpose_only or sidebar_scroll_only:
         # Full and sparse ANSI updates must be applied to one retained screen.
         # Looking for contiguous output bytes misses unchanged cells reused from
         # before the restart. This dependency is test-only, not part of Luvus.
@@ -345,7 +347,7 @@ def main():
     session_discovery_only = "--session-discovery-only" in sys.argv[1:]
     web_only = "--web-only" in sys.argv[1:]
     remote_only_open_only = "--remote-only-open-only" in sys.argv[1:]
-    positional = [arg for arg in sys.argv[1:] if arg not in ("--worktree-target-only", "--agent-date-only", "--browser-proxy-only", "--browser-open-only", "--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
+    positional = [arg for arg in sys.argv[1:] if arg not in ("--sidebar-scroll-only", "--worktree-target-only", "--agent-date-only", "--browser-proxy-only", "--browser-open-only", "--web-only", "--ssh-admission-only", "--upstream-only", "--restart-only", "--agent-state-only", "--agent-focus-only", "--agent-seen-only", "--reconnect-only", "--network-reconnect-only", "--event-backpressure-only", "--clipboard-helper-only", "--paste-events-only", "--dimensions-only", "--session-discovery-only", "--remote-only-open-only", "--theme-sync-only", "--graphics-only", "--colors-only", "--appearance-only", "--workspace-close-only", "--agent-title-only", "--file-links-only", "--transpose-only", "--terminal-notify-only", "--program-status-only")]
     binary = (Path(positional[0]) if positional else repo / "target/debug/luvus").resolve()
     if not binary.is_file():
         raise SystemExit("Build Luvus first: cargo build --locked")
@@ -978,7 +980,7 @@ def main():
             if colors_only:
                 color_output.clear()
                 color_output.extend(screen)
-            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or browser_open_only or transpose_only:
+            if reconnect_only or network_reconnect_only or event_backpressure_only or colors_only or appearance_only or workspace_close_only or agent_title_only or file_links_only or browser_open_only or transpose_only or sidebar_scroll_only:
                 terminal = pyte.Screen(120, 30)
                 decoder = pyte.ByteStream(terminal)
                 decoder.feed(bytes(screen))
@@ -1058,6 +1060,63 @@ def main():
 
             wait_for(exited)
             assert process.returncode == 0, process.returncode
+
+        if sidebar_scroll_only:
+            select_hosts(["fake-dev"])
+            first = {}
+            for remote in (False, True):
+                label = "remote" if remote else "local"
+                api("config.patch", {"patch": {"layout": {"workspace_paths": True,
+                    "workspace_display": "tree"}}}, remote=remote)
+                for i in range(10):
+                    path = root / f"{label}-sbar-{i:02}"
+                    path.mkdir()
+                    api("workspace.open", {"path": str(path)}, remote=remote)
+                rows = api("workspace.list", remote=remote)["workspaces"]
+                first[remote] = next(w["workspace_id"] for w in rows if w["cwd"] == str(root / f"{label}-sbar-00"))
+                api("workspace.focus", {"workspace_id": first[remote]}, remote=remote)
+            for mode in ("local", "direct-remote", "merge"):
+                run("session", "merge", "on" if mode == "merge" else "off")
+                remote = mode != "local"
+                session = "remote-fake-dev-api" if mode == "direct-remote" else "api"
+                if mode == "merge":
+                    destination = wait_for(lambda: next((w for w in projected()
+                        if w["cwd"] == str(root / "remote-sbar-00")), None))
+                    api("workspace.focus", {"workspace_id": destination["id"]})
+                else:
+                    api("workspace.focus", {"workspace_id": first[remote]}, remote=remote)
+                args = ["session", "attach", session] if mode == "direct-remote" else ["--session", "api"]
+                process, master = start_client(args)
+                terminal = client_terminals[master][0]
+                def bar():
+                    drain(master, .15)
+                    cells = [(x, y) for y in range(terminal.lines) for x in range(45)
+                             if terminal.buffer[y][x].data in ("▐", "▕")]
+                    if not cells: return None
+                    x = min(x for x, _ in cells)
+                    rows = [y for col, y in cells if col == x]
+                    return x + 1, min(rows) + 1, max(rows) + 1
+                x, top, bottom = wait_for(bar)
+                focused = api("pane.current", remote=remote)["pane"]
+                os.write(master, f"\x1b[<0;{x};{bottom}M".encode())
+                last = "remote-sbar-09" if remote else "local-sbar-09"
+                wait_for(lambda: (drain(master, .15), last in "\n".join(terminal.display))[1],
+                         diagnostics=lambda: "\n".join(terminal.display))
+                # The pointer leaves the sidebar and enters a remote pane; its
+                # drag must still belong to the display's scrollbar.
+                os.write(master, b"\x1b[<32;80;1M")
+                first_label = "local-sbar-00" if mode != "direct-remote" else "remote-sbar-00"
+                wait_for(lambda: (drain(master, .15), first_label in "\n".join(terminal.display))[1])
+                os.write(master, b"\x1b[<0;80;1m")
+                drain(master, .2)
+                assert api("pane.current", remote=remote)["pane"] == focused
+                os.write(master, f"\x1b[<32;{x};{bottom}M".encode())
+                drain(master, .2)
+                assert first_label in "\n".join(terminal.display), "release ends the grab"
+                (root / f"sidebar-{mode}.txt").write_text("\n".join(terminal.display))
+                detach_client(process, master)
+                print(f"PASS: {mode} scrollbar click/drag reaches both ends without changing owner focus", flush=True)
+            return
 
         if program_status_only:
             for mode in ("local", "direct-remote", "merge"):

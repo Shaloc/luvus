@@ -137,6 +137,7 @@ mod search;
 mod session_menu;
 mod settings;
 mod sidebar;
+pub(crate) use sidebar::{bar_offset, scrollbar_hit};
 pub(crate) use sidebar::{DOCK_HEADER_ROWS, SIDEBAR_CHROME_ROWS};
 mod status;
 pub(crate) mod switcher;
@@ -343,6 +344,7 @@ fn render_projection_preserving_state(
     let diff_note_rects = std::mem::take(&mut app.diff_note_rects);
     let preview_link_rects = std::mem::take(&mut app.preview_link_rects);
     let module_dock_rects = std::mem::take(&mut app.module_dock_rects);
+    let sidebar_bars = std::mem::take(&mut app.sidebar_bars);
     let dock_dividers = std::mem::take(&mut app.dock_dividers);
     let picker_rects = std::mem::take(&mut app.picker_rects);
     let worktree_open_rects = std::mem::take(&mut app.worktree_open_rects);
@@ -519,6 +521,7 @@ fn render_projection_preserving_state(
     app.diff_note_rects = diff_note_rects;
     app.preview_link_rects = preview_link_rects;
     app.module_dock_rects = module_dock_rects;
+    app.sidebar_bars = sidebar_bars;
     app.dock_dividers = dock_dividers;
     app.picker_rects = picker_rects;
     app.worktree_open_rects = worktree_open_rects;
@@ -802,6 +805,7 @@ fn render_into_mode_impl(
     // a frame that bails out (window too small, no workspace yet) must not
     // leave a dock divider behind as a live drag target.
     app.dock_dividers.clear();
+    app.sidebar_bars.clear();
     // Includes the too-small-window and empty-session exits: old machine or
     // workspace rows must not remain clickable when the dock is not drawn.
     app.ws_rects.clear();

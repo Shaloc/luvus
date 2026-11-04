@@ -269,6 +269,21 @@ pub(super) fn draw_files_dock(f: &mut RenderTarget, area: Rect, app: &mut App, t
         line_at(f, y, Line::from(spans));
         app.file_tree_rects.push((i, rect));
     }
+    if area.width >= 3 {
+        crate::ui::sidebar::draw_scrollbar(
+            f,
+            &mut app.sidebar_bars,
+            crate::app::SidebarBar {
+                list: crate::app::BarDrag::Files,
+                track: Rect::new(area.right() - 2, list_top, 1, cap as u16),
+                total: n,
+                cap,
+                max_scroll,
+            },
+            scroll,
+            t,
+        );
+    }
 }
 
 fn draw_diff_list(

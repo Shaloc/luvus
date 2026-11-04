@@ -27,6 +27,7 @@ impl App {
         if !crate::ui::chrome_uncovered(self)
             || self.copy_mode.is_some()
             || self.mouse_grab.is_some()
+            || self.bar_drag.is_some()
             || self.remote_mouse_capture.is_some()
             || self.selection.as_ref().is_some_and(|s| s.dragging)
         {

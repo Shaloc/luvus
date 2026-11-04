@@ -2069,6 +2069,18 @@ impl App {
         if self.forward_captured_remote_mouse(m) {
             return true;
         }
+        // A scrollbar owns its drag even outside the sidebar. Release it before
+        // overlays can swallow the button-up; a new press replaces a lost release.
+        if self.bar_drag.is_some() {
+            match kind {
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.bar_drag = None;
+                    return true;
+                }
+                MouseEventKind::Down(MouseButton::Left) => self.bar_drag = None,
+                _ => {}
+            }
+        }
         self.cancel_orphaned_pane_search();
         // Pane search is keyboard-owned too. A deliberate mouse action cancels
         // it back to its saved viewport and is swallowed, so neither focus nor
@@ -2927,6 +2939,15 @@ impl App {
             }
             return;
         }
+        // Modals above and the notification inbox retain pointer ownership.
+        // Otherwise a captured scrollbar keeps following the pointer across
+        // headers, remote FILES areas and non-modal notifications.
+        if let (MouseEventKind::Drag(MouseButton::Left), Some(which)) = (m.kind, self.bar_drag) {
+            if !self.notification_inbox.open {
+                self.update_bar_drag(which, m.row);
+            }
+            return;
+        }
         // Mobile chrome is below every modal/popup, including the owner's
         // worktree chooser. Covered MENU/pane arrows must not take the click.
         if let (MouseEventKind::Down(MouseButton::Left), Some(r)) =
@@ -3666,6 +3687,19 @@ impl App {
             return;
         }
 
+        // Rows include the bar column. Claim the bar before a group, workspace,
+        // agent or file row can activate the item beneath it.
+        if let Some(which) = self.bar_hit(c, r) {
+            match which {
+                BarDrag::Files if self.file_tree.filter.is_some() => {}
+                BarDrag::Files => self.files_focused = false,
+                BarDrag::Workspaces | BarDrag::Agents => self.sidebar_focus = None,
+            }
+            self.bar_drag = Some(which);
+            self.update_bar_drag(which, r);
+            return;
+        }
+
         // The sidebar gear opens Settings.
         if self.named_session_button_rect.is_some_and(hit) {
             self.open_named_session_menu();
@@ -4004,6 +4038,35 @@ impl App {
         if let Some((id, _)) = self.pane_rects.iter().find(|(_, rect)| hit(*rect)) {
             let id = *id;
             self.focus_pane_global(id);
+        }
+    }
+
+    fn bar_hit(&self, c: u16, r: u16) -> Option<BarDrag> {
+        self.sidebar_bars
+            .iter()
+            .find(|bar| crate::ui::scrollbar_hit(bar.track, c, r))
+            .map(|bar| bar.list)
+    }
+
+    fn update_bar_drag(&mut self, which: BarDrag, r: u16) {
+        let Some(bar) = self
+            .sidebar_bars
+            .iter()
+            .find(|bar| bar.list == which)
+            .copied()
+        else {
+            return;
+        };
+        let offset = crate::ui::bar_offset(bar, r);
+        match which {
+            BarDrag::Workspaces => self.workspaces_scroll = offset,
+            BarDrag::Agents => self.agents_scroll = offset,
+            BarDrag::Files => {
+                self.file_tree.scroll = offset;
+                if self.file_tree.filter.is_some() {
+                    self.file_tree.cursor = offset;
+                }
+            }
         }
     }
 
