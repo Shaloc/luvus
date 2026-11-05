@@ -2849,7 +2849,9 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
                 let Ok(request) = request else {
                     break;
                 };
-                if request.validate().is_err()
+                // The app handler rejects invalid actions by request ID; keep a
+                // well-framed rejection from tearing down every pane on this display.
+                if !request.has_valid_id()
                     || app_tx
                         .send(AppEvent::ClientAppRequest { id, request })
                         .is_err()

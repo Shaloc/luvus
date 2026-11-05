@@ -470,7 +470,10 @@ Pane IDs are opaque, not tab positions. Inside a Luvus terminal `--pane` default
 to `LUVUS_PANE_ID`. See [browser sessions](/docs/guides/remote/#browser-sessions).
 
 In the macOS desktop client, open an embedded browser leaf before requesting
-control. Run the commands on the **owner** of that leaf:
+control. You can click, type, or navigate in the visible tab immediately. An
+agent can acquire that same page without a mode switch. Click the page or type
+to resume manual interaction, or choose **Take control** to revoke a lease.
+Run the commands on the **owner** of that leaf:
 
 ```sh
 luvus browser list

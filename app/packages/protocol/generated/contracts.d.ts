@@ -273,6 +273,12 @@ export type Request =
       workspace_id: string;
     }
   | {
+      generation: string;
+      id: string;
+      mark_read: boolean;
+      type: "notification_inbox";
+    }
+  | {
       client: boolean;
       generation: string;
       id: string;

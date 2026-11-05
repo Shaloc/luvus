@@ -139,6 +139,10 @@ test('only a fresh visible human gesture permits the native Save dialog, never a
 test('policy validates broker params, UTF-8 sizes, URLs, keys, and encoded results', () => {
   for (const url of ['file:///secret', 'chrome://settings', 'devtools://devtools', 'app://shell', 'javascript:alert(1)', 'data:text/html,x', 'https://a.test/ bad']) assert.equal(policy.allowedUrl(url), false);
   for (const url of ['about:blank', 'http://localhost:3000/', 'https://owner.test']) assert.equal(policy.allowedUrl(url), true);
+  for (const url of ['file:///secret', 'javascript:alert(1)', 'about:config', 'data:text/html,x']) assert.throws(() => policy.humanBrowserAddress(url));
+  assert.equal(policy.humanBrowserAddress('example.com'), 'https://example.com/');
+  assert.equal(policy.humanBrowserAddress('localhost:3000/test'), 'http://localhost:3000/test');
+  assert.equal(policy.humanBrowserAddress('[::1]:3000'), 'http://[::1]:3000/');
   for (const ttl_s of [0, 3601, 1.1, '2']) assert.throws(() => policy.commandParams('browser.control.acquire', { ttl_s }), /invalid_params/);
   for (const timeout_ms of [0, 20001, '20']) assert.throws(() => policy.commandParams('browser.snapshot', { timeout_ms }), /invalid_params/);
   assert.throws(() => policy.commandParams('browser.snapshot', { lease: 'secret' }), /invalid_params/);

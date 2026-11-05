@@ -74,6 +74,7 @@
     --warning: #875900;
 }
 .browser-toolbar { flex-shrink: 0; height: 48px; }
+.browser-control-slot { display: inline-flex; align-items: center; justify-content: center; width: 26px; flex: none; }
 .browser-toolbar input { flex: 1; min-width: 0; }
 .browser-network-label { display: flex; flex-shrink: 0; height: 32px; align-items: center; gap: 6px; padding: 5px 12px; font-size: calc(var(--ui-size, 13px) * 11 / 13); color: var(--muted); border-bottom: 1px solid var(--border); }
 .browser-surface { position: relative; flex: 1; min-height: 0; overflow: hidden; }
@@ -496,6 +497,16 @@
   .choice-check { position: absolute; left: 7px; top: 9px; }
   .session-popup { width: 300px; max-width: calc(100vw - 24px); }
   .session-popup-heading { display: flex; align-items: center; justify-content: space-between; padding: 4px 7px; font-size: calc(var(--ui-size, 13px) * 12 / 13); }
+  .inbox-trigger { display: inline-flex; align-items: center; justify-content: center; gap: 4px; flex: none; height: 22px; min-width: 26px; border-radius: 4px; }
+  .inbox-trigger:hover, .inbox-trigger[data-popup-open] { background: var(--hover); }
+  .inbox-trigger b { color: var(--accent); font-variant-numeric: tabular-nums; }
+  .inbox-popup { width: 340px; }
+  .inbox-list { margin: 0; padding: 0 6px; list-style: none; max-height: min(350px, 60vh); overflow-y: auto; }
+  .inbox-list li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: baseline; gap: 8px; padding: 7px 3px; border-top: 1px solid var(--border); font-size: 12px; }
+  .inbox-list li span { overflow-wrap: anywhere; white-space: pre-wrap; }
+  .inbox-list li[data-level="error"] span { color: var(--danger); }
+  .inbox-list small, .inbox-source { color: var(--muted); font-size: 10px; }
+  .inbox-source { display: block; padding: 5px 7px; }
   .session-popup .filter-input { margin: 4px 5px 8px; }
   .session-list { max-height: min(320px, 45vh); overflow: auto; }
   .session-option { display: flex; align-items: center; width: 100%; gap: 9px; padding: 8px; border-radius: 4px; font-size: calc(var(--ui-size, 13px) * 12 / 13); text-align: left; }

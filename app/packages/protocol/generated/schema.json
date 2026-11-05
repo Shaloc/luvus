@@ -785,6 +785,34 @@
         {
           "additionalProperties": false,
           "properties": {
+            "generation": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "mark_read": {
+              "type": "boolean"
+            },
+            "type": {
+              "const": "notification_inbox"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "generation",
+            "mark_read"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "client": {
               "type": "boolean"
             },

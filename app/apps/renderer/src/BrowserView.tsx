@@ -1,6 +1,6 @@
 import { tr } from './i18n';
 import { useEffect, useRef, useState } from 'react';
-import { ArrowLeft, ArrowRight, Globe, RefreshCw } from 'lucide-react';
+import { ArrowLeft, ArrowRight, Globe, MousePointer2, RefreshCw } from 'lucide-react';
 import { request, reportError } from './bridge';
 import { record, targetKey, text, type Pane } from './model';
 import { AsyncButton, Empty, IconButton } from './ui';
@@ -17,14 +17,14 @@ export function BrowserView({ pane }: { pane: Pane }) {
   const [state, setState] = useState('closed');
   const [controlled, setControlled] = useState(false);
   const address = (value: string) => value === 'about:blank' ? '' : value;
-  const [url, setUrl] = useState(address(text(pane.data.url)));
+  const [url, setUrl] = useState('');
   const surface = useRef<HTMLDivElement>(null), addressBar = useRef<HTMLInputElement>(null);
-  useEffect(() => { if (state === 'ready' && pane.data.url === 'about:blank') addressBar.current?.focus(); }, [state, pane.id]);
+  useEffect(() => { if (state === 'ready' && !url) addressBar.current?.focus(); }, [state, pane.id]);
   const identity = pane.target ? targetKey(pane.target) : pane.id;
   const currentIdentity = useRef(identity);
   const opening = useRef(false);
   currentIdentity.current = identity;
-  useEffect(() => { setBrowser(null); setState('closed'); setControlled(false); setUrl(address(text(pane.data.url))); }, [identity]);
+  useEffect(() => { setBrowser(null); setState('closed'); setControlled(false); setUrl(''); }, [identity]);
   const editing = useRef(false);
   const apply = (value: unknown) => {
     const data = record(value);
@@ -99,9 +99,8 @@ export function BrowserView({ pane }: { pane: Pane }) {
       <IconButton label={tr("Browser forward")} disabled={state !== 'ready'} onClick={() => void navigate('forward').catch(reportError)}><ArrowRight size={14} /></IconButton>
       <IconButton label={tr("Reload browser")} disabled={state !== 'ready'} onClick={() => void navigate('reload').catch(reportError)}><RefreshCw size={14} /></IconButton>
       <Globe size={13}><title>{tr("Workspace owner network")}</title></Globe><input ref={addressBar} placeholder={tr("Enter address")} aria-label={tr("Browser address")} value={url} onBlur={() => { editing.current = false; }} onChange={event => { editing.current = true; setUrl(event.target.value); }} disabled={state !== 'ready'} />
-      {controlled && browser && <AsyncButton run={() => window.luvus.browserTakeover(browser)}>{tr("Take control")}</AsyncButton>}
+      <span className="browser-control-slot">{controlled && browser && <IconButton label={tr("Take control")} title={tr("Agent control") + ' · ' + tr("Take control")} onClick={() => void window.luvus.browserTakeover(browser).catch(reportError)}><MousePointer2 size={14} /></IconButton>}</span>
     </form>
-    {controlled && <span className="badge">{tr("Agent control")}</span>}
     <div className="browser-surface" ref={surface}>
       {state !== 'ready' && <Empty title={state === 'preparing' ? tr("Opening owner-network browser") : state === 'failed' ? tr("Browser could not start") : tr("Embedded browser")} action={state !== 'preparing' ? <AsyncButton className="button primary" run={open}>{tr("Open embedded browser")}</AsyncButton> : undefined}>
         {tr("The browser uses this workspace’s localhost and proxy settings. Closing the app revokes its connection.")}

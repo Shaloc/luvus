@@ -64,6 +64,8 @@ test('App attachment controls a real core without a TUI and preserves the owner 
     const bad = await request({ type: 'focus', target: { ...frame.target, generation: 'stale' } });
     assert.equal(bad.type, 'error');
     assert.equal(bad.code, 'stale_target');
+    const oversized = await request({ type: 'input', target: frame.target, input: { kind:'paste', text:'x'.repeat(256*1024+1) } });
+    assert.equal(oversized.code, 'invalid_request', 'a rejected paste must not detach the display');
     const resized = await request({ type: 'viewport', target: frame.target, cols: 100, rows: 30, cell_width: 8, cell_height: 16 });
     assert.equal(resized.type, 'reply');
     await wait(() => frames.get(frame.target.pane_id)?.cols === 100);

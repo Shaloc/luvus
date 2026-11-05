@@ -46,7 +46,7 @@ async function rememberSession(name: string): Promise<void> {
   await rename(temporary, destination);
 }
 
-function waitForSnapshot(client: CoreClient): Promise<void> {
+function waitForSnapshot(client: CoreClient, existingOnly: boolean): Promise<void> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => finish(new Error('The selected core did not provide a desktop snapshot')), 30_000);
     const listener = (message: AppResponse) => {
@@ -58,7 +58,7 @@ function waitForSnapshot(client: CoreClient): Promise<void> {
       if (error) reject(error); else resolve();
     }
     client.on('message', listener);
-    void client.start().catch(finish);
+    void client.start(existingOnly).catch(finish);
   });
 }
 
@@ -156,9 +156,10 @@ async function createWindow(): Promise<void> {
   direct = Boolean(remote);
   if (remote && !/^[a-zA-Z0-9_.][a-zA-Z0-9_.-]{0,254}$/.test(remote)) throw new Error('Invalid SSH alias');
   if (!/^[a-zA-Z0-9._-]{1,64}$/.test(selectedSession) || ['.', '..'].includes(selectedSession)) throw new Error('Invalid selected session');
-  let starting = false;
+  let starting = false, previouslyConnected = false;
   retryStartup = async () => {
-    if (starting || quitting || core?.bootstrap().some(m => m.type === 'snapshot')) return;
+    if (starting || selecting || quitting || core?.bootstrap().some(m => m.type === 'snapshot')) return;
+    if (core) selectedSession = core.session;
     starting = true;
     try {
       while (!quitting && window && !window.isDestroyed()) {
@@ -171,7 +172,8 @@ async function createWindow(): Promise<void> {
         browserBridge = new BrowserBridge(window, next, publish);
         next.on('message', receive);
         try {
-          await waitForSnapshot(next);
+          await waitForSnapshot(next, previouslyConnected);
+          previouslyConnected = true;
           if (!direct) await rememberSession(selectedSession).catch(() => {
             receive({ type: 'effect', kind: 'notice', data: { text: 'Connected, but the selected session could not be saved for the next launch.' } });
           });
@@ -192,6 +194,7 @@ async function createWindow(): Promise<void> {
           if (answer.response === 0) return;
           if (!direct && answer.response === 2) {
             // A fresh namespace cannot collide with an old desktop owner.
+            previouslyConnected = false;
             selectedSession = 'desktop-' + crypto.randomUUID();
           }
         }
@@ -305,6 +308,7 @@ ipcMain.handle('luvus:request', (event, request: unknown) => {
   if (!core) throw new Error('Core is not connected');
   return core.request(request);
 });
+ipcMain.handle('luvus:reconnect', event => { requireTrusted(event); return retryStartup?.(); });
 ipcMain.handle('luvus:bootstrap', event => { requireTrusted(event); return core?.bootstrap() ?? []; });
 ipcMain.handle('luvus:terminal-menu', (event, selected:unknown, chinese:unknown) => {
   requireTrusted(event);

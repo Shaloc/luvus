@@ -149,7 +149,11 @@ impl App {
             }
         }
         snapshot["config"] = json!(self.config);
-        snapshot["desktop_features"] = json!(["browser_tab", "mouse_options"]);
+        snapshot["notification_inbox"] = json!({
+            "revision": self.bar.history_revision.to_string(),
+            "unread": self.bar.history.iter().filter(|row| row.unread).count(),
+        });
+        snapshot["desktop_features"] = json!(["browser_tab", "blank_browser_tab", "mouse_options"]);
         snapshot["terminal_palette"] =
             json!({"foreground":pack(self.theme.text),"background":pack(self.theme.base)});
         snapshot["commands"] = json!(Cmd::ALL

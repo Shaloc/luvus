@@ -42,6 +42,12 @@ existing shared configuration. Terminal-header mouse toggles change each
 pane's persisted TUI-compatible mouse options; they require an updated owner
 and are currently unavailable for registered projected remote terminals.
 
+The bell at the right end of the desktop status bar opens the session notification
+inbox. Opening it marks the notifications read without shrinking the terminal.
+On older cores the bell shows notifications received in the current window.
+If the desktop connection drops, **Reconnect to session** reattaches the window.
+Input from the lost connection is never replayed.
+
 ### Shared Core Preferences
 
 | Key | Effect |

@@ -137,10 +137,32 @@ pub fn attach<R: Read + Send + 'static, W: Write + Send + 'static>(
         _ => return Err(anyhow!("invalid App handshake")),
     }
     let writer = Arc::new(Mutex::new(writer));
+    let output = Arc::new(Mutex::new(std::io::stdout()));
+    let input_output = output.clone();
     let input_writer = writer.clone();
     std::thread::spawn(move || {
         let mut input = std::io::stdin().lock();
         while let Ok(Some(request)) = protocol::read(&mut input) {
+            // A rejected action has a complete frame. Keep the attachment and its PTYs intact.
+            if let Err(message) = request.validate() {
+                let id = request.id();
+                if !request.has_valid_id() {
+                    break;
+                }
+                if emit(
+                    &input_output,
+                    &protocol::Response::Error {
+                        id: Some(id.into()),
+                        code: "invalid_request".into(),
+                        message: message.into(),
+                    },
+                )
+                .is_err()
+                {
+                    break;
+                }
+                continue;
+            }
             let detach = matches!(request, protocol::Request::Detach { .. });
             let Ok(body) = serde_json::to_string(&request) else {
                 break;
@@ -158,7 +180,6 @@ pub fn attach<R: Read + Send + 'static, W: Write + Send + 'static>(
             let _ = wire::write_message(&mut *writer, &ClientMessage::Detach);
         }
     });
-    let output = Arc::new(Mutex::new(std::io::stdout()));
     let mut browsers = browser::Sessions::default();
     emit(
         &output,

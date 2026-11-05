@@ -3,6 +3,7 @@ import type { Request, Response } from '@luvus/app-protocol';
 
 contextBridge.exposeInMainWorld('luvus', Object.freeze({
   request: (request: Request): Promise<unknown> => ipcRenderer.invoke('luvus:request', request),
+  reconnect: (): Promise<void> => ipcRenderer.invoke('luvus:reconnect'),
   bootstrap: (): Promise<Response[]> => ipcRenderer.invoke('luvus:bootstrap'),
   terminalMenu: (selected:boolean, chinese:boolean) => ipcRenderer.invoke('luvus:terminal-menu',selected,chinese),
   sessions: (op:string, name:unknown, generation:string): Promise<unknown> => ipcRenderer.invoke('luvus:sessions',op,name,generation),

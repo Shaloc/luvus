@@ -8,7 +8,6 @@ import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { _electron } from 'playwright-core';
 import { isolatedEnvironment } from '../scripts/dev.mjs';
 
@@ -30,17 +29,7 @@ const env = { ...isolatedEnvironment(), HOME:home, TMPDIR:join(root,'tmp'), LUVU
 for (const key of Object.keys(env)) if (/^(VITE_|GIT_DIR$|GIT_WORK_TREE$|GH_TOKEN$|GITHUB_TOKEN$)/.test(key) || /^(http_proxy|https_proxy|all_proxy|no_proxy)$/i.test(key)) delete env[key];
 await writeFile(join(home, 'config.json'), JSON.stringify({check_updates:false, language:'en', shell:'/bin/sh'}));
 const cli = async (...argv) => (await exec(core, ['--session', session, ...argv], { env, cwd:workspace, timeout:15_000, maxBuffer:4*1024*1024 })).stdout;
-// The owner's human navigation can still hold the browser while its ready page paints.
-const acquire = async (id, ttl) => {
-  const deadline = Date.now() + 5000;
-  for (;;) {
-    try { return JSON.parse(await cli('browser','control','acquire','--browser',id,'--ttl',ttl)).result; }
-    catch (err) {
-      if (!err.stdout || JSON.parse(err.stdout).error?.code !== 'control_busy' || Date.now() >= deadline) throw err;
-      await sleep(60);
-    }
-  }
-};
+const acquire = async (id, ttl) => JSON.parse(await cli('browser','control','acquire','--browser',id,'--ttl',ttl)).result;
 const snapshot = async () => JSON.parse(await cli('uhp', 'snapshot')).result;
 const report = { bundle, core, session, root, checks:[] };
 const check = name => { report.checks.push(name); console.log('PASS ' + name); };

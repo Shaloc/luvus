@@ -56,6 +56,11 @@ pub enum Request {
         workspace_id: String,
         number: Option<u32>,
     },
+    NotificationInbox {
+        id: String,
+        generation: String,
+        mark_read: bool,
+    },
     Logs {
         id: String,
         generation: String,
@@ -171,6 +176,7 @@ impl Request {
             | Self::FocusHistory { id, .. }
             | Self::Graphic { id, .. }
             | Self::PullRequests { id, .. }
+            | Self::NotificationInbox { id, .. }
             | Self::Logs { id, .. }
             | Self::Widget { id, .. }
             | Self::FileEntry { id, .. }
@@ -186,9 +192,13 @@ impl Request {
         }
     }
 
+    pub fn has_valid_id(&self) -> bool {
+        let id = self.id();
+        !id.is_empty() && id.len() <= 128 && !id.chars().any(char::is_control)
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.id().is_empty() || self.id().len() > 128 || self.id().chars().any(char::is_control)
-        {
+        if !self.has_valid_id() {
             return Err("invalid request id");
         }
         match self {
@@ -245,7 +255,7 @@ impl Request {
                     _ => {}
                 }
             }
-            Self::Logs { generation, .. }
+            Self::NotificationInbox { generation, .. } | Self::Logs { generation, .. }
                 if generation.is_empty()
                     || generation.len() > 128
                     || generation.chars().any(char::is_control) =>
@@ -663,7 +673,6 @@ pub fn read<R: Read>(reader: &mut R) -> io::Result<Option<Request>> {
     let mut bytes = vec![0; size];
     reader.read_exact(&mut bytes)?;
     let request: Request = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    request.validate().map_err(io::Error::other)?;
     Ok(Some(request))
 }
 

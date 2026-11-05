@@ -1,6 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { promisify } from 'node:util';
+import { LEGACY_BLANK_TAB } from './browser-policy.js';
 import { encodeRequest, ResponseDecoder, type Request, type Response } from '@luvus/app-protocol';
 
 const execute = promisify(execFile);
@@ -12,17 +13,18 @@ export class CoreClient extends EventEmitter {
   private readonly pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
   private readonly latest = new Map<string, Response>();
   private closing = false;
+  private failed = false;
   private closePromise: Promise<void> | undefined;
 
   constructor(readonly binary: string, readonly session: string, private readonly environment: NodeJS.ProcessEnv,
     private readonly remote?: string) { super(); }
 
-  async start(): Promise<void> {
+  async start(existingOnly = false): Promise<void> {
     if (this.child) throw new Error('Core attachment already exists');
     const env = { ...this.environment };
     for (const name of ['LUVUS_SOCKET_PATH', 'LUVUS_SESSION', 'LUVUS_REMOTE_HOST', 'LUVUS_REMOTE_SESSION', 'LUVUS_PANE_ID', 'LUVUS_API_ADDRESS']) delete env[name];
     if (!this.remote) {
-      await execute(this.binary, ['--session', this.session, 'server', 'start'], { env, timeout: 15000, maxBuffer: 1024 * 1024, windowsHide: true });
+      if (!existingOnly) await execute(this.binary, ['--session', this.session, 'server', 'start'], { env, timeout: 15000, maxBuffer: 1024 * 1024, windowsHide: true });
       // A running released core can have the same package version as this
       // bundle while lacking HelloApp. Ask its JSON API before binary attach.
       const { stdout } = await execute(this.binary, ['--session', this.session, 'uhp', 'capabilities'], { env, timeout: 10000, maxBuffer: 2 * 1024 * 1024, windowsHide: true });
@@ -50,10 +52,15 @@ export class CoreClient extends EventEmitter {
     let diagnostic = '';
     child.stderr.on('data', (chunk: Buffer) => { diagnostic = (diagnostic + chunk.toString('utf8')).slice(-4096); });
     child.on('error', error => this.fail(error));
-    child.on('exit', () => {
+    child.stdin.on('error', error => { if (!this.closing) this.fail(error); });
+    child.on('close', (code, signal) => {
       if (this.child !== child) return;
       this.child = undefined;
-      if (!this.closing) this.fail(new Error(diagnostic.trim() || 'The selected core attachment closed'));
+      if (!this.closing) {
+        const status = signal || `exit ${code ?? 'unknown'}`;
+        try { decoder.finish(); } catch (error) { this.fail(error); }
+        this.fail(new Error(diagnostic.trim() || `Desktop connection to "${this.session}" closed (${status}).`));
+      }
     });
   }
 
@@ -61,8 +68,15 @@ export class CoreClient extends EventEmitter {
 
   request(request: Request): Promise<unknown> {
     const child = this.child;
-    if (!child || this.closing) return Promise.reject(new Error('The core is not connected'));
+    if (!child || this.failed || this.closing) return Promise.reject(new Error('The core is not connected'));
     if (this.pending.size >= 32 || this.pending.has(request.id)) return Promise.reject(new Error('The attachment request queue is full'));
+    if (request.type === 'browser_tab' && request.url === 'about:blank') {
+      const snapshot = this.latest.get('snapshot');
+      const features = snapshot?.type === 'snapshot' && (snapshot.snapshot as Record<string,unknown>).desktop_features;
+      if (!Array.isArray(features) || !features.includes('browser_tab')) return Promise.reject(new Error('This session does not support browser tabs.'));
+      // Sending about:blank to an early v21 owner terminates the whole desktop transport.
+      if (!features.includes('blank_browser_tab')) request = { ...request, url: LEGACY_BLANK_TAB };
+    }
     let bytes: Uint8Array;
     try { bytes = encodeRequest(request); }
     catch (error) { return Promise.reject(error); }
@@ -90,7 +104,7 @@ export class CoreClient extends EventEmitter {
     for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error('Core attachment closed')); }
     this.pending.clear();
     const child = this.child;
-    if (!child) return;
+    if (!child || child.exitCode !== null || child.signalCode !== null) return;
     await new Promise<void>(resolve => {
       const timeout = setTimeout(() => { child.kill('SIGTERM'); resolve(); }, 5000);
       child.once('exit', () => { clearTimeout(timeout); resolve(); });
@@ -101,6 +115,16 @@ export class CoreClient extends EventEmitter {
   }
 
   private receive(message: Response): void {
+    if (this.failed || this.closing) return;
+    if (message.type === 'effect' && ['disconnected', 'shutdown', 'core_exit'].includes(message.kind)) {
+      const data = message.data as { message?: string; reason?: string } | null;
+      this.fail(new Error(data?.message || data?.reason || 'The selected session disconnected.'));
+      return;
+    }
+    if (message.type === 'error' && !message.id && ['resource_limit','connection_failed','incompatible_protocol'].includes(message.code)) {
+      this.fail(new Error(message.message));
+      return;
+    }
     if (message.type === 'reply' || message.type === 'error' && message.id) {
       const id = message.id;
       const pending = id ? this.pending.get(id) : undefined;
@@ -128,6 +152,9 @@ export class CoreClient extends EventEmitter {
   }
 
   private fail(error: unknown): void {
+    if (this.failed || this.closing) return;
+    this.failed = true;
+    this.latest.clear();
     const message = error instanceof Error ? error.message : 'Core connection failed';
     const response: Response = { type: 'error', id: null, code: 'connection_failed', message };
     this.latest.set('error', response);

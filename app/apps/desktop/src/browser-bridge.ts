@@ -2,7 +2,7 @@ import type { BrowserWindow, Rectangle } from 'electron';
 import { isRequest, type Response, type Target } from '@luvus/app-protocol';
 import { BrowserHost, type BrowserCommand, type BrowserDescriptor } from './browser-host.js';
 import type { CoreClient } from './core-client.js';
-import { MAX_CDP_BYTES, MAX_CDP_EVENT_CHUNK_BYTES, MAX_CDP_MESSAGES, sameTarget } from './browser-policy.js';
+import { displayBrowserUrl, MAX_CDP_BYTES, MAX_CDP_EVENT_CHUNK_BYTES, MAX_CDP_MESSAGES, sameTarget } from './browser-policy.js';
 
 interface Status {
   browser_id: string;
@@ -74,7 +74,7 @@ export class BrowserBridge {
         return true;
       }
       const descriptor: BrowserDescriptor = {
-        id, url: string(data.url), proxy_port: Number(data.proxy_port), target,
+        id, url: displayBrowserUrl(string(data.url)), proxy_port: Number(data.proxy_port), target,
         generation: target.generation, workspace_id: target.workspace_id, pane_id: target.pane_id,
         request_id: requestId, lease_generation: generation,
       };
@@ -128,23 +128,8 @@ export class BrowserBridge {
 
   async navigate(id: string, action: 'navigate' | 'back' | 'forward' | 'reload', url?: string): Promise<void> {
     const target = this.targets.get(id);
-    if (!target || this.states.get(id)?.state !== 'ready') throw new Error('Browser is not ready');
-    await this.core.request({ type: 'browser_takeover', id: crypto.randomUUID(), browser_id: id });
-    const acquired = object(await this.core.request({
-      type: 'action', id: crypto.randomUUID(), generation: target.generation,
-      method: 'browser.control.acquire', params: { browser: id, ttl_s: 30 },
-    }));
-    const lease = string(acquired.lease);
-    if (!lease) throw new Error('Browser control was not acquired');
-    try {
-      await this.core.request({ type: 'action', id: crypto.randomUUID(), generation: target.generation,
-        method: `browser.${action}`, params: { browser: id, lease, ...(action === 'navigate' ? { url } : {}) },
-      });
-    } finally {
-      await this.core.request({ type: 'action', id: crypto.randomUUID(), generation: target.generation,
-        method: 'browser.control.release', params: { browser: id, lease },
-      }).catch(() => {});
-    }
+    if (!target || !this.visibleTargets.has(key(target)) || this.states.get(id)?.state !== 'ready') throw new Error('Browser is not ready');
+    await this.host.navigateHuman(id, action, url);
   }
 
   async takeover(id: string): Promise<void> {

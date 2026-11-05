@@ -19,7 +19,7 @@ pub(super) use registered::{owner_request, remote_response};
 #[derive(Default)]
 pub(super) struct State {
     registered: HashMap<String, crate::app::gui_projection::registered::Route>,
-    view_version: Option<(u64, u64, &'static str)>,
+    view_version: Option<(u64, u64, u64, &'static str)>,
     sequence: Option<u64>,
     terminals: HashMap<String, (String, u16, u16)>,
     offsets: HashMap<String, HistoryViewport>,
@@ -94,6 +94,7 @@ pub(super) fn render(
     let sequence = crate::ipc::api::current_sequence(&app.events);
     let view_version = (
         app.native_view_revision,
+        app.bar.history_revision,
         app.registered_gui.topology,
         app.registered_gui_status(app.active_ws),
     );
@@ -683,6 +684,33 @@ pub(super) fn handle(
                     false
                 }
             }
+        }
+        Request::NotificationInbox {
+            id,
+            generation,
+            mark_read,
+        } => {
+            if generation != app.backend_server_generation {
+                reject(client, &id, "stale_target", "session changed");
+                return false;
+            }
+            let changed = foreground && mark_read && app.bar.history.iter().any(|row| row.unread);
+            if changed {
+                app.bar.mark_notifications_read();
+            }
+            let items: Vec<_> = app.bar.history.iter().rev().map(|row| json!({
+                "id": row.id.to_string(), "text": row.text, "level": row.level,
+                "time": row.time.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+                "count": row.count
+            })).collect();
+            reply(
+                client,
+                Response::Reply {
+                    id,
+                    result: json!({"items": items}),
+                },
+            );
+            changed
         }
         Request::Logs {
             id,

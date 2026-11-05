@@ -45,6 +45,7 @@ pub fn document() -> Value {
         object(json!({"type":{"const":"focus_history"},"id":id,"target":target_ref,"forward":{"type":"boolean"}}), &["type","id","target","forward"]),
         object(json!({"type":{"const":"graphic"},"id":id,"target":target_ref,"sequence":{"type":"string","pattern":"^[0-9]{1,20}$"}}),&["type","id","target","sequence"]),
         object(json!({"type":{"const":"pull_requests"},"id":id,"generation":id,"workspace_id":id,"number":{"type":"integer","minimum":1,"maximum":4294967295u64}}), &["type","id","generation","workspace_id"]),
+        object(json!({"type":{"const":"notification_inbox"},"id":id,"generation":id,"mark_read":{"type":"boolean"}}),&["type","id","generation","mark_read"]),
         object(json!({"type":{"const":"logs"},"id":id,"generation":id,"client":{"type":"boolean"}}),&["type","id","generation","client"]),
         object(json!({"type":{"const":"widget"},"id":id,"generation":id,"workspace_id":id,"item":widget}),&["type","id","generation","workspace_id","item"]),
         object(json!({"type":{"const":"file_entry"},"id":id,"generation":id,"workspace_id":id,"root":string,"path":string,"operation":file_op}),&["type","id","generation","workspace_id","root","path","operation"]),

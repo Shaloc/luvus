@@ -6,6 +6,7 @@ export type Method = Extract<Request, { type: 'action' }>['method'];
 export interface DesktopAPI {
   request(request: Request): Promise<unknown>;
   onMessage(callback: (response: Response) => void): () => void;
+  reconnect(): Promise<void>;
   bootstrap(): Promise<Response[]>;
   sessions(op:'list'|'switch'|'create'|'stop'|'delete'|'host-add'|'merge'|'open-workspace', name:string | {host:string; session:string; path:string}, generation:string): Promise<unknown>;
   gateway(op:'list'|'start'|'stop'|'copy',kind:'web'|'uhp',control:boolean,generation:string):Promise<unknown>;
@@ -18,8 +19,10 @@ export interface DesktopAPI {
   browserTakeover(id: string): Promise<void>;
 }
 declare global { interface Window { luvus: DesktopAPI } }
-interface State { snapshot: Snapshot | null; ready: boolean; capabilities: string[]; remoteHost?: string; error: string | null; notice: string | null; revision: number; browserTitles: Record<string, string> }
-let state: State = { snapshot: null, ready: false, capabilities: [], error: null, notice: null, revision: 0, browserTitles: {} };
+export interface InboxRow { id: string; text: string; level: string; time: number; count: number }
+interface State { fallbackInbox: InboxRow[]; fallbackUnread: number; snapshot: Snapshot | null; ready: boolean; capabilities: string[]; remoteHost?: string; error: string | null; notice: string | null; revision: number; browserTitles: Record<string, string> }
+let inboxGeneration = '';
+let state: State = { fallbackInbox: [], fallbackUnread: 0, snapshot: null, ready: false, capabilities: [], error: null, notice: null, revision: 0, browserTitles: {} };
 const listeners = new Set<() => void>();
 const terminals = new Map<string, TerminalFrame>();
 const frameWeights = new Map<string, number>();
@@ -31,6 +34,12 @@ let disconnect: (() => void) | undefined;
 let started = false;
 const emit = (patch: Partial<State>) => { state = { ...state, ...patch }; listeners.forEach((callback) => callback()); };
 
+function disconnected(error: string) {
+  for (const key of terminals.keys()) dropFrame(key);
+  emit({ ready: false, snapshot: null, capabilities: [], error, notice: null, browserTitles: {} });
+}
+export function markFallbackInboxRead() { if (state.fallbackUnread) emit({ fallbackUnread: 0 }); }
+
 function receive(response: Response) {
   switch (response.type) {
     case 'ready':
@@ -40,16 +49,20 @@ function receive(response: Response) {
       break;
     case 'snapshot': {
       try {
+        if (!state.ready) return;
         const snapshot = parseSnapshot(response.snapshot);
+        const newSession = inboxGeneration !== snapshot.generation;
+        inboxGeneration = snapshot.generation;
         const valid = new Set(snapshot.workspaces.filter((w) => w.active).flatMap((w) => w.tabs.filter((t) => t.active).flatMap((t) => t.panes.filter((p) => !t.zoomed || p.id === t.focus).flatMap((p) => p.target ? [targetKey(p.target)] : []))));
         for (const key of terminals.keys()) if (!valid.has(key)) dropFrame(key);
         const browsers = new Set(snapshot.workspaces.flatMap(w => w.tabs.flatMap(t => t.panes.filter(p => p.kind === 'browser').map(p => p.id))));
         const browserTitles = snapshot.generation === state.snapshot?.generation ? Object.fromEntries(Object.entries(state.browserTitles).filter(([id]) => browsers.has(id))) : {};
-        emit({ snapshot, revision: state.revision + 1, browserTitles });
+        emit({ snapshot, revision: state.revision + 1, browserTitles, ...(newSession ? { fallbackInbox: [], fallbackUnread: 0 } : {}) });
       } catch (error) { emit({ error: message(error) }); }
       break;
     }
     case 'terminal': {
+      if (!state.ready) return;
       const frame = response.frame;
       if (state.snapshot && frame.target.generation !== state.snapshot.generation) return;
       const key = targetKey(frame.target);
@@ -64,7 +77,10 @@ function receive(response: Response) {
       break;
     }
     case 'error':
-      if (!response.id) emit({ error: `${response.code}: ${response.message}`, ...(['connection_failed', 'incompatible_protocol'].includes(response.code) ? { ready: false } : {}) });
+      if (!response.id) {
+        if (['connection_failed', 'incompatible_protocol', 'startup_failed'].includes(response.code)) disconnected(response.message);
+        else reportError(response.message);
+      }
       break;
     case 'effect': {
       const data = record(response.data);
@@ -76,8 +92,16 @@ function receive(response: Response) {
         break;
       }
       if (response.kind === 'direct_ssh') { emit({ remoteHost: text(data.host) }); break; }
-      if (['disconnected', 'shutdown', 'core_exit'].includes(response.kind)) emit({ ready: false, error: text(data.message) || text(data.reason) || 'The core connection closed. Existing server panes were not stopped.' });
-      else if (['toast', 'notice'].includes(response.kind)) notify(text(data.text) || text(data.message) || text(data.body) || text(response.data));
+      if (['disconnected', 'shutdown', 'core_exit'].includes(response.kind)) disconnected(text(data.message) || text(data.reason) || 'The core connection closed.');
+      else if (['toast', 'notice', 'notification'].includes(response.kind)) {
+        const body = (text(data.text) || text(data.message) || text(data.body) || text(response.data)).slice(0, 4096);
+        if (!body) break;
+        if (state.snapshot && !state.snapshot.raw.notification_inbox) {
+          const row = { id: crypto.randomUUID(), text: body, level: text(data.level, 'info'), time: Math.floor(Date.now()/1000), count: 1 };
+          emit({ fallbackInbox: [row, ...state.fallbackInbox].slice(0,100), fallbackUnread: Math.min(100,state.fallbackUnread + 1) });
+        }
+        if (response.kind !== 'notification') notify(body);
+      }
       break;
     }
     // Reply promises and chunk assembly belong to the native bridge.
@@ -109,7 +133,7 @@ export async function connect() {
 }
 window.addEventListener('pagehide', () => disconnect?.());
 export const useCore = () => useSyncExternalStore((callback) => { listeners.add(callback); return () => { listeners.delete(callback); }; }, () => state);
-export const reportError = (error: unknown) => emit({ error: message(error) });
+export const reportError = (error: unknown) => { if (state.ready || !state.error) emit({ error: message(error) }); };
 let noticeTimer: ReturnType<typeof setTimeout> | undefined;
 export function notify(notice: string) {
   clearTimeout(noticeTimer); emit({ notice });
@@ -119,7 +143,7 @@ export const clearError = () => emit({ error: null });
 export const clearNotice = () => emit({ notice: null });
 export const currentSnapshot = () => state.snapshot;
 export async function request(request: Request): Promise<unknown> {
-  if (!window.luvus || !state.ready) throw new Error('The desktop core is not connected.');
+  if (!window.luvus || !state.ready) throw new Error(state.error || 'The desktop core is not connected.');
   return window.luvus.request(request);
 }
 export async function action(method: Method, params: RecordValue = {}, generation = state.snapshot?.generation): Promise<unknown> {

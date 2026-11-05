@@ -70,7 +70,9 @@ if (remote) {
   Object.assign(ownerEnv, { LUVUS_HOME: join(home, 'remote-state'), HOME: join(home, 'remote-home'),
     HTTP_PROXY: `http://fixture-user:fixture-pass@owner-proxy.invalid:${ownerProxyPort}`, NO_PROXY: 'localhost' });
 }
-const command = (...args) => execute(binary, ['--session', 'browser-test', ...args], { env: ownerEnv, cwd: workspace, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
+// A previously packaged v21 owner can be supplied to exercise the upgrade path.
+const ownerBinary = process.env.LUVUS_TEST_OWNER_BINARY ? await realpath(process.env.LUVUS_TEST_OWNER_BINARY) : binary;
+const command = (...args) => execute(ownerBinary, ['--session', 'browser-test', ...args], { env: ownerEnv, cwd: workspace, timeout: 30000, maxBuffer: 2 * 1024 * 1024 });
 const browser = async (...args) => {
   const response = await command('browser', ...args).catch(error => {
     if (error.stdout) return { stdout: error.stdout };
@@ -99,10 +101,16 @@ try {
   const painted = () => page.waitForFunction(() =>
     document.querySelector('.terminal-accessible')?.textContent.includes('terminal-baseline'), null, { timeout: 5000 });
   await painted();
+  await command('ui','notification','push','--text','Browser fixture notice','--level','info');
+  await page.getByRole('button',{name:'Notification inbox',exact:true}).click();
+  await page.locator('.inbox-list').getByText('Browser fixture notice').waitFor();
+  await page.keyboard.press('Escape');
   await page.evaluate(() => { window.__browserEvents = []; window.luvus.onMessage(message => window.__browserEvents.push(message)); });
   await page.getByRole('button', { name: 'New browser tab', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="Browser address"]')?.disabled === false, null, { timeout: 30000 });
   assert.equal(await page.getByLabel('Browser address').inputValue(), '');
+  assert.ok(!proxyRequests.some(req => req.url.includes('new-tab.luvus.invalid')), 'legacy blank tab must never hit a network');
+  assert.equal((await browser('control','status','--browser',(await browser('list')).browsers.find(b=>b.state==='ready').browser_id)).control.state, 'uncontrolled');
   await page.getByLabel('Browser address').fill(`http://owner-only.invalid:${contentPort}/`);
   await page.getByLabel('Browser address').press('Enter');
   await page.getByRole('tab',{name:'Owner browser fixture',exact:true}).waitFor();
@@ -118,8 +126,12 @@ try {
   assert.ok(proxyRequests.length > 0, 'owner proxy was not used');
   assert.equal(wrongProxyRequests, 0, 'display proxy leaked into owner browsing');
   assert.equal(proxyRequests[0].authorization, `Basic ${Buffer.from('fixture-user:fixture-pass').toString('base64')}`);
+  const browserBounds = () => page.locator('.browser-surface').boundingBox();
+  const manualBounds = await browserBounds();
   const acquired = await browser('control', 'acquire', '--browser', target.browser_id, '--ttl', '30');
   assert.ok(acquired.lease);
+  await page.getByRole('button', { name:'Take control', exact:true }).waitFor();
+  assert.deepEqual(await browserBounds(), manualBounds, 'agent acquisition must not move the page under the pointer');
   const control = ['--browser', target.browser_id, '--lease', acquired.lease];
   const snapshot = await browser('snapshot', ...control);
   const document = snapshot.data;
@@ -163,6 +175,22 @@ try {
     console.log('PASS: direct App attachment via SSH substitute, owner HTTP proxy and owner localhost through -D (no real SSH)');
   }
   await page.screenshot({ path: join(home, 'browser-shell.png') });
+  await desktop.evaluate(async ({ webContents }) => {
+    const guest = webContents.getAllWebContents().find(w => /^http:/.test(w.getURL()) && w.getTitle() === 'Owner browser fixture');
+    if (!guest) throw Error('fixture guest unavailable');
+    const pos = await guest.executeJavaScript("(()=>{const r=document.querySelector('#name').getBoundingClientRect();return {x:Math.round(r.x+12),y:Math.round(r.y+r.height/2)}})()");
+    guest.focus();
+    guest.sendInputEvent({ type:'mouseDown', button:'left', clickCount:1, ...pos });
+    guest.sendInputEvent({ type:'mouseUp', button:'left', clickCount:1, ...pos });
+    guest.sendInputEvent({ type:'keyDown', keyCode:'K' });
+    guest.sendInputEvent({ type:'char', keyCode:'k' });
+    guest.sendInputEvent({ type:'keyUp', keyCode:'K' });
+  });
+  await page.getByRole('button', { name: 'Take control', exact: true }).waitFor({state:'hidden'});
+  const regained = await browser('control','acquire','--browser',target.browser_id,'--ttl','30');
+  assert.notEqual(regained.lease, acquired.lease);
+  const typed = await browser('evaluate','--browser',target.browser_id,'--lease',regained.lease,'--expression','document.querySelector("#name").value');
+  assert.ok(typed.data.value.includes('k'), 'first guest click focuses the field and typing goes to the page');
   await page.getByRole('button', { name: 'Take control', exact: true }).click();
   const after = await browser('control', 'status', '--browser', target.browser_id);
   assert.equal(after.control.state, 'uncontrolled');

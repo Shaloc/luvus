@@ -1,4 +1,8 @@
 {
+  "Reconnect to session": "重新连接会话",
+  "Notification inbox": "通知收件箱",
+  "No notifications": "暂无通知",
+  "Showing notifications received by this window.": "仅显示此窗口收到的通知。",
   "Open workspace": "打开工作区",
   "Session": "会话",
   "Workspace session": "目标会话",

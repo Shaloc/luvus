@@ -1,5 +1,9 @@
 import type { Target } from '@luvus/app-protocol';
 
+// Older transport-21 owners require an HTTP(S) URL even for a new tab.
+export const LEGACY_BLANK_TAB = 'https://new-tab.luvus.invalid/';
+export const displayBrowserUrl = (url: string) => url === LEGACY_BLANK_TAB ? 'about:blank' : url;
+
 export const MAX_RESULT_BYTES = 1_044_480;
 export const MAX_TIMEOUT_MS = 20_000;
 export const MAX_REFS = 512;
@@ -136,6 +140,17 @@ export function allowedUrl(value: unknown): value is string {
   if (!/^https?:\/\/[^/\s][^\s]*$/.test(value)) return false;
   try { return ['http:', 'https:'].includes(new URL(value).protocol); }
   catch { return false; }
+}
+
+export function humanBrowserAddress(value: string): string {
+  const address = value.trim() || 'about:blank';
+  if (allowedUrl(address)) return address;
+  // Only infer schemes for hostnames. Never reinterpret a file, script or other scheme.
+  if (!/^[a-z\d.-]+(?::\d+)?(?:[/?#]|$)/i.test(address) && !/^\[[\da-f:]+\](?::\d+)?(?:[/?#]|$)/i.test(address)) fail('invalid_params');
+  const loopback = /^(localhost|127(?:\.\d+){3}|\[::1\])(?=[:/?#]|$)/i.test(address);
+  const url = (loopback ? 'http://' : 'https://') + address;
+  if (!allowedUrl(url)) fail('invalid_params');
+  return new URL(url).href;
 }
 
 export function bounded<T>(value: T, max = MAX_RESULT_BYTES): T {

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { BrowserWindow, session, WebContentsView } from 'electron';
 import type { Target } from '@luvus/app-protocol';
 import {
-  actionParams, allowedUrl, bounded, commandParams, fail, fields, generation, integer,
+  actionParams, allowedUrl, humanBrowserAddress, bounded, commandParams, fail, fields, generation, integer,
   MAX_CDP_BYTES, MAX_CDP_EVENT_MESSAGES, MAX_REFS, MAX_RESULT_BYTES, MAX_TIMEOUT_MS, record, sameTarget, shortText, text, validateTarget,
 } from './browser-policy.js';
 import { BrowserOperation, CANCEL_WAIT, NODE_ACTION, WAIT_FOR_PAGE } from './browser-tools.js';
@@ -186,6 +186,7 @@ export class BrowserHost {
       const expected = tab.input;
       const modifiers = (input.alt ? 1 : 0) | (input.control ? 2 : 0) | (input.meta ? 4 : 0) | (input.shift ? 8 : 0);
       if (expected?.kind === 'key' && !expected.consumed && expected.type === input.type && expected.key === input.key && expected.modifiers === modifiers) expected.consumed = true;
+      else if (!expected && input.type === 'keyDown' && this.humanVisible(tab)) this.revoke(tab, 'control_revoked', true);
       else event.preventDefault();
     });
     contents.on('before-mouse-event', (event, input) => {
@@ -200,6 +201,7 @@ export class BrowserHost {
           && typeof input.globalX === 'number' && typeof input.globalY === 'number'
           && Math.fround(windowBounds.x + viewBounds.x + expected.x!) === Math.fround(input.globalX)
           && Math.fround(windowBounds.y + viewBounds.y + expected.y!) === Math.fround(input.globalY)) expected.consumed = true;
+      else if (!expected && input.type === 'mouseDown' && this.humanVisible(tab)) this.revoke(tab, 'control_revoked', true);
       else event.preventDefault();
     });
     contents.on('input-event', (_event, input) => {
@@ -280,6 +282,21 @@ export class BrowserHost {
       title: shortText(tab.view.webContents.getTitle(), 4096), document_revision: tab.revision.toString(),
       dialog: tab.dialog ? { ...tab.dialog } : null, lease_generation: tab.generation.toString(),
       control: { state: controlled ? 'acquired' : 'uncontrolled', expires_at: tab.lease?.expiresAt ?? null } });
+  }
+
+  async navigateHuman(id: string, action: 'navigate' | 'back' | 'forward' | 'reload', address?: string): Promise<void> {
+    const tab = this.tabs.get(id);
+    if (!tab || !tab.ready || this.active !== id || !tab.view.getVisible()) fail('route_changed');
+    const url = action === 'navigate' ? humanBrowserAddress(address ?? '') : '';
+    const contents = tab.view.webContents;
+    this.revoke(tab, 'control_revoked', true);
+    contents.focus();
+    if (action === 'navigate') {
+      try { await contents.loadURL(url); }
+      catch (error) { if ((error as {code?:string}).code !== 'ERR_ABORTED') throw error; }
+    } else if (action === 'back' && contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+    else if (action === 'forward' && contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+    else if (action === 'reload') contents.reload();
   }
 
   /** Explicit host-UI handover. Keeps the page, but never silently reacquires control. */

@@ -159,6 +159,42 @@ async function openWorkspace(p,path) {
   await submit(p,'Open workspace');
 }
 
+await scenario('attachment-recovery', async ({ page:p, cli, snap, native, ok }) => {
+  const before = await snap();
+  const initial = ids(before);
+  await cli('ui','notification','push','--text','Before reconnect','--level','info');
+  const bell = button(p,'Notification inbox');
+  await eventually('unread badge', () => bell.locator('b').count());
+  const height = () => p.locator('canvas').first().evaluate(el=>el.getBoundingClientRect().height);
+  const h = await height();
+  await bell.click();
+  await p.locator('.inbox-list').getByText('Before reconnect').waitFor();
+  assert.equal(await height(), h);
+  await eventually('marked read',async()=>!await bell.locator('b').count());
+  await p.keyboard.press('Escape');
+  ok('session inbox shows the delivered notice and clears unread without resizing the terminal');
+  const parent = native.process().pid;
+  const { stdout } = await exec('/usr/bin/pgrep', ['-P', String(parent), '-f', 'client --surface app --stdio']);
+  const pid = Number(stdout.trim());
+  assert.ok(Number.isSafeInteger(pid) && pid > 1);
+  const verified = (await exec('/bin/ps',['-p',String(pid),'-o','ppid=,command='])).stdout.trim();
+  assert.ok(verified.startsWith(parent+' ') && verified.includes(binary+' --session matrix client --surface app --stdio'));
+  process.kill(pid, 'SIGTERM');
+  const reconnect = button(p,'Reconnect to session');
+  await reconnect.waitFor();
+  assert.match(await p.locator('.global-error').innerText(), /SIGTERM/);
+  assert.equal(await p.locator('canvas').count(),0);
+  assert.deepEqual((await p.evaluate(()=>window.luvus.bootstrap())).map(m=>m.type), ['error']);
+  await reconnect.click();
+  await p.locator('canvas').first().waitFor();
+  assert.equal((await snap()).server_generation, before.server_generation);
+  assert.deepEqual(ids(await snap()), initial);
+  await bell.click();
+  await p.locator('.inbox-list').getByText('Before reconnect').waitFor();
+  assert.equal(await p.locator('.global-error').count(),0);
+  ok('terminating only the test bridge preserves the first exit reason; reconnect restores the same running owner, panes and inbox');
+});
+
 await scenario('layout-history',async ({page:p,snap,ok})=>{
   await p.locator('canvas').first().waitFor();
   const a = ids(await snap())[0];
