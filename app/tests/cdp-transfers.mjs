@@ -22,7 +22,14 @@ export async function observeTransfers({ binary, browserId, home, workspace, env
     const guest = context.pages()[0];
     const cdp = await context.newCDPSession(guest);
     const crossSite=new URL(guest.url()); crossSite.hostname='matrix-child.invalid'; crossSite.pathname='/child';
-    await guest.evaluate(url=>{const frame=document.createElement('iframe');frame.id='cross-site-child';frame.src=url;document.body.append(frame);},crossSite.href);
+    await guest.evaluate(url => {
+      const frame = document.createElement('iframe');
+      frame.id = 'cross-site-child';
+      // Exercise the native input fence with a fractional cross-process frame origin.
+      frame.style.cssText = 'position:absolute;left:120.5px;top:80.5px;width:350px;height:220px';
+      frame.src = url;
+      document.body.append(frame);
+    }, crossSite.href);
     const child=guest.frameLocator('#cross-site-child');
     await child.getByRole('textbox',{name:'Name'}).fill('child scope',{timeout:12_000});
     await child.getByRole('button',{name:'Greet'}).click({timeout:12_000});

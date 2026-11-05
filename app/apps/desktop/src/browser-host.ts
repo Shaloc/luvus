@@ -67,7 +67,7 @@ interface Tab {
   inputTail: Promise<void>;
   // At most one matching native hook may pass during each CDP dispatch. Electron does not
   // expose a trusted source marker here. Physical/synthetic overlap still needs App E2E coverage.
-  input?: { kind: 'key' | 'mouse'; type: string; key?: string; x?: number; y?: number; modifiers?: number;
+  input?: { kind: 'key' | 'mouse'; type: string; key?: string; button?: string; x?: number; y?: number; modifiers?: number;
     consumed: boolean; observed: boolean; wheelGestures: Set<string> };
   cdp?: BrowserCdp;
   humanGesture?: {revision:bigint; generation:bigint; until:number};
@@ -194,13 +194,15 @@ export class BrowserHost {
         if(input.type==='mouseDown' && input.button==='left')this.noteHumanGesture(tab);return;
       }
       const expected = tab.input;
-      // OOPIF events are frame-local; project CDP coordinates through the current view position.
+      // Chromium snaps cross-process frame origins to a pixel; the projected hook
+      // position can be half a CSS pixel from the root CDP point on either axis.
       const windowBounds = this.window.getContentBounds();
       const viewBounds = tab.view.getBounds();
       if (expected?.kind === 'mouse' && !expected.consumed && expected.type === input.type
+          && (input.type !== 'mouseDown' && input.type !== 'mouseUp' || input.button === expected.button)
           && typeof input.globalX === 'number' && typeof input.globalY === 'number'
-          && Math.fround(windowBounds.x + viewBounds.x + expected.x!) === Math.fround(input.globalX)
-          && Math.fround(windowBounds.y + viewBounds.y + expected.y!) === Math.fround(input.globalY)) expected.consumed = true;
+          && Math.abs(Math.fround(windowBounds.x + viewBounds.x + expected.x!) - Math.fround(input.globalX)) <= 0.5
+          && Math.abs(Math.fround(windowBounds.y + viewBounds.y + expected.y!) - Math.fround(input.globalY)) <= 0.5) expected.consumed = true;
       else if (!expected && input.type === 'mouseDown' && this.humanVisible(tab)) this.revoke(tab, 'control_revoked', true);
       else event.preventDefault();
     });
@@ -636,7 +638,7 @@ export class BrowserHost {
       const admission = { consumed: false, observed: false, wheelGestures: new Set<string>() };
       expected = method === 'Input.dispatchKeyEvent'
         ? { kind: 'key', type: params.type === 'keyUp' ? 'keyUp' : 'keyDown', key: String(params.key), modifiers: Number(params.modifiers ?? 0), ...admission }
-        : { kind: 'mouse', type: mouseTypes[String(params.type)]!, x: Math.fround(Number(params.x)), y: Math.fround(Number(params.y)), ...admission };
+        : { kind: 'mouse', type: mouseTypes[String(params.type)]!, button: String(params.button ?? 'none'), x: Math.fround(Number(params.x)), y: Math.fround(Number(params.y)), ...admission };
       tab.input = expected;
       return await this.cdp(tab, operation, method, params, sessionId);
     } finally {
