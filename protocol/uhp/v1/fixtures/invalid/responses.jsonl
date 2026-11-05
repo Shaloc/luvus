@@ -1,4 +1,6 @@
 {"id":"unicode-\u00e9","result":{}}
+{"id":"browser-acquire-no-secret","result":{"type":"browser_result","browser_id":"b1","request_id":"r1","method":"browser.control.acquire","state":"completed"}}
+{"id":"browser-list-secret","result":{"type":"browser_list","browsers":[],"lease":"secret"}}
 {"id":"bad-agent-wait-match","result":{"type":"agent_wait","matched":true,"pane":null,"status":null}}
 {"id":"non-object-result","result":[]}
 {"id":"non-object-error","error":"bad"}

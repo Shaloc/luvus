@@ -33,6 +33,69 @@ pub(in crate::app) struct PendingWorkspaceSwitch {
 }
 
 impl App {
+    pub(crate) fn preparing_registered_workspace(&self) -> bool {
+        self.pending_workspace_switch.is_some()
+    }
+    pub(crate) fn registered_gui_binding(
+        &self,
+    ) -> Option<(
+        crate::app::gui_projection::registered::Route,
+        u64,
+        Arc<RemoteInput>,
+    )> {
+        if self.pending_workspace_switch.is_some() {
+            return None;
+        }
+        let view = self.remote_workspace_view(self.active_ws)?;
+        let frame = view.projection.frame_state.as_ref()?;
+        if !view.projection.display.workspace_app
+            || !view.projection.active
+            || view.state != RemoteViewState::Ready
+            || frame.workspace_id != view.target.workspace_id
+            || frame.epoch != view.projection.epoch
+            || Some(&frame.server_generation) != view.projection.display.server_generation.as_ref()
+        {
+            return None;
+        }
+        let ws = &self.workspaces[self.active_ws];
+        let pane = ws.tabs.first()?.layout.focus;
+        // link.epoch allocates tickets; it can advance past the committed
+        // epoch when a candidate is cancelled. Only the selected view commits.
+        let link = self.remote_session_displays.values().find(|l| {
+            l.selected == Some(pane)
+                && l.target.host == view.target.host
+                && l.target.session == view.target.session
+        })?;
+        let input = link.input.as_ref()?;
+        if !view.input.as_ref().is_some_and(|v| Arc::ptr_eq(v, input)) {
+            return None;
+        }
+        Some((
+            crate::app::gui_projection::registered::Route {
+                connection: link.id,
+                generation: link.generation,
+                workspace: ws.id.clone(),
+                scope: protocol::WorkspaceScope {
+                    server_generation: frame.server_generation.clone(),
+                    workspace_id: frame.workspace_id.clone(),
+                    epoch: frame.epoch,
+                },
+            },
+            view.projection.gui_frame,
+            input.clone(),
+        ))
+    }
+
+    pub(crate) fn registered_gui_status(&self, index: usize) -> &'static str {
+        match self.remote_workspace_view(index) {
+            Some(v) if v.input.is_none() && v.state == RemoteViewState::Disconnected => {
+                "disconnected"
+            }
+            Some(_) if self.pending_workspace_switch.is_some() => "switching",
+            Some(v) if !v.projection.display.workspace_app => "upgrade_required",
+            _ => "connecting",
+        }
+    }
     pub(super) fn ensure_session_display(
         &mut self,
         target: &RemoteSession,
@@ -664,6 +727,68 @@ mod tests {
                 false,
             ),
         )
+    }
+
+    #[test]
+    fn registered_gui_only_binds_scenes_to_the_committed_display() {
+        use crate::ipc::app_surface::protocol::{Response, Target};
+        use serde_json::json;
+        let _env = crate::persist::test_env("registered-gui-commit");
+        let (mut app, link, _rx) = fixture();
+        for view in app.views.values_mut() {
+            if let ViewKind::Remote(view) = view {
+                view.projection.display.workspace_app = true;
+            }
+        }
+        app.focus_workspace(2);
+        let (state, frame) = response(&app);
+        app.apply_prepared_workspace(link, 1, state, frame, vec![]);
+        app.refresh_registered_gui();
+        let (ticket, _, _) = app.registered_gui_binding().unwrap();
+        let scene = |ticket: &crate::app::gui_projection::registered::Route| {
+            let target = Target {
+                generation: ticket.scope.server_generation.clone(),
+                workspace_id: ticket.scope.workspace_id.clone(),
+                tab_id: "tab".into(),
+                pane_id: "42".into(),
+                terminal_id: Some("1".repeat(32)),
+            };
+            Response::Reply {
+                id: "scene".into(),
+                result: json!({"frames":[],
+                "tabs":[{"id":"tab","focus":"42","layout":{"Leaf":42},"panes":[{"pane_id":"42","target":target}]}]}),
+            }
+        };
+        assert!(!app.apply_registered_scene(link, 0, &ticket.scope, scene(&ticket)));
+        assert!(app.apply_registered_scene(link, 1, &ticket.scope, scene(&ticket)));
+        let selected = |app: &App| {
+            let ws = &app.gui_snapshot()["workspaces"][app.active_ws];
+            serde_json::from_value::<Target>(ws["tabs"][0]["panes"][0]["target"].clone()).unwrap()
+        };
+        let before = selected(&app);
+        assert_eq!(app.registered_target(&before).unwrap().1.pane_id, "42");
+        app.focus_workspace(3);
+        assert!(app.registered_target(&before).is_none());
+        // An abandoned candidate cannot leave the still-committed source unusable.
+        app.cancel_workspace_switch();
+        assert!(app.registered_target(&before).is_some());
+        for index in [3, 2] {
+            app.focus_workspace(index);
+            let (state, frame) = response(&app);
+            app.apply_prepared_workspace(link, 1, state, frame, vec![]);
+            app.refresh_registered_gui();
+            let (current, _, _) = app.registered_gui_binding().unwrap();
+            assert!(!app.apply_registered_scene(link, 1, &ticket.scope, scene(&ticket)));
+            assert!(app.apply_registered_scene(link, 1, &current.scope, scene(&current)));
+            assert!(app.registered_target(&before).is_none());
+        }
+        let after = selected(&app);
+        assert_eq!(before.workspace_id, after.workspace_id);
+        assert_eq!(before.terminal_id, after.terminal_id);
+        assert_ne!(before.pane_id, after.pane_id);
+        app.session_display_closed(link, 1, "disconnected");
+        assert!(app.registered_target(&after).is_none());
+        assert_eq!(app.registered_gui_status(app.active_ws), "disconnected");
     }
 
     #[test]

@@ -307,6 +307,30 @@ fn copy_link_at_grid(
 
 impl App {
     fn handle_api_request(&mut self, mut req: crate::ipc::api::ApiRequest) -> bool {
+        // Browser IDs resolve to their original owner target, never the active
+        // workspace. Read methods cannot mint a control lease.
+        if crate::browser::control::handles(&req.method) {
+            let owner = req
+                .params
+                .get("browser")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|id| {
+                    let target = self.browser_control.target(id)?;
+                    match self.validate_gui_target(target, false) {
+                        Ok((workspace, _, _)) => Some(workspace),
+                        Err(_) => {
+                            self.browser_control.revoke(id);
+                            None
+                        }
+                    }
+                });
+            let root = owner
+                .map(|w| &self.workspaces[w])
+                .filter(|w| w.remote.is_none())
+                .map(|w| w.cwd.as_path());
+            self.browser_control.handle_owner_request(req, root);
+            return true;
+        }
         if let Err((code, message)) = self.check_remote_workspace_request(&req.method, &req.params)
         {
             let _ = req.reply.send(
@@ -655,6 +679,81 @@ impl App {
         // off-loop. Apply its completed registry before the empty-workspace guard
         // so the single writer always observes the result.
         let ev = match ev {
+            AppEvent::Api(req) if crate::browser::control::handles(&req.method) => {
+                return self.handle_api_request(req);
+            }
+            AppEvent::BrowserCdpSubscribe {
+                browser_id,
+                lease,
+                subscription_id,
+                sender,
+                active,
+                reply,
+            } => {
+                let workspace = self
+                    .browser_control
+                    .target(&browser_id)
+                    .and_then(|target| self.validate_gui_target(target, false).ok())
+                    .map(|(workspace, _, _)| &self.workspaces[workspace]);
+                let result = if let Some(workspace) = workspace {
+                    // Only the owner gateway receives this root. A projected workspace
+                    // must never grant access to a similarly named display-local path.
+                    let root = workspace
+                        .remote
+                        .is_none()
+                        .then(|| workspace.cwd.to_str())
+                        .flatten();
+                    self.browser_control
+                        .subscribe_cdp(&browser_id, &lease, subscription_id, sender, active)
+                        .map(|mut ack| {
+                            ack["owner_workspace_root"] = serde_json::json!(root);
+                            ack
+                        })
+                } else {
+                    Err("route_changed".into())
+                };
+                let _ = reply.send(result);
+                return false;
+            }
+            AppEvent::BrowserCdpUnsubscribe {
+                browser_id,
+                subscription_id,
+            } => {
+                return self
+                    .browser_control
+                    .unsubscribe_cdp(&browser_id, &subscription_id);
+            }
+            AppEvent::BrowserControlTimeout => {
+                self.browser_control.expire();
+                return true;
+            }
+            AppEvent::BrowserControlResult {
+                client_id,
+                request_id,
+                target,
+                lease_generation,
+                result,
+            } => {
+                if self.validate_gui_target(&target, false).is_err() {
+                    let ids: Vec<_> = self
+                        .browser_control
+                        .bindings()
+                        .filter(|(_, _, binding)| self.validate_gui_target(binding, false).is_err())
+                        .map(|(id, _, _)| id.to_owned())
+                        .collect();
+                    for id in ids {
+                        self.browser_control.revoke(&id);
+                    }
+                    return true;
+                }
+                return self.browser_control.complete_bound(
+                    client_id,
+                    &request_id,
+                    &target,
+                    lease_generation,
+                    result,
+                );
+            }
             AppEvent::LocalClipboardSucceeded => {
                 self.show_toast(self.catalog.copied);
                 return true;
@@ -1197,7 +1296,13 @@ impl App {
                 }
                 changed
             }
-            AppEvent::BrowserStatus(_) => unreachable!("handled before remote routing"),
+            AppEvent::BrowserStatus(_)
+            | AppEvent::BrowserControlTimeout
+            | AppEvent::BrowserControlResult { .. }
+            | AppEvent::BrowserCdpSubscribe { .. }
+            | AppEvent::BrowserCdpUnsubscribe { .. } => {
+                unreachable!("handled before remote routing")
+            }
             AppEvent::ClientCommand(command) => {
                 if command == "send_prefix" {
                     return self.handle_event(AppEvent::PrefixKey(self.prefix.key_event()));
@@ -1772,7 +1877,8 @@ impl App {
                 kind,
                 token,
                 load,
-            } => self.apply_preview_read(id, path, kind, token, load),
+                mtime,
+            } => self.apply_preview_read(id, path, kind, token, load, mtime),
             AppEvent::PreviewLayout {
                 id,
                 path,
@@ -1824,6 +1930,9 @@ impl App {
             }
             // Handled by the server loop; never reaches here at runtime.
             AppEvent::ClientConnected { .. }
+            | AppEvent::WorkspaceAppRequest { .. }
+            | AppEvent::WorkspaceAppResponse { .. }
+            | AppEvent::ClientAppRequest { .. }
             | AppEvent::ClientDetach { .. }
             | AppEvent::ClientInput { .. }
             | AppEvent::LocalClipboardSucceeded
@@ -5370,8 +5479,74 @@ impl App {
             && (self.focused().is_some() || self.active_remote_pane().is_some())
     }
 
-    fn forward_key_to_pane(&mut self, id: PaneId, key: KeyEvent) -> bool {
+    pub(crate) fn forward_key_to_pane(&mut self, id: PaneId, key: KeyEvent) -> bool {
         self.forward_key_to_pane_with_scroll(id, key, true)
+    }
+
+    /// Use the native mouse encoder after the GUI adapter has fenced the target
+    /// and geometry. Shift is the host-selection override, as in the TUI.
+    pub(crate) fn gui_mouse_bytes(
+        event: ratatui::crossterm::event::MouseEvent,
+        mode: crate::terminal::pty::MouseModes,
+    ) -> Option<Vec<u8>> {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        if event.modifiers.contains(KeyModifiers::SHIFT) {
+            return None;
+        }
+        if !mode.report {
+            return match event.kind {
+                MouseEventKind::ScrollUp if mode.alternate_scroll => Some(b"\x1b[A".to_vec()),
+                MouseEventKind::ScrollDown if mode.alternate_scroll => Some(b"\x1b[B".to_vec()),
+                _ => None,
+            };
+        }
+        let button = |button| match button {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        };
+        let (code, kind) = match event.kind {
+            MouseEventKind::Down(b) => (button(b), MouseSeq::Press),
+            MouseEventKind::Up(b) => (button(b), MouseSeq::Release),
+            MouseEventKind::Drag(b) if mode.drag => (button(b), MouseSeq::Drag),
+            MouseEventKind::Moved if mode.motion => (3, MouseSeq::Drag),
+            MouseEventKind::ScrollUp => (64, MouseSeq::Press),
+            MouseEventKind::ScrollDown => (65, MouseSeq::Press),
+            _ => return None,
+        };
+        Some(mouse_button_seq(
+            code + mouse_mod_bits(event.modifiers),
+            kind,
+            event.column + 1,
+            event.row + 1,
+            mode.sgr,
+        ))
+    }
+
+    /// GUI keys retain the same press ownership as native input, but never
+    /// alter the shared TUI history viewport or enter TUI command handling.
+    pub(crate) fn forward_gui_key(&mut self, id: PaneId, key: KeyEvent) -> bool {
+        let identity = key_identity(self.input_client_id, self.input_key_origin, key);
+        match key.kind {
+            KeyEventKind::Press => {
+                if let Some(held) = self.forwarded_key_presses.remove(&identity) {
+                    self.release_forwarded_key_press(held);
+                }
+            }
+            KeyEventKind::Repeat | KeyEventKind::Release => {
+                let owned = self
+                    .forwarded_key_presses
+                    .get(&identity)
+                    .is_some_and(|held| held.pane == id && held.remote.is_none());
+                if !owned {
+                    return false;
+                }
+                if key.kind == KeyEventKind::Release {
+                    self.forwarded_key_presses.remove(&identity);
+                }
+            }
+        }
+        self.forward_key_to_pane_preserving_scroll(id, key)
     }
 
     fn forward_key_to_pane_preserving_scroll(&mut self, id: PaneId, key: KeyEvent) -> bool {
@@ -6942,6 +7117,67 @@ fn csi_tilde_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_control_dispatch_is_correlated_and_works_without_an_active_workspace() {
+        let _env = crate::persist::test_env("browser-control-dispatch");
+        let (tx, _events) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let pane = app.layout().focus;
+        let target = crate::ipc::app_surface::protocol::Target {
+            generation: app.backend_server_generation.clone(),
+            workspace_id: app.workspaces[0].id.clone(),
+            tab_id: app.workspaces[0].tabs[0].id.clone(),
+            pane_id: pane.0.to_string(),
+            terminal_id: Some(app.panes[&pane].terminal_runtime().unwrap().terminal_id),
+        };
+        let (id, launch) = app
+            .browser_control
+            .register(7, target.clone(), "about:blank".into())
+            .unwrap();
+        assert!(app.handle_event(AppEvent::BrowserControlResult {
+            client_id: 7,
+            request_id: launch["request_id"].as_str().unwrap().into(),
+            target: target.clone(),
+            lease_generation: 0,
+            result: Ok(json!({})),
+        }));
+        let (reply, replies) = std::sync::mpsc::channel();
+        app.handle_event(AppEvent::Api(crate::ipc::api::ApiRequest {
+            id: "acquire".into(),
+            method: "browser.control.acquire".into(),
+            params: json!({"browser":id}),
+            reply,
+        }));
+        assert!(replies.try_recv().is_err());
+        let command = app.browser_control.take_commands().pop().unwrap().1;
+        assert!(app.handle_event(AppEvent::BrowserControlResult {
+            client_id: 7,
+            request_id: command["request_id"].as_str().unwrap().into(),
+            target,
+            lease_generation: command["lease_generation"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+            result: Ok(json!({})),
+        }));
+        let response: serde_json::Value =
+            serde_json::from_str(&replies.try_recv().unwrap()).unwrap();
+        assert_eq!(response["result"]["state"], "completed");
+        app.workspaces.clear();
+        let (reply, replies) = std::sync::mpsc::channel();
+        app.handle_event(AppEvent::Api(crate::ipc::api::ApiRequest {
+            id: "get".into(),
+            method: "browser.get".into(),
+            params: json!({"browser":id}),
+            reply,
+        }));
+        let response: serde_json::Value =
+            serde_json::from_str(&replies.try_recv().unwrap()).unwrap();
+        assert_eq!(response["result"]["state"], "revoked");
+        assert_eq!(response["result"]["control"]["state"], "uncontrolled");
+    }
 
     #[test]
     fn negotiated_associated_text_reaches_focused_pane_input() {

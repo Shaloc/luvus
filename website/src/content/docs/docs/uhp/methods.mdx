@@ -84,7 +84,7 @@ Luvus release number.
 | host / sessions | `host.capabilities` · `host.info` · `host.doctor` · `host.update.check` · `host.update.install` · `session.list` · `session.status` · `session.start` · `session.stop` · `session.restart` · `session.delete` · `skill.status` · `skill.enable` · `skill.disable` · `integration.status` · `integration.install` · `integration.uninstall` |
 | discovery / config | `uhp.capabilities` · `uhp.stats` · `uhp.token.create` · `uhp.token.list` · `uhp.token.revoke` · `config.get` · `config.patch` · `server.reload_config` · `server.agent_manifests` · `server.reload_agent_manifests` |
 | workspaces | `workspace.list` · `workspace.get` · `workspace.open` · `workspace.focus` · `workspace.rename` · `workspace.pin` · `workspace.move` · `workspace.move_block` · `workspace.report_metadata` · `workspace.close` |
-| browser | `browser.open` · `browser.panel` |
+| browser | `browser.open` · `browser.panel` · `browser.list/get` · `browser.control.acquire/release/status` · `browser.navigate/back/forward/reload/close` · `browser.snapshot/act/evaluate/screenshot/wait/dialog` |
 | tabs | `tab.list` · `tab.get` · `tab.new` · `tab.focus` · `tab.move` · `tab.swap` · `tab.rename` · `tab.close` |
 | runtime and agents | `session.snapshot` · `agent.start` · `agent.prompt` · `agent.wait` · `events.subscribe` |
 | panes | `pane.list` · `pane.get` · `pane.current` · `pane.layout` · `pane.neighbor` · `pane.edges` · `pane.split` · `pane.move` · `pane.swap` · `pane.transpose` · `pane.focus` · `pane.focus_direction` · `pane.resize` · `pane.zoom` · `pane.rename` · `pane.run` · `pane.send_input` · `pane.read` · `pane.status` · `pane.processes` · `pane.restart` · `pane.close` · `attach.pane` |
@@ -1166,16 +1166,18 @@ one layer, callers must pass `layer` instead of accepting an ambiguous result.
 | `diff.note.add` | `{file, layer?, old_line? or new_line?, end_line?, body, kind?}` | one local note |
 | `diff.note.apply` | `{notes:[...]}` | validates and creates the whole batch or creates nothing |
 | `diff.note.list` | `{file?, state?}` | local notes and delivery metadata |
-| `diff.note.edit` | `{id, body}` | revised note |
-| `diff.note.resolve` | `{id}` | resolved note |
-| `diff.note.reopen` | `{id}` | reopened note |
-| `diff.note.remove` | `{id}` | removes only the local note |
+| `diff.note.edit` | `{id, body, if_note_revision?}` | revised note |
+| `diff.note.resolve` | `{id, if_note_revision?}` | resolved note |
+| `diff.note.reopen` | `{id, if_note_revision?}` | reopened note |
+| `diff.note.remove` | `{id, if_note_revision?}` | removes only the local note |
 | `diff.note.send` | `{to, ids? , all_open?}` | sends one bounded grouped message to one live agent |
 
 `layer` is `staged`, `worktree`, `untracked`, or `conflict`. `view` is `auto`,
 `split`, or `stack`; `placement` is `preview`, `pane`, or `tab`. A note kind is
 `question`, `issue`, `suggestion`, or `praise`. Notes are anchored to old or new
 Git source lines, not rendered rows.
+Pass the positive integer `revision` from `diff.note.list` as `if_note_revision`
+to reject an edit, state change, or deletion after another reviewer changes the note.
 
 ### Results and identifiers
 
@@ -1549,3 +1551,15 @@ including `host` or executable arguments, are rejected. Only the selected
 projection supplies the SSH owner to the display. See the
 [browser session guide](/docs/guides/remote/#browser-sessions) for transport and
 lifecycle requirements.
+
+For an embedded desktop tab, `browser.list` and `browser.get` return its
+opaque ID and bound workspace. `browser.control.acquire` grants a timed
+lease; `browser.control.release` and human takeover revoke it.
+`browser.screenshot` takes `{browser, lease, max_bytes?, output?}`.
+Without `output`, `data.base64` carries the image. With `output`, the owner
+creates a new PNG in the bound workspace and returns `data.path` and
+`data.bytes`. A symlink or path outside that workspace fails with
+`file_denied`; an existing destination fails with `file_exists`.
+The capture still obeys the ordinary response budget. This is an owner API
+operation; it does not broaden the temporary UHP gateway's allowlist or grant
+access to display files.

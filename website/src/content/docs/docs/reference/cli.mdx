@@ -154,6 +154,25 @@ bars:
 browser:
   browser open <url> [--pane <id>]  Open links on the display client
   browser panel <url> [--pane <id>]  Open a Chrome / Chromium session panel
+  browser list                     List embedded display browsers
+  browser get --browser <id>       Inspect an exact browser binding
+  browser control status --browser <id>  Inspect control without acquiring it
+  browser control acquire --browser <id> [--ttl <1-3600>]  Request explicit control (default 300s)
+  browser control release --browser <id> --lease <token>  Release control
+  browser cdp --browser <id> [--ttl <1-3600>] --json  Temporary single-tab CDP endpoint
+      Playwright: connectOverCDP(endpoint, { noDefaults: true }). Files stay scoped to the owner workspace.
+  browser navigate --browser <id> --lease <token> --url <url>
+  browser back|forward|reload|close --browser <id> --lease <token>
+  browser snapshot --browser <id> --lease <token>
+  browser act --browser <id> --lease <token> --action <json>
+    Action fields: kind, node, document_revision; click|fill|press|scroll|select.
+  browser evaluate --browser <id> --lease <token> --expression <javascript>
+  browser screenshot --browser <id> --lease <token> [--max-bytes <n>] [--output <owner-path>]
+  browser wait --browser <id> --lease <token> --condition <json>
+    Wait for text or load: {"text":"..."} | {"load":true}.
+  browser dialog --browser <id> --lease <token> --accept <true|false> [--prompt-text <text>]
+    Command timeout: --timeout-ms <1-20000> (default 10000).
+    A timeout does not undo a page action.
 
 appearance:
   ui sidebar [--side left|right] --width <n>     set a sidebar's width (columns)
@@ -213,9 +232,9 @@ diff review:
   diff note add --file <path> (--old-line N|--new-line N) --body <text>
                              [--end-line N] [--kind question|issue|suggestion|praise]
   diff note list [--file <path>] [--state open|resolved|outdated|orphaned]
-  diff note edit <id> --body <text>
-  diff note resolve|reopen <id>
-  diff note remove <id> --yes
+  diff note edit <id> --body <text> [--if-note-revision N]
+  diff note resolve|reopen <id> [--if-note-revision N]
+  diff note remove <id> --yes [--if-note-revision N]
   diff note send --to <agent> [<id>...] [--all-open]
 
 worktrees:
@@ -449,3 +468,30 @@ luvus browser panel http://localhost:3000 --pane 7
 `panel` splits beside the specified owner-local pane and shows a clickable link.
 Pane IDs are opaque, not tab positions. Inside a Luvus terminal `--pane` defaults
 to `LUVUS_PANE_ID`. See [browser sessions](/docs/guides/remote/#browser-sessions).
+
+In the macOS desktop client, open an embedded browser leaf before requesting
+control. Run the commands on the **owner** of that leaf:
+
+```sh
+luvus browser list
+luvus browser control acquire --browser "$id" --ttl 60
+luvus browser screenshot --browser "$id" --lease "$lease" --output capture.png
+luvus browser control release --browser "$id" --lease "$lease"
+luvus browser cdp --browser "$id" --ttl 120 --json
+```
+
+Without `--output`, the screenshot result contains base64. With it, the owner
+returns the path and byte count of a new PNG. Relative paths resolve in the
+bound workspace; symlinks below the workspace and existing destinations are
+rejected. The display does not receive the requested path.
+
+The foreground CDP command grants temporary control of that tab only. Treat its
+loopback WebSocket URL as a credential. For Playwright, use `connectOverCDP`
+with `noDefaults: true` to avoid requesting a host-selected downloads directory.
+`DOM.setFileInputFiles` reads regular files from the owner workspace, up to 16
+files totaling 64 MiB per selection. To receive agent downloads, send
+`Browser.setDownloadBehavior` with `allow` or `allowAndName` and an existing
+owner workspace directory as `downloadPath`. Transfers require a known positive
+size up to 64 MiB. With events enabled, only a `completed` progress event means
+the owner published a new file; `filePath` then refers to the owner. The default
+is to deny downloads. Taking control in the App revokes the temporary endpoint.

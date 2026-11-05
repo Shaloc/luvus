@@ -226,6 +226,25 @@
         "ui.toast",
         "browser.open",
         "browser.panel",
+        "browser.list",
+        "browser.get",
+        "browser.navigate",
+        "browser.back",
+        "browser.forward",
+        "browser.reload",
+        "browser.close",
+        "browser.snapshot",
+        "browser.act",
+        "browser.evaluate",
+        "browser.screenshot",
+        "browser.wait",
+        "browser.dialog",
+        "browser.control.acquire",
+        "browser.control.release",
+        "browser.control.status",
+        "browser.cdp.subscribe",
+        "browser.cdp.connect",
+        "browser.cdp.send",
         "terminal.backend.inventory",
         "terminal.backend.snapshot",
         "terminal.backend.validate",
@@ -1661,6 +1680,20 @@
     }
   },
   "allOf": [
+    {
+      "if": {"properties":{"method":{"enum":["diff.note.edit","diff.note.resolve","diff.note.reopen","diff.note.remove"]}}},
+      "then": {"properties":{"params":{"properties":{"if_note_revision":{"type":"integer","minimum":1,"maximum":18446744073709551615}}}}}
+    },
+    {
+      "if": {"properties": {"method": {"enum": [
+        "browser.list", "browser.get", "browser.navigate", "browser.back",
+        "browser.forward", "browser.reload", "browser.close", "browser.snapshot",
+        "browser.act", "browser.evaluate", "browser.screenshot", "browser.wait",
+        "browser.dialog", "browser.control.acquire", "browser.control.release", "browser.control.status",
+        "browser.cdp.subscribe", "browser.cdp.connect", "browser.cdp.send"
+      ]}}},
+      "then": {"$ref": "https://luvus.dev/protocol/uhp/v1/browser.schema.json"}
+    },
     {
       "if": {
         "properties": {

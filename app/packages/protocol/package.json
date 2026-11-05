@@ -1,0 +1,23 @@
+{
+  "name": "@luvus/app-protocol",
+  "version": "1.0.99",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "node ../../scripts/build.mjs --protocol",
+    "check": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "ajv": "8.20.0"
+  }
+}

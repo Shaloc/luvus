@@ -3,6 +3,25 @@
 use super::*;
 use super::{params::*, projection::*};
 
+fn check_note_revision(params: &Value, current: u64) -> Result<(), (String, String)> {
+    let Some(expected) = params.get("if_note_revision") else {
+        return Ok(());
+    };
+    let expected = expected.as_u64().filter(|n| *n > 0).ok_or_else(|| {
+        (
+            "invalid_request".into(),
+            "if_note_revision must be a positive integer".into(),
+        )
+    })?;
+    if expected != current {
+        return Err((
+            "revision_conflict".into(),
+            "Review note changed. Reload before saving.".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl App {
     pub(super) fn api_search_capabilities(&mut self, method: &str, p: &Value) -> DispatchResult {
         let _ = (method, p);
@@ -440,6 +459,7 @@ impl App {
                 .find(|note| note.id == id)
                 .cloned()
                 .ok_or_else(|| diff_err("review note not found".to_string()))?;
+            check_note_revision(p, note.revision)?;
             let mut updated = note.clone();
             match method {
                 "diff.note.edit" => updated.body = req_str(p, "body")?.to_string(),
@@ -468,6 +488,7 @@ impl App {
                 .find(|note| note.id == id)
                 .cloned()
                 .ok_or_else(|| diff_err("review note not found".to_string()))?;
+            check_note_revision(p, note.revision)?;
             crate::diff::notes::remove(&note, Some(note.revision)).map_err(diff_err)?;
             self.apply_diff_note_removed(id.to_string(), Ok(()));
             Ok(json!({"type":"ok","removed":id}))

@@ -1,0 +1,24 @@
+{
+  "name": "@luvus/app-renderer",
+  "version": "1.0.99",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "vite build",
+    "check": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@base-ui/react": "1.9.0",
+    "@luvus/app-protocol": "1.0.99",
+    "@luvus/terminal-view": "1.0.99",
+    "lucide-react": "1.67.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "tailwindcss": "4.3.4"
+  }
+}

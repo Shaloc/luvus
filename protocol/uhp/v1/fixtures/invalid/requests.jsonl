@@ -1,4 +1,13 @@
 {"method":"uhp.capabilities","params":{}}
+{"id":"browser-read-lease","method":"browser.get","params":{"browser":"b1","lease":"secret"}}
+{"id":"browser-evaluate-no-lease","method":"browser.evaluate","params":{"browser":"b1","expression":"document.title"}}
+{"id":"browser-acquire-force","method":"browser.control.acquire","params":{"browser":"b1","force":true}}
+{"id":"browser-acquire-ttl","method":"browser.control.acquire","params":{"browser":"b1","ttl_s":3601}}
+{"id":"browser-screenshot-budget","method":"browser.screenshot","params":{"browser":"b1","lease":"secret","max_bytes":1044481}}
+{"id":"browser-screenshot-empty-output","method":"browser.screenshot","params":{"browser":"b1","lease":"secret","output":""}}
+{"id":"browser-cdp-missing-lease","method":"browser.cdp.subscribe","params":{"browser":"11111111111111111111111111111111"}}
+{"id":"browser-act-revision","method":"browser.act","params":{"browser":"b1","lease":"secret","action":{"kind":"click","node":"n1"}}}
+{"id":"browser-privileged-url","method":"browser.navigate","params":{"browser":"b1","lease":"secret","url":"file:///private/file"}}
 {"id":"","method":"uhp.capabilities","params":{}}
 {"id":"1","method":"not.a.method","params":{}}
 {"id":"1","method":"pane.neighbor","params":null}
@@ -70,3 +79,4 @@
 {"id":"invalid-worktree-create-6","method":"worktree.create","params":{"branch":"topic","workspace_id":"workspace_example","typo":true}}
 {"id":"invalid-worktree-create-7","method":"worktree.create","params":{"branch":"  ","workspace_id":"workspace_example"}}
 {"id":"invalid-worktree-create-8","method":"worktree.create","params":{"workspace_id":"workspace_example"}}
+{"id":"invalid-note-revision","method":"diff.note.edit","params":{"id":"note1","body":"draft","if_note_revision":0}}

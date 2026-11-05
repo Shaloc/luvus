@@ -19,7 +19,7 @@ pub fn local_cell_pixels() -> (u16, u16) {
 
 // 17 belongs to the incompatible released v0.14.1 wire layout.
 // Keep rejecting it; fork notification delivery starts at 18.
-pub const PROTOCOL_VERSION: u32 = 20;
+pub const PROTOCOL_VERSION: u32 = 21;
 pub const PROJECTION_PROTOCOL_VERSION: u32 = 10;
 pub const LEGACY_PROTOCOL_VERSION: u32 = 9;
 
@@ -38,6 +38,7 @@ pub fn supports_version(version: u32) -> bool {
             | 16
             | 18
             | 19
+            | 20
             | PROTOCOL_VERSION
     )
 }
@@ -133,6 +134,18 @@ pub enum ClientMessage {
     },
     /// Transport 19: display-local browser launch feedback.
     BrowserStatus(String),
+    HelloApp {
+        version: u32,
+        cols: u16,
+        rows: u16,
+    },
+    AppRequest(String),
+    /// Negotiated registered App projection on an existing managed display.
+    WorkspaceApp {
+        scope: WorkspaceScope,
+        origin: u64,
+        body: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -254,6 +267,20 @@ pub enum ServerMessage {
     Browser(crate::browser::Request),
     /// Transport 20: owner proxy environment, never recaptured by a relay.
     BrowserWithProxy(crate::browser::LaunchRequest),
+    AppFrame(String),
+    AppResponse(String),
+    WorkspaceApp {
+        scope: WorkspaceScope,
+        origin: u64,
+        body: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceScope {
+    pub server_generation: String,
+    pub workspace_id: String,
+    pub epoch: u64,
 }
 
 /// Only a peer that negotiated transport 15 receives the appended variant.
@@ -485,9 +512,11 @@ pub const PROJECTION_CAPABILITY: &str = "projection.v1";
 pub const SESSION_DISPLAY_CAPABILITY: &str = "session_display.v1";
 
 pub fn remote_display_capabilities() -> serde_json::Value {
-    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, 14, 15, 16, 18, 19, PROTOCOL_VERSION],
-        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1", "hyperlinks.v1", "scoped_frames.v1", "scoped_clipboard.v1", "notifications.v1", "terminal_colors.v1", "browser_session.v1", "browser_proxy_environment.v1"]})
+    serde_json::json!({"transport":PROTOCOL_VERSION, "compatible_transports":[LEGACY_PROTOCOL_VERSION, PROJECTION_PROTOCOL_VERSION, 11, 12, 13, 14, 15, 16, 18, 19, 20, PROTOCOL_VERSION],
+        "capabilities":[PROJECTION_CAPABILITY, "graphics.v1", "cell_pixels.v1", SESSION_DISPLAY_CAPABILITY, "clipboard_helper_relay.v1", "hyperlinks.v1", "scoped_frames.v1", "scoped_clipboard.v1", "notifications.v1", "terminal_colors.v1", "browser_session.v1", "browser_proxy_environment.v1", WORKSPACE_APP_CAPABILITY]})
 }
+
+pub const WORKSPACE_APP_CAPABILITY: &str = "workspace_app.v1";
 
 #[derive(Clone, PartialEq)]
 pub struct ScopedFrameView {
@@ -1666,7 +1695,8 @@ mod tests {
         assert!(supports_version(18));
         assert!(supports_version(19));
         assert!(supports_version(20));
-        assert!(!supports_version(21));
+        assert!(supports_version(21));
+        assert!(!supports_version(22));
     }
 
     #[test]

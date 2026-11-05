@@ -177,6 +177,9 @@ impl RemoteInput {
         // Upper bound for the owned payload plus its framing/enum overhead.
         // Encoding stays off the app loop, including large image pastes.
         let payload = match &message {
+            ClientMessage::WorkspaceApp { scope, body, .. } => {
+                body.len() + scope.workspace_id.len() + scope.server_generation.len()
+            }
             ClientMessage::Paste(text) | ClientMessage::Command(text) => text.len(),
             ClientMessage::HelloWorkspace { workspace_id, .. }
             | ClientMessage::HelloProjection { workspace_id, .. }

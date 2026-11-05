@@ -1901,6 +1901,129 @@ pub fn start_server(listener: transport::Listener, event_tx: Sender<AppEvent>, b
         });
 }
 
+fn handle_browser_cdp_stream(
+    reader: BufReader<Conn>,
+    mut writer: Conn,
+    id: &str,
+    params: Value,
+    event_tx: Sender<AppEvent>,
+) {
+    #[cfg(not(unix))]
+    {
+        let _ = (reader, params, event_tx);
+        let _ = write_response(
+            &mut writer,
+            id,
+            &json!({"id":id,"error":{
+            "code":"unsupported","message":"CDP streaming requires a Unix desktop transport"}})
+            .to_string(),
+        );
+    }
+    #[cfg(unix)]
+    {
+        let mut reader = reader;
+        let browser_id = params["browser"].as_str().unwrap_or("");
+        let lease = params["lease"].as_str().unwrap_or("");
+        if crate::browser::control::validate_params("browser.cdp.subscribe", &params).is_err() {
+            let _ = write_response(
+                &mut writer,
+                id,
+                &json!({"id":id,"error":{
+                "code":"invalid_params","message":"CDP requires a browser and control lease"}})
+                .to_string(),
+            );
+            return;
+        }
+        let Ok(subscription_id) = crate::terminal::backend::random_id() else {
+            return;
+        };
+        if writer.clear_timeouts().is_err()
+            || !matches!(
+                writer.set_send_timeout(std::time::Duration::from_secs(5)),
+                Ok(transport::TimeoutMode::Kernel)
+            )
+        {
+            return;
+        }
+        let (sender, receiver) = mpsc::sync_channel::<String>(8);
+        let (reply, replies) = mpsc::channel();
+        let active = Arc::new(AtomicBool::new(true));
+        let unsubscribe = || {
+            active.store(false, Ordering::Release);
+            let _ = event_tx.send(AppEvent::BrowserCdpUnsubscribe {
+                browser_id: browser_id.to_owned(),
+                subscription_id: subscription_id.clone(),
+            });
+        };
+        if event_tx
+            .send(AppEvent::BrowserCdpSubscribe {
+                browser_id: browser_id.to_owned(),
+                lease: lease.to_owned(),
+                subscription_id: subscription_id.clone(),
+                sender,
+                active: active.clone(),
+                reply,
+            })
+            .is_err()
+        {
+            return;
+        }
+        let response = match replies.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Ok(result)) => json!({"id":id,"result":result}),
+            result => {
+                let code = match result {
+                    Ok(Err(code)) => code,
+                    _ => "timeout".into(),
+                };
+                let _ = write_response(
+                    &mut writer,
+                    id,
+                    &json!({"id":id,"error":{"code":code,"message":"CDP subscription rejected"}})
+                        .to_string(),
+                );
+                unsubscribe();
+                return;
+            }
+        };
+        if write_response(&mut writer, id, &response.to_string()).is_err() {
+            unsubscribe();
+            return;
+        }
+        let mut output = writer.clone();
+        let live = active.clone();
+        let forwarder = thread::Builder::new()
+            .name("luvus-cdp-events".into())
+            .stack_size(EVENT_FORWARDER_STACK_BYTES)
+            .spawn(move || {
+                for frame in receiver {
+                    if !live.load(Ordering::Acquire)
+                        || frame.len() + 1 > crate::terminal::backend::MAX_FRAME_BYTES
+                        || write_event_frame(&mut output, &frame).is_err()
+                    {
+                        break;
+                    }
+                }
+                live.store(false, Ordering::Release);
+                let _ = output.shutdown();
+            });
+        let Ok(forwarder) = forwarder else {
+            unsubscribe();
+            return;
+        };
+        let mut byte = [0];
+        loop {
+            match reader.read(&mut byte) {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                _ => break,
+            }
+        }
+        unsubscribe();
+        let _ = writer.shutdown();
+        let _ = forwarder.join();
+        finish_subscription_log(crate::logging::Reason::Eof);
+    }
+}
+
 fn handle_conn(
     mut stream: Conn,
     event_tx: Sender<AppEvent>,
@@ -2036,8 +2159,10 @@ fn handle_conn(
             | "server.agent_manifests"
             | "server.reload_agent_manifests"
     );
-    let versioned_api =
-        method.starts_with("terminal.backend.") || versioned_runtime || versioned_uhp;
+    let versioned_api = method.starts_with("terminal.backend.")
+        || method == "browser.cdp.subscribe"
+        || versioned_runtime
+        || versioned_uhp;
     let params = match val.get("params") {
         None | Some(Value::Null) if versioned_api => json!({}),
         None => Value::Null,
@@ -2067,6 +2192,11 @@ fn handle_conn(
     };
     if let Some(response) = handle_auth_method(&id, &method, &params, delegated_scopes.as_deref()) {
         let _ = write_response(&mut writer, &id, &response);
+        return;
+    }
+
+    if method == "browser.cdp.subscribe" {
+        handle_browser_cdp_stream(reader, writer, &id, params, event_tx);
         return;
     }
 
@@ -2735,7 +2865,7 @@ fn wait_for_parked_reply(
 /// `None` only when the field is absent; a present but non-numeric, negative,
 /// NaN, infinite, or overflowing value is rejected rather than mapped to an
 /// unbounded wait or allowed to panic `from_secs_f64`.
-fn parse_timeout_s(params: &Value) -> Result<Option<std::time::Duration>, &'static str> {
+pub(crate) fn parse_timeout_s(params: &Value) -> Result<Option<std::time::Duration>, &'static str> {
     let Some(v) = params.get("timeout_s") else {
         return Ok(None);
     };

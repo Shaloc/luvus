@@ -70,6 +70,8 @@ impl App {
         }
         self.schedule_preview_read(id, path);
         self.mode = Mode::Normal;
+        self.session_dirty = true;
+        self.emit_event("pane.created", serde_json::json!({"pane":id.0.to_string()}));
     }
 
     pub(crate) fn schedule_preview_read(&mut self, id: PaneId, path: PathBuf) {
@@ -77,13 +79,11 @@ impl App {
             return;
         };
         view.read_token = view.read_token.wrapping_add(1);
-        view.mtime = std::fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
         let token = view.read_token;
         let kind = view.kind;
         let tx = self.app_tx.clone();
         std::thread::spawn(move || {
+            let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
             let load = preview::read(&path, kind);
             let _ = tx.send(AppEvent::PreviewRead {
                 id,
@@ -91,6 +91,7 @@ impl App {
                 kind,
                 token,
                 load,
+                mtime,
             });
         });
     }
@@ -102,6 +103,7 @@ impl App {
         kind: PreviewKind,
         token: u64,
         load: PreviewLoad,
+        mtime: Option<std::time::SystemTime>,
     ) -> bool {
         let Some(ViewKind::Preview(view)) = self.views.get_mut(&id) else {
             return false;
@@ -109,7 +111,9 @@ impl App {
         if view.read_token != token || view.path != path || view.kind != kind {
             return false;
         }
+        view.mtime = mtime;
         view.apply(load);
+        self.native_view_revision = self.native_view_revision.wrapping_add(1);
         true
     }
 
@@ -467,6 +471,7 @@ mod tests {
             PreviewKind::Markdown,
             token,
             PreviewLoad::Error("stale".into()),
+            None,
         ));
         assert!(!app.apply_preview_read(
             id,
@@ -474,6 +479,7 @@ mod tests {
             PreviewKind::Mermaid,
             token,
             PreviewLoad::Error("stale".into()),
+            None,
         ));
         assert!(!app.apply_preview_read(
             id,
@@ -481,6 +487,7 @@ mod tests {
             PreviewKind::Markdown,
             token.wrapping_add(1),
             PreviewLoad::Error("stale".into()),
+            None,
         ));
         assert!(matches!(
             app.views.get(&id),

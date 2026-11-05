@@ -1,0 +1,1617 @@
+{
+  "$defs": {
+    "CdpChunk": {
+      "additionalProperties": false,
+      "properties": {
+        "index": {
+          "maximum": 16383,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "maxLength": 131072,
+          "minLength": 1,
+          "type": "string"
+        },
+        "total": {
+          "maximum": 16384,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "transfer": {
+          "pattern": "^[0-9a-f]{32}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "transfer",
+        "index",
+        "total",
+        "text"
+      ],
+      "type": "object"
+    },
+    "Cell": {
+      "additionalProperties": false,
+      "properties": {
+        "bg": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "col": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "fg": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "link": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mods": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "text": {
+          "type": "string"
+        },
+        "width": {
+          "maximum": 2,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "row",
+        "col",
+        "text",
+        "width",
+        "fg",
+        "bg",
+        "mods",
+        "link"
+      ],
+      "type": "object"
+    },
+    "CellPoint": {
+      "items": [
+        {
+          "maximum": 299,
+          "minimum": 0,
+          "type": "integer"
+        },
+        {
+          "maximum": 499,
+          "minimum": 0,
+          "type": "integer"
+        }
+      ],
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
+    "Cursor": {
+      "additionalProperties": false,
+      "properties": {
+        "col": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "row": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "shape": {
+          "enum": [
+            "block",
+            "beam",
+            "underline"
+          ]
+        },
+        "visible": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "col",
+        "visible",
+        "shape"
+      ],
+      "type": "object"
+    },
+    "Input": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "paste"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "alt": {
+              "type": "boolean"
+            },
+            "ctrl": {
+              "type": "boolean"
+            },
+            "key": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "key"
+            },
+            "release": {
+              "type": "boolean"
+            },
+            "repeat": {
+              "type": "boolean"
+            },
+            "shift": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "key"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "kind": {
+              "const": "scroll"
+            },
+            "lines": {
+              "maximum": 32767,
+              "minimum": -32768,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "lines"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "action": {
+              "enum": [
+                "press",
+                "release",
+                "move",
+                "wheel_up",
+                "wheel_down"
+              ]
+            },
+            "alt": {
+              "type": "boolean"
+            },
+            "button": {
+              "maximum": 3,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "col": {
+              "maximum": 499,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ctrl": {
+              "type": "boolean"
+            },
+            "geometry": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "mouse"
+            },
+            "row": {
+              "maximum": 299,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "shift": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "geometry",
+            "action",
+            "button",
+            "row",
+            "col"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "end": {
+              "$ref": "#/$defs/CellPoint"
+            },
+            "geometry": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "selection"
+            },
+            "mode": {
+              "enum": [
+                "cell",
+                "word",
+                "line"
+              ]
+            },
+            "revision": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "start": {
+              "$ref": "#/$defs/CellPoint"
+            }
+          },
+          "required": [
+            "kind",
+            "geometry",
+            "revision",
+            "start",
+            "end",
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "geometry": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "kind": {
+              "const": "copy"
+            }
+          },
+          "required": [
+            "kind",
+            "geometry"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "focused": {
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "focus_event"
+            }
+          },
+          "required": [
+            "kind",
+            "focused"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Request": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "snapshot"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "method": {
+              "enum": [
+                "uhp.capabilities",
+                "uhp.stats",
+                "uhp.token.create",
+                "uhp.token.list",
+                "uhp.token.revoke",
+                "ping",
+                "server.stop",
+                "server.reload_config",
+                "server.agent_manifests",
+                "server.reload_agent_manifests",
+                "config.get",
+                "config.patch",
+                "session.snapshot",
+                "events.subscribe",
+                "events.wait",
+                "wait.output",
+                "workspace.list",
+                "workspace.get",
+                "workspace.new",
+                "workspace.open",
+                "workspace.focus",
+                "workspace.rename",
+                "workspace.pin",
+                "workspace.move",
+                "workspace.move_block",
+                "workspace.report_metadata",
+                "workspace.close",
+                "node.list",
+                "node.new",
+                "node.open",
+                "node.focus",
+                "node.rename",
+                "node.pin",
+                "node.close",
+                "tab.list",
+                "tab.get",
+                "tab.new",
+                "tab.focus",
+                "tab.move",
+                "tab.swap",
+                "tab.rename",
+                "tab.close",
+                "pane.list",
+                "pane.get",
+                "pane.current",
+                "pane.layout",
+                "pane.neighbor",
+                "pane.edges",
+                "pane.split",
+                "pane.move",
+                "pane.swap",
+                "pane.transpose",
+                "pane.focus",
+                "pane.focus_direction",
+                "pane.resize",
+                "pane.zoom",
+                "pane.rename",
+                "pane.run",
+                "pane.send_input",
+                "pane.read",
+                "pane.status",
+                "pane.processes",
+                "pane.report_session",
+                "pane.release_session",
+                "pane.report_event",
+                "pane.restart",
+                "pane.close",
+                "attach.pane",
+                "layout.export",
+                "layout.apply",
+                "layout.set_split_ratio",
+                "agent.list",
+                "agent.get",
+                "agent.explain",
+                "agent.report",
+                "agent.release",
+                "agent.start",
+                "agent.prompt",
+                "agent.wait",
+                "agent.name",
+                "agent.fork",
+                "agent.send",
+                "agent.keys",
+                "agent.read",
+                "agent.sessions",
+                "agent.resume",
+                "search",
+                "search.capabilities",
+                "search.query",
+                "search.activate",
+                "files.tree",
+                "files.open",
+                "files.reveal",
+                "files.refresh",
+                "git.status",
+                "git.branches",
+                "git.log",
+                "git.open",
+                "mission.snapshot",
+                "mission.refresh",
+                "mission.open",
+                "diff.refresh",
+                "diff.list",
+                "diff.open",
+                "diff.get",
+                "diff.navigate",
+                "diff.note.add",
+                "diff.note.apply",
+                "diff.note.list",
+                "diff.note.edit",
+                "diff.note.resolve",
+                "diff.note.reopen",
+                "diff.note.remove",
+                "diff.note.send",
+                "worktree.list",
+                "worktree.create",
+                "worktree.open",
+                "worktree.remove",
+                "task.add",
+                "task.list",
+                "task.get",
+                "task.claim",
+                "task.next",
+                "task.start",
+                "task.heartbeat",
+                "task.update",
+                "task.done",
+                "task.retry",
+                "task.merge",
+                "task.release",
+                "task.delete",
+                "automation.create",
+                "automation.list",
+                "automation.get",
+                "automation.update",
+                "automation.enable",
+                "automation.disable",
+                "automation.rebind",
+                "automation.delete",
+                "automation.run",
+                "automation.history",
+                "automation.preview",
+                "automation.health",
+                "lease.acquire",
+                "lease.list",
+                "lease.release",
+                "module.list",
+                "module.info",
+                "module.link",
+                "module.update",
+                "module.unlink",
+                "module.uninstall",
+                "module.enable",
+                "module.disable",
+                "module.action.list",
+                "module.action.invoke",
+                "module.pane.open",
+                "module.pane.focus",
+                "module.pane.close",
+                "module.config_dir",
+                "module.settings.list",
+                "module.settings.get",
+                "module.settings.set",
+                "module.log.list",
+                "theme.list",
+                "theme.path",
+                "theme.use",
+                "theme.reload",
+                "manifest.reload",
+                "ui.sidebar",
+                "ui.agent_title.push",
+                "ui.agent_title.clear",
+                "ui.dock.push",
+                "ui.dock.list",
+                "ui.dock.move",
+                "ui.bar.push",
+                "ui.bar.list",
+                "ui.bar.move",
+                "ui.bar.remove",
+                "ui.notification.push",
+                "ui.notification.clear",
+                "ui.toast",
+                "browser.open",
+                "browser.panel",
+                "browser.list",
+                "browser.get",
+                "browser.navigate",
+                "browser.back",
+                "browser.forward",
+                "browser.reload",
+                "browser.close",
+                "browser.snapshot",
+                "browser.act",
+                "browser.evaluate",
+                "browser.screenshot",
+                "browser.wait",
+                "browser.dialog",
+                "browser.control.acquire",
+                "browser.control.release",
+                "browser.control.status",
+                "browser.cdp.subscribe",
+                "browser.cdp.connect",
+                "browser.cdp.send",
+                "terminal.backend.inventory",
+                "terminal.backend.snapshot",
+                "terminal.backend.validate",
+                "terminal.backend.processes",
+                "terminal.backend.capture",
+                "terminal.backend.observe",
+                "terminal.backend.control",
+                "terminal.backend.type_literal",
+                "terminal.backend.paste_text",
+                "terminal.backend.submit_text",
+                "terminal.backend.send_key",
+                "terminal.backend.set_title",
+                "terminal.backend.notify",
+                "terminal.backend.create",
+                "terminal.backend.close",
+                "terminal.backend.wait_change",
+                "terminal.backend.wait_output",
+                "terminal.backend.events.subscribe"
+              ]
+            },
+            "params": {
+              "type": "object"
+            },
+            "type": {
+              "const": "action"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "generation",
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "input": {
+              "$ref": "#/$defs/Input"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "input"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "target",
+            "input"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "cell_height": {
+              "maximum": 512,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "cell_width": {
+              "maximum": 512,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "cols": {
+              "maximum": 500,
+              "minimum": 2,
+              "type": "integer"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "rows": {
+              "maximum": 300,
+              "minimum": 2,
+              "type": "integer"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "viewport"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "target",
+            "cols",
+            "rows",
+            "cell_width",
+            "cell_height"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "activate": {
+              "type": "boolean"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "focus"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "target"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "forward": {
+              "type": "boolean"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "focus_history"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "target",
+            "forward"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "sequence": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "graphic"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "target",
+            "sequence"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "number": {
+              "maximum": 4294967295,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "type": {
+              "const": "pull_requests"
+            },
+            "workspace_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "generation",
+            "workspace_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "client": {
+              "type": "boolean"
+            },
+            "generation": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "logs"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "generation",
+            "client"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "item": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "action": {
+                      "maxLength": 128,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "index": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "key": {
+                      "maxLength": 128,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "kind": {
+                      "const": "dock"
+                    },
+                    "menu": {
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "owner": {
+                      "maxLength": 128,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "key",
+                    "owner",
+                    "index",
+                    "action",
+                    "text",
+                    "value"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "action": {
+                      "maxLength": 128,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "compact": {
+                      "type": "boolean"
+                    },
+                    "index": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "key": {
+                      "maxLength": 128,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "kind": {
+                      "const": "bar"
+                    },
+                    "owner": {
+                      "maxLength": 128,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "value": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "key",
+                    "owner",
+                    "index",
+                    "action",
+                    "value",
+                    "compact"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "type": {
+              "const": "widget"
+            },
+            "workspace_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "generation",
+            "workspace_id",
+            "item"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "generation": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "operation": {
+              "oneOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "expand",
+                        "collapse",
+                        "markdown",
+                        "mermaid",
+                        "inspect"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "kind"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "enum": [
+                        "create_file",
+                        "create_directory"
+                      ]
+                    },
+                    "name": {
+                      "maxLength": 255,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "name"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "identity": {
+                      "maxLength": 128,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "kind": {
+                      "const": "rename"
+                    },
+                    "name": {
+                      "maxLength": 255,
+                      "minLength": 1,
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "name",
+                    "identity"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "identity": {
+                      "maxLength": 128,
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "kind": {
+                      "const": "delete"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "identity"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "root": {
+              "type": "string"
+            },
+            "type": {
+              "const": "file_entry"
+            },
+            "workspace_id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "generation",
+            "workspace_id",
+            "root",
+            "path",
+            "operation"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "browser_open"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "target"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "browser_id": {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "browser_closed"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "browser_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "browser_id": {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "lease_generation": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "browser_takeover"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "browser_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "error": {
+              "maxLength": 128,
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "lease_generation": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "browser_result"
+            },
+            "value": {}
+          },
+          "required": [
+            "type",
+            "id",
+            "target",
+            "lease_generation",
+            "value",
+            "error"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "browser_id": {
+              "pattern": "^[0-9a-f]{32}$",
+              "type": "string"
+            },
+            "chunk": {
+              "$ref": "#/$defs/CdpChunk"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "lease_generation": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "browser_cdp_event"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "browser_id",
+            "target",
+            "lease_generation",
+            "chunk"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "detach"
+            }
+          },
+          "required": [
+            "type",
+            "id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "receipt": {
+              "pattern": "^[0-9]{1,20}$",
+              "type": "string"
+            },
+            "type": {
+              "const": "clipboard_succeeded"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "receipt"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Response": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "capabilities": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "protocol": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "transport": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "ready"
+            }
+          },
+          "required": [
+            "type",
+            "protocol",
+            "transport",
+            "capabilities"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "snapshot": {
+              "type": "object"
+            },
+            "type": {
+              "const": "snapshot"
+            }
+          },
+          "required": [
+            "type",
+            "snapshot"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "frame": {
+              "$ref": "#/$defs/TerminalFrame"
+            },
+            "type": {
+              "const": "terminal"
+            }
+          },
+          "required": [
+            "type",
+            "frame"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "result": {},
+            "type": {
+              "const": "reply"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "result"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "const": "error"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "data": {},
+            "kind": {
+              "type": "string"
+            },
+            "type": {
+              "const": "effect"
+            }
+          },
+          "required": [
+            "type",
+            "kind",
+            "data"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "index": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "text": {
+              "type": "string"
+            },
+            "total": {
+              "maximum": 1024,
+              "minimum": 1,
+              "type": "integer"
+            },
+            "transfer": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "chunk"
+            }
+          },
+          "required": [
+            "type",
+            "transfer",
+            "index",
+            "total",
+            "text"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Target": {
+      "additionalProperties": false,
+      "properties": {
+        "generation": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "pane_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "tab_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "terminal_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "generation",
+        "workspace_id",
+        "tab_id",
+        "pane_id",
+        "terminal_id"
+      ],
+      "type": "object"
+    },
+    "TerminalFrame": {
+      "additionalProperties": false,
+      "properties": {
+        "cells": {
+          "items": {
+            "$ref": "#/$defs/Cell"
+          },
+          "type": "array"
+        },
+        "cols": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cursor"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "geometry": {
+          "pattern": "^[0-9]{1,20}$",
+          "type": "string"
+        },
+        "graphics": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "cells": {
+                "items": {
+                  "items": {
+                    "minimum": 0,
+                    "type": "integer"
+                  },
+                  "maxItems": 4,
+                  "minItems": 4,
+                  "type": "array"
+                },
+                "maxItems": 150000,
+                "type": "array"
+              },
+              "cols": {
+                "maximum": 297,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "rows": {
+                "maximum": 297,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "sequence": {
+                "pattern": "^[0-9]{1,20}$",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sequence",
+              "cols",
+              "rows",
+              "cells"
+            ],
+            "type": "object"
+          },
+          "maxItems": 128,
+          "type": "array"
+        },
+        "history_rows": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "modes": {
+          "$ref": "#/$defs/TerminalModes"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "rows": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "scroll_offset": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "target": {
+          "$ref": "#/$defs/Target"
+        },
+        "wraps": {
+          "items": {
+            "type": "boolean"
+          },
+          "maxItems": 300,
+          "type": "array"
+        }
+      },
+      "required": [
+        "target",
+        "revision",
+        "cols",
+        "rows",
+        "cells",
+        "cursor",
+        "history_rows",
+        "scroll_offset",
+        "geometry",
+        "wraps",
+        "modes"
+      ],
+      "type": "object"
+    },
+    "TerminalModes": {
+      "additionalProperties": false,
+      "properties": {
+        "alternate_screen": {
+          "type": "boolean"
+        },
+        "alternate_scroll": {
+          "type": "boolean"
+        },
+        "focus_reporting": {
+          "type": "boolean"
+        },
+        "mouse": {
+          "type": "boolean"
+        },
+        "mouse_drag": {
+          "type": "boolean"
+        },
+        "mouse_motion": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "mouse",
+        "mouse_drag",
+        "mouse_motion",
+        "alternate_screen",
+        "alternate_scroll",
+        "focus_reporting"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/Request"
+    },
+    {
+      "$ref": "#/$defs/Response"
+    }
+  ],
+  "title": "LuvusAppProtocol"
+}

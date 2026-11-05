@@ -149,6 +149,10 @@ branch, and HEAD against the intended repository before starting an agent.
 There is no `--base`; create the branch at the desired base in that repository
 first when needed. Existing branches must be verified, never overwritten.
 
+When several clients review the same diff, read the note's `revision` with
+`luvus diff note list`. Pass `--if-note-revision N` on edit, resolve, reopen,
+or remove. A conflict leaves the newer note unchanged; reread it before retrying.
+
 `worktree remove <path>` refuses to delete a worktree that still owns a working
 or blocked agent pane, unfinished task, or lease. Report the returned
 `worktree_in_use` blockers. Use `--force` only with explicit approval to stop
@@ -838,3 +842,12 @@ the pane's owning server. The display derives the SSH alias from the existing
 remote projection, uses loopback-only forward SOCKS5 (`ssh -D`, never `-R`), and
 requires transport 19 at both ends. Never supply a host or executable in these
 API requests; no remote server is started or restarted. See `luvus help browser`.
+
+For an embedded desktop tab, get the opaque ID from `luvus browser list` and
+acquire an expiring control lease. `browser screenshot --browser <id> --lease
+<token> --output <path>` creates a new PNG inside **that tab's owner workspace**.
+Keep lease tokens and CDP endpoint URLs private. Run `luvus browser cdp --browser
+<id> --json` on the owner to attach a tool to that one tab. CDP file inputs
+resolve paths under its workspace; download destinations must be existing
+workspace directories. Outside paths, symlink traversal and overwrites are
+denied. Human takeover ends the lease and closes its file-transfer resources.

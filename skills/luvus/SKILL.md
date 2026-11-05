@@ -605,7 +605,8 @@ Use these read routes to resolve state and exact targets:
 - Files and Git: `luvus files tree`, `luvus git status`,
   `luvus git branches`, `luvus git log`
 - DIFF: `luvus diff list`, `luvus diff get <path>`,
-  `luvus diff note list`
+  `luvus diff note list`. Supply the observed `--if-note-revision N` when editing,
+  resolving, reopening, or deleting a shared review note.
 - Worktrees: `luvus worktree list`
 - Orchestration: `luvus task list`, `luvus task get <id>`,
   `luvus lease list`
@@ -825,3 +826,12 @@ the pane's owning server. The display derives the SSH alias from the existing
 remote projection, uses loopback-only forward SOCKS5 (`ssh -D`, never `-R`), and
 requires transport 19 at both ends. Never supply a host or executable in these
 API requests; no remote server is started or restarted. See `luvus help browser`.
+
+For an embedded desktop tab, get the opaque ID from `luvus browser list` and
+acquire an expiring control lease. `browser screenshot --browser <id> --lease
+<token> --output <path>` creates a new PNG inside **that tab's owner workspace**.
+Keep lease tokens and CDP endpoint URLs private. Run `luvus browser cdp --browser
+<id> --json` on the owner to attach a tool to that one tab. CDP file inputs
+resolve paths under its workspace; download destinations must be existing
+workspace directories. Outside paths, symlink traversal and overwrites are
+denied. Human takeover ends the lease and closes its file-transfer resources.

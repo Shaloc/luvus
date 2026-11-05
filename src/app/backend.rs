@@ -1335,6 +1335,18 @@ impl App {
                 "a native client owns terminal geometry",
             ));
         }
+        self.resize_terminal_viewport(pane_id, cols, rows);
+        Ok(executed_action_json())
+    }
+
+    /// Shared resize bookkeeping after the caller has proven geometry authority.
+    /// Ordinary UHP requests must still pass backend_set_viewport's native guard.
+    pub(crate) fn resize_terminal_viewport(
+        &mut self,
+        pane_id: PaneId,
+        cols: u16,
+        rows: u16,
+    ) -> bool {
         let resized = self
             .panes
             .get_mut(&pane_id)
@@ -1360,7 +1372,7 @@ impl App {
             }
             self.backend_output_changed(pane_id);
         }
-        Ok(executed_action_json())
+        resized
     }
 
     pub(super) fn start_backend_wait(&mut self, req: ApiRequest) {

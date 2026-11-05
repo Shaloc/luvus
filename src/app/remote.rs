@@ -248,6 +248,7 @@ pub struct RemoteSessionSnapshot {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RemoteDisplay {
+    pub workspace_app: bool,
     pub browser_proxy_environment: bool,
     pub browser_session: bool,
     pub terminal_colors: bool,
@@ -265,7 +266,9 @@ pub struct RemoteDisplay {
 
 impl RemoteDisplay {
     fn projection_version(&self) -> u32 {
-        if self.browser_proxy_environment {
+        if self.workspace_app {
+            21
+        } else if self.browser_proxy_environment {
             20
         } else if self.browser_session {
             19
@@ -291,6 +294,7 @@ impl RemoteDisplay {
 
 #[derive(Default)]
 pub struct RemoteProjection {
+    gui_frame: u64,
     retry_delay: Option<Duration>,
     frame_deadline: Option<crate::session::remote::ConnectionDeadline>,
     cell_pixels: Option<(u16, u16)>,
@@ -1649,6 +1653,7 @@ impl App {
             }
             view.projection.frame_deadline = None;
             view.frame = Some(frame);
+            view.projection.gui_frame = view.projection.gui_frame.wrapping_add(1);
             view.graphics = graphics;
             view.state = RemoteViewState::Ready;
             view.error = None;
@@ -2205,6 +2210,9 @@ impl App {
     }
 
     fn remote_workspace_rect(&self, workspace: usize) -> ratatui::layout::Rect {
+        if let Some((cols, rows)) = self.registered_gui.display_size {
+            return ratatui::layout::Rect::new(0, 0, cols, rows);
+        }
         self.workspaces
             .get(workspace)
             .filter(|workspace| workspace.remote.is_some())
@@ -2744,6 +2752,12 @@ pub(super) fn parse_remote_snapshot(
         .collect::<Result<Vec<_>, String>>()?;
     let snapshot = RemoteSessionSnapshot {
         display: RemoteDisplay {
+            workspace_app: response.pointer("/result/remote_display").is_some_and(|d| {
+                remote_transport_at_least(d, 21)
+                    && d["capabilities"].as_array().is_some_and(|caps| {
+                        caps.iter().any(|c| c == protocol::WORKSPACE_APP_CAPABILITY)
+                    })
+            }),
             browser_proxy_environment: response
                 .get("result")
                 .and_then(|r| r.get("remote_display"))
@@ -3046,6 +3060,26 @@ fn run_projection(
             match protocol::read_message::<_, ServerMessage>(&mut output)
                 .and_then(protocol::decode_hyperlinks)
             {
+                Ok(ServerMessage::WorkspaceApp {
+                    scope,
+                    origin,
+                    body,
+                }) if display.workspace_app => {
+                    if body.len() > crate::app::gui_projection::registered::MAX_SCENE_BYTES {
+                        return Err("registered App projection exceeds the frame budget".into());
+                    }
+                    let response = serde_json::from_str(&body)
+                        .map_err(|_| "invalid registered App response")?;
+                    app_tx
+                        .send(AppEvent::WorkspaceAppResponse {
+                            connection: pane,
+                            generation,
+                            scope,
+                            origin,
+                            response,
+                        })
+                        .map_err(|_| "local session closed")?;
+                }
                 Ok(ServerMessage::WorkspaceEffect {
                     workspace_id,
                     epoch,
@@ -3599,7 +3633,7 @@ pub(crate) mod tests {
 
     #[test]
     fn remote_link_capability_keeps_older_projection_features() {
-        for version in (9..=16).chain([18, 19, 20]) {
+        for version in (9..=16).chain([18, 19, 20, 21]) {
             let mut capabilities = protocol::remote_display_capabilities();
             capabilities["transport"] = json!(version);
             let response = json!({"result":{"workspaces":[], "event_sequence":0,
@@ -3609,6 +3643,7 @@ pub(crate) mod tests {
                 .display;
             assert_eq!(display.browser_session, version >= 19);
             assert_eq!(display.browser_proxy_environment, version >= 20);
+            assert_eq!(display.workspace_app, version >= 21);
             if display.projection {
                 assert_eq!(display.projection_version(), version);
             }
@@ -3622,6 +3657,18 @@ pub(crate) mod tests {
             assert_eq!(display.session_display, version >= 13);
             assert_eq!(display.clipboard_helper_relay, version >= 14);
         }
+        let mut caps = protocol::remote_display_capabilities();
+        caps["capabilities"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|c| c != protocol::WORKSPACE_APP_CAPABILITY);
+        let response = json!({"result":{"workspaces":[], "event_sequence":0,
+            "server_generation":"boot","remote_display":caps}});
+        let display = parse_remote_snapshot(&response, RemoteBinaryLocation::Path)
+            .unwrap()
+            .display;
+        assert!(!display.workspace_app);
+        assert_eq!(display.projection_version(), 20);
     }
 
     #[test]

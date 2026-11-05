@@ -1,0 +1,47 @@
+{
+  "name": "@luvus/app",
+  "version": "1.0.99",
+  "private": true,
+  "description": "Luvus macOS desktop client",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "apps/desktop/dist/main.cjs",
+  "packageManager": "npm@11.20.0",
+  "engines": {
+    "node": ">=26.11.1 <27",
+    "npm": ">=11.20.0 <12"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "dev": "node scripts/dev.mjs",
+    "check": "node scripts/check.mjs",
+    "test": "npm run build && node --test tests/*.test.mjs packages/terminal-view/src/*.test.mjs",
+    "test:parity": "node scripts/parity.mjs --require-complete",
+    "parity:status": "node scripts/parity.mjs",
+    "test:e2e": "node tests/e2e.mjs",
+    "test:installed": "node tests/installed.mjs",
+    "test:startup": "node tests/startup.mjs",
+    "test:matrix": "node tests/desktop-matrix.mjs",
+    "test:browser": "node tests/browser-e2e.mjs",
+    "test:remote": "node tests/browser-e2e.mjs --remote-substitute --cdp",
+    "test:ssh": "node tests/ssh-e2e.mjs",
+    "test:ssh:registered": "node tests/registered-ssh.mjs",
+    "test:cdp": "node tests/browser-e2e.mjs --cdp",
+    "pack:mac": "node scripts/pack.mjs"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@tailwindcss/vite": "4.3.4",
+    "@types/node": "26.6.6",
+    "electron": "45.2.2",
+    "electron-builder": "26.18.0",
+    "esbuild": "0.28.2",
+    "json-schema-to-typescript": "16.0.0",
+    "typescript": "7.0.2",
+    "vite": "8.3.5"
+  }
+}

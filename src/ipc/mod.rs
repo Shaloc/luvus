@@ -4,6 +4,7 @@
 //! sockets / Windows named pipes). See docs/08-ipc-socket-api.md.
 
 pub mod api;
+pub mod app_surface;
 pub mod client;
 pub mod protocol;
 pub mod server;

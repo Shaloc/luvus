@@ -860,6 +860,7 @@ impl App {
             }
         }
         self.refresh_diff_note_counts();
+        self.native_view_revision = self.native_view_revision.wrapping_add(1);
         true
     }
 

@@ -53,6 +53,77 @@ pub(crate) fn resolved_dir() -> std::path::PathBuf {
     path::log_dir()
 }
 
+/// Return bounded event headers, never raw log fields or paths. Call off-loop.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn desktop_records(client: bool) -> std::io::Result<serde_json::Value> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::MetadataExt;
+    let root = crate::persist::session_dir();
+    let pinned = crate::browser::WorkspaceFiles::open(&root)?;
+    let path = std::path::Path::new(if client {
+        "logs/client.log"
+    } else {
+        "logs/server.log"
+    });
+    let result = (|| {
+        let (parent, name) = pinned.parent(path, &|| false)?;
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let meta = file.metadata()?;
+        if !meta.is_file()
+            || meta.uid() != unsafe { libc::geteuid() }
+            || meta.nlink() != 1
+            || meta.mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::other("unsafe log file"));
+        }
+        file.seek(SeekFrom::Start(meta.len().saturating_sub(64 * 1024)))?;
+        let mut bytes = vec![];
+        file.take(64 * 1024).read_to_end(&mut bytes)?;
+        let mut rows = bytes
+            .rsplit(|b| *b == b'\n')
+            .filter_map(|line| {
+                let v: serde_json::Value = serde_json::from_slice(line).ok()?;
+                let ts = v["ts"].as_str()?;
+                let level = v["level"].as_str()?;
+                let event = v["event"].as_str()?;
+                if [ts, level, event].iter().any(|s| {
+                    s.is_empty()
+                        || s.len() > 96
+                        || !s
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"._-:+".contains(&c))
+                }) {
+                    return None;
+                }
+                Some(serde_json::json!({"time":ts,"level":level,"event":event}))
+            })
+            .take(100)
+            .collect::<Vec<_>>();
+        rows.reverse();
+        Ok(serde_json::json!({"records":rows}))
+    })();
+    match result {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({"records":[]})),
+        other => other,
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub(crate) fn desktop_records(_: bool) -> std::io::Result<serde_json::Value> {
+    Err(std::io::Error::other("secure log view unavailable"))
+}
+
 pub(crate) fn log_dir_writable() -> bool {
     path::directory_writable_without_creating(&resolved_dir())
 }

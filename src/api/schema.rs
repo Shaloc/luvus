@@ -19,11 +19,18 @@ pub fn schema_bundle() -> Value {
     let access_descriptor = schema(include_str!(
         "../../protocol/uhp/v1/schema/access/descriptor.schema.json"
     ));
+    let browser = schema(include_str!(
+        "../../protocol/uhp/v1/schema/browser.schema.json"
+    ));
     let terminal = crate::terminal::backend::schema_bundle();
     let mut documents = terminal["documents"]
         .as_object()
         .cloned()
         .unwrap_or_default();
+    documents.insert(
+        "https://luvus.dev/protocol/uhp/v1/browser.schema.json".into(),
+        browser.clone(),
+    );
     documents.insert(
         "https://luvus.dev/protocol/uhp/v1/request.schema.json".into(),
         request.clone(),
@@ -56,6 +63,7 @@ pub fn schema_bundle() -> Value {
         "event_catalog":event_catalog,
         "access":{"descriptor":access_descriptor},
         "terminal":terminal,
+        "browser":browser,
         "documents":documents,
     })
 }
@@ -63,6 +71,50 @@ pub fn schema_bundle() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_contract_matches_registry_limits_and_explicit_admin_scope() {
+        let bundle = schema_bundle();
+        let browser = &bundle["browser"];
+        let methods: std::collections::BTreeSet<_> = browser["oneOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|branch| {
+                let method = &branch["properties"]["method"];
+                method["const"].as_str().into_iter().chain(
+                    method["enum"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            methods,
+            crate::browser::control::METHODS.iter().copied().collect()
+        );
+        assert_eq!(
+            browser["$defs"]["screenshotParams"]["properties"]["max_bytes"]["maximum"],
+            crate::browser::control::MAX_RESULT_BYTES
+        );
+        assert_eq!(
+            browser["$defs"]["timeout"]["maximum"],
+            crate::browser::control::MAX_TIMEOUT_MS
+        );
+        for method in crate::browser::control::METHODS {
+            let read = crate::browser::control::is_read(method);
+            assert_eq!(crate::api::capabilities::is_read_only(method), read);
+            assert_eq!(
+                crate::api::capabilities::required_scope(method),
+                if read { "read" } else { "admin" }
+            );
+        }
+        assert!(bundle["documents"]
+            .get("https://luvus.dev/protocol/uhp/v1/browser.schema.json")
+            .is_some());
+    }
 
     #[test]
     fn transpose_contract_is_mutating_and_revision_fenced() {

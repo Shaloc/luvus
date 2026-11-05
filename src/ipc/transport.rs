@@ -158,6 +158,16 @@ impl Read for DeadlineReader<'_> {
 }
 
 impl Conn {
+    #[cfg(unix)]
+    pub fn shutdown(&self) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::shutdown(self.as_raw_fd(), libc::SHUT_RDWR) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     fn new(stream: Stream) -> Self {
         Conn(Arc::new(stream))
     }

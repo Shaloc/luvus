@@ -1373,7 +1373,7 @@ impl App {
     pub(super) fn api_pane_focus(&mut self, method: &str, p: &Value) -> DispatchResult {
         let _ = (method, p);
         {
-            let id = self.resolve_pane(p)?.ok_or_else(not_found)?;
+            let id = self.resolve_pane_or_focus(p)?;
             self.focus_pane_global(id);
             Ok(json!({"type":"ok"}))
         }

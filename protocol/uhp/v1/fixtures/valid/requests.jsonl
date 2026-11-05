@@ -1,4 +1,24 @@
 {"id":"1","method":"uhp.capabilities","params":{}}
+{"id":"browser-list","method":"browser.list","params":{}}
+{"id":"browser-get","method":"browser.get","params":{"browser":"b1"}}
+{"id":"browser-status","method":"browser.control.status","params":{"browser":"b1"}}
+{"id":"browser-acquire","method":"browser.control.acquire","params":{"browser":"b1","ttl_s":300}}
+{"id":"browser-release","method":"browser.control.release","params":{"browser":"b1","lease":"opaque-secret"}}
+{"id":"browser-navigate","method":"browser.navigate","params":{"browser":"b1","lease":"opaque-secret","url":"about:blank"}}
+{"id":"browser-back","method":"browser.back","params":{"browser":"b1","lease":"opaque-secret"}}
+{"id":"browser-forward","method":"browser.forward","params":{"browser":"b1","lease":"opaque-secret"}}
+{"id":"browser-reload","method":"browser.reload","params":{"browser":"b1","lease":"opaque-secret"}}
+{"id":"browser-close","method":"browser.close","params":{"browser":"b1","lease":"opaque-secret"}}
+{"id":"browser-snapshot","method":"browser.snapshot","params":{"browser":"b1","lease":"opaque-secret"}}
+{"id":"browser-act","method":"browser.act","params":{"browser":"b1","lease":"opaque-secret","action":{"kind":"fill","node":"n1","document_revision":"d1","text":"literal; $(text)"}}}
+{"id":"browser-evaluate","method":"browser.evaluate","params":{"browser":"b1","lease":"opaque-secret","expression":"document.title"}}
+{"id":"browser-screenshot","method":"browser.screenshot","params":{"browser":"b1","lease":"opaque-secret","max_bytes":1044480}}
+{"id":"browser-screenshot-file","method":"browser.screenshot","params":{"browser":"b1","lease":"opaque-secret","output":"artifacts/page.png"}}
+{"id":"browser-cdp-subscribe","method":"browser.cdp.subscribe","params":{"browser":"11111111111111111111111111111111","lease":"22222222222222222222222222222222"}}
+{"id":"browser-cdp-connect","method":"browser.cdp.connect","params":{"browser":"b1","lease":"opaque-secret"}}
+{"id":"browser-cdp-send","method":"browser.cdp.send","params":{"browser":"b1","lease":"opaque-secret","chunk":{"transfer":"11111111111111111111111111111111","total":1,"index":0,"text":"{\"id\":1,\"method\":\"Browser.getVersion\"}"}}}
+{"id":"browser-wait","method":"browser.wait","params":{"browser":"b1","lease":"opaque-secret","condition":{"load":true},"timeout_ms":20000}}
+{"id":"browser-dialog","method":"browser.dialog","params":{"browser":"b1","lease":"opaque-secret","accept":false}}
 {"id":"2","method":"workspace.get","params":{"workspace":0}}
 {"id":"3","method":"tab.get","params":{"workspace":0,"tab":1}}
 {"id":"4","method":"pane.current","params":{}}
@@ -69,3 +89,4 @@
 {"id":"valid-worktree-create-1","method":"worktree.create","params":{"branch":"topic","workspace":0}}
 {"id":"valid-worktree-create-2","method":"worktree.create","params":{"branch":"topic","node":"1"}}
 {"id":"valid-worktree-create-3","method":"worktree.create","params":{"branch":"topic","workspace_id":"workspace_example","if_revision":7}}
+{"id":"valid-note-revision","method":"diff.note.edit","params":{"id":"note1","body":"draft","if_note_revision":2}}

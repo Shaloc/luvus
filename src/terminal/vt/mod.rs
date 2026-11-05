@@ -207,6 +207,9 @@ pub struct RenderCell {
 
 pub type LinkedCellVisitor<'a> = dyn FnMut(u16, u16, &str, RenderCell, Option<&str>) + 'a;
 
+/// Width is the engine's cell advance: 0 for a continuation, 1 or 2 otherwise.
+pub type StyledCellVisitor<'a> = dyn FnMut(u16, u16, &str, RenderCell, Option<&str>, u8) + 'a;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Cursor {
     pub x: u16,
@@ -420,6 +423,23 @@ pub trait VtEngine: Send {
         self.for_each_cell(&mut |row, col, symbol, style| f(row, col, symbol, style, None));
     }
 
+    /// Read a bounded oldest-first retained row slice without changing the TUI
+    /// display offset. Returns soft-wrap flags for the visited rows. Both dense
+    /// and packed cold rows must be read through the engine's grid primitives.
+    fn retained_styled_rows(
+        &self,
+        start: usize,
+        rows: u16,
+        cols: u16,
+        f: &mut StyledCellVisitor<'_>,
+    ) -> Vec<bool>;
+
+    /// Live cursor metadata, independent of the TUI's history viewport.
+    fn live_cursor(&self) -> Cursor;
+    fn cursor_shape(&self) -> &'static str;
+    fn geometry_revision(&self) -> u64;
+    fn focus_reporting(&self) -> bool;
+
     /// Capture owned visible rows affected since the last acknowledged render.
     /// Implementations may conservatively return [`DamageKind::Full`].
     /// Title changes must return Full until acknowledged: titles can also
@@ -558,6 +578,9 @@ pub trait VtEngine: Send {
     /// Total lines of retained scrollback history (the maximum `scroll_offset`).
     /// Lets scroll mode jump to a proportional position (the `1`–`9` keys).
     fn history_len(&self) -> usize;
+
+    /// Active-grid history epoch and cumulative row displacement, both wrapping and nonpersisted.
+    fn history_scroll_state(&self) -> (u64, u64);
 
     /// Current scroll position and retained-history accounting.
     fn history_metrics(&self) -> HistoryMetrics;

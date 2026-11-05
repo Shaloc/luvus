@@ -49,6 +49,13 @@
   "allOf": [
     {
       "if": {
+        "required": ["result"],
+        "properties": {"result": {"required": ["type"], "properties": {"type": {"enum": ["browser_session", "browser_list", "browser_result"]}}}}
+      },
+      "then": {"properties": {"result": {"$ref": "https://luvus.dev/protocol/uhp/v1/browser.schema.json#/$defs/result"}}}
+    },
+    {
+      "if": {
         "required": [
           "result"
         ],

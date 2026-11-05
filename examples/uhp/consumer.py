@@ -686,6 +686,107 @@ def valid_session_report_params(params):
     return True
 
 
+def valid_browser_params(method, params):
+    def text(v, cap=128, empty=False):
+        return isinstance(v, str) and (empty or bool(v)) and len(v.encode()) <= cap
+
+    def number(v, low, high):
+        return integer(v) and low <= v <= high
+
+    def opaque(v):
+        return isinstance(v, str) and re.fullmatch(r"[0-9a-f]{32}", v) is not None
+
+    if len(json.dumps(params, ensure_ascii=False, separators=(",", ":")).encode()) > 65536:
+        return False
+    if method == "browser.list":
+        return not params
+    if not text(params.get("browser")):
+        return False
+    if method in {"browser.get", "browser.control.status"}:
+        return set(params) == {"browser"}
+    if method == "browser.cdp.subscribe":
+        return set(params) == {"browser", "lease"} and all(opaque(v) for v in params.values())
+    keys = {"browser", "timeout_ms"}
+    if not number(params.get("timeout_ms", 10000), 1, 20000):
+        return False
+    if method == "browser.control.acquire":
+        return set(params) <= keys | {"ttl_s"} and number(params.get("ttl_s", 300), 1, 3600)
+    keys.add("lease")
+    if not text(params.get("lease")):
+        return False
+    if method == "browser.navigate":
+        url = params.get("url")
+        return set(params) <= keys | {"url"} and text(url, 8192) and (
+            url == "about:blank" or re.fullmatch(r"https?://[^/\s][^\s]*", url) is not None)
+    if method == "browser.evaluate":
+        return set(params) <= keys | {"expression"} and text(params.get("expression"), 32768)
+    if method == "browser.screenshot":
+        return (set(params) <= keys | {"max_bytes", "output"}
+                and number(params.get("max_bytes", 1044480), 1, 1044480)
+                and ("output" not in params or text(params["output"], 4096) and "\0" not in params["output"]))
+    if method == "browser.dialog":
+        return (set(params) <= keys | {"accept", "prompt_text"} and type(params.get("accept")) is bool
+                and text(params.get("prompt_text", ""), 4096, True))
+    if method == "browser.wait":
+        c = params.get("condition")
+        return (set(params) <= keys | {"condition"} and isinstance(c, dict) and
+                (set(c) == {"text"} and text(c["text"], 4096) or set(c) == {"load"} and c["load"] is True))
+    if method == "browser.cdp.send":
+        c = params.get("chunk")
+        return (set(params) <= keys | {"chunk"} and isinstance(c, dict)
+                and set(c) == {"transfer", "index", "total", "text"} and opaque(c["transfer"])
+                and number(c["total"], 1, 16384) and number(c["index"], 0, c["total"] - 1) and text(c["text"], 8192))
+    if method == "browser.act":
+        a = params.get("action")
+        if set(params) - keys != {"action"} or not isinstance(a, dict) or not (
+                text(a.get("node")) and text(a.get("document_revision")) and text(a.get("kind"))):
+            return False
+        extra = set(a) - {"kind", "node", "document_revision"}
+        return (a["kind"] == "click" and not extra
+                or a["kind"] == "fill" and extra == {"text"} and text(a["text"], 32768, True)
+                or a["kind"] == "press" and extra == {"key"} and text(a["key"])
+                or a["kind"] == "scroll" and extra == {"x", "y"} and all(number(a[k], -100000, 100000) for k in extra)
+                or a["kind"] == "select" and extra == {"values"} and isinstance(a["values"], list)
+                and len(a["values"]) <= 100 and all(text(v, 1024, True) for v in a["values"]))
+    return (set(params) <= keys and method in {"browser.back", "browser.forward", "browser.reload",
+            "browser.close", "browser.snapshot", "browser.control.release", "browser.cdp.connect"})
+
+
+def valid_browser_result(result):
+    if result["type"] == "browser_list":
+        browsers = result.get("browsers")
+        return (set(result) == {"type", "browsers"} and isinstance(browsers, list) and len(browsers) <= 64
+                and all(isinstance(b, dict) and b.get("type") == "browser_session" and valid_browser_result(b) for b in browsers))
+    if not bounded_string(result.get("browser_id"), 128, allow_empty=False):
+        return False
+    if result["type"] == "browser_session":
+        target, control = result.get("target"), result.get("control")
+        return (set(result) == {"type", "browser_id", "target", "url", "state", "lease_generation", "control"}
+                and isinstance(target, dict) and set(target) == {"generation", "workspace_id", "tab_id", "pane_id", "terminal_id"}
+                and all(bounded_string(target[k], 128, False) for k in target if k != "terminal_id")
+                and (target["terminal_id"] is None or bounded_string(target["terminal_id"], 128, False))
+                and bounded_string(result["url"], 8192, False) and (result["url"] == "about:blank"
+                    or re.fullmatch(r"https?://[^/\s][^\s]*", result["url"]) is not None)
+                and isinstance(result["lease_generation"], str) and re.fullmatch("[0-9]+", result["lease_generation"]) is not None
+                and result["state"] in ("preparing", "ready", "failed", "revoked", "closed")
+                and isinstance(control, dict) and set(control) == {"state", "expires_at"}
+                and control["state"] in ("acquired", "preparing", "uncontrolled")
+                and (control["expires_at"] is None or integer(control["expires_at"]) and control["expires_at"] >= 0))
+    required = {"type", "method", "state", "browser_id", "request_id"}
+    if not required <= set(result) or not bounded_string(result["request_id"], 128, False):
+        return False
+    if result["method"] == "browser.control.acquire":
+        return (set(result) <= required | {"lease", "lease_generation", "expires_at", "data"}
+                and bounded_string(result.get("lease"), 128, False) and integer(result.get("expires_at"))
+                and result["expires_at"] >= 0 and isinstance(result.get("lease_generation"), str)
+                and re.fullmatch("[0-9]+", result["lease_generation"]) is not None and result["state"] == "completed")
+    return (set(result) <= required | {"data"} and result["method"] in (
+            "browser.launch", "browser.navigate", "browser.back", "browser.forward", "browser.reload",
+            "browser.close", "browser.snapshot", "browser.act", "browser.evaluate", "browser.screenshot",
+            "browser.wait", "browser.dialog", "browser.control.release", "browser.cdp.connect", "browser.cdp.send")
+            and result["state"] == ("ready" if result["method"] == "browser.launch" else "completed"))
+
+
 def valid_global_request(value, methods):
     if not isinstance(value, dict) or not set(value) <= {"id", "method", "params", "auth"}:
         return False
@@ -720,6 +821,11 @@ def valid_global_request(value, methods):
                      or (type(pane) is int and 0 <= pane <= 4294967295))
                 and isinstance(params.get("url"), str) and len(params["url"].encode()) <= 8192
                 and re.fullmatch(r"https?://[^/\s][^\s]*", params["url"]) is not None)
+    if value["method"].startswith("browser."):
+        return valid_browser_params(value["method"], value["params"])
+    if value["method"] in {"diff.note.edit", "diff.note.resolve", "diff.note.reopen", "diff.note.remove"}:
+        revision = value["params"].get("if_note_revision", 1)
+        return integer(revision) and 0 < revision <= (1 << 64) - 1
     if value["method"] == "pane.transpose":
         params = value["params"]
         target = params.get("pane")
@@ -922,6 +1028,8 @@ def valid_global_response(value):
                 and integer(data["content_revision"]) and data["content_revision"] >= 0
             )
     result = value.get("result")
+    if isinstance(result, dict) and result.get("type") in ("browser_list", "browser_session", "browser_result"):
+        return valid_browser_result(result)
     if isinstance(result, dict) and result.get("type") == "ok" and "verified" in result:
         return type(result["verified"]) is bool
     if isinstance(result, dict) and result.get("type") == "session_match":

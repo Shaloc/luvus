@@ -42,16 +42,19 @@ pub(crate) fn is_handshake_io_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<HandshakeIoError>().is_some()
 }
 
-fn read_handshake_message<R: Read>(reader: &mut R) -> Result<ServerMessage> {
+pub(crate) fn read_handshake_message<R: Read>(reader: &mut R) -> Result<ServerMessage> {
     protocol::read_message(reader).map_err(|error| HandshakeIoError(error).into())
 }
 
-fn read_welcome_message<R: Read>(reader: &mut R) -> Result<ServerMessage> {
+pub(crate) fn read_welcome_message<R: Read>(reader: &mut R) -> Result<ServerMessage> {
     let (version, error) = protocol::read_welcome_message(reader).map_err(HandshakeIoError)?;
     Ok(ServerMessage::Welcome { version, error })
 }
 
-fn write_handshake_message<W: Write>(writer: &mut W, message: &ClientMessage) -> Result<()> {
+pub(crate) fn write_handshake_message<W: Write>(
+    writer: &mut W,
+    message: &ClientMessage,
+) -> Result<()> {
     protocol::write_message(writer, message).map_err(|error| HandshakeIoError(error).into())
 }
 

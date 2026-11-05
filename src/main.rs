@@ -103,6 +103,10 @@ fn main() -> Result<()> {
         _ => {}
     }
 
+    if ipc::app_surface::requested(&args) {
+        return ipc::app_surface::run(&args);
+    }
+
     if let Some(target) = session::remote::process_target() {
         if let Some(command) = managed_remote_local_only_command(&args) {
             return Err(anyhow!(
@@ -831,6 +835,11 @@ fn remote_control_existing_only(options: &[String]) -> Result<bool> {
 }
 
 fn managed_remote_attach(target: &session::remote::RemoteSession) -> Result<()> {
+    prepare_managed_remote_attach(target)?;
+    ipc::client::run(&persist::client_socket_path())
+}
+
+fn prepare_managed_remote_attach(target: &session::remote::RemoteSession) -> Result<()> {
     session::remote::ensure_session(target).map_err(anyhow::Error::msg)?;
     let name = session::remote::local_attach_name(
         target,
@@ -840,7 +849,7 @@ fn managed_remote_attach(target: &session::remote::RemoteSession) -> Result<()> 
     session::start_client_session(&name).map_err(anyhow::Error::msg)?;
     session::remote::clear_process_target();
     session::apply_explicit_name(&name).map_err(anyhow::Error::msg)?;
-    ipc::client::run(&session::client_socket_path_for(Some(&name)))
+    Ok(())
 }
 
 fn managed_remote_attach_pane(
@@ -931,14 +940,18 @@ fn attach_cmd(args: &[String]) -> Result<()> {
 /// socket through plain ssh and attach to it locally. No port-forwarding, no
 /// `~/.ssh/config` edits — keepalive options are passed on argv only.
 fn remote_attach(args: &[String]) -> Result<()> {
-    let (result, status) = remote_attach_attempt(remote_ssh_command(args)?, args);
+    remote_attach_surface(args, false)
+}
+
+fn remote_attach_surface(args: &[String], app_surface: bool) -> Result<()> {
+    let (result, status) = remote_attach_attempt(remote_ssh_command(args)?, args, app_surface);
     if result
         .as_ref()
         .is_err_and(ipc::client::is_handshake_io_error)
         && status.as_ref().and_then(std::process::ExitStatus::code) == Some(127)
     {
         let (fallback_result, fallback_status) =
-            remote_attach_attempt(remote_fallback_ssh_command(args)?, args);
+            remote_attach_attempt(remote_fallback_ssh_command(args)?, args, app_surface);
         if fallback_result
             .as_ref()
             .is_err_and(ipc::client::is_handshake_io_error)
@@ -968,6 +981,7 @@ fn remote_attach(args: &[String]) -> Result<()> {
 fn remote_attach_attempt(
     mut cmd: Command,
     args: &[String],
+    app_surface: bool,
 ) -> (Result<()>, Option<std::process::ExitStatus>) {
     cmd.stdin(Stdio::piped()).stdout(Stdio::piped()); // stderr inherited so ssh can prompt for auth
     let mut child = cmd
@@ -991,7 +1005,11 @@ fn remote_attach_attempt(
     } else {
         Err("Browser sessions with custom SSH arguments need a configured SSH alias".into())
     };
-    let result = ipc::client::attach(stdout, stdin, route);
+    let result = if app_surface {
+        ipc::app_surface::attach(stdout, stdin, route)
+    } else {
+        ipc::client::attach(stdout, stdin, route)
+    };
     let status = wait_for_remote_child(child);
     (result, status)
 }

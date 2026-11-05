@@ -16,7 +16,7 @@ use ratatui::style::{Color, Modifier};
 use super::{
     AlignedRows, ClaudeComposerEvidence, CodexComposerRegion, Cursor, DamageCell, DamageHyperlink,
     DamageKind, DamageRow, DamageSnapshot, HistoryMetrics, LinkedCellVisitor, RenderCell,
-    RetainedRowLayout, VtEngine, ALIGNED_WIDE_CELL,
+    RetainedRowLayout, StyledCellVisitor, VtEngine, ALIGNED_WIDE_CELL,
 };
 use crate::terminal::appearance::PaneAppearance;
 use crate::terminal::backend::{CaptureMode, CaptureResult};
@@ -193,6 +193,7 @@ pub struct AlacrittyEngine {
     appearance: Arc<Mutex<PaneAppearance>>,
     history_budget_bytes: usize,
     output_generation: u64,
+    geometry_revision: u64,
     // One bounded summary, invalidated at every storage mutation boundary.
     // Output generation alone is insufficient: quiet packing changes storage.
     history_metrics_cache: Cell<Option<HistoryMetrics>>,
@@ -280,6 +281,7 @@ impl AlacrittyEngine {
             appearance,
             history_budget_bytes,
             output_generation: 0,
+            geometry_revision: 0,
             history_metrics_cache: Cell::new(None),
             history_maintenance_cursors: [0; 2],
             history_maintenance_pending: false,
@@ -598,6 +600,11 @@ impl VtEngine for AlacrittyEngine {
 
     fn resize(&mut self, cols: u16, rows: u16) {
         let (cols, rows) = super::clamp_terminal_size(cols, rows);
+        if self.term.grid().columns() != usize::from(cols)
+            || self.term.grid().screen_lines() != usize::from(rows)
+        {
+            self.geometry_revision = self.geometry_revision.wrapping_add(1);
+        }
         self.term.resize(Dims {
             cols: cols as usize,
             rows: rows as usize,
@@ -856,6 +863,85 @@ impl VtEngine for AlacrittyEngine {
                 hyperlink.as_ref().map(|hyperlink| hyperlink.uri()),
             );
         }
+    }
+
+    fn retained_styled_rows(
+        &self,
+        start: usize,
+        rows: u16,
+        cols: u16,
+        f: &mut StyledCellVisitor<'_>,
+    ) -> Vec<bool> {
+        let grid = self.term.grid();
+        let mut wraps = Vec::new();
+        let mut symbol = String::new();
+        for row in 0..rows.min(300) {
+            let Some(index) = start.checked_add(usize::from(row)) else {
+                break;
+            };
+            let Some(line) = self.retained_line(index) else {
+                break;
+            };
+            wraps.push(self.retained_row_wraps(index));
+            for col in 0..usize::from(cols.min(500)).min(grid.columns()) {
+                let cell = &grid[line][Column(col)];
+                let continuation = cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+                let width = if continuation {
+                    0
+                } else if cell.flags.contains(Flags::WIDE_CHAR) {
+                    2
+                } else {
+                    1
+                };
+                symbol.clear();
+                if !continuation {
+                    symbol.push(if cell.c == '\0' { ' ' } else { cell.c });
+                    if let Some(chars) = cell.zerowidth() {
+                        symbol.extend(chars);
+                    }
+                }
+                let hyperlink = cell.hyperlink();
+                f(
+                    row,
+                    col as u16,
+                    &symbol,
+                    RenderCell {
+                        fg: map_foreground(cell, self.term.colors()),
+                        bg: map_color(cell.bg, self.term.colors()),
+                        underline_color: cell.underline_color().map(raw_color),
+                        mods: map_flags(cell.flags),
+                    },
+                    hyperlink.as_ref().map(|link| link.uri()),
+                    width,
+                );
+            }
+        }
+        wraps
+    }
+
+    fn live_cursor(&self) -> Cursor {
+        let mut cursor = self.cursor();
+        cursor.visible = self.term.mode().contains(TermMode::SHOW_CURSOR);
+        cursor
+    }
+
+    fn cursor_shape(&self) -> &'static str {
+        use alacritty_terminal::vte::ansi::CursorShape;
+        match self.term.cursor_style().shape {
+            CursorShape::Underline => "underline",
+            CursorShape::Beam => "beam",
+            _ => "block",
+        }
+    }
+
+    fn geometry_revision(&self) -> u64 {
+        self.geometry_revision
+    }
+
+    fn focus_reporting(&self) -> bool {
+        self.term.mode().contains(TermMode::FOCUS_IN_OUT)
     }
 
     fn damage_snapshot(&mut self) -> DamageSnapshot {
@@ -1444,6 +1530,10 @@ impl VtEngine for AlacrittyEngine {
         self.term.grid().history_size()
     }
 
+    fn history_scroll_state(&self) -> (u64, u64) {
+        self.term.grid().history_scroll_state()
+    }
+
     fn history_metrics(&self) -> HistoryMetrics {
         if let Some(mut metrics) = self.history_metrics_cache.get() {
             // Viewport movement changes no allocation. Keep it live without
@@ -1881,6 +1971,50 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("STILL_ALIVE")));
         }
+    }
+
+    #[test]
+    fn gui_retained_styled_slice_is_private_bounded_and_preserves_cell_metadata() {
+        let (tx, _rx) = channel();
+        let mut engine = AlacrittyEngine::new(8, 3, tx, budget_for_rows(8, 500));
+        engine.advance("\x1b[31m  界e\u{301}abcX\r\n".as_bytes());
+        engine.advance("\r\nnext".repeat(150).as_bytes());
+        engine.finish_output_batch();
+        engine.scroll(7);
+        let mut cells = Vec::new();
+        let wraps = engine.retained_styled_rows(0, 2, 8, &mut |row, col, text, style, _, width| {
+            cells.push((row, col, text.to_string(), style.fg, width));
+        });
+        assert_eq!(engine.scroll_offset(), 7);
+        assert!(wraps[0]);
+        assert!(
+            cells.iter().any(|(_, col, text, fg, width)| *col == 2
+                && text == "界"
+                && *fg == Color::Indexed(1)
+                && *width == 2),
+            "{cells:?}"
+        );
+        assert!(cells
+            .iter()
+            .any(|(_, col, text, _, width)| *col == 3 && text.is_empty() && *width == 0));
+        assert!(cells.iter().any(|(_, _, text, _, _)| text == "e\u{301}"));
+        assert_eq!(
+            engine.retained_selection_text(((0, 0), (1, 0))).unwrap(),
+            "  界e\u{301}abcX"
+        );
+        let mut count = 0;
+        engine.retained_styled_rows(0, u16::MAX, u16::MAX, &mut |_, _, _, _, _, _| count += 1);
+        assert!(count <= 300 * 8);
+        assert!(engine
+            .retained_styled_rows(usize::MAX, 1, 8, &mut |_, _, _, _, _, _| panic!(
+                "out of bounds"
+            ))
+            .is_empty());
+        let geometry = engine.geometry_revision();
+        engine.resize(9, 3);
+        assert_ne!(engine.geometry_revision(), geometry);
+        engine.set_history_budget(0);
+        assert_eq!(engine.history_len(), 1, "the core retains its minimum row");
     }
 
     fn budget_for_rows(cols: usize, rows: usize) -> usize {

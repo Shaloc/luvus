@@ -23,6 +23,8 @@ use crate::ipc::protocol::{self, ClientMessage, ServerMessage};
 use crate::persist;
 use crate::ui;
 
+mod app_surface;
+
 const DEFAULT_SIZE: (u16, u16) = (120, 32);
 /// Minimum time between rendered frames — the fps cap during activity (60fps).
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -228,6 +230,7 @@ impl ClientSender {
 
 struct ClientState {
     version: u32,
+    app_surface: Option<app_surface::State>,
     clipboard_receipt: Option<u64>,
     /// None is an ordinary/legacy client; Some(None) is a monolithic relay.
     clipboard_helper_origin: Option<Option<u64>>,
@@ -293,6 +296,7 @@ impl ClientState {
         let size = (cols.max(1), rows.max(1));
         Self {
             version: crate::ipc::protocol::PROTOCOL_VERSION,
+            app_surface: None,
             clipboard_receipt: None,
             clipboard_helper_origin: None,
             render_origin: None,
@@ -509,6 +513,7 @@ pub fn run() -> Result<()> {
     }
 
     let mut clients: Clients = HashMap::new();
+    let mut browser_revision = None;
     let mut foreground: Option<u64> = None;
     let mut render_scratch = RenderScratch::default();
     // Geometry last committed to the shared PTYs and interactive hit-test state.
@@ -693,7 +698,7 @@ pub fn run() -> Result<()> {
             render_request.record(RenderCause::Detection);
         }
         for (text, level) in app.bar.pending_notifications.drain(..) {
-            broadcast_projection_notification(
+            broadcast_notification_chrome(
                 &mut clients,
                 ServerMessage::Notification { text, level },
             );
@@ -711,6 +716,7 @@ pub fn run() -> Result<()> {
         }
         dispatch_program_url(&mut app, &clients, foreground);
         dispatch_browser(&mut app, &clients, foreground);
+        app_surface::dispatch_browsers(&mut app, &clients, &mut browser_revision);
         if let Some(text) = app.pending_clipboard.take() {
             dispatch_clipboard(&mut clients, foreground, &mut next_activity, text);
         }
@@ -842,6 +848,23 @@ fn apply(
 ) -> bool {
     app.has_attached_client = !clients.is_empty();
     match ev {
+        AppEvent::WorkspaceAppRequest {
+            id,
+            scope,
+            origin,
+            request,
+        } => clients.get_mut(&id).is_some_and(|client| {
+            app_surface::owner_request(app, client, id, scope, origin, request)
+        }),
+        AppEvent::WorkspaceAppResponse {
+            connection,
+            generation,
+            scope,
+            origin,
+            response,
+        } => app_surface::remote_response(
+            app, clients, connection, generation, &scope, origin, response,
+        ),
         AppEvent::NamedSessionPrepared {
             generation,
             action,
@@ -887,6 +910,7 @@ fn apply(
             terminal_colors,
             workspace_id,
             managed_projection,
+            app_surface,
         } => {
             crate::logging::event(
                 crate::logging::EventKind::ServerClientAttach,
@@ -914,6 +938,10 @@ fn apply(
                 ),
             );
             clients.get_mut(&id).expect("connected client").version = version;
+            if app_surface {
+                clients.get_mut(&id).expect("connected client").app_surface =
+                    Some(app_surface::State::default());
+            }
             if managed_projection {
                 if let Some(client) = clients.get_mut(&id) {
                     client.projection = Some(ProjectionSubscription::default());
@@ -927,7 +955,104 @@ fn apply(
             app.mark_runtime_scans_dirty();
             true
         }
+        AppEvent::ClientAppRequest { id, request } => {
+            if matches!(
+                request,
+                crate::ipc::app_surface::protocol::Request::Detach { .. }
+            ) {
+                return apply(
+                    AppEvent::ClientDetach { id },
+                    app,
+                    clients,
+                    foreground,
+                    interactive_size,
+                    next_activity,
+                );
+            }
+            let Some(client) = clients
+                .get_mut(&id)
+                .filter(|client| client.app_surface.is_some())
+            else {
+                return false;
+            };
+            let promote = match &request {
+                crate::ipc::app_surface::protocol::Request::Input { target, input, .. } => {
+                    app_surface::real_input(input)
+                        && request.validate().is_ok()
+                        && (app.registered_target(target).is_some()
+                            || app
+                                .validate_gui_target(target, true)
+                                .is_ok_and(|(wi, ti, pane)| {
+                                    wi == app.active_ws
+                                        && ti == app.workspaces[wi].active_tab
+                                        && pane == app.workspaces[wi].tabs[ti].layout.focus
+                                        && !app.preparing_registered_workspace()
+                                }))
+                }
+                crate::ipc::app_surface::protocol::Request::Focus {
+                    target,
+                    activate: true,
+                    ..
+                } => {
+                    request.validate().is_ok()
+                        && (app.registered_target(target).is_some()
+                            || app.validate_gui_target(target, false).is_ok())
+                }
+                crate::ipc::app_surface::protocol::Request::FocusHistory { target, .. } => {
+                    request.validate().is_ok()
+                        && !app.preparing_registered_workspace()
+                        && app
+                            .validate_gui_target(target, false)
+                            .is_ok_and(|(wi, ti, pane)| {
+                                wi == app.active_ws
+                                    && app.workspaces[wi].active_tab == ti
+                                    && app.workspaces[wi].tabs[ti].layout.focus == pane
+                            })
+                }
+                crate::ipc::app_surface::protocol::Request::FileEntry {
+                    generation,
+                    workspace_id,
+                    root,
+                    ..
+                } => {
+                    request.validate().is_ok()
+                        && generation == &app.backend_server_generation
+                        && !app.preparing_registered_workspace()
+                        && app.workspaces.get(app.active_ws).is_some_and(|ws| {
+                            ws.remote.is_none()
+                                && &ws.id == workspace_id
+                                && ws.cwd == std::path::Path::new(root)
+                        })
+                }
+                crate::ipc::app_surface::protocol::Request::Action {
+                    generation, method, ..
+                } => {
+                    generation == &app.backend_server_generation
+                        && crate::api::capabilities::METHODS.contains(&method.as_str())
+                        && !crate::api::capabilities::is_read_only(method)
+                }
+                _ => false,
+            };
+            if promote {
+                client.last_activity = *next_activity;
+                *next_activity = next_activity.saturating_add(1);
+                *foreground = Some(id);
+            }
+            let owns_geometry = match &request {
+                crate::ipc::app_surface::protocol::Request::Input { target, .. }
+                | crate::ipc::app_surface::protocol::Request::Focus { target, .. }
+                | crate::ipc::app_surface::protocol::Request::Viewport { target, .. } => {
+                    *foreground == Some(id)
+                        && workspace_size_owner(app, clients, *foreground, &target.workspace_id)
+                            == Some(id)
+                }
+                _ => *foreground == Some(id),
+            };
+            let client = clients.get_mut(&id).expect("validated App client");
+            app_surface::handle(app, client, id, owns_geometry, request)
+        }
         AppEvent::ClientDetach { id } => {
+            app.browser_control.detach(id);
             app.release_client_key_presses(id);
             app.notify_remote_client_detach(id);
             app.close_client_commander(id);
@@ -942,6 +1067,11 @@ fn apply(
             let was_projection = clients
                 .remove(&id)
                 .is_some_and(|client| client.workspace_id.is_some());
+            if !clients.values().any(|client| client.app_surface.is_some()) {
+                // Keep the shared SSH session alive, but drop its desktop-only
+                // terminal grids and in-flight scene ticket with the last App.
+                app.registered_gui = Default::default();
+            }
             if was_foreground {
                 app.close_commander();
                 *foreground = latest_client(clients);
@@ -1626,10 +1756,10 @@ fn dispatch_clipboard(
     });
 }
 
-fn broadcast_projection_notification(clients: &mut Clients, msg: ServerMessage) {
+fn broadcast_notification_chrome(clients: &mut Clients, msg: ServerMessage) {
     clients.retain(|_, client| {
         client.version < 18
-            || client.projection.is_none()
+            || (client.projection.is_none() && client.app_surface.is_none())
             || client.send_control(msg.clone()).is_ok()
     });
 }
@@ -2062,6 +2192,15 @@ fn render_client(
     damage: &HashMap<crate::ids::PaneId, crate::terminal::vt::DamageSnapshot>,
     client_id: Option<u64>,
 ) -> RenderClientOutcome {
+    if interactive {
+        app.registered_gui.display_size = client.app_surface.as_ref().map(|_| client.size);
+    }
+    if client.app_surface.is_some() {
+        if interactive {
+            app.resize_active_remote_projection();
+        }
+        return app_surface::render(app, client, owns_size, force_all);
+    }
     let origin = client.render_origin;
     let previous_chrome = app.relay_notification_chrome;
     // Each projection is painted for its own displaying terminal. The owner's
@@ -2469,8 +2608,26 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
     let mut reader = BufReader::new(stream.clone());
     let mut writer = stream;
 
+    let mut app_surface = false;
     let (version, cols, rows, workspace_id, managed_projection) =
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::HelloApp {
+                version,
+                cols,
+                rows,
+            }) => {
+                if version != crate::ipc::app_surface::protocol::TRANSPORT_VERSION
+                    || cols == 0
+                    || rows == 0
+                    || cols > 500
+                    || rows > 300
+                {
+                    let _ = protocol::write_version_mismatch(&mut writer, Some(version));
+                    return;
+                }
+                app_surface = true;
+                (version, cols, rows, None, false)
+            }
             Ok(ClientMessage::Hello {
                 version,
                 cols,
@@ -2558,6 +2715,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
     }
 
     let probe_terminal = !managed_projection
+        && !app_surface
         && workspace_id.is_none()
         && (version >= 18 || terminal_theme.load(Ordering::Relaxed));
     if protocol::write_message(&mut writer, &ServerMessage::Ready { probe_terminal }).is_err() {
@@ -2575,12 +2733,15 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
     let (message_tx, message_rx) = mpsc::channel::<ServerMessage>();
     let frame_pending = Arc::new(AtomicBool::new(false));
     let writer_frame_pending = frame_pending.clone();
+    let (projected_write, projected_flushed) = mpsc::sync_channel(1);
     thread::spawn(move || {
         for msg in message_rx {
+            let projected = matches!(msg, ServerMessage::WorkspaceApp { .. });
             let msg = protocol::encode_hyperlinks(msg, version);
             let frame_stats = match &msg {
                 ServerMessage::ScopedFrame { .. }
                 | ServerMessage::LinkedFrame { .. }
+                | ServerMessage::AppFrame(_)
                 | ServerMessage::Frame(_) => Some((true, 0usize)),
                 ServerMessage::FrameDiff(frame) => Some((false, frame.runs.len())),
                 ServerMessage::ProjectionFrame { .. } | ServerMessage::PreparedWorkspace { .. } => {
@@ -2606,6 +2767,9 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             );
             match protocol::write_message_counted(&mut writer, &msg) {
                 Ok(bytes) => {
+                    if projected {
+                        let _ = projected_write.try_send(());
+                    }
                     if let Some((full, runs)) = frame_stats {
                         FRAMES_SENT.fetch_add(1, Ordering::Relaxed);
                         FULL_FRAMES_SENT.fetch_add(u64::from(full), Ordering::Relaxed);
@@ -2633,6 +2797,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             terminal_colors,
             workspace_id,
             managed_projection,
+            app_surface,
         })
         .is_err()
     {
@@ -2641,6 +2806,57 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
 
     loop {
         match protocol::read_message::<_, ClientMessage>(&mut reader) {
+            Ok(ClientMessage::WorkspaceApp {
+                scope,
+                origin,
+                body,
+            }) => {
+                if version < 21
+                    || !managed_projection
+                    || body.len() > crate::ipc::app_surface::protocol::MAX_ENVELOPE_BYTES
+                    || scope.server_generation.len() > 128
+                    || scope.workspace_id.len() > 128
+                {
+                    break;
+                }
+                let Ok(request) =
+                    serde_json::from_str::<crate::ipc::app_surface::protocol::Request>(&body)
+                else {
+                    break;
+                };
+                if request.validate().is_err()
+                    || app_tx
+                        .send(AppEvent::WorkspaceAppRequest {
+                            id,
+                            scope,
+                            origin,
+                            request,
+                        })
+                        .is_err()
+                    || projected_flushed
+                        .recv_timeout(Duration::from_secs(10))
+                        .is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ClientMessage::AppRequest(body)) if app_surface => {
+                if body.len() > crate::ipc::app_surface::protocol::MAX_ENVELOPE_BYTES {
+                    break;
+                }
+                let request =
+                    serde_json::from_str::<crate::ipc::app_surface::protocol::Request>(&body);
+                let Ok(request) = request else {
+                    break;
+                };
+                if request.validate().is_err()
+                    || app_tx
+                        .send(AppEvent::ClientAppRequest { id, request })
+                        .is_err()
+                {
+                    break;
+                }
+            }
             Ok(ClientMessage::InputSourceClosed { origin })
                 if version >= 16 && managed_projection =>
             {
@@ -2912,6 +3128,8 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             }
             Ok(
                 ClientMessage::InputSourceClosed { .. }
+                | ClientMessage::AppRequest(_)
+                | ClientMessage::HelloApp { .. }
                 | ClientMessage::ClipboardHelperOrigin(_)
                 | ClientMessage::Hello { .. }
                 | ClientMessage::HelloWorkspace { .. }
@@ -2927,6 +3145,7 @@ fn handle_client(id: u64, stream: Conn, app_tx: Sender<AppEvent>, terminal_theme
             ) => {}
         }
     }
+    let _ = app_tx.send(AppEvent::ClientDetach { id });
 }
 
 /// Graceful shutdown on a termination signal. The handler only flips an atomic
@@ -4759,7 +4978,7 @@ mod tests {
                 for rx in &fixture._client_receivers {
                     rx.try_iter().for_each(drop);
                 }
-                crate::ipc::server::broadcast_projection_notification(
+                crate::ipc::server::broadcast_notification_chrome(
                     &mut fixture.clients,
                     ServerMessage::Notification {
                         text: "NOTIFICATION-PROOF".into(),
@@ -5803,6 +6022,7 @@ mod tests {
                 terminal_colors: None,
                 workspace_id: Some(workspace_id),
                 managed_projection: false,
+                app_surface: false,
             },
             &mut app,
             &mut clients,

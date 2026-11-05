@@ -1,4 +1,7 @@
 {"id":"1","result":{"type":"uhp_capabilities","protocol":{"name":"luvus-uhp","major":1,"minor":0}}}
+{"id":"browser-list","result":{"type":"browser_list","browsers":[]}}
+{"id":"browser-acquire","result":{"type":"browser_result","browser_id":"b1","request_id":"r1","method":"browser.control.acquire","state":"completed","lease":"opaque-secret","lease_generation":"1","expires_at":1900000000}}
+{"id":"browser-get","result":{"type":"browser_session","browser_id":"b1","target":{"generation":"g1","workspace_id":"w1","tab_id":"t1","pane_id":"1","terminal_id":null},"url":"about:blank","state":"ready","lease_generation":"1","control":{"state":"acquired","expires_at":1900000000}}}
 {"id":"2","result":{"type":"workspace","workspace":"0","name":"project"}}
 {"id":"3","result":{"type":"pane_neighbor","pane":"7","neighbor":"9"}}
 {"id":"4","error":{"code":"not_found","message":"pane not found"}}

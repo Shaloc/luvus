@@ -181,6 +181,15 @@ Keys typed while disconnected are not queued or replayed. Reconnection uses
 existing-only bridges: it never starts a stopped owner, installs a binary or
 bypasses the managed-host/version checks. A stopped owner remains stopped until
 you start it. Deselecting its host or removing its merge connection cancels retries.
+
+In the macOS desktop development client, selecting a registered workspace
+opens its graphical terminal on the existing shared SSH display. Both cores
+must support transport 21 and the owner must advertise `workspace_app.v1`.
+Switching or losing the display disables input until the selected workspace
+has a fresh view. A key or paste captured for an earlier selection cannot
+move to the new workspace, even when switching back to the same terminal.
+The client never replays an input whose receipt was lost. A command accepted
+before the loss may already have run on its original terminal.
 An initial open that fails before connecting still reports its setup error.
 Authentication, host-key and incompatible-protocol errors stop automatic retries
 and retain their SSH diagnostic. Fix SSH access or explicitly update the owner,

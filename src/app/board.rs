@@ -4872,13 +4872,17 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     #[test]
     fn gate_command_runner_terminates_a_detached_session() {
+        let _fixture = crate::persist::test_env("gate-detached-readiness");
+        let dir = crate::persist::config_dir();
+        std::fs::create_dir_all(&dir).unwrap();
         let executable = shell_quote(&std::env::current_exe().unwrap().to_string_lossy());
-        let command = format!(
-            "LUVUS_GATE_DETACH_HELPER=1 {executable} --exact app::board::tests::gate_detached_child_helper & sleep 0.05; exit 0"
-        );
         let cancelled = std::sync::atomic::AtomicBool::new(false);
         let started = std::time::Instant::now();
-        for _ in 0..3 {
+        for i in 0..3 {
+            // Synchronize on setsid + flushed output. Launching a test binary on a
+            // loaded macOS host can take longer than the old fixed 50 ms sleep.
+            let ready = shell_quote(&dir.join(format!("ready-{i}")).to_string_lossy());
+            let command=format!("LUVUS_GATE_DETACH_HELPER={ready} {executable} --exact app::board::tests::gate_detached_child_helper & child=$!; i=0; while [ ! -f {ready} ] && kill -0 \"$child\" 2>/dev/null && [ \"$i\" -lt 250 ]; do sleep 0.02; i=$((i+1)); done; test -f {ready}");
             let (code, out) = run_gate_command(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
                 &command,
@@ -4888,7 +4892,7 @@ mod tests {
             assert!(out.contains("detached-helper-ready"));
         }
         assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
+            started.elapsed() < std::time::Duration::from_secs(20),
             "an escaped descendant kept the gate output pipe open"
         );
     }
@@ -4898,12 +4902,17 @@ mod tests {
     fn gate_detached_child_helper() {
         use std::io::Write;
 
-        if std::env::var_os("LUVUS_GATE_DETACH_HELPER").is_none() {
+        let Some(ready) = std::env::var_os("LUVUS_GATE_DETACH_HELPER") else {
             return;
-        }
+        };
         assert!(unsafe { libc::setsid() } >= 0);
         writeln!(std::io::stdout(), "detached-helper-ready").unwrap();
         std::io::stdout().flush().unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(ready)
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_secs(30));
     }
 

@@ -36,6 +36,7 @@ exclude = [
     "/RELEASING.md",
     "/scripts",
     "/web",
+    "/app",
     "/website",
     "/flake.nix",
     "/flake.lock",

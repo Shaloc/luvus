@@ -41,6 +41,7 @@ mod dispatch;
 mod file_jobs;
 pub(crate) mod files;
 mod git;
+pub(crate) mod gui_projection;
 pub(crate) mod hover;
 mod input;
 pub(crate) mod io_jobs;
@@ -3080,6 +3081,8 @@ pub struct App {
     remote_session_watchers: std::collections::HashMap<String, remote::RemoteWatcher>,
     remote_display_pane: Option<PaneId>,
     remote_session_displays: std::collections::HashMap<String, remote::SessionDisplay>,
+    pub(crate) registered_gui: gui_projection::registered::DisplayState,
+    pub(crate) native_view_revision: u64,
     pending_workspace_switch: Option<remote::PendingWorkspaceSwitch>,
     /// Ordinary interactive display context, temporarily bound during scoped
     /// input when creating a workspace. Existing workspace spawns use its own
@@ -3147,6 +3150,8 @@ pub struct App {
     /// A child program's browser request belongs to its pane's display.
     pub(crate) pending_program_url: Option<(PaneId, String)>,
     pub(crate) pending_browser: Option<(PaneId, Option<u64>, crate::browser::LaunchRequest)>,
+    /// Ephemeral exact-target display browser sessions; never part of snapshots.
+    pub(crate) browser_control: crate::browser::control::BrowserRegistry,
     /// The cell `hover_link` was resolved for, so holding `Ctrl` while resting on a
     /// cell does not rescan. Cleared when `Ctrl` is released, so pointing at a
     /// link *first* and pressing `Ctrl` after still lights it up.
@@ -3833,6 +3838,8 @@ impl App {
             remote_session_watchers: std::collections::HashMap::new(),
             remote_display_pane: None,
             remote_session_displays: std::collections::HashMap::new(),
+            registered_gui: Default::default(),
+            native_view_revision: 0,
             pending_workspace_switch: None,
             display_cell_pixels: None,
             remote_mouse_capture: None,
@@ -3865,6 +3872,7 @@ impl App {
             pending_open_url: None,
             pending_program_url: None,
             pending_browser: None,
+            browser_control: crate::browser::control::BrowserRegistry::new(app_tx.clone()),
             link_scan_at: None,
             hover_link: None,
             link_press: None,
@@ -4222,6 +4230,7 @@ impl App {
                         let path = preview.path.clone();
                         let kind = preview.kind;
                         std::thread::spawn(move || {
+                            let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
                             let load = crate::files::preview::read(&path, kind);
                             let _ = tx.send(crate::event::AppEvent::PreviewRead {
                                 id,
@@ -4229,6 +4238,7 @@ impl App {
                                 kind,
                                 token: 1,
                                 load,
+                                mtime,
                             });
                         });
                         remap.insert(*raw, id);
@@ -4630,6 +4640,8 @@ impl App {
             remote_session_watchers: std::collections::HashMap::new(),
             remote_display_pane: None,
             remote_session_displays: std::collections::HashMap::new(),
+            registered_gui: Default::default(),
+            native_view_revision: 0,
             pending_workspace_switch: None,
             display_cell_pixels: None,
             remote_mouse_capture: None,
@@ -4662,6 +4674,7 @@ impl App {
             pending_open_url: None,
             pending_program_url: None,
             pending_browser: None,
+            browser_control: crate::browser::control::BrowserRegistry::new(app_tx.clone()),
             link_scan_at: None,
             hover_link: None,
             link_press: None,
@@ -10046,7 +10059,7 @@ impl App {
     /// Reuse the existing focus event for all user/API mutation paths. This is
     /// O(1), including for workspace-scoped remote input: the server restores
     /// another client's workspace only after this operation returns.
-    fn with_focus_events<T>(&mut self, action: impl FnOnce(&mut Self) -> T) -> T {
+    pub(crate) fn with_focus_events<T>(&mut self, action: impl FnOnce(&mut Self) -> T) -> T {
         if self.focus_event_scope {
             return action(self);
         }

@@ -1,0 +1,16 @@
+{
+  "name": "@luvus/desktop",
+  "version": "1.0.99",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "dist/main.cjs",
+  "files": ["dist"],
+  "scripts": {
+    "build": "node ../../scripts/build.mjs --desktop",
+    "check": "tsc --project tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@luvus/app-protocol": "1.0.99"
+  }
+}

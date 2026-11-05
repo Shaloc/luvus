@@ -187,6 +187,25 @@ pub const METHODS: &[&str] = &[
     "ui.toast",
     "browser.open",
     "browser.panel",
+    "browser.list",
+    "browser.get",
+    "browser.navigate",
+    "browser.back",
+    "browser.forward",
+    "browser.reload",
+    "browser.close",
+    "browser.snapshot",
+    "browser.act",
+    "browser.evaluate",
+    "browser.screenshot",
+    "browser.wait",
+    "browser.dialog",
+    "browser.control.acquire",
+    "browser.control.release",
+    "browser.control.status",
+    "browser.cdp.subscribe",
+    "browser.cdp.connect",
+    "browser.cdp.send",
     "terminal.backend.inventory",
     "terminal.backend.snapshot",
     "terminal.backend.validate",
@@ -208,6 +227,9 @@ pub const METHODS: &[&str] = &[
 ];
 
 const READ_ONLY_METHODS: &[&str] = &[
+    "browser.list",
+    "browser.get",
+    "browser.control.status",
     "host.capabilities",
     "host.info",
     "host.doctor",
@@ -296,6 +318,15 @@ pub fn is_read_only(method: &str) -> bool {
 }
 
 pub fn required_scope(method: &str) -> &'static str {
+    // Page inspection can execute JavaScript/debugger operations. Do not treat
+    // it as generic read, workspace, or web-control authority.
+    if crate::browser::control::handles(method) {
+        return if crate::browser::control::is_read(method) {
+            "read"
+        } else {
+            "admin"
+        };
+    }
     if matches!(
         method,
         "host.capabilities"
@@ -421,6 +452,19 @@ pub fn capabilities(event_sequence: u64) -> Value {
             "automation_prompt_bytes":crate::automation::MAX_PROMPT_BYTES,
             "automation_gate_bytes":crate::automation::MAX_GATE_BYTES,
             "automation_min_interval_s":crate::automation::MIN_INTERVAL_SECONDS,
+        },
+        "browser":{
+            "control":"explicit_bearer_lease","scope":"admin","persistence":"ephemeral",
+            "cdp":{"scope":"single_tab","foreground":true,"object_bytes":67108864,"event_queue":8},
+            "per_display":crate::browser::control::MAX_PER_DISPLAY,
+            "sessions":crate::browser::control::MAX_BROWSERS,
+            "pending":crate::browser::control::MAX_PENDING,
+            "params_bytes":crate::browser::control::MAX_PARAMS_BYTES,
+            "result_bytes":crate::browser::control::MAX_RESULT_BYTES,
+            "default_ttl_s":crate::browser::control::DEFAULT_TTL_S,
+            "max_ttl_s":crate::browser::control::MAX_TTL_S,
+            "max_timeout_ms":crate::browser::control::MAX_TIMEOUT_MS,
+            "cdp":false,"file_transfer":false
         },
         "identity":{"workspace":"stable","tab":"stable","terminal":"pty_lifetime"},
         "worktree":{"create_requires_workspace":true},

@@ -145,6 +145,19 @@ pub fn slot_color(slot: u32) -> Color {
     Color::Rgb((slot >> 16) as u8, (slot >> 8) as u8, slot as u8)
 }
 
+pub(crate) fn tile_of(symbol: &str) -> Option<[u16; 2]> {
+    let mut chars = symbol.chars();
+    if chars.next()? != MARKER {
+        return None;
+    }
+    let row = chars.next()?;
+    let col = chars.next()?;
+    Some([
+        DIACRITICS.iter().position(|c| *c == col)? as u16,
+        DIACRITICS.iter().position(|c| *c == row)? as u16,
+    ])
+}
+
 /// Remap an application's explicit Unicode placeholder to a composed scene
 /// slot. The actual text cell owns position, clipping and scrollback; never
 /// paint a rectangle for virtual resources or reuse child IDs on the display.

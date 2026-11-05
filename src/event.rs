@@ -60,7 +60,42 @@ pub enum ClientInput {
 }
 
 pub enum AppEvent {
+    WorkspaceAppRequest {
+        id: u64,
+        scope: crate::ipc::protocol::WorkspaceScope,
+        origin: u64,
+        request: crate::ipc::app_surface::protocol::Request,
+    },
+    WorkspaceAppResponse {
+        connection: PaneId,
+        generation: u64,
+        scope: crate::ipc::protocol::WorkspaceScope,
+        origin: u64,
+        response: crate::ipc::app_surface::protocol::Response,
+    },
     BrowserStatus(String),
+    /// One-shot broker deadline wake; never routed to an active remote workspace.
+    BrowserControlTimeout,
+    /// Trusted display adapter completion, fenced independently of active focus.
+    BrowserControlResult {
+        client_id: u64,
+        request_id: String,
+        target: crate::ipc::app_surface::protocol::Target,
+        lease_generation: u64,
+        result: Result<serde_json::Value, String>,
+    },
+    BrowserCdpSubscribe {
+        browser_id: String,
+        lease: String,
+        subscription_id: String,
+        sender: std::sync::mpsc::SyncSender<String>,
+        active: Arc<AtomicBool>,
+        reply: Sender<Result<serde_json::Value, String>>,
+    },
+    BrowserCdpUnsubscribe {
+        browser_id: String,
+        subscription_id: String,
+    },
     #[cfg(test)]
     PasteImage(std::path::PathBuf),
     IoCompleted(crate::app::io_jobs::Completion),
@@ -163,6 +198,11 @@ pub enum AppEvent {
         /// merge client. It never competes for whole-session foreground state.
         workspace_id: Option<String>,
         managed_projection: bool,
+        app_surface: bool,
+    },
+    ClientAppRequest {
+        id: u64,
+        request: crate::ipc::app_surface::protocol::Request,
     },
     /// A binary client detached.
     ClientDetach {
@@ -390,6 +430,7 @@ pub enum AppEvent {
         kind: crate::files::preview::PreviewKind,
         token: u64,
         load: crate::files::preview::PreviewLoad,
+        mtime: Option<std::time::SystemTime>,
     },
     /// A width-specific immutable preview layout finished off the app loop.
     PreviewLayout {

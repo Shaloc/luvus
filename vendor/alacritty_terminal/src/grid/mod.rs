@@ -135,6 +135,14 @@ pub struct Grid<T> {
     /// updates this offset accordingly.
     display_offset: usize,
 
+    /// Wrapping row displacement from rotations of the entire history.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    history_scroll_sequence: u64,
+
+    /// Wrapping lifetime fence for private history viewports, never persisted.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    history_epoch: u64,
+
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
 }
@@ -145,6 +153,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             raw: Storage::with_capacity(lines, columns),
             max_scroll_limit,
             display_offset: 0,
+            history_scroll_sequence: 0,
+            history_epoch: 0,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
             lines,
@@ -307,6 +317,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
             // Rotate the entire line buffer upward.
             self.raw.rotate(-(positions as isize));
+            self.history_scroll_sequence =
+                self.history_scroll_sequence.wrapping_add(positions as u64);
 
             // Swap the fixed lines at the bottom back into position.
             let screen_lines = self.screen_lines() as i32;
@@ -409,6 +421,8 @@ impl<T> Grid<T> {
 
     #[inline]
     pub fn clear_history(&mut self) {
+        self.history_epoch = self.history_epoch.wrapping_add(1);
+
         // Explicitly purge all lines from history.
         self.raw.shrink_lines(self.history_size());
         self.raw.compact();
@@ -508,6 +522,12 @@ impl<T> Grid<T> {
     #[inline]
     pub fn display_offset(&self) -> usize {
         self.display_offset
+    }
+
+    /// Wrapping history epoch and cumulative scroll rows, including eviction at capacity.
+    #[inline]
+    pub fn history_scroll_state(&self) -> (u64, u64) {
+        (self.history_epoch, self.history_scroll_sequence)
     }
 
     #[inline]

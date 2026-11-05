@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://luvus.dev/protocol/uhp/v1/browser.schema.json",
+  "title": "Ephemeral display browser control",
+  "$comment": "All params are bounded to 65536 serialized UTF-8 bytes. String lengths below also have equivalent UTF-8 byte limits at runtime. Only list/get/control.status are read-only; every other method requires explicit admin authority. Lease secrets are bearer credentials, not browser IDs, and are never present in status or display commands. Results are bounded to 1044480 serialized bytes before the public envelope. CDP commands and events use bounded chunks under the same lease; each assembled object is limited to 64 MiB. The subscription is a private event stream rather than the global event bus. The owner gateway maps CDP file inputs and explicitly granted download directories within the bound workspace.",
+  "type": "object",
+  "required": ["method", "params"],
+  "oneOf": [
+    {"properties": {"method": {"const": "browser.list"}, "params": {"type": "object", "additionalProperties": false}}},
+    {"properties": {"method": {"enum": ["browser.get", "browser.control.status"]}, "params": {"$ref": "#/$defs/readParams"}}},
+    {"properties": {"method": {"const": "browser.control.acquire"}, "params": {"$ref": "#/$defs/acquireParams"}}},
+    {"properties": {"method": {"enum": ["browser.control.release", "browser.back", "browser.forward", "browser.reload", "browser.close", "browser.snapshot"]}, "params": {"$ref": "#/$defs/controlParams"}}},
+    {"properties": {"method": {"const": "browser.navigate"}, "params": {"$ref": "#/$defs/navigateParams"}}},
+    {"properties": {"method": {"const": "browser.act"}, "params": {"$ref": "#/$defs/actParams"}}},
+    {"properties": {"method": {"const": "browser.evaluate"}, "params": {"$ref": "#/$defs/evaluateParams"}}},
+    {"properties": {"method": {"const": "browser.screenshot"}, "params": {"$ref": "#/$defs/screenshotParams"}}},
+    {"properties": {"method": {"const": "browser.wait"}, "params": {"$ref": "#/$defs/waitParams"}}},
+    {"properties": {"method": {"const": "browser.dialog"}, "params": {"$ref": "#/$defs/dialogParams"}}},
+    {"properties": {"method": {"const": "browser.cdp.connect"}, "params": {"$ref": "#/$defs/controlParams"}}},
+    {"properties": {"method": {"const": "browser.cdp.send"}, "params": {"$ref": "#/$defs/cdpSendParams"}}},
+    {"properties": {"method": {"const": "browser.cdp.subscribe"}, "params": {"$ref": "#/$defs/cdpSubscribeParams"}}}
+  ],
+  "$defs": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "revision": {"type": "string", "pattern": "^[0-9]+$"},
+    "timeout": {"type": "integer", "minimum": 1, "maximum": 20000, "default": 10000},
+    "url": {"type": "string", "maxLength": 8192, "anyOf": [{"const": "about:blank"}, {"pattern": "^https?://[^/\\s][^\\s]*$"}]},
+    "readParams": {
+      "type": "object", "additionalProperties": false, "required": ["browser"],
+      "properties": {"browser": {"$ref": "#/$defs/id"}}
+    },
+    "acquireParams": {
+      "type": "object", "additionalProperties": false, "required": ["browser"],
+      "properties": {
+        "browser": {"$ref": "#/$defs/id"},
+        "ttl_s": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 300},
+        "timeout_ms": {"$ref": "#/$defs/timeout"}
+      }
+    },
+    "controlBase": {
+      "type": "object", "required": ["browser", "lease"],
+      "properties": {
+        "browser": {"$ref": "#/$defs/id"}, "lease": {"$ref": "#/$defs/id"},
+        "timeout_ms": {"$ref": "#/$defs/timeout"}
+      }
+    },
+    "controlParams": {"$ref": "#/$defs/controlBase", "unevaluatedProperties": false},
+    "navigateParams": {
+      "$ref": "#/$defs/controlBase", "unevaluatedProperties": false,
+      "required": ["url"], "properties": {"url": {"$ref": "#/$defs/url"}}
+    },
+    "actParams": {
+      "$ref": "#/$defs/controlBase", "unevaluatedProperties": false,
+      "required": ["action"], "properties": {"action": {"$ref": "#/$defs/action"}}
+    },
+    "evaluateParams": {
+      "$ref": "#/$defs/controlBase", "unevaluatedProperties": false,
+      "required": ["expression"],
+      "properties": {"expression": {"type": "string", "minLength": 1, "maxLength": 32768}}
+    },
+    "screenshotParams": {
+      "$ref": "#/$defs/controlBase", "unevaluatedProperties": false,
+      "properties": {
+        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1044480},
+        "output": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^[^\u0000]+$", "description": "Create a new PNG within the bound owner workspace; never overwrite a file."}
+      }
+    },
+    "waitParams": {
+      "$ref": "#/$defs/controlBase", "unevaluatedProperties": false,
+      "required": ["condition"],
+      "properties": {"condition": {"oneOf": [
+        {"type": "object", "additionalProperties": false, "required": ["text"], "properties": {"text": {"type": "string", "minLength": 1, "maxLength": 4096}}},
+        {"type": "object", "additionalProperties": false, "required": ["load"], "properties": {"load": {"const": true}}}
+      ]}}
+    },
+    "dialogParams": {
+      "$ref": "#/$defs/controlBase", "unevaluatedProperties": false,
+      "required": ["accept"],
+      "properties": {"accept": {"type": "boolean"}, "prompt_text": {"type": "string", "maxLength": 4096}}
+    },
+    "cdpSubscribeParams": {
+      "type": "object", "additionalProperties": false, "required": ["browser", "lease"],
+      "properties": {
+        "browser": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "lease": {"type": "string", "pattern": "^[0-9a-f]{32}$"}
+      }
+    },
+    "cdpSendParams": {
+      "$ref": "#/$defs/controlBase", "unevaluatedProperties": false,
+      "required": ["chunk"], "properties": {"chunk": {"$ref": "#/$defs/cdpChunk"}}
+    },
+    "cdpChunk": {
+      "type": "object", "additionalProperties": false, "required": ["transfer", "index", "total", "text"],
+      "properties": {
+        "transfer": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "index": {"type": "integer", "minimum": 0, "maximum": 16383},
+        "total": {"type": "integer", "minimum": 1, "maximum": 16384},
+        "text": {"type": "string", "minLength": 1, "maxLength": 8192}
+      }
+    },
+    "nodeAction": {
+      "type": "object", "required": ["kind", "node", "document_revision"],
+      "properties": {"node": {"$ref": "#/$defs/id"}, "document_revision": {"$ref": "#/$defs/id"}}
+    },
+    "action": {
+      "oneOf": [
+        {"$ref": "#/$defs/nodeAction", "unevaluatedProperties": false, "properties": {"kind": {"const": "click"}}},
+        {"$ref": "#/$defs/nodeAction", "unevaluatedProperties": false, "required": ["text"], "properties": {"kind": {"const": "fill"}, "text": {"type": "string", "maxLength": 32768}}},
+        {"$ref": "#/$defs/nodeAction", "unevaluatedProperties": false, "required": ["key"], "properties": {"kind": {"const": "press"}, "key": {"type": "string", "minLength": 1, "maxLength": 128}}},
+        {"$ref": "#/$defs/nodeAction", "unevaluatedProperties": false, "required": ["x", "y"], "properties": {"kind": {"const": "scroll"}, "x": {"type": "integer", "minimum": -100000, "maximum": 100000}, "y": {"type": "integer", "minimum": -100000, "maximum": 100000}}},
+        {"$ref": "#/$defs/nodeAction", "unevaluatedProperties": false, "required": ["values"], "properties": {"kind": {"const": "select"}, "values": {"type": "array", "maxItems": 100, "items": {"type": "string", "maxLength": 1024}}}}
+      ]
+    },
+    "target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["generation", "workspace_id", "tab_id", "pane_id", "terminal_id"],
+      "properties": {
+        "generation": {"$ref": "#/$defs/id"}, "workspace_id": {"$ref": "#/$defs/id"},
+        "tab_id": {"$ref": "#/$defs/id"}, "pane_id": {"$ref": "#/$defs/id"},
+        "terminal_id": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/id"}]}
+      }
+    },
+    "session": {
+      "type": "object", "additionalProperties": false,
+      "required": ["type", "browser_id", "target", "url", "state", "lease_generation", "control"],
+      "properties": {
+        "type": {"const": "browser_session"}, "browser_id": {"$ref": "#/$defs/id"},
+        "target": {"$ref": "#/$defs/target"}, "url": {"$ref": "#/$defs/url", "description": "Last successfully requested URL; live page metadata comes from display command results."},
+        "state": {"enum": ["preparing", "ready", "failed", "closed", "revoked"]},
+        "lease_generation": {"$ref": "#/$defs/revision"},
+        "control": {
+          "type": "object", "additionalProperties": false, "required": ["state", "expires_at"],
+          "properties": {"state": {"enum": ["preparing", "acquired", "uncontrolled"]}, "expires_at": {"type": ["integer", "null"], "minimum": 0}}
+        }
+      }
+    },
+    "result": {
+      "oneOf": [
+        {"$ref": "#/$defs/session"},
+        {"type": "object", "additionalProperties": false, "required": ["type", "browsers"], "properties": {"type": {"const": "browser_list"}, "browsers": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/session"}}}},
+        {
+          "type": "object", "additionalProperties": false,
+          "required": ["type", "browser_id", "request_id", "method", "state"],
+          "properties": {
+            "type": {"const": "browser_result"}, "browser_id": {"$ref": "#/$defs/id"}, "request_id": {"$ref": "#/$defs/id"},
+            "method": {"enum": ["browser.launch", "browser.navigate", "browser.back", "browser.forward", "browser.reload", "browser.close", "browser.snapshot", "browser.act", "browser.evaluate", "browser.screenshot", "browser.wait", "browser.dialog", "browser.control.acquire", "browser.control.release", "browser.cdp.connect", "browser.cdp.send"]},
+            "state": {"enum": ["ready", "completed"]}, "data": {},
+            "lease": {"$ref": "#/$defs/id"}, "expires_at": {"type": "integer", "minimum": 0},
+            "lease_generation": {"$ref": "#/$defs/revision"}
+          },
+          "allOf": [
+            {"if": {"properties": {"method": {"const": "browser.control.acquire"}}}, "then": {"required": ["lease", "expires_at", "lease_generation"]}, "else": {"not": {"anyOf": [{"required": ["lease"]}, {"required": ["expires_at"]}, {"required": ["lease_generation"]}]}}},
+            {"if": {"properties": {"method": {"const": "browser.launch"}}}, "then": {"properties": {"state": {"const": "ready"}}}, "else": {"properties": {"state": {"const": "completed"}}}}
+          ]
+        }
+      ]
+    }
+  }
+}

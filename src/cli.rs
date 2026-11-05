@@ -269,6 +269,25 @@ bars:
 browser:
   browser open <url> [--pane <id>]  Open links on the display client
   browser panel <url> [--pane <id>]  Open a Chrome / Chromium session panel
+  browser list                     List embedded display browsers
+  browser get --browser <id>       Inspect an exact browser binding
+  browser control status --browser <id>  Inspect control without acquiring it
+  browser control acquire --browser <id> [--ttl <1-3600>]  Request explicit control (default 300s)
+  browser control release --browser <id> --lease <token>  Release control
+  browser cdp --browser <id> [--ttl <1-3600>] --json  Temporary single-tab CDP endpoint
+      Playwright: connectOverCDP(endpoint, { noDefaults: true }). Files stay scoped to the owner workspace.
+  browser navigate --browser <id> --lease <token> --url <url>
+  browser back|forward|reload|close --browser <id> --lease <token>
+  browser snapshot --browser <id> --lease <token>
+  browser act --browser <id> --lease <token> --action <json>
+    Action fields: kind, node, document_revision; click|fill|press|scroll|select.
+  browser evaluate --browser <id> --lease <token> --expression <javascript>
+  browser screenshot --browser <id> --lease <token> [--max-bytes <n>] [--output <owner-path>]
+  browser wait --browser <id> --lease <token> --condition <json>
+    Wait for text or load: {\"text\":\"...\"} | {\"load\":true}.
+  browser dialog --browser <id> --lease <token> --accept <true|false> [--prompt-text <text>]
+    Command timeout: --timeout-ms <1-20000> (default 10000).
+    A timeout does not undo a page action.
 
 appearance:
   ui sidebar [--side left|right] --width <n>     set a sidebar's width (columns)
@@ -328,9 +347,9 @@ diff review:
   diff note add --file <path> (--old-line N|--new-line N) --body <text>
                              [--end-line N] [--kind question|issue|suggestion|praise]
   diff note list [--file <path>] [--state open|resolved|outdated|orphaned]
-  diff note edit <id> --body <text>
-  diff note resolve|reopen <id>
-  diff note remove <id> --yes
+  diff note edit <id> --body <text> [--if-note-revision N]
+  diff note resolve|reopen <id> [--if-note-revision N]
+  diff note remove <id> --yes [--if-note-revision N]
   diff note send --to <agent> [<id>...] [--all-open]
 
 worktrees:
@@ -529,6 +548,11 @@ fn run_inner(args: &[String]) -> Result<i32> {
     }
     if args.get(1).map(String::as_str) == Some("host") {
         return host_cmd(&args[2..], crate::i18n::cli::Context::configured());
+    }
+    if args.get(1).map(String::as_str) == Some("browser")
+        && args.get(2).map(String::as_str) == Some("cdp")
+    {
+        return crate::browser::cdp::run_cli(&args[3..]);
     }
     if args.get(1).map(String::as_str) == Some("uhp")
         && args.get(2).map(String::as_str) == Some("access")
@@ -865,7 +889,7 @@ fn write_topic_help_english(
             detailed_section("bars:\n", "\nbrowser:\n"),
         ),
         "browser" => (
-            "luvus browser <open|panel> <url> [--pane <id>]",
+            "luvus browser <action> [--browser <id>] [--lease <token>]",
             detailed_section("browser:\n", "\nappearance:\n"),
         ),
         "ui" => (
@@ -3046,12 +3070,74 @@ fn register_directly(installed: &crate::module::install::Installed) -> Result<()
     Ok(())
 }
 
+fn parse_browser_control(verb: &str, rest: &[String]) -> Result<(String, Value)> {
+    let (method, rest) = if verb == "control" {
+        let action = rest
+            .first()
+            .ok_or_else(|| anyhow!("expected control acquire, release, or status"))?;
+        (format!("browser.control.{action}"), &rest[1..])
+    } else {
+        (format!("browser.{verb}"), rest)
+    };
+    if !crate::browser::control::handles(&method) {
+        return Err(anyhow!("unknown browser action; see luvus help browser"));
+    }
+    let mut params = serde_json::Map::new();
+    let mut args = rest.iter();
+    while let Some(flag) = args.next() {
+        let key = match flag.as_str() {
+            "--browser" => "browser",
+            "--lease" => "lease",
+            "--ttl" => "ttl_s",
+            "--timeout-ms" => "timeout_ms",
+            "--url" => "url",
+            "--action" => "action",
+            "--expression" => "expression",
+            "--condition" => "condition",
+            "--max-bytes" => "max_bytes",
+            "--output" => "output",
+            "--accept" => "accept",
+            "--prompt-text" => "prompt_text",
+            _ => return Err(anyhow!("unknown browser option")),
+        };
+        if params.contains_key(key) {
+            return Err(anyhow!("duplicate browser option"));
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| anyhow!("missing browser option value"))?;
+        if value.len() > crate::browser::control::MAX_PARAMS_BYTES {
+            return Err(anyhow!("browser option exceeds parameter budget"));
+        }
+        let value = match key {
+            "ttl_s" | "timeout_ms" | "max_bytes" => json!(value
+                .parse::<u64>()
+                .map_err(|_| anyhow!("expected a non-negative integer"))?),
+            "accept" => json!(value
+                .parse::<bool>()
+                .map_err(|_| anyhow!("accept must be true or false"))?),
+            "action" | "condition" => {
+                serde_json::from_str(value).map_err(|_| anyhow!("expected bounded browser JSON"))?
+            }
+            _ => json!(value),
+        };
+        params.insert(key.into(), value);
+    }
+    let params = Value::Object(params);
+    crate::browser::control::validate_params(&method, &params)
+        .map_err(|message| anyhow!(message))?;
+    Ok((method, params))
+}
+
 /// Map argv to a `(method, params)` pair.
 fn parse(args: &[String]) -> Result<(String, Value)> {
     let noun = args.get(1).map(String::as_str).unwrap_or("");
     let verb = args.get(2).map(String::as_str).unwrap_or("");
     let rest = &args[3.min(args.len())..];
     if noun == "browser" {
+        if !matches!(verb, "open" | "panel") {
+            return parse_browser_control(verb, rest);
+        }
         let usage = "usage: luvus browser <open|panel> <url> [--pane <id>]";
         if !matches!(verb, "open" | "panel") || !matches!(rest.len(), 1 | 3) {
             return Err(anyhow!(usage));
@@ -4194,6 +4280,10 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                                         | "--kind"
                                 )
                                 | ("edit", "--body")
+                                | (
+                                    "edit" | "resolve" | "reopen" | "remove",
+                                    "--if-note-revision"
+                                )
                                 | ("send", "--to")
                         ) =>
                         {
@@ -4225,6 +4315,14 @@ fn parse(args: &[String]) -> Result<(String, Value)> {
                     .transpose()
             };
             let mut obj = serde_json::Map::new();
+            if let Some(raw) = flag(rest, "--if-note-revision") {
+                let revision = raw
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|r| *r > 0)
+                    .ok_or_else(|| anyhow!("--if-note-revision must be a positive integer"))?;
+                obj.insert("if_note_revision".into(), json!(revision));
+            }
             match sub {
                 "list" => {
                     if let Some(path) = flag(args, "--file") {
@@ -5125,6 +5223,65 @@ mod tests {
     }
 
     #[test]
+    fn browser_control_parser_bounds_json_and_keeps_page_code_literal() {
+        let expression = "document.title + '; $(not-a-shell)'";
+        let args = [
+            "luvus",
+            "browser",
+            "evaluate",
+            "--browser",
+            "opaque",
+            "--lease",
+            "secret",
+            "--expression",
+            expression,
+        ]
+        .map(str::to_owned);
+        let (method, params) = parse(&args).unwrap();
+        assert_eq!(method, "browser.evaluate");
+        assert_eq!(params["expression"], expression);
+        let (method, params) = parse(&argv(
+            "luvus browser control acquire --browser opaque --ttl 300",
+        ))
+        .unwrap();
+        assert_eq!(method, "browser.control.acquire");
+        assert_eq!(params["ttl_s"], 300);
+        let action =
+            r#"{"kind":"fill","node":"n1","document_revision":"d1","text":"two words; $()"}"#;
+        let args = [
+            "luvus",
+            "browser",
+            "act",
+            "--browser",
+            "opaque",
+            "--lease",
+            "secret",
+            "--action",
+            action,
+        ]
+        .map(str::to_owned);
+        assert_eq!(parse(&args).unwrap().1["action"]["text"], "two words; $()");
+        assert_eq!(parse(&argv("luvus browser list")).unwrap().1, json!({}));
+        for command in [
+            "luvus browser control acquire --browser b --ttl 3601",
+            "luvus browser control acquire --browser b --ttl 0",
+            "luvus browser control acquire --browser b --force true",
+            "luvus browser get --browser b --lease secret",
+            "luvus browser list --browser b",
+            "luvus browser evaluate --browser b --expression 1",
+            "luvus browser reload --browser b --lease l --timeout-ms 20001",
+            "luvus browser get --browser b --browser b",
+            "luvus browser act --browser b --lease l --action []",
+            "luvus browser cdp --browser b",
+        ] {
+            assert!(parse(&argv(command)).is_err(), "{command}");
+        }
+        assert!(rendered_topic_help("browser", None).contains("browser control acquire"));
+        assert!(rendered_topic_help("browser", Some("evaluate")).contains("--expression"));
+        assert!(rendered_topic_help("browser", Some("act")).contains("document_revision"));
+    }
+
+    #[test]
     fn browser_open_parsing_and_help_preserve_one_url_argument() {
         let args = [
             "luvus",
@@ -5195,6 +5352,7 @@ mod tests {
                             | "automation"
                             | "integration"
                             | "host"
+                            | "browser"
                             | "web"
                     )
                 ) && !trimmed.contains("  ");
@@ -6030,6 +6188,8 @@ mod tests {
         let (method, params) = parse(&argv("luvus diff note edit --body updated n1")).unwrap();
         assert_eq!(method, "diff.note.edit");
         assert_eq!(params, json!({"id":"n1","body":"updated"}));
+        let (_, guarded) = parse(&argv("luvus diff note resolve n1 --if-note-revision 3")).unwrap();
+        assert_eq!(guarded, json!({"id":"n1","if_note_revision":3}));
 
         let (method, params) = parse(&argv("luvus diff note remove --yes n1")).unwrap();
         assert_eq!(method, "diff.note.remove");
@@ -6061,6 +6221,7 @@ mod tests {
             "luvus diff note send --to reviewer",
             "luvus diff note edit n1 --state open --body check",
             "luvus diff note edit n1 --body",
+            "luvus diff note resolve n1 --if-note-revision 0",
         ] {
             assert!(parse(&argv(bad)).is_err(), "{bad} must be rejected");
         }

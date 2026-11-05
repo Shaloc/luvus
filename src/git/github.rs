@@ -2,8 +2,10 @@
 //! auth dependency — we shell out and parse JSON, and degrade gracefully when
 //! `gh` is missing or unauthenticated.
 
+use std::io::{self, Read};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -32,9 +34,9 @@ impl GhState {
 
 /// Probe `gh` once (installed? authenticated?).
 pub fn detect() -> GhState {
-    match crate::platform::no_window(Command::new("gh").arg("--version")).output() {
+    match bounded_gh(Command::new("gh").arg("--version")) {
         Ok(o) if o.status.success() => {
-            match crate::platform::no_window(Command::new("gh").args(["auth", "status"])).output() {
+            match bounded_gh(Command::new("gh").args(["auth", "status"])) {
                 Ok(a) if a.status.success() => GhState::Ready,
                 Ok(_) => GhState::NotAuthed,
                 Err(_) => GhState::Missing,
@@ -44,9 +46,71 @@ pub fn detect() -> GhState {
     }
 }
 
+// These are explicit background reads, never interactive gh operations.
+// Drain pipes concurrently and cap both runtime and retained JSON/diagnostics.
+fn bounded_gh(command: &mut Command) -> io::Result<Output> {
+    let deadline = Instant::now() + Duration::from_secs(12);
+    let mut child = crate::platform::no_window(command)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    fn read(
+        r: impl Read + Send + 'static,
+        limit: usize,
+    ) -> std::sync::mpsc::Receiver<io::Result<Vec<u8>>> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut data = Vec::new();
+            let result = r
+                .take(limit as u64 + 1)
+                .read_to_end(&mut data)
+                .and_then(|_| {
+                    if data.len() > limit {
+                        Err(io::Error::other("gh output exceeds the response limit"))
+                    } else {
+                        Ok(data)
+                    }
+                });
+            let _ = tx.send(result);
+        });
+        rx
+    }
+    let out = read(child.stdout.take().unwrap(), 4 * 1024 * 1024);
+    let err = read(child.stderr.take().unwrap(), 16 * 1024);
+    let timeout = || io::Error::new(io::ErrorKind::TimedOut, "gh timed out");
+    let result = (|| {
+        let stdout = out
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| timeout())??;
+        let stderr = err
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| timeout())??;
+        loop {
+            if let Some(status) = child.try_wait()? {
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            if Instant::now() >= deadline {
+                return Err(timeout());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    })();
+    if result.is_err() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result
+}
+
 fn run_gh(cwd: &Path, args: &[&str]) -> Result<String, String> {
-    let out = crate::platform::no_window(Command::new("gh").args(args).current_dir(cwd))
-        .output()
+    let out = bounded_gh(Command::new("gh").args(args).current_dir(cwd))
         .map_err(|e| format!("gh: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -272,16 +336,13 @@ const PR_DETAIL_FIELDS: &str = "number,title,state,isDraft,author,baseRefName,he
 
 /// Full detail for one PR — the detail panel (`gh pr view <n> --json …`).
 pub fn pr_detail(cwd: &Path, number: u64) -> Result<PrDetail, String> {
-    let raw = run_gh(
-        cwd,
-        &[
-            "pr",
-            "view",
-            &number.to_string(),
-            "--json",
-            PR_DETAIL_FIELDS,
-        ],
-    )?;
+    let number = number.to_string();
+    let slug = super::local::origin_slug(cwd);
+    let mut args = vec!["pr", "view", &number, "--json", PR_DETAIL_FIELDS];
+    if let Some(slug) = &slug {
+        args.extend(["--repo", slug]);
+    }
+    let raw = run_gh(cwd, &args)?;
     let v: Value = serde_json::from_str(&raw).map_err(|e| format!("parse gh: {e}"))?;
     Ok(parse_pr_detail(&v))
 }

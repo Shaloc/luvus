@@ -267,7 +267,7 @@ pub(crate) fn stage_web_png(encoded: &str) -> io::Result<PathBuf> {
 }
 
 /// Strict bounded base64 shared by clipboard uploads and terminal paste offers.
-fn decode_base64(encoded: &str, limit: usize) -> io::Result<Vec<u8>> {
+pub(crate) fn decode_base64(encoded: &str, limit: usize) -> io::Result<Vec<u8>> {
     if encoded.is_empty()
         || encoded.len() > limit.div_ceil(3) * 4
         || !encoded.len().is_multiple_of(4)
