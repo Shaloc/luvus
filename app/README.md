@@ -29,6 +29,40 @@ does not migrate their workspaces. Cancel changes nothing; **Luvus > Retry
 Connection** reopens recovery. Explicit `--session` and `--remote` still win
 over the saved local choice.
 
+## Desktop controls
+
+The sidebar separates host-grouped workspaces and agents into independently
+scrollable sections. Drag their divider to change the split. Agent state,
+workspace scope, grouping (workspace, state, date or ungrouped), and section
+size are local display preferences. The session button opens an on-demand
+session picker; connection diagnostics remain under **Manage connections**.
+Open Workspace offers the attached session and discovered sessions on registered hosts. The directory is resolved by the selected owner; Finder is only offered for local folders.
+
+**New tab** and Command-T create a terminal immediately. Unnamed tabs display their one-based position; names set by a user or agent take precedence. Closing an individual pane takes effect immediately.
+Both split buttons and the command-palette split action immediately request
+the core's automatic split direction. Rename, move and transpose remain
+separate actions. A new browser opens in a sibling core-owned tab, without
+prompting for an address or creating a hidden PTY; switching to another tab preserves the live browser.
+
+Settings has General, Appearance, Terminal, Workspaces, Agents, Keybindings,
+Integrations and Advanced categories, plus cross-category search. General
+offers a device interface language (English, Simplified Chinese or system default)
+separately from the nine-language core selector. Appearance controls the desktop light/dark/system mode, interface
+font/size, terminal theme and local background image. Terminal controls its
+own font/size. Pick from installed font families, filtered to monospaced families for the terminal. Backgrounds accept PNG,
+JPEG and WebP up to 20 MB and 32 megapixels, with visibility and fill/fit
+controls; images stay in this device's Electron profile, not the owner config.
+
+The terminal header exposes right-click passthrough and copy-on-selection
+toggles for local and direct-SSH terminals. These are the core pane's persisted
+mouse preferences, shared with TUI. Right-click opens the native terminal menu; Shift-right-click also opens it while a mouse-reporting program owns right-click. Registered projected terminals cannot yet
+change them from the desktop. New browser-tab creation and mouse toggles need
+the updated owner; an older running owner is never automatically restarted.
+
+```sh
+npm --prefix app run test:matrix -- desktop-ux layout-history local-sessions settings-inventory
+```
+
 ## Browser checks
 
 ```sh

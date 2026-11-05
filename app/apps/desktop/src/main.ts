@@ -122,8 +122,9 @@ async function createWindow(): Promise<void> {
       return new Response(response.body, { status: response.status, headers });
     } catch { return new Response('Not found', { status: 404 }); }
   });
-  session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
-  session.defaultSession.setPermissionCheckHandler(() => false);
+  const fontOrigin = (url:string) => { try { return url.startsWith(applicationScheme+'://app/') || (allowedOrigin.startsWith('http:') && new URL(url).origin===allowedOrigin); } catch { return false; } };
+  session.defaultSession.setPermissionRequestHandler((contents, permission, callback, details) => callback(permission === 'local-fonts' && contents === window?.webContents && details.isMainFrame && fontOrigin(details.requestingUrl)));
+  session.defaultSession.setPermissionCheckHandler((contents,permission,origin)=>permission === 'local-fonts' && contents === window?.webContents && fontOrigin(origin+'/'));
   window = new BrowserWindow({
     width: 1440, height: 900, minWidth: 900, minHeight: 600, show: false,
     title: 'Luvus', backgroundColor: '#000000', titleBarStyle: 'hiddenInset',
@@ -206,6 +207,11 @@ ipcMain.handle('luvus:sessions', async (event, op:unknown, name:unknown, generat
   const current = source?.bootstrap().find(m=>m.type==='snapshot');
   if (direct || !source || !manager || !current || (current.snapshot as Record<string,unknown>).server_generation!==generation || selecting || quitting) throw new Error('Session selection changed');
   if (op==='list') return manager.inventory();
+  if (op === 'open-workspace' && name && typeof name === 'object' && 'host' in name && 'session' in name && 'path' in name) {
+    selecting = true;
+    try { await manager.openRemote(name.host, name.session, name.path); } finally { selecting = false; }
+    return;
+  }
   if (op==='host-add' || op==='merge') {
     selecting=true;
     try {
@@ -300,6 +306,22 @@ ipcMain.handle('luvus:request', (event, request: unknown) => {
   return core.request(request);
 });
 ipcMain.handle('luvus:bootstrap', event => { requireTrusted(event); return core?.bootstrap() ?? []; });
+ipcMain.handle('luvus:terminal-menu', (event, selected:unknown, chinese:unknown) => {
+  requireTrusted(event);
+  const parent = window;
+  if (!parent) return null;
+  return new Promise((resolve, reject) => {
+    let picking = false;
+    const menu = Menu.buildFromTemplate([
+      {label:chinese === true ? '复制' : 'Copy', enabled:selected === true, click:()=>resolve({action:'copy'})},
+      {label:chinese === true ? '粘贴' : 'Paste', click:()=>{
+        picking = true;
+        void clipboard.readText().then(text => { if (Buffer.byteLength(text) > 256*1024) throw Error('Paste exceeds 256 KiB'); resolve({action:'paste',text}); }).catch(reject);
+      }},
+    ]);
+    menu.popup({window:parent,callback:()=>setImmediate(()=>{if (!picking) resolve(null);})});
+  });
+});
 ipcMain.handle('luvus:choose-directory', async event => {
   requireTrusted(event);
   if (!window) return null;

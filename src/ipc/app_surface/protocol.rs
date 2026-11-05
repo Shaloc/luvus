@@ -79,6 +79,17 @@ pub enum Request {
         id: String,
         target: Target,
     },
+    BrowserTab {
+        id: String,
+        target: Target,
+        url: String,
+    },
+    MouseOptions {
+        id: String,
+        target: Target,
+        right_click_to_app: bool,
+        copy_on_select: bool,
+    },
     BrowserTakeover {
         id: String,
         browser_id: String,
@@ -164,6 +175,8 @@ impl Request {
             | Self::Widget { id, .. }
             | Self::FileEntry { id, .. }
             | Self::BrowserOpen { id, .. }
+            | Self::BrowserTab { id, .. }
+            | Self::MouseOptions { id, .. }
             | Self::BrowserTakeover { id, .. }
             | Self::BrowserClosed { id, .. }
             | Self::BrowserResult { id, .. }
@@ -357,7 +370,14 @@ impl Request {
                     _ => {}
                 }
             }
-            Self::Focus { target, .. }
+            Self::BrowserTab { target, url, .. } => {
+                target.validate()?;
+                if url != crate::browser::BLANK_URL && !crate::browser::valid_url(url) {
+                    return Err("invalid browser URL");
+                }
+            }
+            Self::MouseOptions { target, .. }
+            | Self::Focus { target, .. }
             | Self::FocusHistory { target, .. }
             | Self::BrowserOpen { target, .. } => target.validate()?,
             Self::BrowserTakeover {

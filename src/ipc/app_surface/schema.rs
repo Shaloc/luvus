@@ -49,6 +49,8 @@ pub fn document() -> Value {
         object(json!({"type":{"const":"widget"},"id":id,"generation":id,"workspace_id":id,"item":widget}),&["type","id","generation","workspace_id","item"]),
         object(json!({"type":{"const":"file_entry"},"id":id,"generation":id,"workspace_id":id,"root":string,"path":string,"operation":file_op}),&["type","id","generation","workspace_id","root","path","operation"]),
         object(json!({"type":{"const":"browser_open"},"id":id,"target":target_ref}), &["type","id","target"]),
+        object(json!({"type":{"const":"browser_tab"},"id":id,"target":target_ref,"url":{"type":"string","maxLength":8192}}), &["type","id","target","url"]),
+        object(json!({"type":{"const":"mouse_options"},"id":id,"target":target_ref,"right_click_to_app":{"type":"boolean"},"copy_on_select":{"type":"boolean"}}), &["type","id","target","right_click_to_app","copy_on_select"]),
         object(json!({"type":{"const":"browser_closed"},"id":id,"browser_id":{"type":"string","pattern":"^[0-9a-f]{32}$"}}), &["type","id","browser_id"]),
         object(json!({"type":{"const":"browser_takeover"},"id":id,"browser_id":{"type":"string","pattern":"^[0-9a-f]{32}$"},"lease_generation":{"type":"string","pattern":"^[0-9]{1,20}$"}}), &["type","id","browser_id"]),
         object(json!({"type":{"const":"browser_result"},"id":id,"target":target_ref,"lease_generation":{"type":"string","pattern":"^[0-9]{1,20}$"},"value":{},"error":{"type":["string","null"],"maxLength":128}}), &["type","id","target","lease_generation","value","error"]),

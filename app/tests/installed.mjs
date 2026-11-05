@@ -1,5 +1,6 @@
 // Test the installed ASAR and embedded release binary, without inheriting a
 // development URL, executable override or production session.
+import { useEnglishUi } from './device-language.mjs';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createServer } from 'node:http';
@@ -7,6 +8,7 @@ import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { _electron } from 'playwright-core';
 import { isolatedEnvironment } from '../scripts/dev.mjs';
 
@@ -28,6 +30,17 @@ const env = { ...isolatedEnvironment(), HOME:home, TMPDIR:join(root,'tmp'), LUVU
 for (const key of Object.keys(env)) if (/^(VITE_|GIT_DIR$|GIT_WORK_TREE$|GH_TOKEN$|GITHUB_TOKEN$)/.test(key) || /^(http_proxy|https_proxy|all_proxy|no_proxy)$/i.test(key)) delete env[key];
 await writeFile(join(home, 'config.json'), JSON.stringify({check_updates:false, language:'en', shell:'/bin/sh'}));
 const cli = async (...argv) => (await exec(core, ['--session', session, ...argv], { env, cwd:workspace, timeout:15_000, maxBuffer:4*1024*1024 })).stdout;
+// The owner's human navigation can still hold the browser while its ready page paints.
+const acquire = async (id, ttl) => {
+  const deadline = Date.now() + 5000;
+  for (;;) {
+    try { return JSON.parse(await cli('browser','control','acquire','--browser',id,'--ttl',ttl)).result; }
+    catch (err) {
+      if (!err.stdout || JSON.parse(err.stdout).error?.code !== 'control_busy' || Date.now() >= deadline) throw err;
+      await sleep(60);
+    }
+  }
+};
 const snapshot = async () => JSON.parse(await cli('uhp', 'snapshot')).result;
 const report = { bundle, core, session, root, checks:[] };
 const check = name => { report.checks.push(name); console.log('PASS ' + name); };
@@ -37,6 +50,7 @@ const launch = async (offline = true) => {
   // unavailable without modifying this Mac's network or firewall.
   desktop = await _electron.launch({ executablePath:exe, args:['--session',session, ...(offline ? ['--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE localhost'] : [])], cwd:workspace, env, timeout:35_000 });
   page = await desktop.firstWindow();
+  await useEnglishUi(page);
   page.setDefaultTimeout(8000);
   const identity = await desktop.evaluate(({app}) => ({packaged:app.isPackaged,path:app.getAppPath(),resources:process.resourcesPath}));
   assert.ok(identity.packaged && identity.path === join(bundle,'Contents/Resources/app.asar'));
@@ -67,14 +81,15 @@ try {
   check('installed keyboard input reaches the persistent owner PTY');
 
   await new Promise(resolve => origin.listen(0,'127.0.0.1',resolve));
-  await page.getByRole('button',{name:'Open browser leaf',exact:true}).click();
-  await page.getByRole('textbox',{name:/HTTP\(S\) URL/}).fill('http://127.0.0.1:' + origin.address().port + '/');
-  await page.getByRole('button',{name:'Open browser',exact:true}).click();
-  await page.getByRole('button',{name:'Open embedded browser',exact:true}).click();
+  await page.getByRole('button',{name:'New browser tab',exact:true}).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="Browser address"]')?.disabled === false, null, {timeout:20_000});
+  assert.equal(await page.getByLabel('Browser address').inputValue(), '');
+  await page.getByLabel('Browser address').fill('http://127.0.0.1:' + origin.address().port + '/');
+  await page.getByLabel('Browser address').press('Enter');
+  await page.getByRole('tab',{name:'Installed guest',exact:true}).waitFor();
   const browser = JSON.parse(await cli('browser','list')).result.browsers.find(b => b.state === 'ready');
   assert.ok(browser);
-  const lease = JSON.parse(await cli('browser','control','acquire','--browser',browser.browser_id,'--ttl','30')).result.lease;
+  const lease = (await acquire(browser.browser_id,'30')).lease;
   const auth = ['--browser',browser.browser_id,'--lease',lease];
   await cli('browser','wait',...['--condition','{"text":"Local package"}',...auth]);
   assert.equal(JSON.parse(await cli('browser','snapshot',...auth)).result.data.title,'Installed guest');
@@ -122,14 +137,14 @@ try {
     };
     report.electronBefore=await metrics();
     const ready=async()=>JSON.parse(await cli('browser','list')).result.browsers.filter(b=>b.state==='ready');
-    const newTab=async()=>{await page.getByRole('button',{name:'New tab',exact:true}).click();await page.getByRole('button',{name:'Create tab',exact:true}).click();await page.getByRole('dialog').waitFor({state:'hidden'});};
+    const newTab=async()=>{const before=await page.getByRole('tab').count();await page.getByRole('button',{name:'New tab',exact:true}).click();await page.waitForFunction(n=>document.querySelectorAll('[role=tab]').length===n,before+1);};
     for(let i=0;i<8;i++){
       await newTab();
-      await page.getByRole('button',{name:'Open browser leaf',exact:true}).click();
-      await page.getByRole('textbox',{name:/HTTP\(S\) URL/}).fill('http://127.0.0.1:'+origin.address().port+'/tab/'+i);
-      await page.getByRole('button',{name:'Open browser',exact:true}).click();
-      await page.getByRole('button',{name:'Open embedded browser',exact:true}).click();
+      await page.getByRole('button',{name:'New browser tab',exact:true}).click();
       await page.waitForFunction(()=>document.querySelector('[aria-label="Browser address"]')?.disabled===false,null,{timeout:20_000});
+      assert.equal(await page.getByLabel('Browser address').inputValue(), '');
+      await page.getByLabel('Browser address').fill('http://127.0.0.1:'+origin.address().port+'/tab/'+i);
+      await page.getByLabel('Browser address').press('Enter');
       assert.equal((await ready()).length,i+1);
     }
     report.electronEight=await metrics();
@@ -137,7 +152,7 @@ try {
     const targets=(await ready()).slice(0,2);
     const controls=[];
     for (const b of targets) {
-      const result=JSON.parse(await cli('browser','control','acquire','--browser',b.browser_id,'--ttl','60')).result;
+      const result=await acquire(b.browser_id,'60');
       controls.push(['--browser',b.browser_id,'--lease',result.lease]);
     }
     await page.locator('canvas').first().click();

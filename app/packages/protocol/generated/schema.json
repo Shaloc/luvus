@@ -1092,6 +1092,63 @@
         {
           "additionalProperties": false,
           "properties": {
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "browser_tab"
+            },
+            "url": {
+              "maxLength": 8192,
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "target",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "copy_on_select": {
+              "type": "boolean"
+            },
+            "id": {
+              "maxLength": 128,
+              "minLength": 1,
+              "type": "string"
+            },
+            "right_click_to_app": {
+              "type": "boolean"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            },
+            "type": {
+              "const": "mouse_options"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "target",
+            "right_click_to_app",
+            "copy_on_select"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
             "browser_id": {
               "pattern": "^[0-9a-f]{32}$",
               "type": "string"

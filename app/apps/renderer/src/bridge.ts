@@ -7,9 +7,10 @@ export interface DesktopAPI {
   request(request: Request): Promise<unknown>;
   onMessage(callback: (response: Response) => void): () => void;
   bootstrap(): Promise<Response[]>;
-  sessions(op:'list'|'switch'|'create'|'stop'|'delete'|'host-add'|'merge', name:string, generation:string): Promise<unknown>;
+  sessions(op:'list'|'switch'|'create'|'stop'|'delete'|'host-add'|'merge'|'open-workspace', name:string | {host:string; session:string; path:string}, generation:string): Promise<unknown>;
   gateway(op:'list'|'start'|'stop'|'copy',kind:'web'|'uhp',control:boolean,generation:string):Promise<unknown>;
   addons(op:'list'|'install'|'uninstall'|'enable'|'disable',agent:string,generation:string):Promise<unknown>;
+  terminalMenu(selection:boolean, chinese:boolean): Promise<{action:'copy'} | {action:'paste'; text:string} | null>;
   chooseDirectory(): Promise<string | null>;
   browserBounds(id: string, bounds: { x: number; y: number; width: number; height: number } | null): Promise<void>;
   browserStatus(id: string): Promise<unknown>;
@@ -17,8 +18,8 @@ export interface DesktopAPI {
   browserTakeover(id: string): Promise<void>;
 }
 declare global { interface Window { luvus: DesktopAPI } }
-interface State { snapshot: Snapshot | null; ready: boolean; capabilities: string[]; remoteHost?: string; error: string | null; notice: string | null; revision: number }
-let state: State = { snapshot: null, ready: false, capabilities: [], error: null, notice: null, revision: 0 };
+interface State { snapshot: Snapshot | null; ready: boolean; capabilities: string[]; remoteHost?: string; error: string | null; notice: string | null; revision: number; browserTitles: Record<string, string> }
+let state: State = { snapshot: null, ready: false, capabilities: [], error: null, notice: null, revision: 0, browserTitles: {} };
 const listeners = new Set<() => void>();
 const terminals = new Map<string, TerminalFrame>();
 const frameWeights = new Map<string, number>();
@@ -42,7 +43,9 @@ function receive(response: Response) {
         const snapshot = parseSnapshot(response.snapshot);
         const valid = new Set(snapshot.workspaces.filter((w) => w.active).flatMap((w) => w.tabs.filter((t) => t.active).flatMap((t) => t.panes.filter((p) => !t.zoomed || p.id === t.focus).flatMap((p) => p.target ? [targetKey(p.target)] : []))));
         for (const key of terminals.keys()) if (!valid.has(key)) dropFrame(key);
-        emit({ snapshot, revision: state.revision + 1 });
+        const browsers = new Set(snapshot.workspaces.flatMap(w => w.tabs.flatMap(t => t.panes.filter(p => p.kind === 'browser').map(p => p.id))));
+        const browserTitles = snapshot.generation === state.snapshot?.generation ? Object.fromEntries(Object.entries(state.browserTitles).filter(([id]) => browsers.has(id))) : {};
+        emit({ snapshot, revision: state.revision + 1, browserTitles });
       } catch (error) { emit({ error: message(error) }); }
       break;
     }
@@ -65,9 +68,16 @@ function receive(response: Response) {
       break;
     case 'effect': {
       const data = record(response.data);
+      if (response.kind === 'browser_status') {
+        const target = record(data.target);
+        const pane = text(target.pane_id), title = text(data.title).slice(0, 2048);
+        if (target.generation === state.snapshot?.generation && pane && title && title !== state.browserTitles[pane]
+            && (Object.hasOwn(state.browserTitles, pane) || Object.keys(state.browserTitles).length < 128)) emit({ browserTitles: { ...state.browserTitles, [pane]: title } });
+        break;
+      }
       if (response.kind === 'direct_ssh') { emit({ remoteHost: text(data.host) }); break; }
       if (['disconnected', 'shutdown', 'core_exit'].includes(response.kind)) emit({ ready: false, error: text(data.message) || text(data.reason) || 'The core connection closed. Existing server panes were not stopped.' });
-      else if (['notification', 'toast', 'notice'].includes(response.kind)) emit({ notice: text(data.text) || text(data.message) || text(data.body) || text(response.data) });
+      else if (['toast', 'notice'].includes(response.kind)) notify(text(data.text) || text(data.message) || text(data.body) || text(response.data));
       break;
     }
     // Reply promises and chunk assembly belong to the native bridge.
@@ -100,7 +110,11 @@ export async function connect() {
 window.addEventListener('pagehide', () => disconnect?.());
 export const useCore = () => useSyncExternalStore((callback) => { listeners.add(callback); return () => { listeners.delete(callback); }; }, () => state);
 export const reportError = (error: unknown) => emit({ error: message(error) });
-export const notify = (notice: string) => emit({ notice });
+let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+export function notify(notice: string) {
+  clearTimeout(noticeTimer); emit({ notice });
+  noticeTimer = setTimeout(() => emit({ notice: null }), 4000);
+}
 export const clearError = () => emit({ error: null });
 export const clearNotice = () => emit({ notice: null });
 export const currentSnapshot = () => state.snapshot;

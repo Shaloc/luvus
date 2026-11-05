@@ -420,6 +420,44 @@ pub(super) fn handle(
                 })
             })
         }
+        Request::BrowserTab { id, target, url } => {
+            let Ok((wi, _, _)) = app.validate_gui_target(&target, false) else {
+                reject(client, &id, "stale_target", "browser workspace changed");
+                return false;
+            };
+            let pane = app.insert_browser_view(wi, None, url);
+            reply(
+                client,
+                Response::Reply {
+                    id,
+                    result: json!({"pane":pane.0.to_string()}),
+                },
+            );
+            true
+        }
+        Request::MouseOptions {
+            id,
+            target,
+            right_click_to_app,
+            copy_on_select,
+        } => {
+            let Ok((_, _, pane)) = app.validate_gui_target(&target, true) else {
+                reject(client, &id, "stale_target", "terminal changed");
+                return false;
+            };
+            let pane = app.panes.get_mut(&pane).expect("validated terminal");
+            pane.mouse_options.right_click_to_app = right_click_to_app;
+            pane.mouse_options.copy_on_select = copy_on_select;
+            app.session_dirty = true;
+            reply(
+                client,
+                Response::Reply {
+                    id,
+                    result: json!({"accepted":true}),
+                },
+            );
+            true
+        }
         Request::BrowserOpen { id, target } => {
             let (_, _, pane) = match app.validate_gui_target(&target, false) {
                 Ok(target) => target,
@@ -1061,7 +1099,11 @@ fn private_input(
             if text.len() > crate::ipc::protocol::MAX_FRAME - 1024 {
                 return Err("selection exceeds the clipboard budget".into());
             }
-            state.selection = Some((target.clone(), text));
+            state.selection = Some((target.clone(), text.clone()));
+            if pane.mouse_options.copy_on_select {
+                drop(engine);
+                super::send_private_clipboard(client, text);
+            }
         }
         Input::Mouse {
             action,
@@ -1075,6 +1117,10 @@ fn private_input(
         } => {
             if !foreground || offset != 0 || row >= rows || col >= cols {
                 return Err("mouse target is passive, scrolled, or outside geometry".into());
+            }
+            if button == 2 && action == MouseAction::Press && !pane.mouse_options.right_click_to_app
+            {
+                return Err("right-click passthrough is disabled for this terminal".into());
             }
             drop(engine);
             let button_kind = match button {
@@ -1626,12 +1672,102 @@ mod tests {
     }
 
     #[test]
+    fn app_surface_browser_tab_and_mouse_preferences_preserve_exact_targets() {
+        let _env = crate::persist::test_env("app-surface-desktop-controls");
+        let (tx, _rx) = mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        let target = target(&app);
+        let pane = app.validate_gui_target(&target, true).unwrap().2;
+        let (mut client, rx) = client();
+        assert!(handle(
+            &mut app,
+            &mut client,
+            1,
+            true,
+            Request::MouseOptions {
+                id: "mouse".into(),
+                target: target.clone(),
+                right_click_to_app: true,
+                copy_on_select: false,
+            },
+        ));
+        assert!(app.panes[&pane].mouse_options.right_click_to_app);
+        assert!(!app.panes[&pane].mouse_options.copy_on_select);
+        rx.recv().unwrap();
+        let mut stale = target.clone();
+        stale.terminal_id = Some("0".repeat(32));
+        assert!(!handle(
+            &mut app,
+            &mut client,
+            1,
+            true,
+            Request::MouseOptions {
+                id: "stale".into(),
+                target: stale,
+                right_click_to_app: false,
+                copy_on_select: true,
+            },
+        ));
+        assert!(app.panes[&pane].mouse_options.right_click_to_app);
+        assert!(!app.panes[&pane].mouse_options.copy_on_select);
+        let ServerMessage::AppResponse(body) = rx.recv().unwrap() else {
+            panic!("missing stale-target receipt")
+        };
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["code"],
+            "stale_target"
+        );
+        let terminals = app.panes.len();
+        let tabs = app.workspaces[0].tabs.len();
+        assert!(handle(
+            &mut app,
+            &mut client,
+            1,
+            true,
+            Request::BrowserTab {
+                id: "browser".into(),
+                target: target.clone(),
+                url: "https://example.invalid/".into(),
+            },
+        ));
+        assert_eq!(app.panes.len(), terminals);
+        assert_eq!(app.workspaces[0].tabs.len(), tabs + 1);
+        assert!(app.panes.contains_key(&pane));
+        let browser = app.workspaces[0].tabs.last().unwrap().layout.focus;
+        assert!(matches!(
+            app.views.get(&browser),
+            Some(crate::app::ViewKind::Browser(_))
+        ));
+        assert_eq!(app.workspaces[0].active_tab, tabs);
+        rx.recv().unwrap();
+        let mut stale = target;
+        stale.generation = "previous-owner".into();
+        assert!(!handle(
+            &mut app,
+            &mut client,
+            1,
+            true,
+            Request::BrowserTab {
+                id: "stale-browser".into(),
+                target: stale,
+                url: "https://example.invalid/".into()
+            },
+        ));
+        assert_eq!(app.workspaces[0].tabs.len(), tabs + 1);
+    }
+
+    #[test]
     fn app_surface_selection_copy_and_geometry_fences() {
         let _env = crate::persist::test_env("app-surface-selection");
         let (tx, _rx) = mpsc::channel();
         let mut app = App::new(80, 24, tx).unwrap();
         let target = target(&app);
         let pane = app.validate_gui_target(&target, true).unwrap().2;
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .mouse_options
+            .copy_on_select = false;
         app.resize_terminal_viewport(pane, 8, 3);
         let (tx, _rx) = mpsc::channel();
         let engine = crate::terminal::vt::create_engine(
@@ -1673,6 +1809,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(rx.try_recv().is_err(), "copy-on-select is disabled");
         private_input(
             &app,
             &mut client,
@@ -1681,6 +1818,29 @@ mod tests {
             false,
             Input::Copy {
                 geometry: frame.geometry.clone(),
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(rx.recv().unwrap(), ServerMessage::Clipboard(text) if text == "  界e\u{301}abcX")
+        );
+        app.panes
+            .get_mut(&pane)
+            .unwrap()
+            .mouse_options
+            .copy_on_select = true;
+        private_input(
+            &app,
+            &mut client,
+            &target,
+            pane,
+            false,
+            Input::Selection {
+                geometry: frame.geometry.clone(),
+                revision: frame.revision.clone(),
+                start: [1, 0],
+                end: [0, 0],
+                mode: SelectionMode::Cell,
             },
         )
         .unwrap();

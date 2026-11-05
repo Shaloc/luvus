@@ -10,6 +10,7 @@ export interface TerminalOptions {
   onError: (error: unknown) => void;
   onLink: (url: string) => void;
   onFocus: () => void;
+  onMenu?: (x: number, y: number) => void;
   fontSize?: number;
   fontFamily?: string;
   /** Retained history is enabled by default; false disables host history gestures. */
@@ -49,8 +50,21 @@ export class CanvasTerminal {
   private sending = false;
   private wheelLines = 0;
   private wheelRaf = 0;
-  private readonly fontSize: number;
-  private readonly fontFamily: string;
+  private fontSize: number;
+  private fontFamily: string;
+  private backgroundOpacity = 1;
+  private rightClickToApp = false;
+
+  setAppearance(value: { fontSize: number; fontFamily: string; backgroundOpacity: number; rightClickToApp: boolean; foreground: string; background: string }) {
+    this.fontSize = Math.min(32, Math.max(9, value.fontSize));
+    this.fontFamily = value.fontFamily;
+    this.backgroundOpacity = Math.min(1, Math.max(0, value.backgroundOpacity));
+    this.rightClickToApp = value.rightClickToApp;
+    this.host.style.setProperty('--terminal-fg', value.foreground);
+    this.host.style.setProperty('--terminal-bg', value.background);
+    this.preedit.style.font = this.textarea.style.font = `${this.fontSize}px ${this.fontFamily}`;
+    this.measure(); this.schedule();
+  }
 
   constructor(private readonly host: HTMLElement, private readonly options: TerminalOptions) {
     this.images=new TerminalImages(options.target,options.send,()=>this.schedule());
@@ -111,7 +125,11 @@ export class CanvasTerminal {
     this.canvas.addEventListener('pointermove', this.pointermove, { signal });
     this.canvas.addEventListener('pointerup', this.pointerup, { signal });
     this.canvas.addEventListener('pointercancel', this.pointerup, { signal });
-    this.canvas.addEventListener('contextmenu', event => { if (this.frame?.modes.mouse) event.preventDefault(); }, { signal });
+    this.canvas.addEventListener('contextmenu', event => {
+      event.preventDefault();
+      if (this.rightClickToApp && this.frame?.modes.mouse && !this.frame.scroll_offset && !event.shiftKey) return;
+      options.onMenu?.(event.clientX, event.clientY);
+    }, { signal });
     host.addEventListener('wheel', (event) => {
       if (!this.frame || options.enableScroll === false) return;
       event.preventDefault();
@@ -162,7 +180,7 @@ export class CanvasTerminal {
       const url = link && safeLink(link);
       if (url) { event.preventDefault(); this.options.onLink(url); return; }
     }
-    const reporting = frame.modes.mouse && !event.shiftKey && frame.scroll_offset === 0;
+    const reporting = frame.modes.mouse && !event.shiftKey && frame.scroll_offset === 0 && (event.button !== 2 || this.rightClickToApp);
     if (!reporting && event.button !== 0) return;
     event.preventDefault(); this.activate(); this.focus();
     if (!this.viewport.startsWith(`${frame.cols}:${frame.rows}:`)) { this.selection = null; return; }
@@ -185,7 +203,7 @@ export class CanvasTerminal {
     if (!frame) return;
     const pointer = this.pointer;
     if (!pointer) {
-      if (frame.modes.mouse_motion && !event.shiftKey) this.mouse('move', 3, this.point(event), event);
+      if (frame.modes.mouse_motion && !event.shiftKey && this.viewport.startsWith(`${frame.cols}:${frame.rows}:`)) this.mouse('move', 3, this.point(event), event);
       return;
     }
     if (pointer.id !== event.pointerId || pointer.geometry !== frame.geometry) return;
@@ -205,12 +223,15 @@ export class CanvasTerminal {
     if (pointer.reporting) this.mouse('release', pointer.button, this.point(event), event);
     else if (this.selection?.revision === frame.revision && event.type !== 'pointercancel') {
       const { anchor, cursor, mode, revision } = this.selection;
-      this.input({ kind: 'selection', geometry: frame.geometry, revision, start: anchor, end: cursor, mode });
+      if (mode !== 'cell' || anchor[0] !== cursor[0] || anchor[1] !== cursor[1]) this.input({ kind: 'selection', geometry: frame.geometry, revision, start: anchor, end: cursor, mode });
+      else this.selection = null;
     } else this.selection = null;
     this.schedule();
   };
 
-  private copy() {
+  hasSelection() { return Boolean(this.selection); }
+  paste(text: string) { if (!this.disposed && text) this.input({ kind: 'paste', text }); }
+  copy() {
     if (this.frame && this.selection) this.input({ kind: 'copy', geometry: this.frame.geometry });
   }
 
@@ -242,7 +263,13 @@ export class CanvasTerminal {
         const batch = takeInputBatch(this.queue);
         try {
           const receipts = await Promise.allSettled(batch.map(request => this.options.send(request)));
-          const failure = receipts.find(result => result.status === 'rejected');
+          const failure = receipts.find((result, i) => {
+            if (result.status !== 'rejected') return false;
+            const r = batch[i];
+            // A redraw can invalidate pointer coordinates in flight. Never replay them.
+            return !(r?.type === 'input' && ['mouse', 'selection', 'copy'].includes(r.input.kind)
+              && String(result.reason).endsWith('stale terminal geometry; wait for a fresh frame'));
+          });
           if (failure?.status === 'rejected') throw failure.reason;
         }
         catch (error) { if (!this.disposed) { this.queue = []; this.options.onError(error); } }
@@ -329,7 +356,7 @@ export class CanvasTerminal {
     this.foreground = style.getPropertyValue('--terminal-fg').trim() || '#f1f3f7';
     this.background = style.getPropertyValue('--terminal-bg').trim() || '#000000';
     context.font = `${this.fontSize}px ${this.fontFamily}`;
-    this.cellWidth = Math.ceil(context.measureText('M').width);
+    this.cellWidth = Math.max(1, context.measureText('M').width);
     this.cellHeight = Math.ceil(this.fontSize * 1.45);
     this.width = this.host.clientWidth; this.height = this.host.clientHeight;
     const dpr = window.devicePixelRatio || 1;
@@ -343,7 +370,7 @@ export class CanvasTerminal {
         this.viewport = viewport;
         // Coalesce resize intents without discarding ordered input.
         this.queue = this.queue.filter((request) => request.type !== 'viewport');
-        this.enqueue({ type: 'viewport', id: crypto.randomUUID(), target: this.options.target, cols, rows, cell_width: this.cellWidth, cell_height: this.cellHeight });
+        this.enqueue({ type: 'viewport', id: crypto.randomUUID(), target: this.options.target, cols, rows, cell_width: Math.round(this.cellWidth), cell_height: this.cellHeight });
       }
     }
     this.schedule();
@@ -358,7 +385,10 @@ export class CanvasTerminal {
     if (!context) return;
     const dpr = window.devicePixelRatio || 1;
     context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    context.clearRect(0, 0, this.width, this.height);
+    context.globalAlpha = this.backgroundOpacity;
     context.fillStyle = this.background; context.fillRect(0, 0, this.width, this.height);
+    context.globalAlpha = 1;
     const frame = this.frame;
     if (!frame) return;
     context.textBaseline = 'alphabetic';
@@ -371,10 +401,12 @@ export class CanvasTerminal {
       const bg = unpackColor(reverse ? cell.fg : cell.bg, reverse ? this.foreground : this.background);
       if (bg !== this.background) {
         context.fillStyle = bg;
-        context.fillRect(cell.col * this.cellWidth, cell.row * this.cellHeight, Math.max(1, cell.width) * this.cellWidth, this.cellHeight);
+        const snap = (pos: number) => Math.round(pos * dpr) / dpr;
+        const x = snap(cell.col * this.cellWidth), y = snap(cell.row * this.cellHeight);
+        context.fillRect(x, y, snap((cell.col + Math.max(1, cell.width)) * this.cellWidth) - x, snap((cell.row + 1) * this.cellHeight) - y);
       }
     }
-    // Shape each styled run together, then map its advance onto the VT cells.
+    // Keep the font’s natural advance; wide fallback glyphs start at an explicit VT column.
     // No Unicode-width table or second parser exists in this renderer.
     for (const cell of styledRuns(frame.cells)) {
       if (cell.col >= frame.cols || cell.row >= frame.rows) continue;
@@ -385,12 +417,10 @@ export class CanvasTerminal {
       context.globalAlpha = cell.mods & 2 ? 0.6 : 1;
       context.font = `${cell.mods & 4 ? 'italic ' : ''}${cell.mods & 1 ? 'bold ' : ''}${this.fontSize}px ${this.fontFamily}`;
       const advance = cell.width * this.cellWidth;
-      const measured = context.measureText(cell.text).width;
+
       context.save();
       context.beginPath(); context.rect(x, y, advance, this.cellHeight); context.clip();
-      context.translate(x, y);
-      if (measured > 0) context.scale(advance / measured, 1);
-      context.fillText(cell.text, 0, baseline);
+      context.fillText(cell.text, x, y + baseline);
       context.restore();
       if (cell.mods & 8) context.fillRect(x, y + this.cellHeight - 2, advance, 1);
       if (cell.mods & 256) context.fillRect(x, y + this.cellHeight / 2, advance, 1);

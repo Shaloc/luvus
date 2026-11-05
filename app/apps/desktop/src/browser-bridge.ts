@@ -9,6 +9,8 @@ interface Status {
   url: string;
   state: 'preparing' | 'ready' | 'closed' | 'failed';
   controlled: boolean;
+  title?: string;
+  target?: Target;
 }
 
 export class BrowserBridge {
@@ -116,7 +118,7 @@ export class BrowserBridge {
     if (status.state !== 'ready') return status;
     try {
       const metadata = this.host.metadata(id);
-      return { ...status, url: metadata.url, controlled: metadata.control.state === 'acquired' };
+      return { ...status, url: metadata.url, title: metadata.title, target: this.targets.get(id), controlled: metadata.control.state === 'acquired' };
     } catch { return { ...status, state: 'closed', controlled: false }; }
   }
   bounds(id: string, bounds: Rectangle | null): void {

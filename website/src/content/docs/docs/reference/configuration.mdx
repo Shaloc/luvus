@@ -25,6 +25,25 @@ cleanly across versions because unknown fields get defaults.
 
 ## Notable `config.json` keys
 
+### Desktop display preferences
+
+In the macOS desktop client, **Settings > General** offers two language choices.
+**Interface language** selects English, Simplified Chinese or the system default for this device.
+**Core language** applies to the selected session independently. **Appearance** contains desktop
+light/dark/system mode, interface font and size, the core terminal theme, and a
+local background image with visibility and fill/fit controls. **Terminal** has
+separate terminal font and size controls. Use a font installed on the display
+computer. Background images accept PNG/JPEG/WebP up to 20 MB and 32 megapixels.
+
+Interface language, fonts, desktop mode, wallpaper and agent sidebar grouping stay in the local
+desktop profile. They are not written to the server's `config.json` and are
+not uploaded to SSH owners. The terminal theme and core language use the
+existing shared configuration. Terminal-header mouse toggles change each
+pane's persisted TUI-compatible mouse options; they require an updated owner
+and are currently unavailable for registered projected remote terminals.
+
+### Shared Core Preferences
+
 | Key | Effect |
 |---|---|
 | `theme` | active bundled, installed, or virtual theme ID. A missing installed ID falls back visually without erasing the stored value. |

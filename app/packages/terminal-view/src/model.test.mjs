@@ -23,7 +23,9 @@ const frame = {
 test('styled runs use engine advances, retain combining/emoji and join shaping context', () => {
   const runs = styledRuns(frame.cells);
   assert.deepEqual(runs.map(({ row, col, text, width }) => ({ row, col, text, width })), [
-    { row: 0, col: 0, text: '  界e\u0301abc', width: 8 },
+    { row: 0, col: 0, text: '  ', width: 2 },
+    { row: 0, col: 2, text: '界', width: 2 },
+    { row: 0, col: 4, text: 'e\u0301abc', width: 4 },
     { row: 1, col: 0, text: 'X', width: 1 },
     { row: 2, col: 0, text: '👩\u200d💻', width: 2 },
   ]);

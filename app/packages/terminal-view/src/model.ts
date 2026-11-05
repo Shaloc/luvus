@@ -22,13 +22,16 @@ export interface Run { row: number; col: number; width: number; text: string; fg
 /** Only the VT defines advances. Continuations contribute backgrounds, not text. */
 export function styledRuns(cells: readonly Cell[]): Run[] {
   const runs: Run[] = [];
+  let joinable = false;
   for (const cell of cells) {
     if (cell.width === 0) continue;
     const last = runs.at(-1);
-    if (last && last.row === cell.row && last.col + last.width === cell.col && last.fg === cell.fg && last.bg === cell.bg && last.mods === cell.mods) {
-      last.text += cell.text;
+    if (joinable && cell.width === 1 && last && last.row === cell.row && last.col + last.width === cell.col && last.fg === cell.fg && last.bg === cell.bg && last.mods === cell.mods) {
+      last.text += cell.text || ' '.repeat(cell.width);
       last.width += cell.width;
-    } else runs.push({ row: cell.row, col: cell.col, width: cell.width, text: cell.text, fg: cell.fg, bg: cell.bg, mods: cell.mods });
+    } else runs.push({ row: cell.row, col: cell.col, width: cell.width, text: cell.text || ' '.repeat(cell.width), fg: cell.fg, bg: cell.bg, mods: cell.mods });
+    // Fallback CJK/emoji fonts need not advance exactly two primary-font cells.
+    joinable = cell.width === 1;
   }
   return runs;
 }

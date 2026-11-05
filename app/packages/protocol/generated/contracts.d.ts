@@ -335,6 +335,19 @@ export type Request =
       type: "browser_open";
     }
   | {
+      id: string;
+      target: Target;
+      type: "browser_tab";
+      url: string;
+    }
+  | {
+      copy_on_select: boolean;
+      id: string;
+      right_click_to_app: boolean;
+      target: Target;
+      type: "mouse_options";
+    }
+  | {
       browser_id: string;
       id: string;
       type: "browser_closed";

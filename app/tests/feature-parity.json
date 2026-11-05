@@ -1,8 +1,8 @@
 {
   "domains": [
-    {"area":"Sessions and hosts","methods":["session","host","server","attach","node"],"surface":"SettingsPanels.tsx","entry":"Session selector / Core connection","scenarios":["direct-ssh","registered-switch-recovery","local-sessions","ssh-admission-and-jump"],"remaining":["Graphical one-use SSH authentication and host-key prompts"]},
-    {"area":"Workspace layout","methods":["workspace","tab","layout","pane"],"surface":"WorkspaceArea.tsx","entry":"Workspace, tab and pane menus","scenarios":["layout-history","workspace-lifecycle"],"remaining":[]},
-    {"area":"Terminal and agents","methods":["terminal","agent"],"surface":"Sidebar.tsx","entry":"Terminal leaf and agent inspector","scenarios":["terminal-input","terminal-ime","terminal-graphics","terminal-selection","agent-native","agent-recovery","mixed-clients","slow-display"],"remaining":[]},
+    {"area":"Sessions and hosts","methods":["session","host","server","attach","node"],"surface":"SessionSelector.tsx","entry":"Session selector / Core connection","scenarios":["direct-ssh","registered-switch-recovery","local-sessions","ssh-admission-and-jump"],"remaining":["Graphical one-use SSH authentication and host-key prompts"]},
+    {"area":"Workspace layout","methods":["workspace","tab","layout","pane"],"surface":"WorkspaceArea.tsx","entry":"Workspace, tab and pane menus","scenarios":["layout-history","workspace-lifecycle","desktop-ux"],"remaining":[]},
+    {"area":"Terminal and agents","methods":["terminal","agent"],"surface":"Sidebar.tsx","entry":"Terminal leaf and agent inspector","scenarios":["terminal-input","terminal-ime","terminal-graphics","terminal-selection","agent-native","agent-recovery","mixed-clients","slow-display"],"remaining":["Registered remote pane mouse-preference controls"]},
     {"area":"Commander","methods":[],"surface":"Commander.tsx","entry":"Commander","scenarios":["commander-private","commander-receipts"],"remaining":[]},
     {"area":"Files and finder","methods":["files","search"],"surface":"RepositoryPanels.tsx","entry":"Files and search panels","scenarios":["file-view","files"],"remaining":[]},
     {"area":"Native previews and diff","methods":["diff"],"surface":"NativeView.tsx","entry":"Native view and diff notes","scenarios":["native-diff"],"remaining":[]},
@@ -10,11 +10,12 @@
     {"area":"Mission Control","methods":["mission"],"surface":"ManagementPanels.tsx","entry":"Mission Control","scenarios":["commander-receipts","agent-native"],"remaining":[]},
     {"area":"Orchestration","methods":["task","lease","worktree","automation"],"surface":"ManagementPanels.tsx","entry":"Orchestration","scenarios":["orchestration","active-automation","agent-recovery"],"remaining":[]},
     {"area":"Modules and docks","methods":["module","ui","manifest"],"surface":"ProjectedWidgets.tsx","entry":"Settings, module docks and bars","scenarios":["module-widgets"],"remaining":[]},
-    {"area":"Settings and help","methods":["config","theme","skill","integration"],"surface":"SettingsPanels.tsx","entry":"Settings","scenarios":["settings-modules","settings-inventory"],"remaining":["Fully localized desktop chrome and layout verification in all registered languages"]},
-    {"area":"Embedded browser","methods":["browser"],"surface":"BrowserView.tsx","entry":"Open browser leaf / Open embedded browser","scenarios":["owner-files","owner-network","browser-descendant","agent-browser","human-download","local-secure-network"],"remaining":["Explicit per-site permissions and registered-host browser handover","Real-owner HTTPS/QUIC, proxy permutations and positive IPv6 coverage"]},
+    {"area":"Settings and help","methods":["config","theme","skill","integration"],"surface":"SettingsPage.tsx","entry":"Settings","scenarios":["settings-modules","settings-inventory","desktop-ux"],"remaining":["Fully localized desktop chrome and layout verification in all registered languages"]},
+    {"area":"Embedded browser","methods":["browser"],"surface":"BrowserView.tsx","entry":"New browser tab / Open embedded browser","scenarios":["owner-files","owner-network","browser-descendant","agent-browser","human-download","local-secure-network"],"remaining":["Explicit per-site permissions and registered-host browser handover","Real-owner HTTPS/QUIC, proxy permutations and positive IPv6 coverage"]},
     {"area":"Diagnostics and gateways","methods":["ping","uhp","wait","events"],"surface":"SettingsPanels.tsx","entry":"Core connection and structured tools","scenarios":["diagnostics"],"remaining":[]}
   ],
   "scenarios": {
+    "desktop-ux":{"driver":"desktop-matrix.mjs","check":"Independent footer hover targets, numbered and agent-renamed tabs, immediate splits and pane close, native terminal menu, continuous ANSI background pixels, interface language, fonts and device-local wallpaper"},
     "direct-ssh":{"driver":"ssh-e2e.mjs","check":"Real SSH terminal input and detach; no display-local owner starts"},
     "local-sessions":{"driver":"desktop-matrix.mjs","check":"Create, attach, switch, cancel, stop and delete; another window stays on the original generation"},
     "ssh-admission-and-jump":{"driver":"registered-ssh.mjs","check":"Connect a registered host from the UI and enable merge, optionally through two real ProxyJump hops on the isolated fixture"},
@@ -42,7 +43,7 @@
     "settings-inventory":{"driver":"desktop-matrix.mjs","check":"Every projected preference has a control; all nine language settings persist, integration cancel/install/uninstall and skill enable/disable touch only isolated profiles"},
     "browser-descendant":{"driver":"cdp-transfers.mjs","check":"Control a cross-site child and reject unrelated target attachment and browser-wide shutdown"},
     "agent-browser":{"driver":"agent-browser.mjs","check":"Pinned agent-browser connects via the scoped endpoint and snapshots, fills, clicks and captures the tab"},
-    "registered-switch-recovery":{"driver":"registered-ssh.mjs","check":"One shared SSH display for A/B/A, reject old tickets and offline input, recover the same owner PTYs; verify both terminal outputs on the owner"},
+    "registered-switch-recovery":{"driver":"registered-ssh.mjs","check":"Choose a registered remote session and open its directory, share one SSH display for A/B/A, reject old tickets and offline input, verify both recovered PTYs on the owner"},
     "terminal-input":{"driver":"e2e.mjs","check":"Typed input returns from the real terminal frame"},
     "file-view":{"driver":"e2e.mjs","check":"Opening a workspace file displays its contents in a native leaf"},
     "owner-files":{"driver":"cdp-transfers.mjs","check":"Verify exact bytes both ways, reject escape and overwrite, cancel during transfer"},

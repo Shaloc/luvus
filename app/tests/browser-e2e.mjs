@@ -1,3 +1,4 @@
+import { useEnglishUi } from './device-language.mjs';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { createServer, request as httpRequest } from 'node:http';
@@ -90,6 +91,7 @@ try {
     ...(remote ? ['--remote', 'fake-dev'] : []),'--session','browser-test'], env: displayEnv,
     cwd: remote ? join(home, 'local-home') : workspace, timeout: 45000 });
   page = await desktop.firstWindow();
+  await useEnglishUi(page);
   await page.locator('canvas').first().waitFor({ state: 'visible', timeout: 20000 });
   await page.locator('canvas').first().click();
   await page.keyboard.type("printf 'terminal-\\142aseline\\n'");
@@ -98,15 +100,19 @@ try {
     document.querySelector('.terminal-accessible')?.textContent.includes('terminal-baseline'), null, { timeout: 5000 });
   await painted();
   await page.evaluate(() => { window.__browserEvents = []; window.luvus.onMessage(message => window.__browserEvents.push(message)); });
-  await page.getByRole('button', { name: 'Open browser leaf', exact: true }).click();
-  await page.getByRole('textbox', { name: /HTTP\(S\) URL/ }).fill(`http://owner-only.invalid:${contentPort}/`);
-  await page.getByRole('button', { name: 'Open browser', exact: true }).click();
-  await page.getByRole('button', { name: 'Open embedded browser', exact: true }).waitFor({ timeout: 10000 });
-  assert.equal(proxyRequests.length, 0, 'creating/restoring a leaf must not launch a browser');
-  await page.getByRole('button', { name: 'Open embedded browser', exact: true }).click();
+  await page.getByRole('button', { name: 'New browser tab', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="Browser address"]')?.disabled === false, null, { timeout: 30000 });
+  assert.equal(await page.getByLabel('Browser address').inputValue(), '');
+  await page.getByLabel('Browser address').fill(`http://owner-only.invalid:${contentPort}/`);
+  await page.getByLabel('Browser address').press('Enter');
+  await page.getByRole('tab',{name:'Owner browser fixture',exact:true}).waitFor();
+  assert.equal(await page.locator('.global-error').count(),0);
   const inventory = await browser('list');
+  assert.equal(await page.getByRole('tab').count(), 2, 'browser is a peer tab');
+  await page.getByRole('tab', {name:'1',exact:true}).click();
   await painted();
+  await page.getByRole('tab', {name:'Owner browser fixture',exact:true}).click();
+  await page.waitForFunction(() => document.querySelector('[aria-label="Browser address"]')?.disabled === false);
   const target = inventory.browsers.find(value => value.state === 'ready');
   assert.ok(target, 'a ready display browser must be registered');
   assert.ok(proxyRequests.length > 0, 'owner proxy was not used');
@@ -125,6 +131,11 @@ try {
   await browser('act', ...control, '--action', JSON.stringify({ kind: 'click', node: button.node, document_revision: document.document_revision }));
   const result = await browser('evaluate', ...control, '--expression', 'document.getElementById("result").textContent');
   assert.equal(result.data.value, 'Hello Luvus');
+  await page.getByRole('tab', {name:'1',exact:true}).click();
+  await painted();
+  await page.getByRole('tab', {name:'Owner browser fixture',exact:true}).click();
+  await page.waitForFunction(() => document.querySelector('[aria-label="Browser address"]')?.disabled === false);
+  assert.equal((await browser('evaluate', ...control, '--expression', 'document.getElementById("result").textContent')).data.value, 'Hello Luvus');
   const isolation = await browser('evaluate', ...control, '--expression', '({node:typeof require,bridge:typeof window.luvus})');
   assert.deepEqual(isolation.data.value, { node: 'undefined', bridge: 'undefined' });
   const screenshot = await browser('screenshot', ...control);

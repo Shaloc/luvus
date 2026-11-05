@@ -7,6 +7,7 @@ VoiceOver and accessibility certification are excluded by request.
 
 | Boundary | Runtime evidence |
 | --- | --- |
+| Desktop interaction | `desktop-ux`: fixed 6px agent status dots at wide/compact widths, independently sized sidebar sections, styled filter popup, on-demand session picker without leaving the terminal, independent footer hover targets, desktop language switching, immediate numbered tabs and automatic splits, core mouse toggles, live fonts and device-local wallpaper restored after reload. Browser checks switch between terminal and browser sibling tabs, with the document title reflected in the tab strip. |
 | Registered owner | `test:ssh:registered -- HOST ROOT --jump` opens a real installed window. The owner shells are queried independently after A/B/A, transport loss and owner restart; a delayed input must be rejected and absent on both. |
 | Direct owner network | `test:ssh` verifies authenticated owner HTTP proxy, NO_PROXY localhost, WebSocket, binary upload/download and detach. Stopping just the test proxy returns an error despite valid same-port direct destinations on both machines. With a pinned owner-side agent-browser supplied to the fixture preparer, it also runs agent-browser on Linux. |
 | Display network probes | A page attempts ICE with a UDP listener on the display and a unique DNS probe. The run records ICE gathering state, candidate count, display packets, and Chromium resolver events for that name. It does not change Wi-Fi, DNS settings or firewall rules. |
@@ -27,7 +28,10 @@ VoiceOver and accessibility certification are excluded by request.
 - Sensitive site permissions remain denied by default. Human download byte/chooser-option checks do not certify every physical macOS permission or file dialog.
 - The tested Linux owner has no IPv6 socket support (`EAFNOSUPPORT`). A positive remote IPv6 test and parity of the entire proxy/TLS matrix on that owner remain open. The positive IPv6 and pinned HTTPS/QUIC checks above run on the Mac. A zero-packet probe is evidence for that probe only.
 - The core's language preference persists across all nine supported values.
-  Full localized desktop labels and layout review in all languages remain open.
+  The separate desktop language switch supports English, Simplified Chinese and system default; other desktop UI locales are not offered.
+- The new browser-tab and per-pane mouse-preference requests require an updated
+  owner. Attaching to an older compatible owner does not restart or upgrade it.
+  Registered projected terminals still lack desktop mouse-preference controls.
 
 For the machine-readable surface inventory see [feature-parity.json](tests/feature-parity.json).
 Inspect the printed fixture results alongside it; a static count of linked

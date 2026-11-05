@@ -1,5 +1,6 @@
 // Real registered-host path: Electron attaches locally. Only the fixture's
 // pooled display child is interrupted; the owner, PTYs and network stay up.
+import { useEnglishUi } from './device-language.mjs';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, readFile, realpath, symlink, unlink, writeFile } from 'node:fs/promises';
@@ -85,7 +86,9 @@ try {
   if(bundle)delete env.LUVUS_APP_BINARY;
   desktop = await _electron.launch({ ...(bundle?{executablePath:join(bundle,'Contents/MacOS/Luvus')}:{}),args: [...(bundle?[]:[join(root,'app/apps/desktop/dist/main.cjs')]), '--session', 'ssh'], cwd: local, env, timeout: 30_000 });
   page = await desktop.firstWindow();
+  await useEnglishUi(page);
   await page.locator('.session-selector').click();
+  await page.getByRole('button',{name:'Manage connections',exact:true}).click();
   await page.getByRole('button',{name:'List sessions'}).click();
   await page.getByRole('button',{name:'Add host…'}).click();
   await page.getByRole('dialog').getByRole('textbox').fill(host);
@@ -98,6 +101,15 @@ try {
   await page.getByRole('dialog').waitFor({state:'hidden',timeout:35_000});
   assert.ok(await merge.isChecked());
   await page.getByRole('button',{name:'Back to terminals'}).click();
+  await page.getByRole('button',{name:'Open workspace',exact:true}).first().click();
+  const picker = page.getByRole('dialog');
+  await picker.getByRole('combobox',{name:'Workspace session'}).click();
+  await page.getByRole('option',{name:host+' / ssh',exact:true}).click();
+  assert.equal(await picker.getByRole('button',{name:'Browse'}).count(),0);
+  await picker.getByRole('textbox',{name:'Directory'}).fill(remote+'/state');
+  await picker.getByRole('button',{name:'Open workspace',exact:true}).click();
+  await picker.waitFor({state:'hidden',timeout:35_000});
+  await until('directory opened on remote owner',async()=>JSON.parse(await owner('uhp','snapshot')).result.workspaces.some(w=>w.cwd===remote+'/state'));
   const snap = () => page.evaluate(async () => (await window.luvus.bootstrap()).find(r => r.type === 'snapshot')?.snapshot);
   const select = async i => {
     await page.locator('.workspace-main').and(page.locator('[title="' + paths[i] + '"]')).click({ timeout: 30_000 });

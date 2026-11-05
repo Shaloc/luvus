@@ -119,6 +119,7 @@ impl App {
                             leaf.as_object_mut().expect("snapshot leaf").extend(fields);
                         }
                     } else if let Some(pane) = terminal {
+                        leaf["mouse_options"] = json!({"right_click_to_app":pane.mouse_options.right_click_to_app,"copy_on_select":pane.mouse_options.copy_on_select});
                         let (cols, rows) = pane.size();
                         let modes = pane.engine.try_lock().ok().map(|engine| json!({
                             "alternate_screen":engine.alt_screen(), "application_cursor":engine.application_cursor(),
@@ -148,6 +149,9 @@ impl App {
             }
         }
         snapshot["config"] = json!(self.config);
+        snapshot["desktop_features"] = json!(["browser_tab", "mouse_options"]);
+        snapshot["terminal_palette"] =
+            json!({"foreground":pack(self.theme.text),"background":pack(self.theme.base)});
         snapshot["commands"] = json!(Cmd::ALL
             .iter()
             .map(|cmd| json!({

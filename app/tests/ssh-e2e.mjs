@@ -1,5 +1,6 @@
 // Opt in with an SSH alias and a pre-provisioned isolated fixture. Never use
 // the PATH-installed remote binary or the host's default Luvus namespace.
+import { useEnglishUi } from './device-language.mjs';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -60,6 +61,7 @@ try {
   await cli('server', 'start');
   started = true;
   await cli('workspace', 'open', remote + '/workspace');
+  await cli('tab', 'new');
   const env = { ...isolatedEnvironment(), HOME: local, TMPDIR: join(local, 'tmp'), LUVUS_HOME: join(local, 'state'),
     XDG_DATA_HOME: join(local, 'data'), XDG_CONFIG_HOME: join(local, 'config'), XDG_CACHE_HOME: join(local, 'cache'),
     LUVUS_APP_USER_DATA: join(local, 'electron'), LUVUS_APP_BINARY: binary, APP_SSH_LOCAL: local,
@@ -68,8 +70,10 @@ try {
   desktop = await _electron.launch({...(bundle?{executablePath:join(bundle,'Contents/MacOS/Luvus')}:{}),args: [...(bundle?[]:[join(root,'app/apps/desktop/dist/main.cjs')]), '--remote', host, '--session', 'ssh'],
     cwd: local, env, timeout: 30_000 });
   const page = await desktop.firstWindow();
+  await useEnglishUi(page);
   await page.locator('canvas').first().waitFor({ state: 'visible', timeout: 20_000 });
-  await page.getByRole('button', { name: `ssh SSH: ${host}` }).waitFor();
+  await page.getByRole('button', { name: 'Switch session', exact: true }).waitFor();
+  await page.locator('.session-name small').filter({hasText:host}).waitFor();
   await page.locator('canvas').first().click();
   const inputStarted = performance.now();
   await page.keyboard.type("printf 'SSH owner: %s %s\\n' \"$(uname -s)\" \"$(uname -m)\"");
@@ -88,11 +92,12 @@ try {
     });
   await painted();
   const inputMs = Math.round(performance.now() - inputStarted);
-  await page.getByRole('button', { name: 'Open browser leaf', exact: true }).click();
-  await page.getByRole('textbox', { name: /HTTP\(S\) URL/ }).fill('http://owner-only.invalid/');
-  await page.getByRole('button', { name: 'Open browser', exact: true }).click();
-  await page.getByRole('button', { name: 'Open embedded browser', exact: true }).click();
+  const terminalIndex = await page.getByRole('tab').evaluateAll(nodes => nodes.findIndex(node => node.getAttribute('aria-selected') === 'true'));
+  await page.getByRole('button', { name: 'New browser tab', exact: true }).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="Browser address"]')?.disabled === false, null, { timeout: 30_000 });
+  assert.equal(await page.getByLabel('Browser address').inputValue(), '');
+  await page.getByLabel('Browser address').fill('http://owner-only.invalid/');
+  await page.getByLabel('Browser address').press('Enter');
   const target = (await api('browser', 'list')).browsers.find(b => b.state === 'ready');
   assert.ok(target);
   const { lease } = await api('browser', 'control', 'acquire', '--browser', target.browser_id, '--ttl', '60');
@@ -137,11 +142,16 @@ try {
   }
   await api('browser','navigate',...authority,'--url',`http://localhost:${ports.origin}/`);
   await api('browser','wait',...authority,'--condition','{"load":true}');
-  const capture = await api('browser', 'screenshot', ...authority, '--output', 'owner.png');
-  assert.equal(capture.data.path, remote + '/workspace/owner.png');
+  const screenshotName = `owner-${Date.now()}.png`;
+  const capture = await api('browser', 'screenshot', ...authority, '--output', screenshotName);
+  assert.equal(capture.data.path, remote + '/workspace/' + screenshotName);
   await api('browser', 'control', 'release', ...authority);
   const transfer = JSON.parse(await run('cdp', target.browser_id));
+  const browserIndex = await page.getByRole('tab').evaluateAll(nodes => nodes.findIndex(node => node.getAttribute('aria-selected') === 'true'));
+  await page.getByRole('tab').nth(terminalIndex).click();
   await painted();
+  await page.getByRole('tab').nth(browserIndex).click();
+  await page.waitForFunction(() => document.querySelector('[aria-label="Browser address"]')?.disabled === false);
   assert.equal(transfer.ownerDownload, remote + '/workspace/remote.bin');
   assert.equal(requests, 0, 'guest accessed the display at the same localhost port');
   const screenshot = await desktop.evaluate(async ({ BrowserWindow }) => (await BrowserWindow.getAllWindows()[0].capturePage()).toPNG().toString('base64'));

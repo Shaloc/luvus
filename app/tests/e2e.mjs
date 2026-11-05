@@ -1,3 +1,4 @@
+import { useEnglishUi } from './device-language.mjs';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
 import { mkdtemp, mkdir, readFile, realpath, writeFile } from 'node:fs/promises';
@@ -30,6 +31,7 @@ try {
   await command('workspace', 'open', workspace);
   desktop = await _electron.launch({ args: [join(root, 'app/apps/desktop/dist/main.cjs')], env, cwd: workspace, timeout: 45000 });
   const page = await desktop.firstWindow();
+  await useEnglishUi(page);
   const errors = [];
   page.on('pageerror', error => errors.push(error.message));
   await page.locator('canvas').first().waitFor({ state: 'visible', timeout: 30000 });

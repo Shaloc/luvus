@@ -8,6 +8,7 @@ export function validName(name: unknown): name is string {
 export interface Inventory {
   sessions: {name:string; running:boolean}[];
   hosts: {host:string; error:string|null}[];
+  remotes: {host:string; session:string}[];
   merge:boolean;
 }
 export class SessionAdmin {
@@ -27,7 +28,15 @@ export class SessionAdmin {
     // Do not expose endpoint paths or confuse an SSH presentation with a local owner.
     return {sessions:raw.sessions.filter((s:{name:string})=>validName(s.name) && !remotes.has(s.name))
       .map((s:{name:string;running:boolean})=>({name:s.name,running:s.running===true})),
+      remotes:raw.remote_sessions.filter((r:{host:string;session:string})=>validName(r.session) && raw.hosts.some((h:{host:string})=>h.host===r.host)).map((r:{host:string;session:string})=>({host:r.host,session:r.session})),
       hosts:raw.hosts.map((h:{host:string;error:string|null})=>({host:h.host,error:h.error})),merge:raw.merge===true};
+  }
+  async openRemote(host:unknown, session:unknown, path:unknown) {
+    if (typeof host !== 'string' || !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,253}$/.test(host) || !validName(session) ||
+        typeof path !== 'string' || !path.startsWith('/') || path.length > 4096 || /[\x00-\x1f]/.test(path)) throw Error('Invalid remote workspace destination');
+    const {remotes} = await this.inventory();
+    if (!remotes.some(r => r.host === host && r.session === session)) throw Error('Remote session is no longer registered');
+    await exec(this.binary, ['--host', host, '--session', session, 'workspace', 'open', path], {env:this.env, timeout:35_000, maxBuffer:128*1024});
   }
   async check(name:string, create:boolean) {
     if (!validName(name) || name.startsWith('remote-')) throw new Error('Choose a local session name');

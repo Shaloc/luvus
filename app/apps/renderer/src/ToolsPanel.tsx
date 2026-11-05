@@ -1,9 +1,10 @@
+import { tr } from './i18n';
 import { useState } from 'react';
 import { Search } from 'lucide-react';
 import requestSchema from '../../../../protocol/uhp/v1/schema/request.schema.json';
 import { action, useQuery, type Method } from './bridge';
 import { array, label, record, text, type RecordValue } from './model';
-import { AsyncButton, Detail, ErrorBox, Loading, Notice } from './ui';
+import { AsyncButton, Choice, Detail, ErrorBox, Loading, Notice } from './ui';
 
 const documentSchema = record(requestSchema);
 function resolveSchema(value: unknown, depth = 0): RecordValue {
@@ -34,33 +35,33 @@ export function ToolsPanel() {
   const schema = methodSchema(method);
   const contracts = record(record(capabilities.data).method_contracts);
   const contract = record(contracts[method]);
-  return <section className="domain-panel"><h2>Structured tools</h2><p className="muted">Low-frequency UHP operations. Fields come from the checked-in core request schema; results come from the connected core.</p>
+  return <section className="domain-panel"><h2>{tr("Structured tools")}</h2><p className="muted">{tr("Low-frequency UHP operations. Fields come from the checked-in core request schema; results come from the connected core.")}</p>
     {capabilities.loading ? <Loading /> : capabilities.error ? <ErrorBox error={capabilities.error} /> : <>
-      <div className="filter-input"><Search size={14} /><input aria-label="Filter UHP methods" placeholder="Filter methods…" value={filter} onChange={(event) => setFilter(event.target.value)} /></div>
-      <label className="field"><span>Method</span><select value={method} onChange={(event) => { setMethod(event.target.value); setParams({}); setResult(null); setConfirmed(false); }}>{methods.filter((item) => item.includes(filter) || item === method).map((item) => <option key={item}>{item}</option>)}</select></label>
+      <div className="filter-input"><Search size={14} /><input aria-label={tr("Filter UHP methods")} placeholder={tr("Filter methods…")} value={filter} onChange={(event) => setFilter(event.target.value)} /></div>
+      <label className="field"><span>{tr("Method")}</span><Choice label={tr("Method")} value={method} onChange={value => { setMethod(value); setParams({}); setResult(null); setConfirmed(false); }} options={methods.filter(item => item.includes(filter) || item === method).map(value => ({ value, label: value }))} /></label>
       {schema ? <><SchemaFields key={method} schema={schema} value={params} onChange={setParams} name="params" />
-        <label className="check-label"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />I reviewed this operation and its target. It may change core state.</label>
-        <AsyncButton className="button primary" disabled={!confirmed || !methods.includes(method)} run={async () => { validateFields(schema, params, 'params'); const value = await action(method as Method, record(params)); setResult(value); setConfirmed(false); }}>Execute {method}</AsyncButton>
-      </> : <Notice>The current public schema has no field contract for this method. It cannot be invoked through the generic form; use its dedicated interface where available.</Notice>}
-      {Object.keys(contract).length > 0 && <details className="disclosure"><summary>Method contract</summary><Detail value={contract} /></details>}
-      {result !== null && <div className="tool-result"><h3>Core result</h3><Detail value={result} /></div>}
+        <label className="check-label"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />{tr("I reviewed this operation and its target. It may change core state.")}</label>
+        <AsyncButton className="button primary" disabled={!confirmed || !methods.includes(method)} run={async () => { validateFields(schema, params, 'params'); const value = await action(method as Method, record(params)); setResult(value); setConfirmed(false); }}>{tr("Execute")} {method}</AsyncButton>
+      </> : <Notice>{tr("The current public schema has no field contract for this method. It cannot be invoked through the generic form; use its dedicated interface where available.")}</Notice>}
+      {Object.keys(contract).length > 0 && <details className="disclosure"><summary>{tr("Method contract")}</summary><Detail value={contract} /></details>}
+      {result !== null && <div className="tool-result"><h3>{tr("Core result")}</h3><Detail value={result} /></div>}
     </>}
   </section>;
 }
 function SchemaFields({ schema: raw, value, onChange, name, depth = 0 }: { schema: RecordValue; value: unknown; onChange: (value: unknown) => void; name: string; depth?: number }) {
   const schema = resolveSchema(raw), [variant, setVariant] = useState(0);
   const variants = array(schema.oneOf ?? schema.anyOf).map(record);
-  if (depth > 10) return <Notice>Schema exceeds the nested form limit.</Notice>;
-  if (variants.length) return <div className="schema-group"><label className="field"><span>{label(name)} format</span><select value={variant} onChange={(event) => { setVariant(Number(event.target.value)); onChange(undefined); }}>{variants.map((item, i) => { const s = resolveSchema(item), properties = record(s.properties); return <option key={i} value={i}>{text(s.title) || text(record(properties.kind).const) || text(record(properties.type).const) || text(s.type, `Option ${i + 1}`)}</option>; })}</select></label><SchemaFields schema={variants[variant] ?? {}} value={value} onChange={onChange} name={name} depth={depth + 1} /></div>;
-  if (schema.const !== undefined) return <div className="field"><span>{label(name)}: <code>{String(schema.const)}</code></span><AsyncButton run={async () => onChange(schema.const)}>Use {String(schema.const)}</AsyncButton></div>;
+  if (depth > 10) return <Notice>{tr("Schema exceeds the nested form limit.")}</Notice>;
+  if (variants.length) return <div className="schema-group"><label className="field"><span>{label(name)} {tr("format")}</span><Choice label={`${label(name)} format`} value={String(variant)} onChange={value => { setVariant(Number(value)); onChange(undefined); }} options={variants.map((item, i) => { const s = resolveSchema(item), properties = record(s.properties); return { value: String(i), label: text(s.title) || text(record(properties.kind).const) || text(record(properties.type).const) || text(s.type, `Option ${i + 1}`) }; })} /></label><SchemaFields schema={variants[variant] ?? {}} value={value} onChange={onChange} name={name} depth={depth + 1} /></div>;
+  if (schema.const !== undefined) return <div className="field"><span>{label(name)}: <code>{String(schema.const)}</code></span><AsyncButton run={async () => onChange(schema.const)}>{tr("Use")} {String(schema.const)}</AsyncButton></div>;
   if (schema.type === 'object' || schema.properties) {
     const current = record(value), required = array(schema.required);
-    return <div className="schema-group">{Object.entries(record(schema.properties)).map(([key, field]) => <div key={key} className="schema-property"><div className="schema-property-heading"><strong>{label(key)}</strong>{required.includes(key) ? <small>Required</small> : <label className="check-label"><input type="checkbox" aria-label={`Include ${key}`} checked={current[key] !== undefined} onChange={(event) => { const next = { ...current }; if (event.target.checked) { const spec = resolveSchema(field); next[key] = spec.default ?? spec.const ?? (spec.type === 'object' ? {} : spec.type === 'boolean' ? false : ''); } else delete next[key]; onChange(next); }} />Include</label>}</div>
+    return <div className="schema-group">{Object.entries(record(schema.properties)).map(([key, field]) => <div key={key} className="schema-property"><div className="schema-property-heading"><strong>{label(key)}</strong>{required.includes(key) ? <small>{tr("Required")}</small> : <label className="check-label"><input type="checkbox" aria-label={`Include ${key}`} checked={current[key] !== undefined} onChange={(event) => { const next = { ...current }; if (event.target.checked) { const spec = resolveSchema(field); next[key] = spec.default ?? spec.const ?? (spec.type === 'object' ? {} : spec.type === 'boolean' ? false : ''); } else delete next[key]; onChange(next); }} />{tr("Include")}</label>}</div>
       {(required.includes(key) || current[key] !== undefined) && <SchemaFields schema={record(field)} value={current[key]} onChange={(item) => onChange({ ...current, [key]: item })} name={key} depth={depth + 1} />}
-    </div>)}{schema.maxProperties === 0 && <p className="muted">No parameters.</p>}</div>;
+    </div>)}{schema.maxProperties === 0 && <p className="muted">{tr("No parameters.")}</p>}</div>;
   }
   const options = array(schema.enum);
-  if (options.length) return <label className="field"><select aria-label={name} value={value === undefined ? '' : String(value)} onChange={(event) => { const option = options.find((item) => String(item) === event.target.value); onChange(option); }}><option value="">Choose…</option>{options.map((item, i) => <option key={i} value={String(item)}>{String(item)}</option>)}</select></label>;
+  if (options.length) return <label className="field"><Choice label={name} value={value === undefined ? '' : String(value)} onChange={next => onChange(options.find(item => String(item) === next))} options={[{ value: '', label: tr("Choose…") }, ...options.map(item => ({ value: String(item), label: String(item) }))]} /></label>;
   if (schema.type === 'boolean') return <label className="check-label"><input type="checkbox" checked={value === true} onChange={(event) => onChange(event.target.checked)} />{label(name)}</label>;
   if (schema.type === 'array' || !schema.type || Array.isArray(schema.type)) return <JsonField value={value} onChange={onChange} name={name} />;
   return <label className="field"><input aria-label={name} type={schema.type === 'integer' || schema.type === 'number' ? 'number' : 'text'} step={schema.type === 'integer' ? 1 : undefined} min={typeof schema.minimum === 'number' ? schema.minimum : undefined} max={typeof schema.maximum === 'number' ? schema.maximum : undefined} pattern={text(schema.pattern) || undefined} maxLength={typeof schema.maxLength === 'number' ? schema.maxLength : undefined} value={value === undefined ? '' : String(value)} onChange={(event) => onChange(schema.type === 'integer' || schema.type === 'number' ? Number(event.target.value) : event.target.value)} />{(schema.description || schema.$comment) ? <small>{text(schema.description) || text(schema.$comment)}</small> : null}</label>;
@@ -93,5 +94,5 @@ function validateFields(raw: RecordValue, value: unknown, path: string, depth = 
 }
 function JsonField({ value, onChange, name }: { value: unknown; onChange: (value: unknown) => void; name: string }) {
   const [draft, setDraft] = useState(value === undefined ? '' : JSON.stringify(value, null, 2)), [error, setError] = useState<string | null>(null);
-  return <label className="field"><span>{label(name)} (structured JSON)</span><textarea rows={4} value={draft} onChange={(event) => { setDraft(event.target.value); try { onChange(JSON.parse(event.target.value)); setError(null); } catch { onChange(undefined); setError('Enter valid JSON before executing.'); } }} />{error && <ErrorBox error={error} />}</label>;
+  return <label className="field"><span>{label(name)} {tr("(structured JSON)")}</span><textarea rows={4} value={draft} onChange={(event) => { setDraft(event.target.value); try { onChange(JSON.parse(event.target.value)); setError(null); } catch { onChange(undefined); setError('Enter valid JSON before executing.'); } }} />{error && <ErrorBox error={error} />}</label>;
 }

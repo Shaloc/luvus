@@ -1,5 +1,6 @@
 // Exercise visible controls; use the owner only to seed fixtures and
 // independently verify effects. Failed cases retain their own state and screenshot.
+import { useEnglishUi } from './device-language.mjs';
 import assert from 'node:assert/strict';
 import { execFile, spawn } from 'node:child_process';
 import { once } from 'node:events';
@@ -61,6 +62,7 @@ async function scenario(name, fn) {
       cwd:workspace,env:{...env,LUVUS_APP_USER_DATA:profile},timeout:30_000 });
     clients.push(native);
     const p = await native.firstWindow();
+    await useEnglishUi(p);
     p.setDefaultTimeout(7000);
     await p.waitForFunction(() => document.querySelector('.connection-dot.online'),null,{timeout:20_000});
     return p;
@@ -96,7 +98,7 @@ async function scenario(name, fn) {
         await chmod(join(bin,'gh'),0o700);
       }
     }
-    if(name==='agent-native'||name==='agent-recovery'){
+    if(name==='agent-native'||name==='agent-recovery'||name==='desktop-ux'){
       const bin=join(home,'bin'),sessions=join(env.CODEX_HOME,'sessions','2026','11','04');
       await mkdir(bin);await mkdir(sessions,{recursive:true});env.PATH=bin+':'+env.PATH;
       env.MATRIX_AGENT_RECEIPTS=join(home,'agent-argv');
@@ -137,6 +139,11 @@ async function scenario(name, fn) {
 const button = (page,name) => page.getByRole('button',{name,exact:true});
 const dialog = page => page.getByRole('dialog');
 const submit = async (p, name) => {await button(dialog(p),name).click();await dialog(p).waitFor({state:'hidden'});};
+async function choose(field, value) {
+  await field.click();
+  const options = field.page().getByRole('option');
+  await (typeof value === 'object' ? options.nth(value.index) : field.page().locator('[role="option"][data-value=' + JSON.stringify(value) + ']')).click();
+}
 const active = snap => snap.workspaces.find(w=>w.active);
 const tab = snap => active(snap).tabs.find(t=>t.active);
 const ids = snap => tab(snap).panes.map(p=>p.pane_id);
@@ -156,7 +163,7 @@ await scenario('layout-history',async ({page:p,snap,ok})=>{
   await p.locator('canvas').first().waitFor();
   const a = ids(await snap())[0];
   await button(p,'Split active pane').click();
-  await submit(p,'Create split');
+  assert.equal(await dialog(p).count(),0);
   await eventually('two real panes',async()=>ids(await snap()).length === 2);
   const b = ids(await snap()).find(id=>id!==a);
   const pane = () => p.locator('.pane-focused');
@@ -167,7 +174,7 @@ await scenario('layout-history',async ({page:p,snap,ok})=>{
   await eventually('two canvases',async()=>await p.locator('canvas').count()===2);
   ok('zoom and unzoom preserve both terminal IDs');
   await menu(); await button(pane(),'Swap with pane…').click();
-  await dialog(p).getByRole('combobox').selectOption(a);
+  await choose(dialog(p).getByRole('combobox'),a);
   await submit(p,'Apply');
   await eventually('swapped order',async()=>ids(await snap())[0]===b);
   if (!await button(pane(),'Transpose split').isVisible()) await menu();
@@ -226,14 +233,13 @@ await scenario('workspace-lifecycle',async ({page:p,home,workspace,snap,cli,ok})
 await scenario('settings-modules',async ({page:p,home,ok})=>{
   await p.locator('.sidebar-bottom').getByRole('button',{name:'Settings'}).click();
   await p.getByLabel('Find setting').fill('persist_pane_screen');
-  const toggle=p.getByRole('checkbox',{name:'session.persist_pane_screen'});
-  await toggle.setChecked(false);
-  await button(p,'Save').click();
+  const toggle=p.getByRole('switch',{name:'session.persist_pane_screen'});
+  await toggle.click();
   await eventually('persist option stored',async()=>JSON.parse(await readFile(join(home,'config.json'),'utf8')).session?.persist_pane_screen===false);
-  await p.getByRole('tab',{name:'keys',exact:true}).click();
+  await button(p,'Keybindings').click();
   await p.locator('.details dt').filter({hasText:/^prefix$/i}).first().waitFor();
-  await p.getByRole('tab',{name:'themes',exact:true}).click();
-  await p.locator('.list-card').first().waitFor();
+  await button(p,'Appearance').click();
+  await p.getByRole('combobox',{name:'Terminal theme',exact:true}).waitFor();
   ok('saving a setting changes the owner; effective keys and installed themes render');
   await button(p,'Back to terminals').click();
   await button(p,'Modules').click();
@@ -244,6 +250,133 @@ await scenario('settings-modules',async ({page:p,home,ok})=>{
   await button(dialog(p),'Cancel').click();
 });
 
+await scenario('desktop-ux',async ({page:p,native,home,api,snap,ok})=>{
+  await native.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setContentSize(1280,820));
+  await p.getByLabel('Terminal input').fill('codex');
+  await p.getByLabel('Terminal input').press('Enter');
+  await p.locator('.agent-row').first().waitFor();
+  const checkDot=async()=>{
+    const rect=await p.locator('.agent-main .status-dot').first().boundingBox();
+    assert.equal(rect.width,6);assert.equal(rect.height,6);
+  };
+  await checkDot();
+  const footer = p.locator('.sidebar-bottom'), settings = button(footer,'Settings');
+  const actions = [settings,button(footer,'Mission Control'),button(footer,'Orchestration')];
+  const background = locator => locator.evaluate(e=>getComputedStyle(e).backgroundColor);
+  await p.emulateMedia({colorScheme:'dark'});
+  await p.mouse.move(500,42);
+  const idle = await Promise.all(actions.map(background));
+  for (const [i, action] of actions.entries()) {
+    await eventually('only the hovered footer action highlights: '+i,async()=>{
+      await action.hover();
+      return await background(action)!==idle[i];
+    });
+    const colors = await Promise.all(actions.map(background));
+    assert.deepEqual(colors.filter((_,j)=>j!==i),idle.filter((_,j)=>j!==i));
+  }
+  await p.screenshot({path:join(home,'footer-hover.png'),clip:await footer.boundingBox()});
+  await p.emulateMedia({colorScheme:null});
+  assert.equal(await p.locator('.workspace-section').count(),1);
+  assert.equal(await p.locator('.agent-section').count(),1);
+  await p.getByRole('combobox',{name:'Filter agents by state'}).click();
+  await p.getByRole('option',{name:'Working',exact:true}).waitFor();
+  await p.screenshot({path:join(home,'state-menu.png')});
+  await p.keyboard.press('Escape');
+  await p.getByRole('button',{name:'Switch session',exact:true}).click();
+  await p.getByLabel('Find session').waitFor();
+  await p.locator('.session-option').filter({hasText:'matrix'}).waitFor();
+  assert.equal(await p.locator('.full-tool').count(),0);
+  assert.ok(await p.locator('.terminal-surface canvas').isVisible());
+  await p.screenshot({path:join(home,'session-picker.png')});
+  await p.keyboard.press('Escape');
+  const count=active(await snap()).tabs.length;
+  await button(p,'New tab').click();
+  await eventually('new tab without naming prompt',async()=>active(await snap()).tabs.length===count+1);
+  assert.equal(await p.locator('dialog[open]').count(),0);
+  await p.getByLabel('Terminal input').click();
+  await p.keyboard.press('Meta+t');
+  await eventually('terminal shortcut opens tab',async()=>active(await snap()).tabs.length===count+2);
+  assert.equal(await p.locator('dialog[open]').count(),0);
+  await button(p,'Split active pane').click();
+  await eventually('automatic split without a dialog',async()=>ids(await snap()).length===2 && await p.locator('.pane').count()===2);
+  assert.equal(await dialog(p).count(),0);
+  await p.screenshot({path:join(home,'automatic-split.png')});
+  await native.evaluate(({Menu})=>{
+    const popup=Menu.prototype.popup;
+    Menu.prototype.popup=function(options){
+      globalThis.menuLabels=this.items.map(i=>i.label);
+      globalThis.dismissMenu=()=>this.closePopup(options.window);
+      Menu.prototype.popup=popup;
+      return popup.call(this,options);
+    };
+  });
+  const surface=p.locator('.pane-focused canvas').first();
+  await surface.click({button:'right'});
+  await eventually('native terminal context menu',async()=>JSON.stringify(await native.evaluate(()=>globalThis.menuLabels))==='["Copy","Paste"]');
+  await native.evaluate(()=>globalThis.dismissMenu());
+  await surface.click();
+  const input=p.locator('.pane-focused').getByLabel('Terminal input');
+  await input.fill("printf '\\033[48;2;109;83;61m%36s\\033[0m\\n' ''");
+  await input.press('Enter');
+  await p.waitForFunction(()=> {
+    const canvas=document.querySelector('.pane-focused canvas');
+    const {width:w,height:h}=canvas, ctx=canvas.getContext('2d');
+    const data=ctx.getImageData(0,0,w,h).data;
+    const minimum=36*ctx.measureText('M').width*devicePixelRatio-3;
+    for(let y=0;y<h;y+=2){
+      let streak=0;
+      for(let x=0;x<w;x++){const i=4*(w*y+x);streak=data[i]===109 && data[i+1]===83 && data[i+2]===61?streak+1:0;if(streak>=minimum)return true;}
+    }
+    return false;
+  },null,{timeout:7000});
+  ok('native right-click menu, continuous true-color terminal background at physical-pixel resolution');
+  await p.locator('.pane-focused').getByRole('button',{name:'Copy on selection',exact:true}).click();
+  await eventually('copy toggle owner snapshot',async()=>!(await p.locator('.pane-focused').getByRole('button',{name:'Copy on selection'}).getAttribute('aria-pressed')==='true'));
+  await button(p.locator('.pane-focused'),'Right-click passthrough').click();
+  await eventually('mouse toggle owner snapshot',async()=>await p.locator('.pane-focused').getByRole('button',{name:'Right-click passthrough'}).getAttribute('aria-pressed')==='true');
+  const activeTab=active(await snap()).tabs.find(t=>t.active);
+  await api('tab.rename',{tab_id:activeTab.id,name:'agent-rename'});
+  await p.getByRole('tab',{name:'agent-rename',exact:true}).waitFor();
+  await p.locator('.pane-focused').getByLabel('Pane actions').click();
+  await button(p.locator('.pane-focused'),'Close pane').click();
+  await eventually('one-click close',async()=>await p.locator('.pane').count()===1);
+  assert.equal(await dialog(p).count(),0);
+  ok('split sidebar, fixed status dots, styled filters, compact session picker, immediate tabs and automatic splits, core mouse toggles');
+  await p.locator('.sidebar-bottom').getByRole('button',{name:'Settings',exact:true}).click();
+  await choose(p.getByRole('combobox',{name:'Interface language',exact:true}),'zh');
+  await p.getByRole('heading',{name:'通用',exact:true}).waitFor();
+  await p.getByRole('button',{name:'添加主机'}).waitFor();
+  await p.screenshot({path:join(home,'settings-zh.png')});
+  await choose(p.getByRole('combobox',{name:'界面语言',exact:true}),'en');
+  await p.getByRole('combobox',{name:'Core language',exact:true}).waitFor();
+  await choose(p.getByRole('combobox',{name:'notifications.display',exact:true}),'inbox');
+  await eventually('notification preference persisted',async()=> JSON.parse(await readFile(join(home,'config.json'),'utf8')).notifications?.display==='inbox');
+  await button(p,'Appearance').click();
+  await button(p,'Dark').click();
+  assert.equal(await p.evaluate(()=>document.documentElement.dataset.mode),'dark');
+  await p.getByLabel('Interface font size').fill('14');
+  await p.getByLabel('Background image',{exact:true}).setInputFiles(join(repo,'website/public/brand/luvus-logo.png'));
+  await p.getByAltText('Selected background').waitFor();
+  await p.getByLabel('Background visibility').fill('27');
+  await p.screenshot({path:join(home,'appearance-dark.png')});
+  await button(p,'Light').click();
+  await p.screenshot({path:join(home,'appearance-light.png')});
+  await button(p,'Terminal').click();
+  await p.getByLabel('Terminal font size',{exact:true}).fill('17');
+  await button(p,'Back to terminals').click();
+  assert.equal(await p.getByLabel('Terminal input').first().evaluate(e=>getComputedStyle(e).fontSize),'17px');
+  await p.reload();
+  await p.waitForFunction(()=>document.querySelector('.connection-dot.online'));
+  assert.equal(await p.evaluate(()=>document.documentElement.dataset.mode),'light');
+  await p.waitForFunction(()=>document.documentElement.dataset.wallpaper==='true');
+  assert.equal(await p.getByLabel('Terminal input').first().evaluate(e=>getComputedStyle(e).fontSize),'17px');
+  await checkDot();
+  await native.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setContentSize(900,650));
+  await checkDot();
+  await p.screenshot({path:join(home,'sidebar-compact.png')});
+  ok('categorized settings, visible language, live fonts, light/dark mode, local wallpaper survives reload, compact layout');
+});
+
 await scenario('settings-inventory',async ({page:p,native,home,api,env,ok})=>{
   await mkdir(env.CODEX_HOME,{recursive:true});
   const hooks=join(env.CODEX_HOME,'hooks.json');
@@ -251,16 +384,20 @@ await scenario('settings-inventory',async ({page:p,native,home,api,env,ok})=>{
   await p.locator('.sidebar-bottom').getByRole('button',{name:'Settings'}).click();
   const config=await p.evaluate(async()=>(await window.luvus.bootstrap()).find(m=>m.type==='snapshot').snapshot.config);
   const paths=(o,prefix='')=>Object.entries(o).flatMap(([k,v])=>{const name=prefix?prefix+'.'+k:k;return v && typeof v==='object' && !Array.isArray(v) && Object.keys(v).length?paths(v,name):[name];});
-  const rendered=await p.locator('.setting-control [aria-label]').evaluateAll(nodes=>nodes.map(n=>n.getAttribute('aria-label')));
+  const rendered=new Set();
+  for (const key of Object.keys(config)) {
+    await p.getByLabel('Find setting').fill(key);
+    for (const path of await p.locator('.settings-content [aria-label]').evaluateAll(nodes=>nodes.map(n=>n.getAttribute('aria-label')))) rendered.add(path);
+  }
+  assert.ok(rendered.delete('Interface language')); assert.ok(rendered.delete('Core language')); rendered.add('language');
   assert.deepEqual([...rendered].sort(),paths(config).sort());
+  await button(p,'General').click();
   for(const lang of ['zh','ja','ko','de','fr','pt','es','id','en']){
-    await p.getByLabel('Find setting').fill('language');
-    const field=p.getByLabel('language',{exact:true});await field.fill(lang);
-    await button(p,'Save').click();
+    await choose(p.getByRole('combobox',{name:'Core language',exact:true}),lang);
     await eventually('owner language '+lang,async()=>JSON.parse(await readFile(join(home,'config.json'),'utf8')).language===lang);
   }
   ok('every projected core preference has a control; all nine registered language settings persist');
-  await p.getByRole('tab',{name:'integrations',exact:true}).click();
+  await button(p,'Integrations').click();
   const codex=p.locator('[data-agent=codex]');await codex.waitFor();
   const publicRows=(await api('integration.status')).integrations;
   assert.equal(await p.locator('[data-agent]').count(),publicRows.length);
@@ -401,7 +538,7 @@ await scenario('files',async ({page:p,workspace,ok})=>{
   assert.equal(await readFile(join(workspace,'nested/original.txt'),'utf8'),'fixture content');
   ok('cancel preserves the file, stale confirmation refuses replacement, fresh confirmation deletes only the named entry');
   await button(files,'New entry…').click();
-  await dialog(p).getByRole('combobox').selectOption('create_directory');
+  await choose(dialog(p).getByRole('combobox'),'create_directory');
   await dialog(p).getByRole('textbox').fill('created');await submit(p,'Create');
   const folder=files.locator('.file-tree-row').filter({has:p.getByTitle(join(workspace,'created'),{exact:true})});
   await folder.locator('summary').click();await button(folder,'New entry here…').click();
@@ -409,7 +546,7 @@ await scenario('files',async ({page:p,workspace,ok})=>{
   assert.equal(await readFile(join(workspace,'created/lookup-target.txt'),'utf8'),'');
   ok('create folder and new file within the chosen directory');
   await p.keyboard.press('Meta+p');
-  await p.getByRole('combobox',{name:'Search scope'}).selectOption('files');
+  await choose(p.getByRole('combobox',{name:'Search scope'}),'files');
   await p.getByRole('textbox',{name:'Search query'}).fill('lookup-target');
   const result=p.locator('.search-result').filter({hasText:'lookup-target'});
   await eventually('finder indexes new entry',async()=>{
@@ -483,7 +620,7 @@ await scenario('orchestration',async ({page:p,workspace,home,cli,snap,ok})=>{
   const task=p.locator('.task-card').filter({hasText:'Fixture worker'});
   await task.waitFor(); await button(task,'Start').click();
   await dialog(p).getByRole('textbox',{name:'Agent kind'}).fill('codex');
-  await dialog(p).getByRole('combobox',{name:'Execution mode'}).selectOption('worktree');
+  await choose(dialog(p).getByRole('combobox',{name:'Execution mode'}),'worktree');
   await submit(p,'Start worker');
   const tasks=async()=>JSON.parse(await cli('task','list')).result.tasks;
   const live=await eventually('worktree worker',async()=>{
@@ -539,7 +676,7 @@ await scenario('agent-recovery',async ({page:first,native,home,workspace,snap,ap
   await p.locator('.agent-row').filter({hasText:/codex/i}).first().waitFor();
   await button(p,'Orchestration').click();await p.getByRole('tab',{name:'automations'}).click();await button(p,'Schedule agent prompt…').click();
   const d=dialog(p);await d.getByLabel('Name',{exact:false}).fill('Durable check');await d.getByLabel('Prompt').fill('recovered-receipt');
-  await d.getByLabel('Agent terminal').selectOption({index:1});await submit(p,'Schedule');
+  await choose(d.getByLabel('Agent terminal'),{index:1});await submit(p,'Schedule');
   const definition=async()=>(await api('automation.list')).automations.find(a=>a.name==='Durable check');
   const before=await definition();
   assert.equal(before.target.binding,'durable');assert.ok(!JSON.stringify(before).includes(nativeId));
@@ -571,7 +708,7 @@ await scenario('agent-recovery',async ({page:first,native,home,workspace,snap,ap
   });
   await button(p,'Orchestration').click();await p.getByRole('tab',{name:'automations'}).click();
   const card=p.locator('.task-card').filter({hasText:'Durable check'});
-  await button(card,'Rebind terminal…').click();await dialog(p).getByLabel('Agent terminal').selectOption(other.pane_id);
+  await button(card,'Rebind terminal…').click();await choose(dialog(p).getByLabel('Agent terminal'),other.pane_id);
   await button(dialog(p),'Rebind').click();await dialog(p).getByRole('alert').filter({hasText:/identity|native|session|conversation|match/i}).waitFor();
   await button(dialog(p),'Cancel').click();
   assert.equal((await definition()).target.terminal_id,rebound.target.terminal_id);
@@ -581,6 +718,7 @@ await scenario('agent-recovery',async ({page:first,native,home,workspace,snap,ap
 await scenario('mixed-clients',async ({page:p,native,workspace,home,snap,cli,env,ok})=>{
   const original=await snap(), id=ids(original)[0];
   await p.locator('.session-selector').click();
+  await button(p,'Manage connections').click();
   const web=p.locator('[data-bridge=web]');await button(web,'Start read-only').click();
   await native.evaluate(({clipboard})=>{clipboard.writeText=s=>{globalThis.fixturePairing=s;};});
   await button(web,'Copy pairing').click();
@@ -632,7 +770,7 @@ await scenario('mixed-clients',async ({page:p,native,workspace,home,snap,cli,env
     }
     await eventually('origin-only copy reached the App',async()=>await native.evaluate(()=>globalThis.privateCopy)==='LIVE_TAIL_ONLY');
     await cli('ui','notification','push','--text','MixedNotice','--level','info');
-    await p.locator('.global-notice').filter({hasText:'MixedNotice'}).waitFor();
+    assert.equal(await p.locator('.global-notice').count(),0);
     await eventually('TUI renders the shared notice',()=>notice);
     await assert.rejects(readFile(join(home,'tui-clipboard')),{code:'ENOENT'});
     const probe=await native.evaluate(async()=>globalThis.fixtureWeb.webContents.executeJavaScript(`new Promise((res,rej)=>{
@@ -694,7 +832,7 @@ await scenario('active-automation',async ({page:p,home,workspace,snap,cli,env,ok
     await button(p,'Schedule agent prompt…').click();const d=dialog(p);
     await d.getByLabel('Name',{exact:false}).fill('Fixture '+policy);
     await d.getByLabel('Prompt').fill('receipt-'+policy);
-    await d.getByLabel('Agent terminal').selectOption(id);await d.getByLabel('When busy').selectOption(policy);
+    await choose(d.getByLabel('Agent terminal'),id);await choose(d.getByLabel('When busy'),policy);
     await submit(p,'Schedule');
     const card=p.locator('.task-card').filter({has:p.getByRole('heading',{name:'Fixture '+policy})});
     await button(card,'Run now…').click();await submit(p,'Run');
@@ -773,6 +911,7 @@ await scenario('diagnostics',async ({page:p,snap,ok})=>{
   await p.keyboard.type('echo fixture-output-marker');await p.keyboard.press('Enter');
   await eventually('marker visible on owner before opening diagnostics',async()=>(await p.locator('.terminal-accessible').first().textContent()).includes('fixture-output-marker'));
   await p.locator('.session-selector').click();
+  await button(p,'Manage connections').click();
   const listening=port=>new Promise(resolve=>{
     const socket=connect({host:'127.0.0.1',port});
     socket.once('connect',()=>{socket.destroy();resolve(true);});
@@ -808,20 +947,21 @@ await scenario('local-sessions',async ({page:p,native,cli,snap,launch,ok})=>{
   const observer = await launch();
   const connection = async (name) => {
     await p.locator('.session-selector').filter({hasText:name}).click();
+    await button(p,'Manage connections').click();
     await button(p,'List sessions').click();
   };
-  await connection('matrix');
-  await button(p,'New session…').click();
+  await button(p,'Switch session').click();
+  await button(p,'New session').click();
   await dialog(p).getByRole('textbox').fill('matrix-spare');
   await button(dialog(p),'Create and switch').click();
-  await p.locator('.session-selector strong').filter({hasText:'matrix-spare'}).waitFor({timeout:25_000});
+  await p.locator('.session-selector .session-name').filter({hasText:'matrix-spare'}).waitFor({timeout:25_000});
   assert.equal((await snap()).server_generation, original.server_generation);
-  assert.equal(await observer.locator('.session-selector strong').textContent(),'matrix');
+  assert.equal(await observer.locator('.session-selector .session-name').textContent(),'matrix');
   ok('new session attaches only this window; original server and second client are unchanged');
-  await connection('matrix-spare');
+  await button(p,'Switch session').click();
+  await p.locator('.session-option').filter({has:p.getByText('matrix',{exact:true})}).click();
   const row = name=>p.locator('.list-card').filter({has:p.getByText(name,{exact:true})});
-  await button(row('matrix'),'Switch').click();
-  await p.waitForFunction(()=>document.querySelector('.session-selector strong')?.textContent==='matrix',null,{timeout:25_000});
+  await p.waitForFunction(()=>document.querySelector('.session-selector .session-name')?.textContent==='matrix',null,{timeout:25_000});
   await connection('matrix');
   // Drive the native confirmation boundary without touching system UI or
   // granting authority to the renderer to confirm its own requests.
@@ -849,11 +989,14 @@ await scenario('commander-receipts',async ({page:p,workspace,home,snap,env,ok})=
   const fixture=join(home,'codex');
   await exec('/usr/bin/cc',[join(repo,'app/tests/fixtures/composer.c'),'-o',fixture],{cwd:workspace,env});
   const first=ids(await snap())[0];
-  await button(p,'Split active pane').click(); await submit(p,'Create split');
+  await button(p,'Split active pane').click(); assert.equal(await dialog(p).count(),0);
   await eventually('split',async()=>ids(await snap()).length===2);
   const other=ids(await snap()).find(id=>id!==first);
+  await eventually('both split canvases painted',async()=>await p.locator('.pane canvas').count()===2);
   for (const [i,mode] of [[0,'idle'],[1,'busy']]) {
-    const canvas=p.locator('.pane canvas').nth(i); await canvas.click();
+    const expected=ids(await snap())[i];
+    const canvas=p.locator('.pane canvas').nth(i); await canvas.click({position:{x:10,y:10}});
+    await eventually('owner focus before typing',async()=>tab(await snap()).panes.find(pane=>pane.focused)?.pane_id===expected);
     await p.keyboard.type('exec '+fixture+' '+mode); await p.keyboard.press('Enter');
     const sentinel=mode==='idle'?'Ready for your next task':'Generating answer (esc to cancel';
     await eventually('composer started '+mode,async()=>(await p.locator('.terminal-accessible').nth(i).textContent()).includes(sentinel));

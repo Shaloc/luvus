@@ -227,7 +227,7 @@ export class BrowserHost {
       this.revoke(tab, 'control_revoked', true, true);
       this.invalidateDocument(tab);
     });
-    contents.on('page-title-updated', () => tab.cdp?.changed());
+    contents.on('page-title-updated', () => { tab.cdp?.changed(); this.onMetadataChanged?.(descriptor.id); });
     contents.on('did-navigate', () => { tab.cdp?.changed(); this.onMetadataChanged?.(descriptor.id); });
     contents.on('did-navigate-in-page', (_event, _url, main) => { if (main) { tab.cdp?.changed(); this.onMetadataChanged?.(descriptor.id); } });
     contents.debugger.on('message', (_event, method, params, sessionId) => {
