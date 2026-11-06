@@ -22,7 +22,7 @@ export async function buildIcon() {
 
 export async function writeNotices() {
   const lock = JSON.parse(await readFile(path.join(appRoot, "package-lock.json"), "utf8"));
-  const notices = ["Third-party notices for the JavaScript and CSS bundled with Luvus desktop.\n"];
+  const notices = ["Third-party notices for Luvus desktop.\n"];
   for (const [relative, entry] of Object.entries(lock.packages)) {
     if (!relative.includes("node_modules/") || entry.link) continue;
     if (entry.dev && relative !== "node_modules/tailwindcss") continue;
@@ -41,6 +41,10 @@ export async function writeNotices() {
       throw new Error(`Missing third-party license notice: ${manifest.name}`);
     }
     for (const filename of licenseFiles) notices.push(await readFile(path.join(directory, filename), "utf8"));
+  }
+  notices.push("\n--- Symbols Nerd Font Mono 3.4.0 ---\nhttps://github.com/ryanoasis/nerd-fonts/tree/v3.4.0/patched-fonts/NerdFontsSymbolsOnly");
+  for (const file of ["SYMBOLS-LICENSE", "LICENSE", "license-audit.md"]) {
+    notices.push(await readFile(path.join(appRoot, "apps/renderer/public/fonts/nerd-symbols", file), "utf8"));
   }
   const directory = path.join(appRoot, ".build");
   await mkdir(directory, { recursive: true });

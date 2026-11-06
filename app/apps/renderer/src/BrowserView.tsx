@@ -5,6 +5,19 @@ import { request, reportError } from './bridge';
 import { record, targetKey, text, type Pane } from './model';
 import { AsyncButton, Empty, IconButton } from './ui';
 
+function guestBounds(surface: HTMLElement | null) {
+  if (!surface || !surface.isConnected || document.querySelector('dialog[open]')) return null;
+  const {left,top,right,bottom} = surface.getBoundingClientRect();
+  const x = Math.max(0,left), y = Math.max(0,top);
+  const r = Math.min(innerWidth,right), b = Math.min(innerHeight,bottom);
+  if (r <= x || b <= y) return null;
+  for (const overlay of document.querySelectorAll('[data-app-overlay], details.dropdown[open] > .dropdown-menu')) {
+    const rect = overlay.getBoundingClientRect();
+    if (rect.width && rect.height && rect.left < r && rect.right > x && rect.top < b && rect.bottom > y) return null;
+  }
+  return {x,y,width:r-x,height:b-y};
+}
+
 const opened = new Set<string>();
 export function rememberBrowser(generation: string, pane: string) {
   opened.add(`${generation}:${pane}`);
@@ -46,13 +59,7 @@ export function BrowserView({ pane }: { pane: Pane }) {
     let frame = 0;
     const place = () => {
       frame = 0;
-      const rect = surface.current?.getBoundingClientRect();
-      const hidden = state !== 'ready' || !rect || document.querySelector('dialog[open], [data-app-overlay], details.dropdown[open]');
-      const bounds = hidden ? null : {
-        x: Math.max(0, rect.left), y: Math.max(0, rect.top),
-        width: Math.max(0, Math.min(rect.right, window.innerWidth) - Math.max(0, rect.left)),
-        height: Math.max(0, Math.min(rect.bottom, window.innerHeight) - Math.max(0, rect.top)),
-      };
+      const bounds = state === 'ready' ? guestBounds(surface.current) : null;
       void window.luvus.browserBounds(browser, bounds).catch(reportError);
     };
     const schedule = () => { if (!frame) frame = requestAnimationFrame(place); };
@@ -85,13 +92,17 @@ export function BrowserView({ pane }: { pane: Pane }) {
   };
   useEffect(() => {
     const resume = () => { if (pane.target && opened.has(`${pane.target.generation}:${pane.id}`)) void open().catch(reportError); };
+    currentIdentity.current = identity;
     resume(); window.addEventListener('luvus-browser-created', resume);
     return () => { currentIdentity.current = ''; window.removeEventListener('luvus-browser-created', resume); };
   }, [identity]);
   const navigate = async (action: 'navigate' | 'back' | 'forward' | 'reload') => {
-    if (!browser) return;
+    const bounds = guestBounds(surface.current);
+    if (!browser || !bounds || state !== 'ready') return;
+    if (currentIdentity.current !== identity) return;
     editing.current = false;
-    await window.luvus.browserNavigate(browser, action, action === 'navigate' ? url : undefined);
+    try { await window.luvus.browserNavigate(browser, action, bounds, action === 'navigate' ? url : undefined); }
+    catch (error) { if (currentIdentity.current === identity) throw error; }
   };
   return <div className="browser-view">
     <form className="native-toolbar browser-toolbar" onSubmit={event => { event.preventDefault(); void navigate('navigate').catch(reportError); }}>

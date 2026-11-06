@@ -32,13 +32,31 @@ over the saved local choice.
 ## Desktop controls
 
 The sidebar separates host-grouped workspaces and agents into independently
-scrollable sections. Drag their divider to change the split. Agent state,
+scrollable sections. Click either heading to collapse its list, or drag the divider
+to change the split when both lists are expanded. The title bar has independent
+left- and right-sidebar toggles. Hiding the right sidebar also hides the tool
+rail; showing it again restores the open panel. Agent state,
 workspace scope, grouping (workspace, state, date or ungrouped), and section
 size are local display preferences. The session button opens an on-demand
 session picker; connection diagnostics remain under **Manage connections**.
 Open Workspace offers the attached session and discovered sessions on registered hosts. The directory is resolved by the selected owner; Finder is only offered for local folders.
 
 **New tab** and Command-T create a terminal immediately. Unnamed tabs display their one-based position; names set by a user or agent take precedence. Closing an individual pane takes effect immediately.
+General → Confirmations controls whether closing a whole tab asks first.
+Command-1 through Command-9 select tabs by position, including from an embedded
+browser page. The desktop reads the core's effective prefix and command bindings;
+changes in Keybindings apply without restarting. With `ctrl+b` configured, press
+Control-B, release it, then `c` for a tab, `n`/`p` to cycle tabs, `v`/`s`/`+` to
+split, `h`/`j`/`k`/`l` to focus, `x` to close a pane, or `z` to zoom. Prefix then
+`?` shows the effective bindings. Press the prefix twice to send it to the child;
+Escape cancels it. Text fields, dialogs and IME composition keep their input.
+Switching panes, tabs, workspaces or sessions cancels an unfinished prefix.
+Resize mode uses arrows or `hjkl`, Shift for a larger step, and `=` to equalize.
+Keyboard copy mode supports viewport selection and paging; each page starts a new
+selection, and TUI cross-page selection/search is not yet exposed in the desktop.
+Registered projections retain their existing topology restrictions; attach the
+owner session directly to create, close or resize its panes. Prefix commands are
+desktop-shell shortcuts, not shortcuts injected into browser-page content.
 Both split buttons and the command-palette split action immediately request
 the core's automatic split direction. Rename, move and transpose remain
 separate actions. A new browser opens in a sibling core-owned tab, without
@@ -49,18 +67,34 @@ Integrations and Advanced categories, plus cross-category search. General
 offers a device interface language (English, Simplified Chinese or system default)
 separately from the nine-language core selector. Appearance controls the desktop light/dark/system mode, interface
 font/size, terminal theme and local background image. Terminal controls its
-own font/size. Pick from installed font families, filtered to monospaced families for the terminal. Backgrounds accept PNG,
+own font/size. Pick from installed font families, filtered to monospaced families for the terminal.
+Terminal text uses the selected font with a bundled, offline Symbols Nerd Font Mono fallback
+for private-use icons. Each pane has one rounded outer border; the accent follows
+focus. Its header and grid share a background matching the device light/dark mode.
+Explicit application colors are preserved. Backgrounds accept PNG,
 JPEG and WebP up to 20 MB and 32 megapixels, with visibility and fill/fit
 controls; images stay in this device's Electron profile, not the owner config.
+The terminal theme also controls ANSI slots 0–15, including existing output.
+True-color cells and the fixed 256-color cube retain their application colors.
+The TUI resolves ANSI through its outer terminal (for example Kitty), so that
+terminal's own palette can differ from the desktop even with the same Luvus theme.
+
+The pane header uses the terminal's live title unless you explicitly name the
+pane. In Settings → Agents, enable title-first display to use that title as the
+sidebar label too. For a Codex session that does not publish titles, enter
+`/title thread-title project-name` in its terminal; this only changes that
+session. Luvus does not change the user's Codex configuration.
 
 The terminal header exposes right-click passthrough and copy-on-selection
 toggles for local and direct-SSH terminals. These are the core pane's persisted
-mouse preferences, shared with TUI. Right-click opens the native terminal menu; Shift-right-click also opens it while a mouse-reporting program owns right-click. Registered projected terminals cannot yet
+mouse preferences, shared with TUI. Right-click opens a themed pane menu for selection, paste, splits, tab moves and pane actions. Workspace rows expose the same actions through right-click and the ellipsis. Shift-right-click opens the pane menu while a mouse-reporting program owns right-click. Registered projected terminals cannot yet
 change them from the desktop. New browser-tab creation and mouse toggles need
 the updated owner; an older running owner is never automatically restarted.
 
 ```sh
-npm --prefix app run test:matrix -- desktop-ux layout-history local-sessions settings-inventory
+npm --prefix app run test:matrix -- workbench-layout desktop-ux layout-history local-sessions settings-inventory
+# Optional: exercise live title changes using an installed Codex CLI and a disposable profile.
+npm --prefix app run test:matrix -- codex-title
 ```
 
 ## Browser checks

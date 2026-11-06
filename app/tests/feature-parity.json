@@ -15,7 +15,7 @@
     {"area":"Diagnostics and gateways","methods":["ping","uhp","wait","events"],"surface":"SettingsPanels.tsx","entry":"Core connection and structured tools","scenarios":["diagnostics"],"remaining":[]}
   ],
   "scenarios": {
-    "desktop-ux":{"driver":"desktop-matrix.mjs","check":"Independent footer hover targets, numbered and agent-renamed tabs, immediate splits and pane close, native terminal menu, continuous ANSI background pixels, interface language, fonts and device-local wallpaper"},
+    "desktop-ux":{"driver":"desktop-matrix.mjs","check":"Independent footer hover targets, numbered and agent-renamed tabs, immediate splits and pane close, themed terminal context menu, continuous ANSI background pixels, interface language, fonts and device-local wallpaper"},
     "direct-ssh":{"driver":"ssh-e2e.mjs","check":"Real SSH terminal input and detach; no display-local owner starts"},
     "local-sessions":{"driver":"desktop-matrix.mjs","check":"Create, attach, switch, cancel, stop and delete; another window stays on the original generation"},
     "ssh-admission-and-jump":{"driver":"registered-ssh.mjs","check":"Connect a registered host from the UI and enable merge, optionally through two real ProxyJump hops on the isolated fixture"},

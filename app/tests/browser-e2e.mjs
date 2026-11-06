@@ -17,6 +17,7 @@ const remote = process.argv.includes('--remote-substitute');
 const home = await mkdtemp(join(root, remote ? 'target/remote-smoke-app-' : 'target/app-e2e-browser-'));
 const workspace = join(home, 'workspace');
 await mkdir(workspace);
+await writeFile(join(workspace,'notes.txt'), 'File menu regression fixture\n');
 await mkdir(join(home, 'electron'));
 await mkdir(join(home, 'tmp'));
 await writeFile(join(home, '.isolated-app'), home);
@@ -111,10 +112,37 @@ try {
   assert.equal(await page.getByLabel('Browser address').inputValue(), '');
   assert.ok(!proxyRequests.some(req => req.url.includes('new-tab.luvus.invalid')), 'legacy blank tab must never hit a network');
   assert.equal((await browser('control','status','--browser',(await browser('list')).browsers.find(b=>b.state==='ready').browser_id)).control.state, 'uncontrolled');
+  // CSS pixels and the native child view's DIPs diverge when the shell is zoomed.
+  for (const zoom of [0.8,1.25,1]) {
+    await desktop.evaluate(({BrowserWindow},z)=>BrowserWindow.getAllWindows()[0].webContents.setZoomFactor(z),zoom);
+    await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
+    const address=page.getByLabel('Browser address'), url=`http://owner-only.invalid:${contentPort}/zoom-${zoom}`;
+    await address.fill(url); await address.press('Enter');
+    await page.waitForFunction(()=>document.querySelector('.global-error') || document.querySelector('.tab-item.selected')?.textContent.includes('Owner browser fixture'),null,{timeout:5000});
+    assert.equal(await page.locator('.global-error').allTextContents().then(a=>a.join(';')),'');
+    const limit=Date.now()+5000;
+    let guest;
+    do {
+      guest=await desktop.evaluate(({BrowserWindow})=>{
+        const view=BrowserWindow.getAllWindows()[0].contentView.children.find(v=>v.getVisible() && v.webContents?.getTitle()==='Owner browser fixture');
+        return view && {url:view.webContents.getURL(),bounds:view.getBounds()};
+      });
+      if(guest?.url===url)break;
+      await new Promise(r=>setTimeout(r,30));
+    } while(Date.now()<limit);
+    assert.equal(guest?.url,url);
+    const css=await page.locator('.browser-surface').boundingBox();
+    for(const k of ['x','y','width','height'])assert.ok(Math.abs(css[k]*zoom-guest.bounds[k])<=1.5,`${zoom} ${k} ${css[k]} ${guest.bounds[k]}`);
+  }
+  // An open file menu outside the guest must not hide the browser beneath its address bar.
+  await page.getByRole('button',{name:'Files',exact:true}).click();
+  await page.locator('.files-panel details.dropdown summary').first().click();
+  await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));
   await page.getByLabel('Browser address').fill(`http://owner-only.invalid:${contentPort}/`);
   await page.getByLabel('Browser address').press('Enter');
   await page.getByRole('tab',{name:'Owner browser fixture',exact:true}).waitFor();
   assert.equal(await page.locator('.global-error').count(),0);
+  await page.getByRole('button',{name:'Close tools panel'}).click();
   const inventory = await browser('list');
   assert.equal(await page.getByRole('tab').count(), 2, 'browser is a peer tab');
   await page.getByRole('tab', {name:'1',exact:true}).click();

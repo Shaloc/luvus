@@ -1,7 +1,7 @@
 import type { Request, Target, TerminalFrame } from '@luvus/app-protocol';
 import { safeLink, unpackColor } from './colors.js';
 import { accessibleText, cellAt, cellPoint, keyRoute, selectionRange, styledRuns, takeInputBatch, terminalButton, type Point, type SelectionMode } from './model.js';
-export { safeLink, unpackColor } from './colors.js';
+export { safeLink, unpackColor, terminalAnsiPalette } from './colors.js';
 
 type Input = Extract<Request, { type: 'input' }>['input'];
 export interface TerminalOptions {
@@ -10,7 +10,7 @@ export interface TerminalOptions {
   onError: (error: unknown) => void;
   onLink: (url: string) => void;
   onFocus: () => void;
-  onMenu?: (x: number, y: number) => void;
+  onMenu?: (x: number, y: number, link?: string) => void;
   fontSize?: number;
   fontFamily?: string;
   /** Retained history is enabled by default; false disables host history gestures. */
@@ -27,6 +27,9 @@ export class CanvasTerminal {
   private readonly abort = new AbortController();
   private readonly observer: ResizeObserver;
   private frame: TerminalFrame | null = null;
+  private previewFrame: TerminalFrame | null = null;
+  private awaitingFrame: Input[] = [];
+  private awaitingFrameBytes = 0;
   private raf = 0;
   private resizeRaf = 0;
   private composing = false;
@@ -34,6 +37,7 @@ export class CanvasTerminal {
   private held = new Map<string, Extract<Input, { kind: 'key' }>>();
   private pendingTextKey: { code: string; shift: boolean; repeat: boolean } | null = null;
   private selection: { anchor: Point; cursor: Point; mode: SelectionMode; revision: string } | null = null;
+  private keyboardCopy: { cursor: Point; anchor: Point; revision: string } | null = null;
   private pointer: { id: number; button: number; reporting: boolean; geometry: string } | null = null;
   private click = { time: 0, row: -1, col: -1, count: 0 };
   private wheelPoint: Point = [0, 0];
@@ -54,16 +58,18 @@ export class CanvasTerminal {
   private fontFamily: string;
   private backgroundOpacity = 1;
   private rightClickToApp = false;
+  private ansi: readonly string[] | undefined;
 
-  setAppearance(value: { fontSize: number; fontFamily: string; backgroundOpacity: number; rightClickToApp: boolean; foreground: string; background: string }) {
+  setAppearance(value: { fontSize: number; fontFamily: string; backgroundOpacity: number; rightClickToApp: boolean; foreground: string; background: string; ansi?: readonly string[] }) {
     this.fontSize = Math.min(32, Math.max(9, value.fontSize));
     this.fontFamily = value.fontFamily;
     this.backgroundOpacity = Math.min(1, Math.max(0, value.backgroundOpacity));
     this.rightClickToApp = value.rightClickToApp;
+    this.ansi = value.ansi;
     this.host.style.setProperty('--terminal-fg', value.foreground);
     this.host.style.setProperty('--terminal-bg', value.background);
     this.preedit.style.font = this.textarea.style.font = `${this.fontSize}px ${this.fontFamily}`;
-    this.measure(); this.schedule();
+    this.measure(); this.paint();
   }
 
   constructor(private readonly host: HTMLElement, private readonly options: TerminalOptions) {
@@ -99,7 +105,7 @@ export class CanvasTerminal {
     this.textarea.addEventListener('compositionend', (event) => {
       this.composing = false;
       this.preedit.textContent = '';
-      if (event.data) this.input({ kind: 'paste', text: event.data });
+      if (event.data && !this.keyboardCopy) this.input({ kind: 'paste', text: event.data });
       this.compositionCommit = event.data;
       this.textarea.value = '';
     }, { signal });
@@ -107,7 +113,7 @@ export class CanvasTerminal {
     this.textarea.addEventListener('paste', (event) => {
       event.preventDefault();
       const text = event.clipboardData?.getData('text/plain');
-      if (text) this.input({ kind: 'paste', text });
+      if (text && !this.keyboardCopy) this.input({ kind: 'paste', text });
     }, { signal });
     this.textarea.addEventListener('focus', () => {
       options.onFocus();
@@ -115,6 +121,7 @@ export class CanvasTerminal {
       this.schedule();
     }, { signal });
     this.textarea.addEventListener('blur', () => {
+      this.endKeyboardCopy();
       for (const key of this.held.values()) this.input({ ...key, repeat: false, release: true });
       this.held.clear(); this.pendingTextKey = null;
       if (this.frame) this.input({ kind: 'focus_event', focused: false });
@@ -127,8 +134,10 @@ export class CanvasTerminal {
     this.canvas.addEventListener('pointercancel', this.pointerup, { signal });
     this.canvas.addEventListener('contextmenu', event => {
       event.preventDefault();
-      if (this.rightClickToApp && this.frame?.modes.mouse && !this.frame.scroll_offset && !event.shiftKey) return;
-      options.onMenu?.(event.clientX, event.clientY);
+      if (!this.frame) return;
+      if (this.rightClickToApp && this.frame.modes.mouse && !this.frame.scroll_offset && !event.shiftKey) return;
+      const href = this.frame && cellAt(this.frame, this.point(event))?.link;
+      options.onMenu?.(event.clientX, event.clientY, (href && safeLink(href)) || undefined);
     }, { signal });
     host.addEventListener('wheel', (event) => {
       if (!this.frame || options.enableScroll === false) return;
@@ -157,6 +166,7 @@ export class CanvasTerminal {
     this.observer = new ResizeObserver(() => this.scheduleResize());
     this.observer.observe(host);
     window.addEventListener('resize', () => this.scheduleResize(), { signal });
+    document.fonts.addEventListener('loadingdone', () => this.scheduleResize(), { signal });
     void document.fonts.ready.then(() => { if (!this.disposed) this.measure(); });
     this.measure();
   }
@@ -172,6 +182,7 @@ export class CanvasTerminal {
   }
 
   private pointerdown = (event: PointerEvent) => {
+    if (this.keyboardCopy) this.endKeyboardCopy();
     const frame = this.frame;
     if (!frame) return;
     const point = this.point(event);
@@ -181,6 +192,7 @@ export class CanvasTerminal {
       if (url) { event.preventDefault(); this.options.onLink(url); return; }
     }
     const reporting = frame.modes.mouse && !event.shiftKey && frame.scroll_offset === 0 && (event.button !== 2 || this.rightClickToApp);
+    if (!reporting && event.button === 2) { this.activate(); this.focus(); return; }
     if (!reporting && event.button !== 0) return;
     event.preventDefault(); this.activate(); this.focus();
     if (!this.viewport.startsWith(`${frame.cols}:${frame.rows}:`)) { this.selection = null; return; }
@@ -235,11 +247,73 @@ export class CanvasTerminal {
     if (this.frame && this.selection) this.input({ kind: 'copy', geometry: this.frame.geometry });
   }
 
+  command(command: string) {
+    const frame=this.frame;if(!frame || this.disposed) return;
+    this.focus();
+    if(command==='copy_mode') {
+      const point:Point=[Math.min(frame.rows-1,frame.cursor?.row ?? frame.rows-1),Math.min(frame.cols-1,frame.cursor?.col ?? 0)];
+      this.keyboardCopy={cursor:point,anchor:point,revision:frame.revision};
+      this.host.dataset.keyboardCopy='true';this.selectKeyboardRange();return;
+    }
+    const lines=command==='scroll:PageUp' ? frame.rows-1 : command==='scroll:PageDown' ? 1-frame.rows : command==='scroll:Home' ? 32767 : command==='scroll:End' ? -32768 : 0;
+    if(lines) {this.selection=null;this.input({kind:'scroll',lines});}
+  }
+
+  private endKeyboardCopy() {
+    this.keyboardCopy=null;delete this.host.dataset.keyboardCopy;this.selection=null;this.schedule();
+  }
+
+  private selectKeyboardRange() {
+    const copy=this.keyboardCopy;if(!copy)return;
+    this.selection={...copy,mode:'cell'};this.schedule();
+  }
+
+  private copyKey(event:KeyboardEvent) {
+    const copy=this.keyboardCopy,frame=this.frame;if(!copy || !frame)return;
+    event.preventDefault();event.stopPropagation();
+    if(['Escape','q'].includes(event.key)) {this.endKeyboardCopy();return;}
+    if(['y','Enter'].includes(event.key) || event.metaKey && event.key==='c') {
+      if(!event.repeat && copy.revision===frame.revision) {
+        this.input({kind:'selection',geometry:frame.geometry,revision:frame.revision,start:copy.anchor,end:copy.cursor,mode:'cell'});
+        this.input({kind:'copy',geometry:frame.geometry});
+      }
+      this.endKeyboardCopy();return;
+    }
+    let [row,col]=copy.cursor;
+    if(['ArrowLeft','h'].includes(event.key)) col--;
+    else if(['ArrowRight','l'].includes(event.key)) col++;
+    else if(['ArrowUp','k'].includes(event.key)) row--;
+    else if(['ArrowDown','j'].includes(event.key)) row++;
+    else if(event.key==='0') col=0;
+    else if(event.key==='$') col=frame.cols-1;
+    else if(event.key==='v' || event.key==='V') copy.anchor=[row,col];
+    else if(['PageUp','b','PageDown','f',' ','Home','g','End','G'].includes(event.key)) {
+      // The wire selection addresses one exact viewport. Scrolling starts a new
+      // selection on its fresh frame, never reusing old cell coordinates.
+      const key=({b:'PageUp',f:'PageDown',' ':'PageDown',g:'Home',G:'End'} as Record<string,string>)[event.key] ?? event.key;
+      this.command('scroll:'+key);return;
+    }
+    copy.cursor=[Math.max(0,Math.min(frame.rows-1,row)),Math.max(0,Math.min(frame.cols-1,col))];
+    this.selectKeyboardRange();
+  }
+
   private activate() {
     this.enqueue({ type: 'focus', id: crypto.randomUUID(), target: this.options.target, activate: true });
   }
 
   private input(input: Input) {
+    if (!this.frame) {
+      // A tab preview may paint before its live frame arrives. Retain only text
+      // for this exact terminal lifetime; pointer geometry is never replayed.
+      if (!this.disposed && (input.kind === 'key' || input.kind === 'paste')) {
+        const bytes = input.kind === 'paste' ? new TextEncoder().encode(input.text).length : 32;
+        if (this.awaitingFrame.length >= 256 || this.awaitingFrameBytes + bytes > 256 * 1024) {
+          this.options.onError(new Error('Terminal input is backlogged. Further input was not sent.')); return;
+        }
+        this.awaitingFrame.push(input); this.awaitingFrameBytes += bytes;
+      }
+      return;
+    }
     if (input.kind === 'paste' && new TextEncoder().encode(input.text).length > 256 * 1024) {
       this.options.onError(new Error('Paste exceeds the core limit of 256 KiB.')); return;
     }
@@ -263,6 +337,9 @@ export class CanvasTerminal {
         const batch = takeInputBatch(this.queue);
         try {
           const receipts = await Promise.allSettled(batch.map(request => this.options.send(request)));
+          if (receipts.some((result,i)=>result.status==='rejected' && batch[i]?.type==='input' && batch[i].input.kind==='selection')) {
+            this.queue=this.queue.filter(request=>request.type!=='input' || request.input.kind!=='copy');
+          }
           const failure = receipts.find((result, i) => {
             if (result.status !== 'rejected') return false;
             const r = batch[i];
@@ -288,6 +365,7 @@ export class CanvasTerminal {
   }
 
   private keydown = (event: KeyboardEvent) => {
+    if(this.keyboardCopy) {this.copyKey(event);return;}
     // Ctrl+C remains child input; explicit host copy never reads the clipboard.
     if (this.selection && event.key.toLowerCase() === 'c' && (event.metaKey || (event.ctrlKey && event.shiftKey))) {
       event.preventDefault(); event.stopPropagation(); this.copy(); return;
@@ -316,6 +394,7 @@ export class CanvasTerminal {
   };
 
   private beforeinput = (event: InputEvent) => {
+    if(this.keyboardCopy) {event.preventDefault();return;}
     if (event.isComposing || this.composing || event.inputType === 'insertCompositionText') return;
     event.preventDefault();
     if (event.inputType === 'insertFromPaste') return; // The paste event is authoritative.
@@ -332,7 +411,13 @@ export class CanvasTerminal {
 
   focus() { this.textarea.focus({ preventScroll: true }); }
 
+  // A cached frame is for the first paint only; input and geometry always use a live frame.
+  preview(frame: TerminalFrame) {
+    if (!this.frame) { this.previewFrame = frame; this.waiting.remove(); this.paint(); }
+  }
+
   update(frame: TerminalFrame) {
+    if (this.disposed) return;
     if (!Number.isInteger(frame.cols) || !Number.isInteger(frame.rows) || frame.cols < 1 || frame.cols > 500 || frame.rows < 1 || frame.rows > 300 || frame.cells.length > frame.cols * frame.rows) {
       this.options.onError(new Error('The core terminal frame exceeds the supported geometry budget.'));
       return;
@@ -341,8 +426,19 @@ export class CanvasTerminal {
     if (f.generation !== t.generation || f.workspace_id !== t.workspace_id || f.tab_id !== t.tab_id || f.pane_id !== t.pane_id || f.terminal_id !== t.terminal_id) return;
     if (this.frame?.revision === frame.revision && this.frame.geometry === frame.geometry) return;
     if (this.selection && this.selection.revision !== frame.revision) this.selection = null;
+    if(this.keyboardCopy) {
+      if(this.frame?.scroll_offset!==frame.scroll_offset && this.frame?.geometry===frame.geometry) {
+        const point:Point=[Math.min(frame.rows-1,this.keyboardCopy.cursor[0]),Math.min(frame.cols-1,this.keyboardCopy.cursor[1])];
+        this.keyboardCopy={cursor:point,anchor:point,revision:frame.revision};this.selectKeyboardRange();
+      } else this.endKeyboardCopy();
+    }
     this.waiting.remove();
-    this.frame = frame; this.images.update(frame.graphics??[]); this.schedule();
+    const first = !this.frame;
+    this.previewFrame = null; this.frame = frame; this.images.update(frame.graphics??[]);
+    const waiting = this.awaitingFrame;
+    this.awaitingFrame = []; this.awaitingFrameBytes = 0;
+    for (const input of waiting) this.input(input);
+    if (first) this.paint(); else this.schedule();
   }
 
   private scheduleResize() {
@@ -360,7 +456,8 @@ export class CanvasTerminal {
     this.cellHeight = Math.ceil(this.fontSize * 1.45);
     this.width = this.host.clientWidth; this.height = this.host.clientHeight;
     const dpr = window.devicePixelRatio || 1;
-    this.canvas.width = Math.round(this.width * dpr); this.canvas.height = Math.round(this.height * dpr);
+    if (this.canvas.width !== Math.round(this.width * dpr)) this.canvas.width = Math.round(this.width * dpr);
+    if (this.canvas.height !== Math.round(this.height * dpr)) this.canvas.height = Math.round(this.height * dpr);
     this.canvas.style.width = `${this.width}px`; this.canvas.style.height = `${this.height}px`;
     if (this.width > 0 && this.height > 0) {
       const cols = Math.max(2, Math.min(500, Math.floor(this.width / this.cellWidth)));
@@ -389,7 +486,7 @@ export class CanvasTerminal {
     context.globalAlpha = this.backgroundOpacity;
     context.fillStyle = this.background; context.fillRect(0, 0, this.width, this.height);
     context.globalAlpha = 1;
-    const frame = this.frame;
+    const frame = this.frame ?? this.previewFrame;
     if (!frame) return;
     context.textBaseline = 'alphabetic';
     const baseline = Math.round((this.cellHeight - this.fontSize) / 2) + this.fontSize - 2;
@@ -398,7 +495,7 @@ export class CanvasTerminal {
     for (const cell of frame.cells) {
       if (cell.col >= frame.cols || cell.row >= frame.rows) continue;
       const reverse = Boolean(cell.mods & 64);
-      const bg = unpackColor(reverse ? cell.fg : cell.bg, reverse ? this.foreground : this.background);
+      const bg = unpackColor(reverse ? cell.fg : cell.bg, reverse ? this.foreground : this.background, this.ansi);
       if (bg !== this.background) {
         context.fillStyle = bg;
         const snap = (pos: number) => Math.round(pos * dpr) / dpr;
@@ -413,14 +510,15 @@ export class CanvasTerminal {
       if (!cell.text || cell.mods & 128) continue;
       const x = cell.col * this.cellWidth, y = cell.row * this.cellHeight;
       const reverse = Boolean(cell.mods & 64);
-      context.fillStyle = unpackColor(reverse ? cell.bg : cell.fg, reverse ? this.background : this.foreground);
+      context.fillStyle = unpackColor(reverse ? cell.bg : cell.fg, reverse ? this.background : this.foreground, this.ansi);
       context.globalAlpha = cell.mods & 2 ? 0.6 : 1;
       context.font = `${cell.mods & 4 ? 'italic ' : ''}${cell.mods & 1 ? 'bold ' : ''}${this.fontSize}px ${this.fontFamily}`;
       const advance = cell.width * this.cellWidth;
 
       context.save();
       context.beginPath(); context.rect(x, y, advance, this.cellHeight); context.clip();
-      context.fillText(cell.text, x, y + baseline);
+      if (cell.symbol) context.fillText(cell.text, x, y + baseline, advance);
+      else context.fillText(cell.text, x, y + baseline);
       context.restore();
       if (cell.mods & 8) context.fillRect(x, y + this.cellHeight - 2, advance, 1);
       if (cell.mods & 256) context.fillRect(x, y + this.cellHeight / 2, advance, 1);
@@ -462,8 +560,9 @@ export class CanvasTerminal {
 
   dispose() {
     this.images.dispose();
+    this.awaitingFrame = []; this.awaitingFrameBytes = 0;
     this.queue = [];
-    for (const key of this.held.values()) this.input({ ...key, repeat: false, release: true });
+    if (this.frame) for (const key of this.held.values()) this.input({ ...key, repeat: false, release: true });
     this.held.clear(); this.pendingTextKey = null;
     if (this.frame && document.activeElement === this.textarea) this.input({ kind: 'focus_event', focused: false });
     this.disposed = true; this.abort.abort(); this.observer.disconnect();

@@ -6,7 +6,7 @@ import { type OpenDialog } from './Actions';
 import { array, label, record, text, type Snapshot } from './model';
 import { AsyncButton, Choice, Detail, ErrorBox, IconButton, Loading } from './ui';
 import { LocalAddons, SettingRow, flatten, nest } from './SettingsPanels';
-import { chooseWallpaper, defaultAppearance, setAppearance, useAppearance, useWallpaper } from './appearance';
+import { chooseWallpaper, defaultAppearance, setAppearance, terminalFontStack, useAppearance, useWallpaper } from './appearance';
 
 const categories = [
   { id: 'general', label: 'General', icon: Settings2 }, { id: 'appearance', label: 'Appearance', icon: Palette },
@@ -37,6 +37,7 @@ export function SettingsPanel({ snapshot, openDialog }: { snapshot: Snapshot; op
   const [selected, setSelected] = useState('general'), [search, setSearch] = useState('');
   const entries = flatten(snapshot.config).filter(([path]) => !(path.length === 1 && path[0] === 'language')).filter(([path]) => search ? `${tr(label(path.at(-1)!))} ${label(path.join('.'))} ${path.join('.')}`.toLowerCase().includes(search.toLowerCase()) : category(path) === selected);
   const showLanguage = !search ? selected === 'general' : ['Interface language','Core language','Language'].some(s => (s+' '+tr(s)).toLowerCase().includes(search.toLowerCase()));
+  const showConfirmation = !search ? selected === 'general' : ('Confirm before closing a tab '+tr('Confirm before closing a tab')).toLowerCase().includes(search.toLowerCase());
   const save = (path: string[], next: unknown) => mutate('config.patch', { patch: nest(path, next) }, snapshot.generation);
   return <section className="settings-page">
     <aside className="settings-nav"><div className="filter-input"><Search size={14} /><input aria-label={tr("Find setting")} placeholder={tr("Search settings")} value={search} onChange={event => setSearch(event.target.value)} /></div>
@@ -47,10 +48,11 @@ export function SettingsPanel({ snapshot, openDialog }: { snapshot: Snapshot; op
         {showLanguage && <section className="settings-section"><h3><Globe size={16} />{tr("Language")}</h3><Setting label={tr("Interface language")}><Choice label={tr("Interface language")} value={appearance.language} options={[{value:'system',label:tr("Follow system")},{value:'en',label:'English'},{value:'zh',label:'简体中文'}]} onChange={language=>setAppearance({language})}/></Setting><Setting label={tr("Core language")}><Choice label={tr("Core language")} value={text(snapshot.config.language, 'en')} options={languages} onChange={value => void save(['language'], value).catch(reportError)} /></Setting></section>}
         {!search && selected === 'appearance' && <AppearancePanel snapshot={snapshot} />}
         {!search && selected === 'terminal' && <TerminalAppearance />}
+        {showConfirmation && <section className="settings-section"><h3>{tr('Confirmations')}</h3><Setting label={tr('Confirm before closing a tab')}><Toggle label={tr('Confirm before closing a tab')} value={appearance.confirmTabClose} save={async confirmTabClose => setAppearance({confirmTabClose})} /></Setting></section>}
         {!search && selected === 'integrations' && <LocalAddons generation={snapshot.generation} />}
         {!search && selected === 'keys' && <><h3>{tr("Keyboard shortcuts")}</h3><Detail value={snapshot.raw.key_bindings} /><button className="button" onClick={() => openDialog({ title: tr("Bind a direct shortcut"), fields: [{ key: 'command', label: tr("Command"), kind: 'select', required: true, options: snapshot.commands.map(command => ({ value: text(command.id), label: text(command.label) })) }, { key: 'chord', label: tr("Chord"), required: true }], run: value => save(['direct_keybindings'], { ...record(snapshot.config.direct_keybindings), [text(value.command)]: text(value.chord) }) })}>{tr("Add direct shortcut")}</button></>}
         {!!entries.length && <section className="settings-section"><h3>{search ? tr("Core settings") : tr("Preferences")}</h3>{entries.map(([path, value]) => enums[path.join('.')] ? <Setting key={path.join('.')} label={path.join('.') === 'notifications.display' ? tr("Notification display") : label(path.at(-1)!)}><Choice label={path.join('.')} value={String(value)} options={Object.entries(enums[path.join('.')]!).map(([value,label])=>({value,label:tr(label)}))} onChange={v=>void save(path,v).catch(reportError)}/></Setting> : typeof value === 'boolean' ? <Setting key={path.join('.')} label={label(path.at(-1)!)} detail={path.length > 1 ? label(path.slice(0, -1).join('.')) : undefined}><Toggle label={path.join('.')} value={value} save={next => save(path, next)} /></Setting> : <SettingRow key={`${snapshot.generation}:${path.join('.')}`} path={path} value={value} save={next => save(path, next)} />)}</section>}
-        {search && !entries.length && !showLanguage && <p className="muted">{tr("No matching settings")}</p>}
+        {search && !entries.length && !showLanguage && !showConfirmation && <p className="muted">{tr("No matching settings")}</p>}
       </div>
     </div>
   </section>;
@@ -95,7 +97,7 @@ function FontSetting({ terminal = false }: { terminal?: boolean }) {
 }
 function TerminalAppearance() {
   const value = useAppearance();
-  return <section className="settings-section"><h3><Type size={16} />{tr("Text")}</h3><FontSetting terminal /><Setting label={tr("Terminal font size")}><input className="size-input" aria-label={tr("Terminal font size")} type="number" min={9} max={32} value={value.terminalSize} onChange={event => { const n = event.target.valueAsNumber; if (n >= 9 && n <= 32) setAppearance({ terminalSize: n }); }} /></Setting><pre className="font-preview" style={{ fontFamily: value.terminalFont, fontSize: value.terminalSize }}>luvus ~/workspace{`\n`}Aa Bb 0123456789</pre></section>;
+  return <section className="settings-section"><h3><Type size={16} />{tr("Text")}</h3><FontSetting terminal /><Setting label={tr("Terminal font size")}><input className="size-input" aria-label={tr("Terminal font size")} type="number" min={9} max={32} value={value.terminalSize} onChange={event => { const n = event.target.valueAsNumber; if (n >= 9 && n <= 32) setAppearance({ terminalSize: n }); }} /></Setting><pre className="font-preview" style={{ fontFamily: terminalFontStack(value.terminalFont), fontSize: value.terminalSize }}>luvus ~/workspace{`\n`}Aa Bb 0123456789{`\n\uf07c src   \ue628 main.ts`}</pre></section>;
 }
 function AppearancePanel({ snapshot }: { snapshot: Snapshot }) {
   const value = useAppearance(), wallpaper = useWallpaper(), picker = useRef<HTMLInputElement>(null);

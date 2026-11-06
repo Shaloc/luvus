@@ -55,20 +55,30 @@ export function ModulesPanel({ snapshot, openDialog }: Props) {
 export function ConnectionPanel({ snapshot, openDialog }: Props) {
   const query = useQuery('ping');
   const {remoteHost} = useCore();
-  const [inventory,setInventory] = useState<RecordValue|null>(null);
+  const [inventory,setInventory] = useState<RecordValue|null>(null), [inventoryError,setInventoryError] = useState('');
+  useEffect(() => {
+    if (remoteHost) return;
+    let live = true;
+    window.luvus.sessions('list','',snapshot.generation).then(result => {
+      if (live) setInventory(record(result));
+    }).catch(error => {if (live) setInventoryError(String(error));});
+    return () => {live = false;};
+  }, [snapshot.generation, remoteHost]);
   const operate = (op: 'switch'|'create'|'stop'|'delete'|'list'|'host-add'|'merge', name='') => window.luvus.sessions(op,name,snapshot.generation);
-  const refresh = async () => setInventory(record(await operate('list')));
-  return <section className="domain-panel"><h2>{tr("Core connection")}</h2><Detail value={{ session: snapshot.session, server_generation: snapshot.generation, transport: 21, surface: 'app', workspaces: snapshot.workspaces.length }} />{query.error ? <ErrorBox error={query.error} /> : query.loading ? <Loading /> : <Detail value={query.data} />}
+  const refresh = async () => {setInventory(record(await operate('list')));setInventoryError('');};
+  return <section className="domain-panel connection-panel"><h2>{tr("Core connection")}</h2>{inventoryError && <ErrorBox error={inventoryError}/>}
+    {remoteHost && <p>{remoteHost} / {snapshot.session}</p>}
     {!remoteHost && <><div className="panel-toolbar"><h3>{tr("Local sessions")}</h3><AsyncButton run={refresh}>{tr("List sessions")}</AsyncButton>
       <button className="button" onClick={()=>openDialog({title:tr("Create local session"),submit:tr("Create and switch"),fields:[{key:'name',label:tr("Session name"),required:true,pattern:'[a-zA-Z0-9_.][a-zA-Z0-9_.\\-]{0,63}'}],run:v=>operate('create',text(v.name))})}>{tr("New session…")}</button></div>
       {array(inventory?.sessions).map(record).map(row=><div className="list-card" key={text(row.name)}><div><strong>{text(row.name)}</strong><small>{row.running?tr("Running"):tr("Stopped")}</small></div>
         {row.name===snapshot.session ? <span className="badge">{tr("Attached")}</span> : <><AsyncButton run={()=>operate('switch',text(row.name))}>{tr("Switch")}</AsyncButton>{(row.running || row.name!=='default') && <AsyncButton run={async()=>{await operate(row.running?'stop':'delete',text(row.name));await refresh();}}>{row.running?tr("Stop…"):tr("Delete…")}</AsyncButton>}</>}
       </div>)}
       {inventory && <><div className="panel-toolbar"><h3>{tr("Registered SSH hosts")}</h3><button className="button" onClick={()=>openDialog({title:tr("Connect registered host"),description:tr("Use an existing SSH Host alias. The host key and installed Luvus version must already be compatible."),submit:tr("Connect host"),fields:[{key:'alias',label:tr("SSH alias"),required:true}],run:async v=>setInventory(record(await operate('host-add',text(v.alias))))})}>{tr("Add host…")}</button></div>
-        {array(inventory.hosts).map(record).map(h=><div className="list-card" key={text(h.host)}><strong>{text(h.host)}</strong><small>{text(h.error,'Connected')}</small></div>)}
+        {array(inventory.hosts).map(record).map(h=><div className="list-card" key={text(h.host)}><div><strong>{text(h.host)}</strong><small title={text(h.error)}>{h.error ? tr("Disconnected") : tr("Connected")}</small></div></div>)}
         <label className="setting-row">{tr("Merge same-name sessions")}<input type="checkbox" checked={inventory.merge===true} onChange={e=>{const enabled=e.target.checked;openDialog({title:enabled?tr("Merge same-name sessions?"):tr("Disconnect merged projections?"),submit:enabled?tr("Enable merge"):tr("Disable merge"),description:tr("Applies to local sessions. Remote shells stay on their owner."),run:async()=>setInventory(record(await operate('merge',enabled?'on':'off')))});}} /></label></>}
     </>}
     {!remoteHost && <LocalDiagnostics key={snapshot.generation} snapshot={snapshot} openDialog={openDialog} />}
+    <details className="connection-protocol"><summary>{tr("Protocol details")}</summary>{query.error ? <ErrorBox error={query.error}/> : query.loading ? <Loading/> : <Detail value={{...record(query.data),server_generation:snapshot.generation}}/>}</details>
     <Notice>{tr("Closing the desktop window detaches this client. It does not stop the server or its terminals.")}</Notice></section>;
 }
 
@@ -83,11 +93,11 @@ function LocalDiagnostics({snapshot,openDialog}:Props){
   }).catch(e=>{if(active)setError(String(e));});return()=>{active=false;};},[generation]);
   const pane=snapshot.workspaces.find(w=>w.active && !w.host)?.tabs.find(t=>t.active)?.panes.find(p=>p.focused && p.target?.terminal_id);
   return <><h3>{tr("Loopback bridges")}</h3>{error && <ErrorBox error={error} />}
-    {rows.map(row=>{const kind=row.kind==='uhp'?'uhp':'web';return <div className="list-card" key={kind} data-bridge={kind}><div><strong>{kind==='web'?'Web':'UHP'}</strong><small>{row.port?`127.0.0.1:${row.port} · ${row.mode}`:text(row.state)}</small></div>
+    {rows.map(row=>{const kind=row.kind==='uhp'?'uhp':'web';return <div className="list-card" key={kind} data-bridge={kind}><div><strong>{kind==='web'?'Web':'UHP'}</strong><small>{row.port?`127.0.0.1:${row.port} · ${row.mode}`:row.state === 'stopped' ? tr('Stopped') : text(row.state)}</small></div>
       {row.state==='stopped'?<><AsyncButton run={()=>op('start',kind)}>{tr("Start read-only")}</AsyncButton><button className="button" onClick={()=>openDialog({title:tr("Allow paired control?"),description:tr("A paired client will be able to send input and change workspaces on this session."),submit:tr("Start with control"),run:()=>op('start',kind,true)})}>{tr("Start with control…")}</button></>:<>
       <AsyncButton disabled={!row.port} run={()=>op('copy',kind)}>{tr("Copy pairing")}</AsyncButton><AsyncButton run={()=>op('stop',kind)}>{tr("Stop bridge")}</AsyncButton></>}
     </div>;})}
-    <h3>{tr("Diagnostics")}</h3><div className="panel-toolbar">
+    <div className="panel-toolbar"><h3>{tr("Diagnostics")}</h3>
       {['server','client'].map(source=><AsyncButton key={source} run={async()=>setOutput(await request({type:'logs',id:crypto.randomUUID(),generation,client:source==='client'}))}>{source==='server'?tr("Server log"):tr("Client log")}</AsyncButton>)}
       <button className="button" disabled={!pane} onClick={()=>openDialog({title:tr("Wait for terminal output"),submit:tr("Wait"),fields:[{key:'needle',label:tr("Match text"),required:true},{key:'timeout',label:tr("Timeout in seconds"),value:'5',required:true}],run:async v=>{
         const timeout=Number(v.timeout);if(!Number.isFinite(timeout)||timeout<=0||timeout>25)throw Error('Use a timeout between 0 and 25 seconds.');

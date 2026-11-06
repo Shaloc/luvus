@@ -6,7 +6,7 @@ import { array, record, message, text, type Pane, type RecordValue, type Snapsho
 import { Choice, ErrorBox, Modal } from './ui';
 
 export interface Field {
-  key: string; label: string; kind?: 'text' | 'textarea' | 'number' | 'select' | 'checkbox' | 'directory';
+  key: string; label: string; kind?: 'text' | 'time' | 'textarea' | 'number' | 'select' | 'checkbox' | 'directory';
   value?: string | boolean; required?: boolean; hint?: string; pattern?: string; options?: { value: string; label: string }[];
 }
 export interface DialogSpec {
@@ -51,8 +51,7 @@ function WorkspacePicker({spec, onClose}: {spec: DialogSpec; onClose: () => void
     } catch(e) {setError(message(e));} finally {setBusy(false);}
   };
   return <Modal title={tr("Open workspace")} onClose={() => {if(!busy) onClose();}}><form onSubmit={submit}>
-    <label className="field"><span>{tr("Session")}</span><Choice label={tr("Workspace session")} value={selected} disabled={busy} options={[{value:'attached',label:`${remoteHost || tr("This computer")} / ${snapshot?.session ?? ''}`},...owners.map((r,i)=>({value:String(i),label:`${r.host} / ${r.session}`}))]} onChange={v => {setSelected(v);setPath('');setError('');}} /></label>
-    {loading && <small>{tr("Looking for remote sessions…")}</small>}
+    <div className="field"><span>{tr("Session")} {loading && <LoaderCircle size={11} className="spin inline-spinner" aria-label={tr("Looking for remote sessions…")}/>}</span><Choice label={tr("Workspace session")} value={selected} disabled={busy} options={[{value:'attached',label:`${remoteHost || tr("This computer")} / ${snapshot?.session ?? ''}`},...owners.map((r,i)=>({value:String(i),label:`${r.host} / ${r.session}`}))]} onChange={v => {setSelected(v);setPath('');setError('');}} /></div>
     <label className="field"><span>{tr("Directory")}</span><div className="input-group"><input required aria-label={tr("Directory")} placeholder={selected === 'attached' && !remoteHost ? '' : '/path/to/project'} value={path} onChange={e=>setPath(e.target.value)} />
     {selected === 'attached' && !remoteHost && <button type="button" className="button" onClick={()=>void window.luvus.chooseDirectory().then(v=>{if(v)setPath(v);}).catch(e=>setError(message(e)))}><FolderOpen size={14}/>{tr("Browse")}</button>}</div></label>
     {error && <ErrorBox error={error}/>}<footer className="modal-actions"><button type="button" className="button" disabled={busy} onClick={onClose}>{tr("Cancel")}</button><button className="button primary" disabled={!path || !selected || busy}>{tr("Open workspace")}</button></footer>
@@ -75,7 +74,7 @@ function FieldsDialog({ spec, onClose }: { spec: DialogSpec; onClose: () => void
       {field.kind === 'textarea' ? <textarea rows={5} value={text(values[field.key])} required={field.required} onChange={(event) => setValues({ ...values, [field.key]: event.target.value })} />
         : field.kind === 'select' ? <Choice label={field.label} value={text(values[field.key])} options={[{ value: '', label: tr("Choose…") }, ...field.options ?? []]} onChange={value => setValues({ ...values, [field.key]: value })} />
           : field.kind === 'checkbox' ? <input type="checkbox" checked={values[field.key] === true} onChange={(event) => setValues({ ...values, [field.key]: event.target.checked })} />
-            : <div className="input-group"><input type={field.kind === 'number' ? 'number' : 'text'} value={text(values[field.key])} required={field.required} pattern={field.pattern} onChange={(event) => setValues({ ...values, [field.key]: event.target.value })} />{field.kind === 'directory' && <button type="button" className="button" disabled={busy} onClick={() => { void window.luvus.chooseDirectory().then((path) => { if (path) setValues((old) => ({ ...old, [field.key]: path })); }).catch((error: unknown) => setError(message(error))); }}><FolderOpen size={15} />{tr("Browse")}</button>}</div>}
+            : <div className="input-group"><input type={field.kind === 'number' || field.kind === 'time' ? field.kind : 'text'} value={text(values[field.key])} required={field.required} pattern={field.pattern} onChange={(event) => setValues({ ...values, [field.key]: event.target.value })} />{field.kind === 'directory' && <button type="button" className="button" disabled={busy} onClick={() => { void window.luvus.chooseDirectory().then((path) => { if (path) setValues((old) => ({ ...old, [field.key]: path })); }).catch((error: unknown) => setError(message(error))); }}><FolderOpen size={15} />{tr("Browse")}</button>}</div>}
       {field.hint && <small>{field.hint}</small>}
     </label>)}
     {error && <ErrorBox error={error} />}
@@ -91,7 +90,7 @@ export function validateContext(snapshot: Snapshot, workspace?: Workspace, tab?:
   if (workspace && (!w || (activeOnly && !w.active))) throw new Error(tr("The selected workspace changed. Reopen this action."));
   const t = tab && w?.tabs.find((item) => item.id === tab.id);
   if (tab && !t) throw new Error(tr("The selected tab no longer exists."));
-  const p = pane && w?.tabs.flatMap((item) => item.panes).find((item) => item.id === pane.id);
+  const p = pane && (t ? t.panes : w?.tabs.flatMap((item) => item.panes))?.find((item) => item.id === pane.id);
   if (pane && (!p?.target || !pane.target || p.target.terminal_id !== pane.target.terminal_id)) throw new Error(tr("The selected pane changed or is unavailable."));
 }
 export const openWorkspaceDialog = (initialHost?: string): DialogSpec => ({ title: tr("Open workspace"), workspacePicker: true, initialHost, run: async () => {} });

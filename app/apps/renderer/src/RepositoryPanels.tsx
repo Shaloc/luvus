@@ -11,7 +11,7 @@ import { AsyncButton, Empty, ErrorBox, IconButton, Loading, Notice } from './ui'
 
 interface Props { snapshot: Snapshot; workspace: Workspace; openDialog: OpenDialog }
 export function FilesPanel({ snapshot, workspace, openDialog }: Props) {
-  const query = useQuery('files.tree'), [filter, setFilter] = useState('');
+  const query = useQuery('files.tree', {}, !workspace.host, true), [filter, setFilter] = useState('');
   const rows = array(record(query.data).rows).map(record).filter((row) => text(row.path).toLocaleLowerCase().includes(filter.toLocaleLowerCase()));
   const open = (path: string) => {
     validateContext(snapshot, workspace, undefined, undefined, true);
@@ -36,7 +36,7 @@ export function FilesPanel({ snapshot, workspace, openDialog }: Props) {
   return <section className="domain-panel files-panel"><div className="panel-toolbar"><h2>{tr("Files")}</h2><IconButton label={tr("Refresh files")} onClick={() => { void action('files.refresh').then(query.reload).catch(() => query.reload()); }}><RefreshCw size={14} /></IconButton></div>
     <div className="filter-input"><Search size={14} /><input aria-label={tr("Filter loaded files")} value={filter} onChange={(event) => setFilter(event.target.value)} placeholder={tr("Filter loaded files…")} /></div>
     <div className="path-caption" title={workspace.cwd}>{workspace.cwd}</div>
-    {query.loading ? <Loading /> : query.error ? <ErrorBox error={query.error} /> : <div className="file-tree">{rows.map((row, index) => <div key={`${text(row.path)}:${index}`} className="file-tree-row" style={{ paddingLeft: `${Math.min(12, numeric(row.depth)) * 12 + 8}px` }}>
+    {query.loading ? <Loading /> : query.error ? <ErrorBox error={query.error} /> : <div className="file-tree">{rows.map(row => <div key={text(row.path)} className="file-tree-row" style={{ paddingLeft: `${Math.min(12, numeric(row.depth)) * 12 + 8}px` }}>
       {row.dir === true ? <AsyncButton className="file-button" aria-expanded={row.expanded===true} run={async()=>{await entry(text(row.path),{kind:row.expanded?'collapse':'expand'});query.reload();}}>{row.expanded?<ChevronDown size={12}/>:<ChevronRight size={12}/>}<Folder size={14} /><span title={text(row.path)}>{text(row.name)}</span></AsyncButton> : <AsyncButton className="file-button" run={() => open(text(row.path))}><File size={14} /><span title={text(row.path)}>{text(row.name)}</span></AsyncButton>}
       <details className="dropdown"><summary className="icon-button" aria-label={'File actions for '+text(row.name)}><MoreHorizontal size={13}/></summary><div className="dropdown-menu">
         {row.dir===true && <button onClick={()=>create(text(row.path))}>{tr("New entry here…")}</button>}

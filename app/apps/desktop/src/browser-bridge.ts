@@ -31,7 +31,9 @@ export class BrowserBridge {
       } else {
         void this.core.request({ type: 'browser_takeover', id: crypto.randomUUID(), browser_id: id, lease_generation:generation }).catch(() => {});
       }
-    }, (id, generation, raw) => this.cdpMessage(id, generation, raw), id => this.update(id, {}));
+    }, (id, generation, raw) => this.cdpMessage(id, generation, raw), id => this.update(id, {}), (target,position)=>{
+      if(!this.closed && this.visibleTargets.has(key(target))) this.publish({type:'effect',kind:'desktop_tab_shortcut',data:{target,position}});
+    });
   }
 
   receive(message: Response): boolean {
@@ -126,9 +128,12 @@ export class BrowserBridge {
     this.host.bounds(id, target && this.visibleTargets.has(key(target)) ? bounds : null);
   }
 
-  async navigate(id: string, action: 'navigate' | 'back' | 'forward' | 'reload', url?: string): Promise<void> {
+  async navigate(id: string, action: 'navigate' | 'back' | 'forward' | 'reload', bounds: Rectangle, url?: string): Promise<void> {
     const target = this.targets.get(id);
     if (!target || !this.visibleTargets.has(key(target)) || this.states.get(id)?.state !== 'ready') throw new Error('Browser is not ready');
+    // Place and navigate in one native dispatch. A queued layout message must
+    // not detach the guest between accepting Enter and starting the load.
+    this.host.bounds(id, bounds);
     await this.host.navigateHuman(id, action, url);
   }
 

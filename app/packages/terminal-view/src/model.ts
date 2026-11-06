@@ -17,7 +17,7 @@ export function takeInputBatch(queue: Request[]): Request[] {
 type Cell = TerminalFrame['cells'][number];
 export type Point = [number, number];
 export type SelectionMode = Extract<Input, { kind: 'selection' }>['mode'];
-export interface Run { row: number; col: number; width: number; text: string; fg: number; bg: number; mods: number }
+export interface Run { row: number; col: number; width: number; text: string; fg: number; bg: number; mods: number; symbol?: boolean }
 
 /** Only the VT defines advances. Continuations contribute backgrounds, not text. */
 export function styledRuns(cells: readonly Cell[]): Run[] {
@@ -26,12 +26,15 @@ export function styledRuns(cells: readonly Cell[]): Run[] {
   for (const cell of cells) {
     if (cell.width === 0) continue;
     const last = runs.at(-1);
-    if (joinable && cell.width === 1 && last && last.row === cell.row && last.col + last.width === cell.col && last.fg === cell.fg && last.bg === cell.bg && last.mods === cell.mods) {
+    // Private-use icons often come from a different font with a different advance.
+    const symbol = /[\uE000-\uF8FF\u{F0000}-\u{FFFFD}\u{100000}-\u{10FFFD}]/u.test(cell.text);
+    const mono = cell.width === 1 && !symbol;
+    if (joinable && mono && last && last.row === cell.row && last.col + last.width === cell.col && last.fg === cell.fg && last.bg === cell.bg && last.mods === cell.mods) {
       last.text += cell.text || ' '.repeat(cell.width);
       last.width += cell.width;
-    } else runs.push({ row: cell.row, col: cell.col, width: cell.width, text: cell.text || ' '.repeat(cell.width), fg: cell.fg, bg: cell.bg, mods: cell.mods });
+    } else runs.push({ row: cell.row, col: cell.col, width: cell.width, text: cell.text || ' '.repeat(cell.width), fg: cell.fg, bg: cell.bg, mods: cell.mods, ...(symbol && { symbol }) });
     // Fallback CJK/emoji fonts need not advance exactly two primary-font cells.
-    joinable = cell.width === 1;
+    joinable = mono;
   }
   return runs;
 }

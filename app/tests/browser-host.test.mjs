@@ -107,17 +107,34 @@ const tools = await loadModule('browser-tools');
 const target = { generation: 'owner-1', workspace_id: 'w1', tab_id: 't1', pane_id: 'p1', terminal_id: 'term1' };
 function descriptor() { return { id: 'browser1', url: 'https://owner.test', proxy_port: 2345, generation: target.generation, workspace_id: target.workspace_id,
   pane_id: target.pane_id, target: { ...target }, request_id: 'launch1', lease_generation: '0' }; }
-function fixture(t) {
+function fixture(t,onTabShortcut) {
   const notifications = [];
-  const window = { isDestroyed: () => false, contentView: { addChildView() {}, removeChildView() {} }, getContentBounds: () => ({ x: 10, y: 20, width: 1000, height: 800 }) };
-  const host = new BrowserHost(window, (id,reason,generation) => { assert.match(generation,/^\d+$/);notifications.push([id,reason]); });
+  const window = { isDestroyed: () => false, getContentBounds:()=>({x:10,y:20,width:1000,height:800}), webContents: {getZoomFactor:()=>1}, contentView: { addChildView() {}, removeChildView() {}, getBounds:()=>({x:0,y:0,width:1000,height:800}) } };
+  const host = new BrowserHost(window, (id,reason,generation) => { assert.match(generation,/^\d+$/);notifications.push([id,reason]); },undefined,undefined,onTabShortcut);
   t.after(() => host.dispose());
   const command = (method, params = {}, generation = '1', override = {}) => host.command({ request_id: 'req1', browser_id: 'browser1', method: `browser.${method}`,
     params, lease_generation: generation, target: { ...target }, ...override });
-  return { host, command, notifications, get view() { return views.at(-1); } };
+  return { host, command, notifications, window, get view() { return views.at(-1); } };
 }
 async function controlled(t) { const f = fixture(t); await f.host.open(descriptor()); await f.command('control.acquire'); return f; }
 async function ref(f) { const snapshot = await f.command('snapshot'); return { node: snapshot.nodes[0].node, document_revision: snapshot.document_revision }; }
+
+test('only visible human Command-digit input can switch desktop tabs',async t=>{
+  const shortcuts=[],f=fixture(t,(target,position)=>shortcuts.push({target,position}));
+  await f.host.open(descriptor());const contents=f.view.webContents;
+  const press=()=>{const e=event();contents.emit('before-input-event',e,{type:'keyDown',key:'2',meta:true});return e;};
+  assert.equal(press().prevented,false);assert.equal(shortcuts.length,0);
+  f.host.bounds('browser1',{x:0,y:0,width:400,height:300});
+  assert.equal(press().prevented,true);assert.equal(shortcuts.length,1);assert.equal(shortcuts[0].position,2);
+  await f.command('control.acquire');
+  const reference=await ref(f);
+  contents.debugger.hook=(method)=>{if(method==='Input.dispatchKeyEvent')press();};
+  await f.command('act',{action:{...reference,kind:'press',key:'Enter'}});
+  assert.equal(shortcuts.length,1,'agent keystroke must not escape into the desktop');
+  press();assert.equal(shortcuts.length,2);assert.equal(f.host.metadata('browser1').control.state,'uncontrolled');
+  contents.emit('did-start-navigation',{},'https://owner.test/slow',false,true);
+  assert.equal(press().prevented,true);assert.equal(shortcuts.length,3,'loading pages must not trap Command-digit shortcuts');
+});
 
 test('only a fresh visible human gesture permits the native Save dialog, never a CDP fallback', async t=>{
   const f=fixture(t);await f.host.open(descriptor());const contents=f.view.webContents;
@@ -176,7 +193,12 @@ test('open keeps isolated fixed-proxy security, denies permissions and navigatio
   assert.deepEqual(f.view.webContents.debugger.calls.find(call => call.method === 'Page.setInterceptFileChooserDialog').params, { enabled: true });
   assert.equal(f.view.visible, false);
   f.host.bounds('browser1', { x: 10, y: 20, width: 400, height: 300 }); assert.equal(f.view.visible, true);
-  assert.throws(() => f.host.bounds('browser1', { x: 0, y: 0, width: 1002, height: 2 }), /Invalid browser bounds/);
+  f.host.bounds('browser1', { x: 0, y: 0, width: 1002, height: 2 });
+  assert.deepEqual(f.view.bounds,{x:0,y:0,width:1000,height:2});
+  for(const width of [-1,NaN,Infinity]) assert.throws(() => f.host.bounds('browser1', { x: 0, y: 0, width, height: 2 }), /Invalid browser bounds/);
+  f.window.webContents.getZoomFactor=()=>1.25;
+  f.host.bounds('browser1',{x:10.4,y:20.8,width:200,height:100});
+  assert.deepEqual(f.view.bounds,{x:13,y:26,width:250,height:125});
   assert.equal(f.host.metadata('browser1').control.state, 'uncontrolled');
   await assert.rejects(f.command('snapshot'), /control_revoked/);
 });
@@ -293,7 +315,7 @@ test('click and press dispatch bounded CDP input without treating it as human ta
     if (method === 'Input.dispatchKeyEvent' || method === 'Input.dispatchMouseEvent') {
       const key = method === 'Input.dispatchKeyEvent';
       const input = key ? { type: params.type, key: params.key, control: true, shift: true } : {
-        type: params.type === 'mousePressed' ? 'mouseDown' : 'mouseUp', globalX: 10 + params.x, globalY: 20 + params.y };
+        type: params.type === 'mousePressed' ? 'mouseDown' : 'mouseUp', button:params.button, globalX: 10 + params.x, globalY: 20 + params.y };
       const synthetic = event(); contents.emit(key ? 'before-input-event' : 'before-mouse-event', synthetic, input); assert.equal(synthetic.prevented, false);
       const duplicate = event(); contents.emit(key ? 'before-input-event' : 'before-mouse-event', duplicate, input); assert.equal(duplicate.prevented, true);
     }

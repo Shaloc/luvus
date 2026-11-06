@@ -17,9 +17,10 @@ export function Modal({ title, children, onClose, wide = false }: { title: strin
   const ref = useRef<HTMLDialogElement>(null), heading = useId();
   useEffect(() => {
     const previous = document.activeElement;
+    const focusVisible = previous?.matches(':focus-visible') ?? false;
     ref.current?.showModal();
     ref.current?.querySelector<HTMLElement>('input:not([type="checkbox"]), textarea, select')?.focus();
-    return () => { ref.current?.close(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus(); };
+    return () => { ref.current?.close(); if (previous instanceof HTMLElement && previous.isConnected) previous.focus({ preventScroll: true, focusVisible } as FocusOptions); };
   }, []);
   return <dialog ref={ref} className={`modal ${wide ? 'modal-wide' : ''}`} aria-labelledby={heading} onCancel={(event) => { event.preventDefault(); onClose(); }} onClick={(event) => { if (event.target === event.currentTarget) onClose(); }}>
     <div className="modal-inner"><header><h2 id={heading}>{title}</h2><IconButton label={tr("Close dialog")} onClick={onClose}><X size={16} /></IconButton></header>{children}</div>
@@ -44,9 +45,9 @@ export function Choice({ label, value, options, onChange, disabled = false }: { 
   const [container, setContainer] = useState<HTMLElement | null>(null);
   // Native dialogs are in the top layer; keep their menus in the same layer.
   useEffect(() => { setContainer(trigger.current?.closest('dialog') ?? document.body); }, []);
-  return <Select.Root value={value} items={options} disabled={disabled} onValueChange={next => { if (next !== null) onChange(next); }}>
+  return <Select.Root modal={false} value={value} items={options} disabled={disabled} onValueChange={next => { if (next !== null) onChange(next); }}>
     <Select.Trigger ref={trigger} className="choice-trigger" aria-label={label}><Select.Value /><Select.Icon><ChevronDown size={14} /></Select.Icon></Select.Trigger>
-    <Select.Portal container={container}><Select.Positioner className="choice-positioner" sideOffset={5} alignItemWithTrigger={false}>
+    <Select.Portal container={container}><Select.Positioner positionMethod="fixed" className="choice-positioner" sideOffset={5} alignItemWithTrigger={false}>
       <Select.Popup className="choice-popup" data-app-overlay><Select.List>{options.map(option => <Select.Item className="choice-option" key={option.value} value={option.value} data-value={option.value}>
         <Select.ItemIndicator className="choice-check"><Check size={13} /></Select.ItemIndicator><Select.ItemText>{option.label}</Select.ItemText>
       </Select.Item>)}</Select.List></Select.Popup>

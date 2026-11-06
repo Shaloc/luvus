@@ -11,11 +11,11 @@ export interface DesktopAPI {
   sessions(op:'list'|'switch'|'create'|'stop'|'delete'|'host-add'|'merge'|'open-workspace', name:string | {host:string; session:string; path:string}, generation:string): Promise<unknown>;
   gateway(op:'list'|'start'|'stop'|'copy',kind:'web'|'uhp',control:boolean,generation:string):Promise<unknown>;
   addons(op:'list'|'install'|'uninstall'|'enable'|'disable',agent:string,generation:string):Promise<unknown>;
-  terminalMenu(selection:boolean, chinese:boolean): Promise<{action:'copy'} | {action:'paste'; text:string} | null>;
+  terminalPaste(target: Target): Promise<void>;
   chooseDirectory(): Promise<string | null>;
   browserBounds(id: string, bounds: { x: number; y: number; width: number; height: number } | null): Promise<void>;
   browserStatus(id: string): Promise<unknown>;
-  browserNavigate(id: string, action: 'navigate' | 'back' | 'forward' | 'reload', url?: string): Promise<void>;
+  browserNavigate(id: string, action: 'navigate' | 'back' | 'forward' | 'reload', bounds: {x:number;y:number;width:number;height:number}, url?: string): Promise<void>;
   browserTakeover(id: string): Promise<void>;
 }
 declare global { interface Window { luvus: DesktopAPI } }
@@ -25,16 +25,19 @@ let inboxGeneration = '';
 let state: State = { fallbackInbox: [], fallbackUnread: 0, snapshot: null, ready: false, capabilities: [], error: null, notice: null, revision: 0, browserTitles: {} };
 const listeners = new Set<() => void>();
 const terminals = new Map<string, TerminalFrame>();
+const liveFrames = new Set<string>();
+let visibleTargets = new Set<string>();
 const frameWeights = new Map<string, number>();
 let cachedFrameBytes = 0;
 const FRAME_CACHE_BYTES = 32 * 1024 * 1024;
-function dropFrame(key: string) { terminals.delete(key); cachedFrameBytes -= frameWeights.get(key) ?? 0; frameWeights.delete(key); }
+function dropFrame(key: string) { terminals.delete(key); liveFrames.delete(key); cachedFrameBytes -= frameWeights.get(key) ?? 0; frameWeights.delete(key); }
 const terminalListeners = new Map<string, Set<(frame: TerminalFrame) => void>>();
 let disconnect: (() => void) | undefined;
 let started = false;
 const emit = (patch: Partial<State>) => { state = { ...state, ...patch }; listeners.forEach((callback) => callback()); };
 
 function disconnected(error: string) {
+  visibleTargets.clear();
   for (const key of terminals.keys()) dropFrame(key);
   emit({ ready: false, snapshot: null, capabilities: [], error, notice: null, browserTitles: {} });
 }
@@ -54,7 +57,13 @@ function receive(response: Response) {
         const newSession = inboxGeneration !== snapshot.generation;
         inboxGeneration = snapshot.generation;
         const valid = new Set(snapshot.workspaces.filter((w) => w.active).flatMap((w) => w.tabs.filter((t) => t.active).flatMap((t) => t.panes.filter((p) => !t.zoomed || p.id === t.focus).flatMap((p) => p.target ? [targetKey(p.target)] : []))));
-        for (const key of terminals.keys()) if (!valid.has(key)) dropFrame(key);
+        visibleTargets = valid;
+        // Keep paint-only previews for sibling tabs. Never reuse another workspace or remote projection.
+        const keep = new Set(snapshot.workspaces.filter(w => w.active && !w.host).flatMap(w => w.tabs.flatMap(t => t.panes.flatMap(p => p.target?.terminal_id ? [targetKey(p.target)] : []))));
+        for (const key of terminals.keys()) {
+          if (!valid.has(key)) liveFrames.delete(key);
+          if (!valid.has(key) && !keep.has(key)) dropFrame(key);
+        }
         const browsers = new Set(snapshot.workspaces.flatMap(w => w.tabs.flatMap(t => t.panes.filter(p => p.kind === 'browser').map(p => p.id))));
         const browserTitles = snapshot.generation === state.snapshot?.generation ? Object.fromEntries(Object.entries(state.browserTitles).filter(([id]) => browsers.has(id))) : {};
         emit({ snapshot, revision: state.revision + 1, browserTitles, ...(newSession ? { fallbackInbox: [], fallbackUnread: 0 } : {}) });
@@ -66,13 +75,14 @@ function receive(response: Response) {
       const frame = response.frame;
       if (state.snapshot && frame.target.generation !== state.snapshot.generation) return;
       const key = targetKey(frame.target);
-      if (terminals.get(key)?.revision === frame.revision) return;
+      if (state.snapshot && !visibleTargets.has(key)) return;
+      if (liveFrames.has(key) && terminals.get(key)?.revision === frame.revision && terminals.get(key)?.geometry === frame.geometry) return;
       if (frame.cols < 1 || frame.cols > 500 || frame.rows < 1 || frame.rows > 300 || frame.cells.length > frame.cols * frame.rows) { emit({ error: 'The core terminal frame exceeds the desktop geometry budget.' }); return; }
       const weight = frame.cells.reduce((size, cell) => size + 64 + cell.text.length * 2 + (cell.link?.length ?? 0) * 2, 0)
         + (frame.graphics??[]).reduce((n,g)=>n+g.cells.length*64,0);
       dropFrame(key);
       while (terminals.size && (terminals.size >= 128 || cachedFrameBytes + weight > FRAME_CACHE_BYTES)) dropFrame(terminals.keys().next().value!);
-      if (weight <= FRAME_CACHE_BYTES) { terminals.set(key, frame); frameWeights.set(key, weight); cachedFrameBytes += weight; }
+      if (weight <= FRAME_CACHE_BYTES) { terminals.set(key, frame); liveFrames.add(key); frameWeights.set(key, weight); cachedFrameBytes += weight; }
       terminalListeners.get(key)?.forEach((callback) => callback(frame));
       break;
     }
@@ -154,16 +164,19 @@ export async function refreshSnapshot() { await request({ type: 'snapshot', id: 
 export async function mutate(method: Method, params: RecordValue = {}, generation?: string) {
   const result = await action(method, params, generation); await refreshSnapshot(); return result;
 }
-export async function focusTarget(target: Target, activate = true) { await request({ type: 'focus', id: crypto.randomUUID(), target, activate }); }
-export function subscribeTerminal(target: Target, callback: (frame: TerminalFrame) => void) {
+export async function focusTarget(target: Target, activate = true) {
+  await request({ type: 'focus', id: crypto.randomUUID(), target, activate });
+  if (activate) await refreshSnapshot();
+}
+export function subscribeTerminal(target: Target, callback: (frame: TerminalFrame) => void, preview?: (frame: TerminalFrame) => void) {
   const key = targetKey(target);
   let set = terminalListeners.get(key);
   if (!set) { set = new Set(); terminalListeners.set(key, set); }
   set.add(callback);
-  const frame = terminals.get(key); if (frame) callback(frame);
+  const frame = terminals.get(key); if (frame) (liveFrames.has(key) ? callback : preview)?.(frame);
   return () => { set.delete(callback); if (!set.size) terminalListeners.delete(key); };
 }
-export function useQuery(method: Method, params: RecordValue = {}, enabled = true) {
+export function useQuery(method: Method, params: RecordValue = {}, enabled = true, retainOnReload = false) {
   const { snapshot } = useCore();
   const [result, setResult] = useState<{ data: unknown; error: string | null; loading: boolean }>({ data: null, error: null, loading: enabled });
   const [refresh, setRefresh] = useState(0);
@@ -172,12 +185,12 @@ export function useQuery(method: Method, params: RecordValue = {}, enabled = tru
   useEffect(() => {
     let live = true;
     if (!enabled || !generation) return;
-    setResult({ data: null, error: null, loading: true });
+    setResult(previous => retainOnReload && previous.data !== null ? previous : { data: null, error: null, loading: true });
     void action(method, JSON.parse(key) as RecordValue, generation).then((data) => checkedDomainResult(method, data)).then(
       (data) => { if (live) setResult({ data, error: null, loading: false }); },
       (error: unknown) => { if (live) setResult({ data: null, error: message(error), loading: false }); },
     );
     return () => { live = false; };
-  }, [method, key, generation, workspaceId, refresh, enabled]);
+  }, [method, key, generation, workspaceId, refresh, enabled, retainOnReload]);
   return { ...result, reload: () => setRefresh((value) => value + 1) };
 }

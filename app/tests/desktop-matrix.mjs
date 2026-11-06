@@ -33,7 +33,9 @@ async function scenario(name, fn) {
   const home = join(root,name), workspace = join(home,'work');
   for (const path of [home,workspace,join(home,'profile'),join(home,'tmp')]) await mkdir(path, {mode:0o700});
   await writeFile(join(home,'.isolated-app'),home,{flag:'wx'});
-  await writeFile(join(home,'config.json'),JSON.stringify({check_updates:false,language:'en',shell:'/bin/sh'}));
+  await writeFile(join(home,'config.json'),JSON.stringify({check_updates:false,language:'en',shell:'/bin/sh',
+    ...(name==='keyboard-shortcuts'?{prefix:'ctrl+b'}:{}),
+    ...(['desktop-ux','codex-title'].includes(name)?{layout:{agent_title_first:true,agent_paths:false,pane_title_path:name==='desktop-ux'}}:{})}));
   const env = { ...isolatedEnvironment(), HOME:home, LUVUS_HOME:home, TMPDIR:join(home,'tmp'),
     SHELL:'/bin/sh', TERM:'xterm-256color', XDG_CONFIG_HOME:join(home,'config'), XDG_DATA_HOME:join(home,'data'),
     XDG_CACHE_HOME:join(home,'cache'), GIT_CONFIG_GLOBAL:'/dev/null', GIT_CONFIG_NOSYSTEM:'1', GIT_TERMINAL_PROMPT:'0',GIT_CEILING_DIRECTORIES:home };
@@ -72,6 +74,10 @@ async function scenario(name, fn) {
     assert.match(await cli('server','status'),/not running/);
     if (name==='files' || name==='native-diff' || name==='github' || name==='orchestration') {
       await mkdir(join(workspace,'nested'));
+      if(name==='files') {
+        for(let i=0;i<50;i++)await mkdir(join(workspace,'dir-'+String(i).padStart(2,'0')));
+        await mkdir(join(workspace,'nested','child','grandchild'),{recursive:true});
+      }
       await writeFile(join(workspace,'nested','before.txt'),'fixture content');
       await writeFile(join(workspace,'notes.md'),'# Matrix document\n\nOwner-side Markdown preview.\n');
       await writeFile(join(workspace,'graph.mmd'),'flowchart TD\n  A[Start] --> B[Finish]\n');
@@ -119,11 +125,12 @@ async function scenario(name, fn) {
     console.log('PASS ' + name);
   } catch (error) {
     report.cases[name] = {pass:false,checks:details,error:String(error)};
-    console.error('FAIL ' + name + ': ' + String(error));
+    console.error('FAIL ' + name + ': ' + String(error.stack ?? error));
     if(page?.isClosed() && clients.at(-1)?.process().exitCode===null)page=await clients.at(-1).firstWindow().catch(()=>null);
     if (page && !page.isClosed()) {
       await page.screenshot({path:join(home,'failure.png')}).catch(()=>{});
       await writeFile(join(home,'failure.txt'),await page.locator('body').innerText().catch(()=>'closed'));
+      await writeFile(join(home,'failure-debug.json'),JSON.stringify(await page.evaluate(async()=>({active:document.activeElement?.outerHTML,panes:[...document.querySelectorAll('.pane')].map(p=>({classes:p.className,terminal:p.querySelector('textarea')?.outerHTML})),snapshot:(await window.luvus.bootstrap()).find(m=>m.type==='snapshot')?.snapshot})).catch(()=>null),null,2));
     }
   } finally {
     for (const client of clients.reverse()) await client.close();
@@ -237,26 +244,40 @@ await scenario('layout-history',async ({page:p,snap,ok})=>{
 
 await scenario('workspace-lifecycle',async ({page:p,home,workspace,snap,cli,ok})=>{
   const other=join(home,'other'), original=active(await snap()).id;
-  await mkdir(other); await openWorkspace(p,other);
+  await mkdir(other);
+  await button(p,'Open workspace').first().click();
+  const bounds=await dialog(p).boundingBox();
+  await dialog(p).getByRole('combobox').click();
+  await p.getByRole('option').first().waitFor();
+  assert.deepEqual(await dialog(p).boundingBox(),bounds);
+  await p.keyboard.press('Escape');
+  assert.deepEqual(await dialog(p).boundingBox(),bounds);
+  await dialog(p).getByRole('textbox').fill(other); await submit(p,'Open workspace');
   await eventually('other focused',async()=>active(await snap()).cwd===other);
   const otherId=active(await snap()).id;
   const first=p.locator('.workspace-row').filter({has:p.locator('button[title="'+workspace+'"]')});
-  await first.locator('summary').click();
-  await button(first,'Rename…').click();
+  const menu=p.getByRole('menu');
+  const item=name=>menu.getByRole('menuitem',{name,exact:true});
+  await first.getByRole('button',{name:/Actions for/}).click();
+  const actions=await menu.getByRole('menuitem').allTextContents();
+  await p.keyboard.press('Escape');
+  await first.click({button:'right'});
+  assert.deepEqual(await menu.getByRole('menuitem').allTextContents(),actions);
+  await item('Rename…').click();
   await dialog(p).getByRole('textbox').fill('original-only'); await submit(p,'Apply');
   assert.equal((await snap()).workspaces.find(w=>w.id===original).name,'original-only');
   assert.equal(active(await snap()).id,otherId);
   ok('background workspace rename does not mutate or focus the foreground workspace');
-  if (!await button(first,'Close workspace…').isVisible()) await first.locator('summary').click();
-  await button(first,'Close workspace…').click(); await button(dialog(p),'Cancel').click();
+  await first.click({button:'right'});
+  await item('Close workspace…').click(); await button(dialog(p),'Cancel').click();
   assert.equal((await snap()).workspaces.length,2);
-  await button(first,'Close workspace…').click(); await submit(p,'Close workspace');
+  await first.click({button:'right'}); await item('Close workspace…').click(); await submit(p,'Close workspace');
   await eventually('no original workspace',async()=>(await snap()).workspaces.length===1);
   // The core intentionally creates a replacement shell in HOME when it
   // exists. Exercise the legitimate zero-workspace state with no fallback.
   await rename(join(home,'user-home'), join(home,'unavailable-home'));
   const last = p.locator('.workspace-row').first();
-  await last.locator('summary').click(); await button(last,'Close workspace…').click(); await submit(p,'Close workspace');
+  await last.click({button:'right'}); await item('Close workspace…').click(); await submit(p,'Close workspace');
   await p.getByText('Your workspace starts here',{exact:true}).waitFor();
   assert.equal((await snap()).workspaces.length,0);
   ok('cancel, explicit close, and a live server with zero workspaces');
@@ -286,6 +307,334 @@ await scenario('settings-modules',async ({page:p,home,ok})=>{
   await button(dialog(p),'Cancel').click();
 });
 
+await scenario('workbench-layout',async ({page:p,native,home,ok})=>{
+  await native.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setContentSize(1280,820));
+  const left=p.locator('.sidebar'), right=p.locator('.tools-panel');
+  await button(p,'Files').click();
+  await right.getByLabel('Filter loaded files').waitFor();
+  const filesWidth=(await right.boundingBox()).width;
+  await button(p,'Hide right sidebar').click();
+  assert.ok(await right.isHidden() && await p.locator('.tool-rail').isHidden());
+  await button(p,'Show right sidebar').click();
+  assert.equal((await right.boundingBox()).width,filesWidth);
+  await button(p,'Close tools panel').click();
+  const spaces=p.locator('.workspace-section'), agents=p.locator('.agent-section');
+  await button(left,'Collapse workspaces').click();
+  assert.ok((await spaces.boundingBox()).height<=27 && (await agents.boundingBox()).height>400);
+  await button(left,'Collapse agents').click();
+  assert.ok((await agents.boundingBox()).height<=27 && await left.locator('.host-name').first().isHidden());
+  await button(p,'Hide left sidebar').click();
+  assert.ok(await left.isHidden() && await p.getByLabel('Sidebar width',{exact:true}).isHidden());
+  assert.ok((await button(p,'Show left sidebar').boundingBox()).x>=76);
+  await button(p,'Hide right sidebar').click();
+  await p.reload(); await p.locator('.connection-dot.online').waitFor();
+  assert.ok(await left.isHidden() && await p.locator('.tool-rail').isHidden());
+  await button(p,'Show left sidebar').click(); await button(p,'Show right sidebar').click();
+  await button(left,'Expand workspaces').click(); await button(left,'Expand agents').click();
+  assert.ok(await left.getByRole('separator').isVisible());
+  ok('left sidebar, right rail and tools panel, independent section collapse and restoration after reload');
+
+  await button(p,'Split active pane').click(); await p.locator('.pane:nth-of-type(1)').first().waitFor();
+  await eventually('two panes',async()=>await p.locator('.pane').count()===2);
+  const first=p.locator('.pane').first(), second=p.locator('.pane').nth(1);
+  await first.locator('canvas').click(); await eventually('first focus',()=>first.evaluate(e=>e.classList.contains('pane-focused')));
+  const frame=el=>el.evaluate(e=>{const s=getComputedStyle(e);return [s.borderTopLeftRadius,s.borderWidth,s.borderColor];});
+  const before=await first.boundingBox(), [r,w,activeColor]=await frame(first);
+  assert.equal(r,'8px'); assert.equal(w,'1px'); assert.notEqual((await frame(second))[2],activeColor);
+  await second.locator('canvas').click();
+  await eventually('accent outline moved',async()=>(await frame(second))[2]===activeColor && (await frame(first))[2]!==activeColor);
+  assert.deepEqual(await first.boundingBox(),before);
+  const input=second.getByLabel('Terminal input');
+  const icon='\uf404';
+  await input.fill("printf '\\033[2J\\033[H\\033[38;2;10;140;181m"+icon+" Files\\033[0m\\n\uf115 src\\n\uf15b README.md\\n'");
+  await input.press('Enter');
+  await p.waitForFunction(s=>document.querySelector('.pane-focused .terminal-accessible')?.textContent.startsWith(s),icon);
+  await p.waitForFunction(()=>[...document.fonts].some(f=>f.family.includes('Luvus Nerd Symbols') && f.status==='loaded'));
+  const glyphRaster=()=>second.evaluate((el,symbol)=>{
+    const canvas=el.querySelector('canvas'), actual=canvas.getContext('2d'), style=getComputedStyle(el.querySelector('textarea'));
+    const fontSize=parseFloat(style.fontSize), height=Math.ceil(fontSize*1.45), dpr=devicePixelRatio;
+    const reference=document.createElement('canvas');reference.width=canvas.width;reference.height=Math.ceil(height*dpr);
+    const ctx=reference.getContext('2d');ctx.setTransform(dpr,0,0,dpr,0,0);
+    ctx.font=fontSize+'px '+style.fontFamily;const advance=ctx.measureText('M').width, width=Math.ceil(advance*dpr);
+    ctx.fillStyle='#0a8cb5';
+    ctx.font=fontSize+'px "Luvus Nerd Symbols"';ctx.fillText(symbol,0,Math.round((height-fontSize)/2)+fontSize-2,advance);
+    const mask=ctx.getImageData(0,0,width,reference.height).data, ink=actual.getImageData(0,0,width,reference.height).data;
+    let expected=0,matching=0;
+    for(let i=0;i<mask.length;i+=4) if(mask[i+3]>190){expected++;if(ink[i+2]-ink[i]>72 && ink[i+1]-ink[i]>55) matching++;}
+    return {expected,matching};
+  },icon);
+  await eventually('bundled glyph repainted on the terminal canvas',async()=>{
+    const proof=await glyphRaster();
+    return proof.expected>=3 && proof.matching/proof.expected>.9;
+  });
+  for (const mode of ['light','dark']) {
+    await p.emulateMedia({colorScheme:mode});
+    await p.waitForFunction(light=>[...document.querySelectorAll('.pane')].every(el=>{
+      const canvas=el.querySelector('canvas'), pixel=canvas.getContext('2d').getImageData(canvas.width-2,canvas.height-2,1,1).data;
+      const head=getComputedStyle(el.querySelector('.pane-header')).backgroundColor;
+      return (light?pixel[0]>165:pixel[0]<110) && head==='rgb('+[...pixel].slice(0,3).join(', ')+')';
+    }),mode==='light');
+    await p.screenshot({path:join(home,'panes-'+mode+'.png')});
+  }
+  ok('8px outer pane corners, stationary focus outline, light/dark header and real canvas pixels, bundled Nerd Font glyph raster');
+  await button(p,'New tab').click();
+  const output=p.locator('.terminal-accessible').first();
+  await p.getByRole('tab',{name:'2',exact:true,selected:true}).waitFor();
+  await p.getByLabel('Terminal input').fill("printf '%s%s\\n' warm_ second"); await p.getByLabel('Terminal input').press('Enter');
+  await eventually('second terminal baseline',async()=>(await output.textContent()).includes('warm_second'));
+  await p.evaluate(()=>{
+    window.__tabSamples=[];
+    function sample() {
+      const tab=document.querySelector('.tab-item.selected > [role=tab]')?.textContent;
+      window.__tabSamples.push([tab,document.querySelector('.terminal-waiting')!==null,
+        [...document.querySelectorAll('.terminal-accessible')].some(e=>e.textContent.includes(tab==='1'?'README.md':'warm_second'))]);
+      if(window.__tabSamples.length<600)window.__tabFrame=requestAnimationFrame(sample);
+    }
+    window.__tabFrame=requestAnimationFrame(sample);
+  });
+  for(const name of ['1','2','1','2']) {
+    await p.getByRole('tab',{name,exact:true}).click();
+    await p.getByRole('tab',{name,exact:true,selected:true}).waitFor();
+    await p.evaluate(()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r))));
+  }
+  const samples=await p.evaluate(()=>{cancelAnimationFrame(window.__tabFrame);return window.__tabSamples;});
+  assert.ok(samples.some(([t])=>t==='1') && samples.some(([t])=>t==='2'));
+  assert.ok(samples.every(([,waiting,correct])=>!waiting && correct),JSON.stringify(samples.filter(([,waiting,correct])=>waiting || !correct)));
+  ok('four warm tab switches: no waiting frame or wrong-terminal output at paint time');
+});
+
+await scenario('keyboard-shortcuts',async ({page:p,native,home,workspace,api,snap,ok})=>{
+  const prefix=async key=>{await p.keyboard.press('Control+b');await p.locator('.prefix-indicator').waitFor();await p.keyboard.press(key);};
+  const gui=()=>p.evaluate(async()=>(await window.luvus.bootstrap()).find(m=>m.type==='snapshot').snapshot);
+  const keyboardFocus=()=>p.waitForFunction(()=>document.querySelector('.pane-focused .terminal-host')?.contains(document.activeElement));
+  const selected=()=>p.getByRole('tab',{selected:true});
+  await p.getByLabel('Terminal input').fill("printf '\\033[2J\\033[HKEY_CAPTURE_READY\\n'; stty raw -echo; cat > key-bytes");
+  await p.getByLabel('Terminal input').press('Enter');
+  await p.waitForFunction(()=>document.querySelector('.terminal-accessible')?.textContent.includes('KEY_CAPTURE_READY'));
+  await eventually('raw fixture ready',async()=>{try{return (await readFile(join(workspace,'key-bytes'))).length===0;}catch{return false;}});
+  await prefix('c');await p.getByRole('tab',{name:'2',exact:true,selected:true}).waitFor();
+  await p.keyboard.press('Meta+1');await p.getByRole('tab',{name:'1',exact:true,selected:true}).waitFor();
+  await p.keyboard.press('Meta+9');assert.equal(await selected().textContent(),'1');
+  await prefix('Escape');assert.equal((await readFile(join(workspace,'key-bytes'))).length,0);
+  await prefix('Control+b');
+  await eventually('double prefix forwards exactly one physical key',async()=>(await readFile(join(workspace,'key-bytes'))).toString('hex')==='02');
+  await prefix('y');await p.locator('[data-keyboard-copy]').waitFor();
+  await p.keyboard.press('k');await p.keyboard.press('0');await p.keyboard.press('l');await p.keyboard.press('Escape');
+  await p.locator('[data-keyboard-copy]').waitFor({state:'detached'});
+  assert.equal((await readFile(join(workspace,'key-bytes'))).toString('hex'),'02','copy-mode motions must not leak to the child');
+  await prefix('n');await p.getByRole('tab',{name:'2',exact:true,selected:true}).waitFor();
+  await prefix('v');await eventually('split right',async()=>ids(await snap()).length===2);
+  const second=tab(await snap()).panes.find(p=>p.focused).pane_id;
+  await eventually('split terminal lifetime ready',async()=>tab(await gui()).panes.some(pane=>pane.focused && pane.pane_id===second && pane.target?.terminal_id));
+  await keyboardFocus();
+  await prefix('h');await eventually('focus left',async()=>tab(await snap()).panes.find(p=>p.focused).pane_id!==second);
+  await eventually('left focus projected',async()=>tab(await gui()).focus!==second);
+  await prefix('l');await eventually('focus right',async()=>tab(await snap()).panes.find(p=>p.focused).pane_id===second);
+  await eventually('right focus projected',async()=>tab(await gui()).focus===second);await keyboardFocus();
+  await prefix('z');await eventually('zoom',async()=>tab(await gui()).zoomed);
+  await prefix('z');await eventually('unzoom',async()=>!tab(await gui()).zoomed);
+  await eventually('right focus survives zoom',async()=>tab(await gui()).focus===second);
+  await p.locator('.pane-focused textarea').waitFor();
+  const ratio=JSON.stringify(tab(await gui()).layout);
+  await prefix('r');await p.locator('[data-resizing]').waitFor();await p.keyboard.press('ArrowLeft');await p.keyboard.press('Escape');
+  await eventually('keyboard resize',async()=>JSON.stringify(tab(await gui()).layout)!==ratio);
+  await prefix('x');await eventually('close pane immediately',async()=>ids(await snap()).length===1);
+  assert.equal(await dialog(p).count(),0);
+  await prefix('b');await p.locator('.desktop-shell[data-left-hidden]').waitFor();
+  await prefix('b');await p.locator('.desktop-shell:not([data-left-hidden])').waitFor();
+  await prefix('t');await p.locator('.session-popup').waitFor();await p.keyboard.press('Escape');await p.locator('.session-popup').waitFor({state:'detached'});
+  await prefix('Shift+/');await dialog(p).waitFor();assert.match(await dialog(p).textContent(),/ctrl\+b/);await p.keyboard.press('Escape');await dialog(p).waitFor({state:'hidden'});
+  await prefix('N');await dialog(p).waitFor();await button(dialog(p),'Cancel').click();await dialog(p).waitFor({state:'hidden'});
+  await prefix('/');await p.getByRole('textbox',{name:'Search query'}).waitFor();await button(p,'Close tools panel').click();
+  ok('Command digits, prefix tab creation/cycling, splits, directional focus, zoom, resize, immediate close and desktop panels');
+
+  await button(p,'Open workspace').click();const directory=p.getByRole('textbox',{name:'Directory',exact:true});
+  await directory.fill('draft');await directory.press('Control+b');await directory.press('c');
+  assert.equal(await p.getByRole('tab').count(),2);await button(dialog(p),'Cancel').click();
+  await p.keyboard.press('Meta+1');await p.getByRole('tab',{name:'1',exact:true,selected:true}).waitFor();
+  await p.keyboard.press('Control+b');await p.getByRole('tab',{name:'2',exact:true}).click();
+  await p.getByRole('tab',{name:'2',exact:true,selected:true}).waitFor();await p.keyboard.press('c');
+  assert.equal(await p.getByRole('tab').count(),2);await p.keyboard.press('Control+u');
+  await api('config.patch',{patch:{prefix:'ctrl+a',keybindings:{new_tab:'a'}}});
+  await p.waitForFunction(()=>window.luvus.bootstrap().then(ms=>ms.some(m=>m.type==='snapshot' && m.snapshot.key_bindings.prefix==='ctrl+a')));
+  await p.keyboard.press('Control+a');await p.locator('.prefix-indicator').waitFor();await p.keyboard.press('a');
+  await p.getByRole('tab',{name:'3',exact:true,selected:true}).waitFor();
+  await p.keyboard.press('Meta+1');await p.getByRole('tab',{name:'1',exact:true,selected:true}).waitFor();
+  await p.keyboard.press('Control+b');await p.keyboard.press('c');
+  await eventually('old prefix now goes to the exact original terminal',async()=>(await readFile(join(workspace,'key-bytes'))).toString('hex')==='020263');
+  assert.equal(await p.getByRole('tab').count(),3);
+  ok('configured prefix and key overrides hot-reload; text dialogs win; tab switches cancel pending prefixes; no consumed bytes leak to the child');
+
+  await button(p,'New browser tab').click();await p.getByLabel('Browser address').waitFor();
+  await eventually('native blank browser is visible',()=>native.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].contentView.children.some(v=>v.webContents && v.getVisible())));
+  await native.evaluate(({BrowserWindow})=>{
+    const guest=BrowserWindow.getAllWindows()[0].contentView.children.find(v=>v.webContents && v.getVisible());
+    guest.webContents.focus();guest.webContents.sendInputEvent({type:'keyDown',keyCode:'2',modifiers:['meta']});
+    guest.webContents.sendInputEvent({type:'keyUp',keyCode:'2',modifiers:['meta']});
+  });
+  await p.getByRole('tab',{name:'2',exact:true,selected:true}).waitFor();
+  assert.equal(await p.locator('.global-error').count(),0);
+  await p.screenshot({path:join(home,'keyboard-tabs.png')});
+  ok('Command-digit switches from the native browser guest back to a terminal tab');
+});
+
+await scenario('appearance-controls',async ({page:p,native,home,cli,snap,ok})=>{
+  await native.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setContentSize(1280,820));
+  await p.emulateMedia({colorScheme:'dark'});
+  await p.locator('.pane-focused canvas').waitFor();
+  const initial=ids(await snap())[0];
+  for(const label of ['Right-click passthrough','Copy on selection']) {
+    const control=button(p.locator('.pane-focused'),label);
+    const before=await control.getAttribute('aria-pressed');
+    for(const expected of [String(before!=='true'),before]) {
+      await control.click();
+      await eventually(label+' updates while the same pane stays focused',async()=>await control.getAttribute('aria-pressed')===expected);
+      assert.equal(ids(await snap())[0],initial);
+    }
+  }
+  const copy=button(p,'Copy on selection'), passthrough=button(p,'Right-click passthrough');
+  const style=el=>el.evaluate(e=>{const s=getComputedStyle(e);return [s.backgroundColor,s.color,s.boxShadow];});
+  await passthrough.hover();
+  assert.notDeepEqual(await style(copy),await style(passthrough));
+  await p.screenshot({path:join(home,'toggle-states.png')});
+  ok('mouse preferences refresh on the focused pane; pressed and hover states are distinct');
+
+  await button(p,'New tab').click();
+  await p.getByRole('tab',{name:'2',exact:true,selected:true}).waitFor();
+  const close=button(p,'Close tab 2');
+  await close.click(); await dialog(p).waitFor();
+  await button(dialog(p),'Cancel').click();
+  assert.equal(await close.evaluate(e=>e.matches(':focus-visible')),false);
+  await p.keyboard.press('Tab');
+  assert.equal(await p.evaluate(()=>document.activeElement.matches(':focus-visible')),true);
+  await button(p.locator('.sidebar-bottom'),'Settings').click();
+  const confirm=p.getByRole('switch',{name:'Confirm before closing a tab'});
+  await confirm.click();
+  await button(p,'Back to terminals').click();
+  await close.click();
+  await eventually('no confirmation tab close',async()=>active(await snap()).tabs.length===1);
+  assert.equal(await dialog(p).count(),0);
+  await p.reload();await p.locator('.connection-dot.online').waitFor();
+  await button(p.locator('.sidebar-bottom'),'Settings').click();
+  assert.equal(await confirm.getAttribute('aria-checked'),'false');
+  await button(p,'Back to terminals').click();
+  ok('tab close confirmation can be disabled and persists; pointer dialog return has no blue ring while keyboard focus stays visible');
+
+  const input=p.getByLabel('Terminal input');
+  await input.fill("printf '\\033[2J\\033[H\\033[44m%8s\\033[104m%8s\\033[48;2;0;0;128m%8s\\033[48;5;21m%8s\\033[0m palette_probe\\n' '' '' '' ''");
+  await input.press('Enter');
+  await p.waitForFunction(()=>document.querySelector('.terminal-accessible')?.textContent.includes('palette_probe'));
+  const pixels=()=>p.locator('.pane-focused canvas').evaluate(canvas=>{
+    const ctx=canvas.getContext('2d'), data=ctx.getImageData(0,0,canvas.width,2).data;
+    const runs=[];
+    for(let x=0;x<canvas.width;x++) {
+      const color=[...data.slice(x*4,x*4+3)].map(v=>v.toString(16).padStart(2,'0')).join('');
+      if(runs.at(-1)!==color)runs.push(color);
+    }
+    return runs;
+  });
+  for(const [theme,mode,blue] of [['catppuccin-mocha','dark','89b4fa'],['nord','dark','81a1c1'],['catppuccin-latte','light','1e66f5']]) {
+    await p.emulateMedia({colorScheme:mode});
+    await button(p.locator('.sidebar-bottom'),'Settings').click();
+    await button(p.locator('.settings-nav'),'Appearance').click();
+    await choose(p.getByRole('combobox',{name:'Terminal theme'}),theme);
+    await button(p,'Back to terminals').click();
+    await eventually('theme recolors already printed ANSI slots '+theme,async()=>{
+      const colors=await pixels();return colors[0]===blue && colors[1]==='000080' && colors[2]==='0000ff';
+    });
+    await p.screenshot({path:join(home,theme+'.png')});
+  }
+  ok('real PTY ANSI normal/bright colors follow three theme changes; literal RGB and fixed 256-color blue remain unchanged');
+  const original=(await p.evaluate(()=>window.luvus.bootstrap())).find(m=>m.type==='snapshot');
+  assert.ok(original);
+  const fixture=structuredClone(original);
+  fixture.snapshot.host_connections=[
+    {host:'matching-host',state:'connected',sessions:['matrix']},
+    {host:'other-session-host',state:'connected',sessions:['default']},
+    {host:'unknown-host',state:'unknown',sessions:[]},
+  ];
+  fixture.snapshot.config.remote_hosts=['matching-host','other-session-host','unknown-host'];
+  await native.evaluate(({BrowserWindow},message)=>BrowserWindow.getAllWindows()[0].webContents.send('luvus:message',message),fixture);
+  await p.locator('.host-name').filter({hasText:'matching-host'}).waitFor();
+  assert.deepEqual(await p.locator('.host-name').allTextContents(),['This computer','matching-host']);
+  await native.evaluate(({BrowserWindow},message)=>BrowserWindow.getAllWindows()[0].webContents.send('luvus:message',message),original);
+  assert.equal(await p.locator('.global-error').count(),0,'appearance controls must not leave a stale-route error');
+  ok('projection fixture: sidebar shows only hosts with the selected named session (no SSH requests)');
+});
+
+if (process.argv.includes('neovim-icons')) await scenario('neovim-icons',async ({page:p,workspace,home,ok})=>{
+  await writeFile(join(workspace,'icons.txt'),[
+    '\uf404  Files', '\uf115  src/', '\uf15b  Cargo.toml', '\ue73e  main.rs', '\uf48a  README.md', '\u{f0214}  package.json'
+  ].join('\n')+'\n');
+  await p.emulateMedia({colorScheme:'dark'});
+  const input=p.getByLabel('Terminal input');
+  await input.fill('exec nvim -u NONE -i NONE -n --noplugin icons.txt'); await input.press('Enter');
+  await p.waitForFunction(()=>document.querySelector('.terminal-accessible')?.textContent.includes('package.json'));
+  await input.press('Escape');
+  await p.keyboard.type(':echo "NEOVIM_GLYPH_FIXTURE"'); await p.keyboard.press('Enter');
+  await p.waitForFunction(()=>document.querySelector('.terminal-accessible')?.textContent.includes('NEOVIM_GLYPH_FIXTURE'));
+  await p.waitForFunction(()=>[...document.fonts].some(f=>f.family.includes('Luvus Nerd Symbols') && f.status==='loaded'));
+  await p.locator('.pane').screenshot({path:join(home,'neovim-icons.png')});
+  ok('real Neovim inside the packaged terminal, default font, six private-use file and prompt symbols');
+});
+
+if (process.argv.includes('codex-title')) await scenario('codex-title',async ({page:p,workspace,home,env,ok})=>{
+  // A real CLI with a fresh profile, a dummy credential and a loopback-only
+  // provider. Slash commands are local; no prompts or model requests are needed.
+  await p.emulateMedia({colorScheme:'dark'});
+  await mkdir(env.CODEX_HOME,{recursive:true});
+  await exec('git',['init','--quiet'],{cwd:workspace,env});
+  await writeFile(join(env.CODEX_HOME,'config.toml'),[
+    'model_provider="fixture"','model="fixture"','check_for_update_on_startup=false',
+    '[model_providers.fixture]','name="fixture"','base_url="http://127.0.0.1:1/v1"','env_key="MATRIX_KEY"','wire_api="responses"',
+    '[tui]','terminal_title=[]','[projects.'+JSON.stringify(workspace)+']','trust_level="trusted"'
+  ].join('\n'));
+  const input=p.getByLabel('Terminal input');
+  await input.fill('exec env -i HOME="$HOME" CODEX_HOME="$HOME/.codex" PATH="$PATH" TERM=xterm-256color MATRIX_KEY=offline codex --no-alt-screen');
+  await input.press('Enter');
+  await eventually('actual Codex TUI ready',async()=>(await p.locator('.terminal-accessible').textContent()).includes('OpenAI Codex'));
+  const slash=async(command)=>{
+    await input.focus();
+    await p.keyboard.type(command,{delay:32});
+    await eventually('command visible in Codex composer',async()=>(await p.locator('.terminal-accessible').textContent()).includes(command));
+    await sleep(200); // Allow the CLI's paste-burst detector to finish the input.
+    await p.keyboard.press('Enter');
+  };
+  await slash('/title thread-title project-name');
+  await eventually('Codex published this project title',async()=>(await p.locator('.pane-title').textContent()).includes(' | work'));
+  for (const name of ['Greeting review','Compiler review']) {
+    await slash('/rename '+name);
+    await eventually('real Codex session title in both surfaces: '+name,async()=>
+      (await p.locator('.pane-title').textContent()).includes(name) && (await p.locator('.agent-main strong').first().textContent()).includes(name));
+  }
+  await p.screenshot({path:join(home,'codex-session-title.png')});
+  ok('running Codex CLI publishes both successive chat names, without a model request');
+});
+
+if (process.argv.includes('public-browser')) await scenario('public-browser',async ({page:p,native,home,ok})=>{
+  const address=p.getByLabel('Browser address'), uiTab=(name)=>p.getByRole('tab',{name,exact:true});
+  await button(p,'New browser tab').click();
+  await address.fill('https://www.google.com'); await address.press('Enter');
+  await uiTab('Google').waitFor({timeout:35000});
+  const capture = await native.evaluate(async({BrowserWindow})=>{
+    const guest=BrowserWindow.getAllWindows()[0].contentView.children.find(v=>v.getVisible() && v.webContents?.getTitle()==='Google');
+    if(!guest) throw Error('Google guest is not visible');
+    const contents=guest.webContents;
+    const ready=await contents.executeJavaScript("!!document.querySelector('textarea[name=q],input[name=q]')");
+    return {ready, documentTime:await contents.executeJavaScript('performance.timeOrigin'),url:contents.getURL(),png:(await contents.capturePage()).toPNG().toString('base64')};
+  });
+  assert.ok(capture.ready && capture.url.startsWith('https://www.google.'));
+  await writeFile(join(home,'google.png'),Buffer.from(capture.png,'base64'));
+  await uiTab('1').click(); await uiTab('Google').click();
+  await address.fill('www.google.com'); await address.press('Enter');
+  await eventually('second address-bar navigation committed to the visible guest',()=>native.evaluate(async({BrowserWindow},oldTime)=>{
+    const guest=BrowserWindow.getAllWindows()[0].contentView.children.find(v=>v.getVisible() && v.webContents?.getTitle()==='Google');
+    return guest && !guest.webContents.isLoadingMainFrame() && await guest.webContents.executeJavaScript('performance.timeOrigin')>oldTime;
+  },capture.documentTime));
+  assert.ok(await p.locator('.global-error').isHidden());
+  ok('real HTTPS Google page, search field, visible guest, bare address after returning to browser tab');
+});
+
 await scenario('desktop-ux',async ({page:p,native,home,api,snap,ok})=>{
   await native.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setContentSize(1280,820));
   await p.getByLabel('Terminal input').fill('codex');
@@ -296,6 +645,15 @@ await scenario('desktop-ux',async ({page:p,native,home,api,snap,ok})=>{
     assert.equal(rect.width,6);assert.equal(rect.height,6);
   };
   await checkDot();
+  for (const title of ['Respond to greeting | work','Review parser | work']) {
+    const input=p.getByLabel('Terminal input');
+    await input.fill(':fixture-title '+title); await input.press('Enter');
+    await eventually('live title in pane and compact agent row',async()=>
+      (await p.locator('.pane-title').textContent()).startsWith(title) && (await p.locator('.agent-main strong').textContent())===title);
+  }
+  assert.ok((await p.locator('.pane-title small').textContent()).includes('/work'));
+  await p.screenshot({path:join(home,'live-agent-title.png')});
+  ok('session title and later rename appear in pane and compact sidebar; optional pane path stays separate');
   const footer = p.locator('.sidebar-bottom'), settings = button(footer,'Settings');
   const actions = [settings,button(footer,'Mission Control'),button(footer,'Orchestration')];
   const background = locator => locator.evaluate(e=>getComputedStyle(e).backgroundColor);
@@ -333,23 +691,25 @@ await scenario('desktop-ux',async ({page:p,native,home,api,snap,ok})=>{
   await p.keyboard.press('Meta+t');
   await eventually('terminal shortcut opens tab',async()=>active(await snap()).tabs.length===count+2);
   assert.equal(await p.locator('dialog[open]').count(),0);
+  const inactive=p.locator('.tab-item:not(.selected)').first(), beforeHover=await inactive.boundingBox();
+  const resting=await background(inactive);
+  assert.equal(await inactive.locator('.icon-button').evaluate(e=>getComputedStyle(e).opacity),'0');
+  await inactive.hover(); assert.notEqual(await background(inactive),resting);
+  assert.deepEqual(await inactive.boundingBox(),beforeHover);
   await button(p,'Split active pane').click();
   await eventually('automatic split without a dialog',async()=>ids(await snap()).length===2 && await p.locator('.pane').count()===2);
   assert.equal(await dialog(p).count(),0);
   await p.screenshot({path:join(home,'automatic-split.png')});
-  await native.evaluate(({Menu})=>{
-    const popup=Menu.prototype.popup;
-    Menu.prototype.popup=function(options){
-      globalThis.menuLabels=this.items.map(i=>i.label);
-      globalThis.dismissMenu=()=>this.closePopup(options.window);
-      Menu.prototype.popup=popup;
-      return popup.call(this,options);
-    };
-  });
   const surface=p.locator('.pane-focused canvas').first();
   await surface.click({button:'right'});
-  await eventually('native terminal context menu',async()=>JSON.stringify(await native.evaluate(()=>globalThis.menuLabels))==='["Copy","Paste"]');
-  await native.evaluate(()=>globalThis.dismissMenu());
+  const menu=p.getByRole('menu');
+  for(const name of ['Copy','Paste','Split pane','Split right','Split down','Running command','New browser tab','Close pane']) {
+    assert.ok(await menu.getByRole('menuitem',{name,exact:true}).isVisible(),name);
+  }
+  assert.ok(await menu.getByRole('menuitem',{name:'Copy',exact:true}).isDisabled());
+  await p.screenshot({path:join(home,'pane-context-menu.png')});
+  await p.keyboard.press('Escape');
+  await menu.waitFor({state:'hidden'});
   await surface.click();
   const input=p.locator('.pane-focused').getByLabel('Terminal input');
   await input.fill("printf '\\033[48;2;109;83;61m%36s\\033[0m\\n' ''");
@@ -365,7 +725,7 @@ await scenario('desktop-ux',async ({page:p,native,home,api,snap,ok})=>{
     }
     return false;
   },null,{timeout:7000});
-  ok('native right-click menu, continuous true-color terminal background at physical-pixel resolution');
+  ok('in-app right-click menu, continuous true-color terminal background at physical-pixel resolution');
   await p.locator('.pane-focused').getByRole('button',{name:'Copy on selection',exact:true}).click();
   await eventually('copy toggle owner snapshot',async()=>!(await p.locator('.pane-focused').getByRole('button',{name:'Copy on selection'}).getAttribute('aria-pressed')==='true'));
   await button(p.locator('.pane-focused'),'Right-click passthrough').click();
@@ -546,7 +906,15 @@ await scenario('terminal-graphics',async ({page:p,workspace,ok})=>{
 await scenario('files',async ({page:p,workspace,ok})=>{
   await button(p,'Files').click();
   const files=p.locator('.files-panel'),filter=p.getByLabel('Filter loaded files');
-  await button(files,'nested').click();
+  const nested=button(files,'nested');
+  await nested.evaluate(el=>el.scrollIntoView({block:'center'}));
+  const panel=p.locator('.tools-panel'), beforeExpand=await panel.evaluate(e=>e.scrollTop);
+  assert.ok(beforeExpand>100);
+  await nested.click();
+  const child=button(files,'child');
+  await child.waitFor(); assert.ok(await panel.evaluate(e=>e.scrollTop)>=beforeExpand-2);
+  await child.click(); await button(files,'grandchild').waitFor();
+  assert.ok(await panel.evaluate(e=>e.scrollTop)>=beforeExpand-2);
   const row=name=>files.locator('.file-tree-row').filter({has:files.page().getByTitle(join(workspace,'nested',name),{exact:true})});
   const before=row('before.txt');
   await before.waitFor();
@@ -710,7 +1078,7 @@ await scenario('agent-recovery',async ({page:first,native,home,workspace,snap,ap
   };
   await history(nativeId);
   await p.locator('.agent-row').filter({hasText:/codex/i}).first().waitFor();
-  await button(p,'Orchestration').click();await p.getByRole('tab',{name:'automations'}).click();await button(p,'Schedule agent prompt…').click();
+  await button(p,'Orchestration').click();await p.getByRole('tab',{name:'Scheduled tasks'}).click();await button(p,'Schedule agent prompt…').click();
   const d=dialog(p);await d.getByLabel('Name',{exact:false}).fill('Durable check');await d.getByLabel('Prompt').fill('recovered-receipt');
   await choose(d.getByLabel('Agent terminal'),{index:1});await submit(p,'Schedule');
   const definition=async()=>(await api('automation.list')).automations.find(a=>a.name==='Durable check');
@@ -727,7 +1095,7 @@ await scenario('agent-recovery',async ({page:first,native,home,workspace,snap,ap
   await writeFile(join(home,'bin/codex'),'#!/bin/sh\nexec /bin/sh "$HOME/fixture-wait" "$@"\n',{mode:0o700});
   p=await launch();assert.notEqual((await snap()).server_generation,generation);
   const hist=async()=>(await api('automation.history',{id:before.id})).runs[0];
-  await button(p,'Orchestration').click();await p.getByRole('tab',{name:'automations'}).click();
+  await button(p,'Orchestration').click();await p.getByRole('tab',{name:'Scheduled tasks'}).click();
   await button(p.locator('.task-card').filter({hasText:'Durable check'}),'Run now…').click();await submit(p,'Run');
   await eventually('restore without readiness cannot deliver',async()=>(await hist())?.status==='pending');
   assert.ok(!JSON.stringify(await hist()).includes(nativeId));
@@ -742,7 +1110,7 @@ await scenario('agent-recovery',async ({page:first,native,home,workspace,snap,ap
     const rows=(await api('terminal.backend.inventory')).terminals??[];
     return rows.find(t=>t.terminal_id!==rebound.target.terminal_id && t.terminal_title==='Codex' && String(t.pane_id)!==String(rebound.target.pane_id));
   });
-  await button(p,'Orchestration').click();await p.getByRole('tab',{name:'automations'}).click();
+  await button(p,'Orchestration').click();await p.getByRole('tab',{name:'Scheduled tasks'}).click();
   const card=p.locator('.task-card').filter({hasText:'Durable check'});
   await button(card,'Rebind terminal…').click();await choose(dialog(p).getByLabel('Agent terminal'),other.pane_id);
   await button(dialog(p),'Rebind').click();await dialog(p).getByRole('alert').filter({hasText:/identity|native|session|conversation|match/i}).waitFor();
@@ -862,7 +1230,16 @@ await scenario('active-automation',async ({page:p,home,workspace,snap,cli,env,ok
   await canvas().click();await p.keyboard.type('exec '+agent+' busy');await p.keyboard.press('Enter');
   await eventually('busy VT',async()=>(await p.locator('.terminal-accessible').first().textContent()).includes('Generating answer'));
   await p.locator('.agent-row').filter({hasText:/codex/i}).first().waitFor();
-  const orch=async()=>{await button(p,'Orchestration').click();await p.getByRole('tab',{name:'automations'}).click();};
+  const orch=async()=>{await button(p,'Orchestration').click();await p.getByRole('tab',{name:'Scheduled tasks'}).click();};
+  await button(p.locator('.sidebar-bottom'),'Scheduled tasks').click();
+  await button(p,'Schedule a worker').click();
+  const worker=dialog(p); await worker.getByLabel('Name').fill('Weekday fixture'); await worker.getByLabel('Prompt').fill('Read-only report');
+  await choose(worker.getByLabel('Repeat'),'weekdays'); await worker.getByLabel('Local time').fill('11:23');
+  await submit(p,'Schedule');
+  const saved=JSON.parse(await cli('automation','list')).result.automations.find(row=>row.name==='Weekday fixture');
+  assert.deepEqual(saved.trigger.weekdays,[1,2,3,4,5]);assert.equal(saved.trigger.second_of_day,40980);
+  assert.equal(saved.task.access,'read_only');assert.equal(saved.target.kind,'new_worker');
+  await button(p.locator('.task-card').filter({hasText:'Weekday fixture'}),'Disable').click();
   await orch();
   const make=async(policy)=>{
     await button(p,'Schedule agent prompt…').click();const d=dialog(p);

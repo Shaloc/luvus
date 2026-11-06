@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { ExternalLink, Search } from 'lucide-react';
 import { safeLink } from '@luvus/terminal-view';
 import { mutate } from './bridge';
-import { array, numeric, page, record, text, truth, type Pane, type RecordValue } from './model';
+import { array, numeric, page, record, targetKey, text, truth, type Pane, type RecordValue } from './model';
 import { AsyncButton, Empty, ErrorBox, Loading, Notice } from './ui';
 import { BrowserView } from './BrowserView';
 
@@ -19,7 +19,7 @@ export function NativeView({ pane }: { pane: Pane }) {
   if (state === 'error') return <ErrorBox error={text(data.error, 'The core could not load this view.')} />;
   if (state === 'unavailable') return <Empty title={tr("This view is not available in the desktop projection")}>{text(data.reason).replaceAll('_', ' ')}{tr(". The original leaf is preserved; no terminal fallback is used.")}</Empty>;
   if (['binary', 'too_large', 'conflict'].includes(state)) return <Empty title={state === 'binary' ? tr("Binary file") : state === 'conflict' ? tr("Conflicted file") : tr("File exceeds the preview limit")}>{text(data.message) || `${numeric(data.bytes).toLocaleString()} bytes`}</Empty>;
-  if (pane.kind === 'browser') return <BrowserView pane={pane} />;
+  if (pane.kind === 'browser') return <BrowserView key={pane.target ? targetKey(pane.target) : pane.id} pane={pane} />;
   if (pane.kind === 'diff') return <div className="native-content"><DiffContent data={data} paginated />{truth(data.text_truncated) && <Notice>{tr("Core preview budget reached; content is truncated.")}</Notice>}</div>;
   if (pane.kind === 'preview') return <article className="document-view">{page(data.blocks).map((block, i) => <Block key={i} block={block} openLink={openLink} />)}{truth(record(data.blocks).truncated) && <Notice>{tr("The core sent a bounded document preview. Further pages are not available in this protocol.")}</Notice>}</article>;
   if (pane.kind !== 'file') return <Empty title={tr("No native content supplied")}>{tr("This leaf needs a semantic projection from the core.")}</Empty>;

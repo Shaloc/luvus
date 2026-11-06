@@ -23,7 +23,15 @@ export class Gateways {
     if(control)argv.push('--control');
     const env={...this.env};for(const k of ['LUVUS_SOCKET_PATH','LUVUS_SESSION','LUVUS_PANE_ID','LUVUS_REMOTE_HOST','LUVUS_REMOTE_SESSION','LUVUS_API_ADDRESS'])delete env[k];
     const child=spawn(this.binary,['--session',this.session,...argv],{env,stdio:'pipe',windowsHide:true});
-    const closed=new Promise<void>(r=>child.once('close',()=>r()));
+    // A descendant can keep a pipe open after the bridge has exited. Revoke
+    // its row on process exit; waiting for all pipe writers would hang Stop.
+    const closed=new Promise<void>(resolve=>{
+      child.once('exit',()=>{
+        child.stdin.destroy();child.stdout.destroy();child.stderr.destroy();
+        resolve();
+      });
+      child.once('close',()=>resolve()); // also covers failure to spawn
+    });
     const row:Managed={child,closed,mode:control?'control':'read_only'};this.children.set(kind,row);
     void closed.then(()=>{row.pairing=undefined;if(this.children.get(kind)===row)this.children.delete(kind);});
     child.stderr.resume();

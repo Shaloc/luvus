@@ -10,7 +10,7 @@ export class IncompatibleCoreError extends Error {}
 
 export class CoreClient extends EventEmitter {
   private child: ChildProcessWithoutNullStreams | undefined;
-  private readonly pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }>();
+  private readonly pending = new Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout; snapshot: boolean; acknowledged: boolean }>();
   private readonly latest = new Map<string, Response>();
   private closing = false;
   private failed = false;
@@ -85,7 +85,7 @@ export class CoreClient extends EventEmitter {
         this.pending.delete(request.id);
         reject(new Error('Core response timed out; the execution outcome may be unknown'));
       }, 35000);
-      this.pending.set(request.id, { resolve, reject, timer });
+      this.pending.set(request.id, { resolve, reject, timer, snapshot: request.type==='snapshot', acknowledged:false });
       child.stdin.write(bytes, error => {
         if (!error) return;
         clearTimeout(timer);
@@ -129,6 +129,9 @@ export class CoreClient extends EventEmitter {
       const id = message.id;
       const pending = id ? this.pending.get(id) : undefined;
       if (pending) {
+        // The owner acknowledges snapshot requests before rendering them. Keep
+        // callers behind that frame, so focus and input use the committed view.
+        if (pending.snapshot && message.type==='reply') {pending.acknowledged=true;return;}
         clearTimeout(pending.timer);
         this.pending.delete(id!);
         if (message.type === 'error') pending.reject(new Error(message.message));
@@ -149,6 +152,11 @@ export class CoreClient extends EventEmitter {
     } else if (message.type === 'terminal') this.latest.set(`terminal:${message.frame.target.pane_id}`, message);
     else if (message.type === 'ready') this.latest.set('ready', message);
     this.emit('message', message);
+    if (message.type==='snapshot') {
+      for (const [id,pending] of this.pending) if (pending.snapshot && pending.acknowledged) {
+        clearTimeout(pending.timer);this.pending.delete(id);pending.resolve(message.snapshot);
+      }
+    }
   }
 
   private fail(error: unknown): void {

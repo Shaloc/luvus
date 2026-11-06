@@ -310,21 +310,16 @@ ipcMain.handle('luvus:request', (event, request: unknown) => {
 });
 ipcMain.handle('luvus:reconnect', event => { requireTrusted(event); return retryStartup?.(); });
 ipcMain.handle('luvus:bootstrap', event => { requireTrusted(event); return core?.bootstrap() ?? []; });
-ipcMain.handle('luvus:terminal-menu', (event, selected:unknown, chinese:unknown) => {
+ipcMain.handle('luvus:terminal-paste', async (event, target: unknown) => {
   requireTrusted(event);
-  const parent = window;
-  if (!parent) return null;
-  return new Promise((resolve, reject) => {
-    let picking = false;
-    const menu = Menu.buildFromTemplate([
-      {label:chinese === true ? '复制' : 'Copy', enabled:selected === true, click:()=>resolve({action:'copy'})},
-      {label:chinese === true ? '粘贴' : 'Paste', click:()=>{
-        picking = true;
-        void clipboard.readText().then(text => { if (Buffer.byteLength(text) > 256*1024) throw Error('Paste exceeds 256 KiB'); resolve({action:'paste',text}); }).catch(reject);
-      }},
-    ]);
-    menu.popup({window:parent,callback:()=>setImmediate(()=>{if (!picking) resolve(null);})});
-  });
+  const owner = core;
+  if (!window?.isFocused() || !owner || selecting) throw new Error('Attachment is changing');
+  const text = await clipboard.readText();
+  if (!text) return;
+  if (Buffer.byteLength(text) > 256 * 1024) throw new Error('Paste exceeds 256 KiB');
+  const input = { type:'input', id:crypto.randomUUID(), target, input:{kind:'paste', text} };
+  if (owner !== core || selecting || !isRequest(input)) throw new Error('Invalid terminal target');
+  await owner.request(input);
 });
 ipcMain.handle('luvus:choose-directory', async event => {
   requireTrusted(event);
@@ -333,23 +328,26 @@ ipcMain.handle('luvus:choose-directory', async event => {
   return result.canceled ? null : result.filePaths[0] ?? null;
 });
 
+function checkedBounds(value: unknown): Electron.Rectangle {
+  if (!value || typeof value !== 'object' || Object.keys(value).sort().join(',') !== 'height,width,x,y') throw new Error('Invalid browser bounds');
+  return value as Electron.Rectangle;
+}
 ipcMain.handle('luvus:browser-bounds', (event, id: unknown, bounds: unknown) => {
   requireTrusted(event);
   if (typeof id !== 'string' || !/^[0-9a-f]{32}$/.test(id)) throw new Error('Invalid browser id');
-  if (bounds !== null && (!bounds || typeof bounds !== 'object' || Object.keys(bounds).sort().join(',') !== 'height,width,x,y')) throw new Error('Invalid browser bounds');
-  browserBridge?.bounds(id, bounds as Electron.Rectangle | null);
+  browserBridge?.bounds(id, bounds === null ? null : checkedBounds(bounds));
 });
 ipcMain.handle('luvus:browser-status', (event, id: unknown) => {
   requireTrusted(event);
   if (typeof id !== 'string') throw new Error('Invalid browser id');
   return browserBridge?.status(id) ?? null;
 });
-ipcMain.handle('luvus:browser-navigate', (event, id: unknown, action: unknown, url: unknown) => {
+ipcMain.handle('luvus:browser-navigate', (event, id: unknown, action: unknown, bounds: unknown, url: unknown) => {
   requireTrusted(event);
   if (typeof id !== 'string' || !/^[0-9a-f]{32}$/.test(id) || !['navigate', 'back', 'forward', 'reload'].includes(String(action))) throw new Error('Invalid browser action');
   if (action === 'navigate' && (typeof url !== 'string' || url.length > 8192)) throw new Error('Invalid browser URL');
   if (!browserBridge) throw new Error('Browser host is not connected');
-  return browserBridge.navigate(id, action as 'navigate' | 'back' | 'forward' | 'reload', typeof url === 'string' ? url : undefined);
+  return browserBridge.navigate(id, action as 'navigate' | 'back' | 'forward' | 'reload', checkedBounds(bounds), typeof url === 'string' ? url : undefined);
 });
 ipcMain.handle('luvus:browser-takeover', (event, id: unknown) => {
   requireTrusted(event);

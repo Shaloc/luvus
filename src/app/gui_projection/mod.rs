@@ -1,4 +1,5 @@
 mod files;
+mod palette;
 pub(crate) mod registered;
 mod repository;
 mod views;
@@ -119,6 +120,12 @@ impl App {
                             leaf.as_object_mut().expect("snapshot leaf").extend(fields);
                         }
                     } else if let Some(pane) = terminal {
+                        leaf["can_fork"] = json!(self
+                            .status
+                            .get(&id)
+                            .is_some_and(
+                                |s| s.agent_session.is_some() && crate::agent::can_fork(&s.agent)
+                            ));
                         leaf["mouse_options"] = json!({"right_click_to_app":pane.mouse_options.right_click_to_app,"copy_on_select":pane.mouse_options.copy_on_select});
                         let (cols, rows) = pane.size();
                         let modes = pane.engine.try_lock().ok().map(|engine| json!({
@@ -149,13 +156,35 @@ impl App {
             }
         }
         snapshot["config"] = json!(self.config);
+        // Reuse discovery evidence already owned by the core; opening the sidebar must not dial SSH.
+        snapshot["host_connections"] = json!(self
+            .remote_host_status
+            .iter()
+            .map(|host| {
+                let state = if host.error.is_some() {
+                    "disconnected"
+                } else if host.sessions.is_empty() {
+                    "unknown"
+                } else {
+                    "connected"
+                };
+                json!({"host":host.host,"state":state,"sessions":host.sessions.iter().map(|s| &s.name).collect::<Vec<_>>()})
+            })
+            .collect::<Vec<_>>());
         snapshot["notification_inbox"] = json!({
             "revision": self.bar.history_revision.to_string(),
             "unread": self.bar.history.iter().filter(|row| row.unread).count(),
         });
+        snapshot["read_only_workers"] = json!(crate::agent::registry::descriptors()
+            .iter()
+            .filter(|d| d.automation.is_some_and(|a| a.read_only.is_some()))
+            .map(|d| d.id)
+            .collect::<Vec<_>>());
         snapshot["desktop_features"] = json!(["browser_tab", "blank_browser_tab", "mouse_options"]);
-        snapshot["terminal_palette"] =
-            json!({"foreground":pack(self.theme.text),"background":pack(self.theme.base)});
+        snapshot["terminal_palette"] = json!({
+            "foreground":pack(self.theme.text), "background":pack(self.theme.base),
+            "ansi":palette::ansi(&self.config.theme, &self.theme),
+        });
         snapshot["commands"] = json!(Cmd::ALL
             .iter()
             .map(|cmd| json!({
@@ -531,6 +560,43 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_host_rows_expose_discovered_session_names_without_endpoint_details() {
+        use crate::session::remote::{HostSession, HostStatus};
+        let _env = crate::persist::test_env("gui-host-session-rows");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(80, 24, tx).unwrap();
+        app.remote_host_status = vec![
+            HostStatus {
+                host: "fixture-host".into(),
+                sessions: vec![
+                    HostSession {
+                        name: "default".into(),
+                        running: true,
+                    },
+                    HostSession {
+                        name: "saved".into(),
+                        running: false,
+                    },
+                ],
+                error: None,
+            },
+            HostStatus {
+                host: "fixture-offline".into(),
+                sessions: vec![],
+                error: Some("offline".into()),
+            },
+        ];
+        let snapshot = app.gui_snapshot();
+        assert_eq!(
+            snapshot["host_connections"],
+            json!([
+                {"host":"fixture-host","state":"connected","sessions":["default","saved"]},
+                {"host":"fixture-offline","state":"disconnected","sessions":[]},
+            ])
+        );
+    }
 
     #[test]
     fn gui_target_fences_identity_and_native_leaf_ownership() {

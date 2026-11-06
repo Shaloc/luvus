@@ -33,6 +33,16 @@ test('styled runs use engine advances, retain combining/emoji and join shaping c
   assert.equal(styledRuns([cell(0, 0, 'a'), cell(0, 1, 'b', 1, 1)]).length, 2);
 });
 
+test('Nerd Font icons use exactly their assigned cells without shifting adjacent text', () => {
+  for (const icon of ['\uf404', '\ue0b0', '\u{f024b}']) {
+    const chars = ['a', icon, 'f', 'o', 'o'];
+    const runs = styledRuns(chars.map((text, col) => cell(0, col, text)));
+    assert.deepEqual(runs.map(r => [r.text, r.col, r.width, !!r.symbol]), [
+      ['a', 0, 1, false], [icon, 1, 1, true], ['foo', 2, 3, false]
+    ]);
+  }
+});
+
 test('accessible rows preserve indentation, join soft wraps and keep hard breaks', () => {
   assert.equal(accessibleText(frame), '  界e\u0301abcX\n👩\u200d💻');
 });

@@ -102,7 +102,8 @@ export class BrowserHost {
   constructor(private readonly window: BrowserWindow,
     private readonly onControlRevoked?: (browserId: string, reason: string, generation:string) => void,
     private readonly onCdpMessage?: (browserId: string, leaseGeneration: string, raw: string) => Promise<void>,
-    private readonly onMetadataChanged?: (browserId: string) => void) {}
+    private readonly onMetadataChanged?: (browserId: string) => void,
+    private readonly onTabShortcut?: (target: Target, position: number) => void) {}
 
   async open(input: BrowserDescriptor): Promise<void> {
     if (!/^[\w:.-]{1,128}$/.test(input.id)) fail('invalid_params');
@@ -118,7 +119,6 @@ export class BrowserHost {
       if (!sameTarget(existing.descriptor.target, input.target) || input.proxy_port !== existing.descriptor.proxy_port || input.request_id !== existing.descriptor.request_id) fail('route_changed');
       // A launch replay is not control acquisition or lease renewal.
       if (leaseGeneration !== existing.generation || !existing.ready) fail('control_revoked');
-      this.show(input.id);
       return;
     }
     if (this.tabs.size >= 8 || this.retired.size >= 1024) fail('limit_exceeded');
@@ -179,6 +179,12 @@ export class BrowserHost {
     });
     contents.on('did-fail-load', (_event, _code, _description, _url, main) => { if (main) tab.navigating = false; });
     contents.on('before-input-event', (event, input) => {
+      if (!tab.input && input.type==='keyDown' && !input.isAutoRepeat && input.meta && !input.control && !input.alt && !input.shift && /^[1-9]$/.test(input.key)
+          && this.tabs.get(descriptor.id)===tab && this.active===descriptor.id && tab.view.getVisible()) {
+        event.preventDefault();
+        if(this.controlled(tab)) this.revoke(tab,'control_revoked',true);
+        this.onTabShortcut?.(descriptor.target,Number(input.key));return;
+      }
       if (!this.controlled(tab)) {
         if (input.type==='keyDown' && ['Enter',' '].includes(input.key)) this.noteHumanGesture(tab);
         return;
@@ -268,7 +274,6 @@ export class BrowserHost {
       operation.check();
       await operation.wait(contents.loadURL(descriptor.url));
       tab.ready = true;
-      this.show(descriptor.id);
     } catch (error) {
       void this.close(descriptor.id);
       throw this.safeError(error);
@@ -786,11 +791,18 @@ export class BrowserHost {
     const tab = this.tabs.get(id);
     if (!tab) return;
     if (!bounds) { tab.view.setVisible(false); return; }
-    const { width, height } = this.window.getContentBounds();
-    if (![bounds.x, bounds.y, bounds.width, bounds.height].every(Number.isFinite) || bounds.x < 0 || bounds.y < 0 || bounds.width < 0 || bounds.height < 0 || bounds.x + bounds.width > width + 1 || bounds.y + bounds.height > height + 1) throw new Error('Invalid browser bounds');
+    if (![bounds.x, bounds.y, bounds.width, bounds.height].every(n => Number.isFinite(n) && n >= 0)) throw new Error('Invalid browser bounds');
+    // DOM rectangles are CSS pixels; child views use DIPs relative to contentView.
+    // Clip to the current parent in case it resized after the renderer measured it.
+    const zoom = this.window.webContents.getZoomFactor();
+    const {width,height} = this.window.contentView.getBounds();
+    const x = Math.min(width, Math.round(bounds.x * zoom)), y = Math.min(height, Math.round(bounds.y * zoom));
+    const right = Math.min(width, Math.round((bounds.x + bounds.width) * zoom));
+    const bottom = Math.min(height, Math.round((bounds.y + bounds.height) * zoom));
+    if (right <= x || bottom <= y) { tab.view.setVisible(false); return; }
     this.show(id);
-    tab.view.setBounds({ x: Math.round(bounds.x), y: Math.round(bounds.y), width: Math.floor(bounds.width), height: Math.floor(bounds.height) });
-    tab.view.setVisible(bounds.width > 0 && bounds.height > 0);
+    tab.view.setBounds({ x, y, width: right - x, height: bottom - y });
+    tab.view.setVisible(true);
   }
 
   private show(id: string): void {

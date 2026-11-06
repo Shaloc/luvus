@@ -90,7 +90,14 @@ impl App {
                         views::native(view, &mut budget)
                     }
                 } else {
-                    json!({"kind":"terminal", "title":self.cached_pane_title(id)})
+                    let status = self.status.get(&id);
+                    json!({
+                        "kind":"terminal", "title":self.cached_pane_title(id),
+                        "agent_session_title":self.agent_session_title(id),
+                        "agent_name":self.agent_name_for(id), "is_agent":self.is_agent_pane(id),
+                        "agent":status.map(|s| &s.agent), "agent_status":status.map(|s| crate::app::dispatch::state_str(s.state)),
+                        "cwd":terminal.map(|p| &p.cwd),
+                    })
                 };
                 leaf["pane_id"] = json!(target.pane_id);
                 leaf["focused"] = json!(active && id == tab.layout.focus);
@@ -378,6 +385,36 @@ fn bind_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_gui_preserves_owner_session_title_and_rename_without_native_session_id() {
+        let _env = crate::persist::test_env("registered-gui-titles");
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut app = App::new(100, 32, tx).unwrap();
+        let id = app.layout().focus;
+        app.status.get_mut(&id).unwrap().agent = "codex".into();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        app.panes.get_mut(&id).unwrap().engine = crate::terminal::vt::create_engine(
+            crate::terminal::vt::VtEngineKind::Alacritty,
+            80,
+            24,
+            tx,
+            crate::config::SCROLLBACK_BYTES_DEFAULT,
+            Default::default(),
+        );
+        for title in ["Respond to greeting | work", "Renamed thread | work"] {
+            app.panes[&id]
+                .engine
+                .lock()
+                .unwrap()
+                .advance(format!("\x1b]2;{title}\x07").as_bytes());
+            let scene = app.owner_gui_scene(0).unwrap();
+            let pane = &scene["tabs"][0]["panes"][0];
+            assert_eq!(pane["is_agent"], true);
+            assert_eq!(pane["agent_session_title"], title);
+            assert!(pane.get("agent_session").is_none());
+        }
+    }
 
     #[test]
     fn registered_gui_rejects_malformed_and_mismatched_layouts() {

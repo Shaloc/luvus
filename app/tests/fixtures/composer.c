@@ -18,6 +18,12 @@ int main(int argc, char **argv) {
     fflush(stdout);
     char line[4096];
     while (fgets(line, sizeof line, stdin)) {
+        if (strncmp(line, ":fixture-title ", 15) == 0) {
+            line[strcspn(line, "\r\n")] = '\0';
+            printf("\033]2;%s\007", line + 15);
+            fflush(stdout);
+            continue;
+        }
         if (strncmp(line, ":fixture-ready", 14) == 0) {
             fputs("\033[2J\033[2;1H\xe2\x80\xba Ready for your next task", stdout);
             fflush(stdout);
