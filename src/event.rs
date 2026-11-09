@@ -84,6 +84,8 @@ pub enum AppEvent {
         lease_generation: u64,
         result: Result<serde_json::Value, String>,
     },
+    // The streaming CDP API currently accepts subscriptions only on Unix.
+    #[cfg_attr(not(unix), allow(dead_code))]
     BrowserCdpSubscribe {
         browser_id: String,
         lease: String,
@@ -92,6 +94,7 @@ pub enum AppEvent {
         active: Arc<AtomicBool>,
         reply: Sender<Result<serde_json::Value, String>>,
     },
+    #[cfg_attr(not(unix), allow(dead_code))]
     BrowserCdpUnsubscribe {
         browser_id: String,
         subscription_id: String,

@@ -42,15 +42,16 @@
       }
     },
     "x86_64-pc-windows-msvc": {
-      "executable_bytes": 19468288,
-      "archive_bytes": 6709160,
+      "executable_bytes": 23374336,
+      "archive_bytes": 7877549,
       "source": {
         "repository": "Shaloc/luvus",
-        "commit": "b1ee9637974f6af0e67e2f6933551420c2a43956",
-        "workflow_run": 36975154551,
-        "job": 110737261483,
-        "archive_sha256": "df442d32fcd815351bcf9b285bc7305cbe30b8860717247555e73ff135cd5744",
-        "measurement": "Windows CI release executable and binary-only ZIP produced by upload-rust-binary-action. This newly imported target previously used the upstream baseline, which excludes fork remote ownership, pooled display, clipboard and Web behavior. Establish its first measured fork baseline; retain the 5% warning and 10% block thresholds."
+        "commit": "e2b6102f50cc6d4442a7d810572ce98502b47d40",
+        "workflow_run": 42570941761,
+        "job": 129007910647,
+        "archive_sha256": "f278f04fc0c78ebf9972c0a49702b0c88e1fc83d68ed13624d20d8bd1cd3e695",
+        "rustc": "1.99.1",
+        "measurement": "Windows CI release executable and binary-only ZIP produced by upload-rust-binary-action. Refresh the cumulative baseline after owner HTTP/WebSocket forwarding, desktop App projections and browser control were added since b1ee9637. The executable grew by 3,906,048 bytes (+20.06%) and the ZIP by 1,168,389 bytes (+17.41%); this imported desktop batch adds no Rust dependencies. Retain the 5% warning and 10% block thresholds. Windows is checked in CI but is not an asset in the three-platform fork CLI release."
       }
     }
   }

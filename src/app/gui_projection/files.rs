@@ -213,13 +213,15 @@ fn edit_entry(root: &Path, path: &Path, op: &FileOperation) -> std::io::Result<V
             }
             #[cfg(target_os = "linux")]
             unsafe {
-                libc::renameat2(
+                // libc exposes no renameat2 wrapper for musl targets.
+                libc::syscall(
+                    libc::SYS_renameat2,
                     fd,
                     source.as_ptr(),
                     fd,
                     dest.as_ptr(),
                     libc::RENAME_NOREPLACE,
-                )
+                ) as libc::c_int
             }
         }
         FileOperation::Delete { .. } => {
@@ -285,5 +287,39 @@ mod tests {
         )
         .is_err());
         assert_eq!(fs::read_to_string(root.join("keep")).unwrap(), "keep");
+
+        let identity = edit_entry(&root, &source, &FileOperation::Inspect).unwrap()["identity"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        symlink(root.join("missing"), root.join("dangling")).unwrap();
+        assert!(edit_entry(
+            &root,
+            &source,
+            &FileOperation::Rename {
+                name: "dangling".into(),
+                identity: identity.clone(),
+            }
+        )
+        .is_err());
+        assert_eq!(
+            fs::read_link(root.join("dangling")).unwrap(),
+            root.join("missing")
+        );
+        assert_eq!(fs::read_to_string(&source).unwrap(), "replacement");
+        edit_entry(
+            &root,
+            &source,
+            &FileOperation::Rename {
+                name: "renamed".into(),
+                identity,
+            },
+        )
+        .unwrap();
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(root.join("renamed")).unwrap(),
+            "replacement"
+        );
     }
 }

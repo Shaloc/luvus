@@ -665,6 +665,14 @@ impl Forwarder {
                         }
                     }
                 }
+                // A concurrent subprocess launch can retain this socket until
+                // exec, even with CLOEXEC. Revoke the shared Linux listener
+                // before dropping our descriptor and reporting closure.
+                #[cfg(target_os = "linux")]
+                unsafe {
+                    use std::os::fd::AsRawFd;
+                    libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR);
+                }
                 tasks.abort_all();
             });
             // Stop tunnels, client drivers and any pending DNS work on detach.
