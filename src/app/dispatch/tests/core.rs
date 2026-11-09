@@ -13,6 +13,41 @@ fn ping_exposes_the_binary_transport_protocol_for_upgrade_preflight() {
 }
 
 #[test]
+fn config_patch_removes_map_overrides_and_preserves_siblings() {
+    let (_env, mut app) = app("config-map-reset");
+    app.dispatch(
+        "config.patch",
+        &json!({"patch":{
+            "keybindings":{"new_tab":"Z","next_tab":"N"},
+            "direct_keybindings":{"next_tab":"alt+right"},
+            "mission_pricing":{"fixture":[1.0,2.0,0.5],"keep":[3.0,4.0,1.0]}
+        }}),
+    )
+    .unwrap();
+    app.dispatch(
+        "config.patch",
+        &json!({"patch":{
+            "keybindings":{"new_tab":null},
+            "direct_keybindings":{"next_tab":null},
+            "mission_pricing":{"fixture":null,"absent":null}
+        }}),
+    )
+    .unwrap();
+    assert!(!app.config.keybindings.contains_key("new_tab"));
+    assert_eq!(app.config.keybindings.get("next_tab").unwrap(), "N");
+    assert!(!app.config.direct_keybindings.contains_key("next_tab"));
+    assert!(!app.config.mission_pricing.contains_key("fixture"));
+    assert_eq!(app.config.mission_pricing.len(), 1);
+    assert!(app.keymap.values().any(|cmd| *cmd == keys::Cmd::NewTab));
+    assert!(app
+        .dispatch(
+            "config.patch",
+            &json!({"patch":{"layout":{"diff_wrap":null}}})
+        )
+        .is_err());
+}
+
+#[test]
 fn config_patch_rejects_unknown_fields_without_mutation() {
     let (_env, mut app) = app("socket-config");
     let before = serde_json::to_value(&app.config).unwrap();

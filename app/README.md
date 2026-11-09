@@ -62,12 +62,14 @@ the core's automatic split direction. Rename, move and transpose remain
 separate actions. A new browser opens in a sibling core-owned tab, without
 prompting for an address or creating a hidden PTY; switching to another tab preserves the live browser.
 
-Settings has General, Appearance, Terminal, Workspaces, Agents, Keybindings,
-Integrations and Advanced categories, plus cross-category search. General
+Settings has General, Appearance, Terminal, Workspaces, Files and diffs, Agents,
+Keybindings, Connections, Integrations, and Layout and bars categories, plus
+cross-category search. General
 offers a device interface language (English, Simplified Chinese or system default)
 separately from the nine-language core selector. Appearance controls the desktop light/dark/system mode, interface
 font/size, terminal theme and local background image. Terminal controls its
-own font/size. Pick from installed font families, filtered to monospaced families for the terminal.
+own font/size and independent regular/bold weights (100–900, including intermediate
+variable-font weights). Interface font weight is device-local too. Pick from installed font families, filtered to monospaced families for the terminal.
 Terminal text uses the selected font with a bundled, offline Symbols Nerd Font Mono fallback
 for private-use icons. Each pane has one rounded outer border; the accent follows
 focus. Its header and grid share a background matching the device light/dark mode.
@@ -78,6 +80,14 @@ The terminal theme also controls ANSI slots 0–15, including existing output.
 True-color cells and the fixed 256-color cube retain their application colors.
 The TUI resolves ANSI through its outer terminal (for example Kitty), so that
 terminal's own palette can differ from the desktop even with the same Luvus theme.
+
+Settings separate files/diffs, connections, agent behavior, shortcuts, and TUI
+layout into explicit sections. Enums use menus, numeric fields validate bounds
+and units, and SSH hosts, model pricing, status-bar placement, and shortcut
+overrides have structured editors. No core configuration JSON is exposed as
+an editable form. Shortcut recording supports clearing a binding and restoring
+its default. Integration and bundled-skill inventories use separate tabs with
+localized status and aligned actions.
 
 The pane header uses the terminal's live title unless you explicitly name the
 pane. In Settings → Agents, enable title-first display to use that title as the

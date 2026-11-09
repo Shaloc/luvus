@@ -226,6 +226,11 @@ screen because it validates changes, applies supported settings live, and
 writes the file. Hand edits are loaded on restart. Preserve unknown keys and do
 not rewrite the file just to change one setting.
 
+In `config.patch`, a `null` entry inside `keybindings`, `direct_keybindings`,
+or `mission_pricing` removes that override and preserves sibling entries.
+An empty shortcut string disables the command; removing its override restores
+the default binding.
+
 Local Settings theme selection and `theme use <id>` on a running server also
 queue that theme ID to running sessions on currently connected selected SSH
 hosts. Other preferences are preserved; remote failures appear as local UI

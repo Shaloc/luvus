@@ -167,6 +167,7 @@ export function App() {
   });
   useEffect(() => {
     const handler = (event: KeyboardEvent) => {
+      if (event.target instanceof Element && event.target.closest('[data-key-recorder]')) return;
       if (!event.metaKey || event.altKey || event.ctrlKey || event.isComposing || document.querySelector('dialog[open]')) return;
       if (event.key.toLowerCase() === 'k') { event.preventDefault(); setPalette(true); }
       else if (event.key.toLowerCase() === 't' && snapshot && workspace) { event.preventDefault(); event.stopImmediatePropagation(); void newTab().catch(reportError); }

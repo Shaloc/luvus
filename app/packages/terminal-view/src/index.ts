@@ -56,19 +56,23 @@ export class CanvasTerminal {
   private wheelRaf = 0;
   private fontSize: number;
   private fontFamily: string;
+  private fontWeight = 400;
+  private fontBoldWeight = 700;
   private backgroundOpacity = 1;
   private rightClickToApp = false;
   private ansi: readonly string[] | undefined;
 
-  setAppearance(value: { fontSize: number; fontFamily: string; backgroundOpacity: number; rightClickToApp: boolean; foreground: string; background: string; ansi?: readonly string[] }) {
+  setAppearance(value: { fontSize: number; fontFamily: string; fontWeight?: number; fontBoldWeight?: number; backgroundOpacity: number; rightClickToApp: boolean; foreground: string; background: string; ansi?: readonly string[] }) {
     this.fontSize = Math.min(32, Math.max(9, value.fontSize));
     this.fontFamily = value.fontFamily;
+    this.fontWeight = Math.min(900, Math.max(100, value.fontWeight ?? 400));
+    this.fontBoldWeight = Math.min(900, Math.max(100, value.fontBoldWeight ?? 700));
     this.backgroundOpacity = Math.min(1, Math.max(0, value.backgroundOpacity));
     this.rightClickToApp = value.rightClickToApp;
     this.ansi = value.ansi;
     this.host.style.setProperty('--terminal-fg', value.foreground);
     this.host.style.setProperty('--terminal-bg', value.background);
-    this.preedit.style.font = this.textarea.style.font = `${this.fontSize}px ${this.fontFamily}`;
+    this.preedit.style.font = this.textarea.style.font = `${this.fontWeight} ${this.fontSize}px ${this.fontFamily}`;
     this.measure(); this.paint();
   }
 
@@ -451,7 +455,7 @@ export class CanvasTerminal {
     const style = getComputedStyle(this.host);
     this.foreground = style.getPropertyValue('--terminal-fg').trim() || '#f1f3f7';
     this.background = style.getPropertyValue('--terminal-bg').trim() || '#000000';
-    context.font = `${this.fontSize}px ${this.fontFamily}`;
+    context.font = `${this.fontWeight} ${this.fontSize}px ${this.fontFamily}`;
     this.cellWidth = Math.max(1, context.measureText('M').width);
     this.cellHeight = Math.ceil(this.fontSize * 1.45);
     this.width = this.host.clientWidth; this.height = this.host.clientHeight;
@@ -512,7 +516,7 @@ export class CanvasTerminal {
       const reverse = Boolean(cell.mods & 64);
       context.fillStyle = unpackColor(reverse ? cell.bg : cell.fg, reverse ? this.background : this.foreground, this.ansi);
       context.globalAlpha = cell.mods & 2 ? 0.6 : 1;
-      context.font = `${cell.mods & 4 ? 'italic ' : ''}${cell.mods & 1 ? 'bold ' : ''}${this.fontSize}px ${this.fontFamily}`;
+      context.font = `${cell.mods & 4 ? 'italic ' : ''}${cell.mods & 1 ? this.fontBoldWeight : this.fontWeight} ${this.fontSize}px ${this.fontFamily}`;
       const advance = cell.width * this.cellWidth;
 
       context.save();

@@ -141,15 +141,54 @@
   .settings-heading > span { color: var(--subtle); }
   .settings-heading h2 { font-size: calc(var(--ui-size, 13px) * 14 / 13); font-weight: 500; }
   .settings-content { max-width: 920px; padding: 24px 32px 48px; margin-inline: auto; }
-  .settings-section { margin-bottom: 32px; }
-  .settings-section > h3 { display: flex; align-items: center; gap: 8px; font-size: calc(var(--ui-size, 13px) * 14 / 13); margin-bottom: 12px; font-weight: 600; }
+  .settings-section { margin-bottom: 24px; min-width: 0; }
+  .settings-section > h3 { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 9px 0; border-bottom: 1px solid var(--input-border); margin-bottom: 4px; font-weight: 600; color: var(--muted); }
   .preference-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 44px; padding: 6px 0; border-bottom: 1px solid var(--border); }
   .preference-row > div:first-child { min-width: 110px; flex: 1; }
-  .preference-row strong { font-weight: 450; font-size: calc(var(--ui-size, 13px) * 12 / 13); text-transform: capitalize; }
+  .preference-row strong { font-weight: var(--ui-weight, 400); font-size: calc(var(--ui-size, 13px) * 12 / 13); }
   .preference-row small { display: block; color: var(--subtle); font-size: calc(var(--ui-size, 13px) * 10 / 13); margin-top: 3px; }
   .preference-control { display: flex; align-items: center; justify-content: flex-end; gap: 10px; width: 260px; max-width: 55%; min-width: 0; }
   .preference-control output { min-width: 34px; font-variant-numeric: tabular-nums; color: var(--subtle); }
   .size-input { max-width: 80px; }
+  body { font-weight: var(--ui-weight, 400); }
+  .settings-tabs { margin: 0 0 14px; width: fit-content; max-width: 100%; }
+  .settings-input, .setting-input { display: flex; align-items: center; gap: 6px; min-width: 0; width: 100%; }
+  .setting-input input { flex: 1; min-width: 0; width: 0; }
+  .setting-number { width: auto; max-width: 100%; }
+  .setting-number input { width: 72px; flex: 0 1 90px; }
+  .input-unit { color: var(--muted); font-size: 11px; white-space: nowrap; }
+  .setting-stacked-control { display: grid; gap: 6px; width: 100%; }
+  .settings-list-row { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  .settings-list-row > :first-child { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+  .settings-list-row > .choice-trigger { flex: 0 0 170px; width: 170px; }
+  .settings-list-row > .button { flex-shrink: 0; }
+  .settings-list-row > .button[aria-label], .price-row .button[aria-label] { display: inline-grid; place-items: center; flex: 0 0 30px; width: 30px; height: 30px; padding: 0; }
+  .settings-list-row > .button[aria-label] > svg, .price-row .button[aria-label] > svg { grid-area: 1 / 1; }
+  .settings-content .button[aria-label] > .spin ~ svg { visibility: hidden; }
+  .settings-list-row strong { font-weight: 500; }
+  .addon-state { width: 104px; color: var(--subtle); font-size: 11px; }
+  .addon-row > .button { min-width: 80px; }
+  .settings-add-row { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 12px; }
+  .settings-add-row input { min-width: 0; max-width: 260px; }
+  .settings-add-row button { flex-shrink: 0; }
+  .key-recorder { min-width: 110px; max-width: 180px; }
+  .key-recorder input { width: 100%; }
+  .key-recorder small { display: block; color: var(--danger); }
+  .key-binding { min-width: 110px; width: 100%; }
+  .key-binding kbd { font-family: var(--font-mono); font-size: 11px; }
+  .price-table { overflow-x: auto; margin-top: 12px; }
+  .price-heading, .price-row { display: grid; grid-template-columns: minmax(100px, 1fr) repeat(3, minmax(68px, .65fr)) 100px; align-items: center; gap: 8px; min-width: 460px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+  .price-heading { color: var(--muted); font-size: 10px; }
+  .price-row > span { overflow: hidden; text-overflow: ellipsis; }
+  .price-row input { min-width: 0; width: 100%; }
+  @media (max-width: 1100px) {
+    .settings-page { grid-template-columns: 150px minmax(0,1fr); }
+    .settings-content { padding: 16px 18px 32px; }
+    .preference-row { gap: 12px; flex-wrap: wrap; }
+    .preference-control { width: 240px; max-width: 100%; }
+    .settings-list-row { flex-wrap: wrap; }
+    .settings-list-row > :first-child { flex-basis: 110px; }
+  }
   .font-control { display: flex; flex-wrap: wrap; gap: 6px; width: 100%; }
   .font-control input { flex: 1; }
   .font-preview { padding: 20px; margin-block: 16px; background: var(--terminal-bg); color: var(--terminal-fg); border: 1px solid var(--border); border-radius: 6px; overflow: auto; }

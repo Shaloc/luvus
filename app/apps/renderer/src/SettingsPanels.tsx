@@ -9,16 +9,26 @@ import { ProjectedDocks } from './ProjectedWidgets';
 
 interface Props { snapshot: Snapshot; openDialog: OpenDialog }
 export { SettingsPanel } from './SettingsPage';
-export function LocalAddons({generation}:{generation:string}){
-  const {remoteHost}=useCore();const [inventory,setInventory]=useState<RecordValue|null>(null),[error,setError]=useState('');
-  useEffect(()=>{let live=true;if(!remoteHost)window.luvus.addons('list','',generation).then(v=>{if(live)setInventory(record(v));}).catch(e=>{if(live)setError(String(e));});return()=>{live=false;};},[remoteHost,generation]);
+export function LocalAddons({generation}:{generation:string}) {
+  const {remoteHost}=useCore();
+  const [inventory,setInventory]=useState<RecordValue|null>(null),[error,setError]=useState(''),[tab,setTab]=useState('integrations');
+  useEffect(()=>{
+    let live=true;
+    if(!remoteHost)window.luvus.addons('list','',generation).then(v=>{if(live)setInventory(record(v));}).catch(e=>{if(live)setError(String(e));});
+    return()=>{live=false;};
+  },[remoteHost,generation]);
   if(remoteHost)return <Notice>{tr("Agent installations are managed on their owner.")}</Notice>;
   if(error)return <ErrorBox error={error}/>;
   if(!inventory)return <Loading/>;
   const change=async(op:'install'|'uninstall'|'enable'|'disable',agent='')=>setInventory(record(await window.luvus.addons(op,agent,generation)));
-  return <><h3>{tr("Local agent integrations")}</h3>{array(inventory.integrations).map(record).map(row=><div className="list-card" data-agent={text(row.agent)} key={text(row.agent)}><strong>{text(row.agent)}</strong><AsyncButton run={()=>change(row.installed?'uninstall':'install',text(row.agent))}>{row.installed?tr("Uninstall…"):tr("Install…")}</AsyncButton></div>)}
-    <h3>{tr("Bundled skill")}</h3>{array(inventory.skills).map(record).map(row=><div className="setting-row" key={text(row.host)}><strong>{text(row.host)}</strong><small>{text(row.state)}</small></div>)}
-    <div className="button-row"><AsyncButton run={()=>change('enable')}>{tr("Enable skill…")}</AsyncButton><AsyncButton run={()=>change('disable')}>{tr("Disable skill…")}</AsyncButton></div></>;
+  const states:Record<string,string>={'not-installed':'Not installed',current:'Installed',installed:'Installed',outdated:'Update available',modified:'Modified',conflict:'Conflict',enabled:'Enabled',disabled:'Disabled','up-to-date':'Installed',missing:'Missing','external-current':'Installed externally',external:'Managed externally','not-detected':'Agent not detected'};
+  return <section className="settings-section">
+    <div className="segmented settings-tabs" role="tablist" aria-label={tr("Integration type")}>{[['integrations','Local agent integrations'],['skills','Bundled skill']].map(([id,title])=><button key={id} role="tab" aria-selected={tab===id} onClick={()=>setTab(id!)}>{tr(title!)}</button>)}</div>
+    {tab==='integrations'?array(inventory.integrations).map(record).map(row=><div className="settings-list-row addon-row" data-agent={text(row.agent)} key={text(row.agent)}><strong>{text(row.agent)}</strong><span className="addon-state">{tr(row.installed?'Installed':'Not installed')}</span><AsyncButton run={()=>change(row.installed?'uninstall':'install',text(row.agent))}>{row.installed?tr("Uninstall…"):tr("Install…")}</AsyncButton></div>):<>
+      {array(inventory.skills).map(record).map(row=><div className="settings-list-row addon-row" key={text(row.host)}><strong>{tr(text(row.host))}</strong><span className="addon-state">{tr(states[text(row.state)]??text(row.state))}</span></div>)}
+      <div className="settings-add-row"><AsyncButton run={()=>change('enable')}>{tr("Enable skill…")}</AsyncButton><AsyncButton run={()=>change('disable')}>{tr("Disable skill…")}</AsyncButton></div>
+    </>}
+  </section>;
 }
 export function flatten(value: RecordValue, path: string[] = []): [string[], unknown][] {
   return Object.entries(value).flatMap(([key, item]) => item !== null && typeof item === 'object' && !Array.isArray(item) && Object.keys(record(item)).length ? flatten(record(item), [...path, key]) : [[[...path, key], item] as [string[], unknown]]);

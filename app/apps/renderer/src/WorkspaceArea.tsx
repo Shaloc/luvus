@@ -114,7 +114,7 @@ function TerminalPane({ pane, snapshot, workspace, tab, openDialog, newBrowser, 
     const unsubscribe = subscribeTerminal(pane.target, (frame) => instance.update(frame), frame => instance.preview(frame));
     return () => { disposed = true;host.removeEventListener('luvus:terminal-command',command);unsubscribe(); instance.dispose(); terminal.current = null; };
   }, [key]);
-  useLayoutEffect(() => { terminal.current?.setAppearance({ fontSize: appearance.terminalSize, fontFamily: terminalFontStack(appearance.terminalFont), backgroundOpacity: wallpaper ? 0 : 1, rightClickToApp, foreground, background, ansi }); }, [key, appearance.terminalSize, appearance.terminalFont, wallpaper, rightClickToApp, foreground, background, ansi]);
+  useLayoutEffect(() => { terminal.current?.setAppearance({ fontSize: appearance.terminalSize, fontFamily: terminalFontStack(appearance.terminalFont), fontWeight: appearance.terminalWeight, fontBoldWeight: appearance.terminalBoldWeight, backgroundOpacity: wallpaper ? 0 : 1, rightClickToApp, foreground, background, ansi }); }, [key, appearance.terminalSize, appearance.terminalFont, appearance.terminalWeight, appearance.terminalBoldWeight, wallpaper, rightClickToApp, foreground, background, ansi]);
   // Clicking a different canvas moves native focus before the owner's snapshot
   // comes back. An older snapshot must never take the keyboard back mid-word.
   useEffect(() => { if (pane.focused && !document.querySelector('dialog[open]') && document.activeElement === document.body) terminal.current?.focus(); }, [pane.focused]);

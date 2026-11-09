@@ -699,6 +699,9 @@ surface:
   Incoming patches and reconnects do not rebroadcast or trigger synchronization.
   Settings language selection uses the same scope, independently of theme edits;
   `config.patch {"patch":{"language":"zh"}}` remains owner-local.
+- `config.patch` removes individual `keybindings`, `direct_keybindings`,
+  or `mission_pricing` overrides when their value is `null`; sibling entries
+  are preserved. An empty shortcut string disables that command instead.
 - CLI widget commands use `luvus bar ...`; the UHP method family is
   `ui.bar.*`. Inspect widgets and docks before changing placement or content.
   The optional `core:focused-pane` widget shows the focused owner's tab

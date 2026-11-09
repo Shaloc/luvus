@@ -37,7 +37,8 @@ export function useTerminalPalette(mode: string, projected: unknown) {
 
 export const defaultAppearance = {
   mode: 'system', language: 'system', uiFont: '-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
-  uiSize: 13, terminalFont: '"SFMono-Regular", Menlo, Monaco, Consolas, monospace', terminalSize: 13,
+  uiSize: 13, uiWeight: 400, terminalFont: '"SFMono-Regular", Menlo, Monaco, Consolas, monospace', terminalSize: 13,
+  terminalWeight: 400, terminalBoldWeight: 700,
   wallpaperOpacity: 20, wallpaperFit: 'cover',
   confirmTabClose: true,
 };
@@ -56,7 +57,7 @@ try {
   if (['system', 'light', 'dark'].includes(saved.mode ?? '')) preferences.mode = saved.mode!;
   if (typeof saved.confirmTabClose === 'boolean') preferences.confirmTabClose = saved.confirmTabClose;
   if (['cover', 'contain'].includes(saved.wallpaperFit ?? '')) preferences.wallpaperFit = saved.wallpaperFit!;
-  for (const [field, min, max] of [['uiSize', 11, 18], ['terminalSize', 9, 32], ['wallpaperOpacity', 0, 100]] as const) {
+  for (const [field, min, max] of [['uiSize', 11, 18], ['terminalSize', 9, 32], ['wallpaperOpacity', 0, 100], ['uiWeight',100,900], ['terminalWeight',100,900], ['terminalBoldWeight',100,900]] as const) {
     const value = saved[field]; if (typeof value === 'number' && Number.isFinite(value)) preferences[field] = Math.max(min, Math.min(max, value));
   }
 } catch { /* Invalid device preferences fall back without touching core config. */ }
@@ -78,6 +79,7 @@ export function applyAppearance() {
   root.style.setProperty('--font-sans', preferences.uiFont);
   root.style.setProperty('--font-mono', terminalFontStack(preferences.terminalFont));
   root.style.setProperty('--ui-size', `${preferences.uiSize}px`);
+  root.style.setProperty('--ui-weight', String(preferences.uiWeight));
   root.style.setProperty('--wallpaper-opacity', String(preferences.wallpaperOpacity / 100));
   root.style.setProperty('--wallpaper-fit', preferences.wallpaperFit);
   root.style.setProperty('--wallpaper', wallpaper ? `url("${wallpaper}")` : 'none');

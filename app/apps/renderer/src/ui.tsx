@@ -28,7 +28,7 @@ export function Modal({ title, children, onClose, wide = false }: { title: strin
 }
 export function AsyncButton({ run, children, className = 'button', ...props }: Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'onClick'> & { run: () => Promise<unknown> }) {
   const [busy, setBusy] = useState(false), [error, setError] = useState<string | null>(null);
-  return <><button type="button" className={className} {...props} disabled={busy || props.disabled} onClick={() => { setBusy(true); setError(null); void run().catch((error: unknown) => setError(message(error))).finally(() => setBusy(false)); }}>{busy && <LoaderCircle size={14} className="spin" />}{children}</button>{error && <ErrorBox error={error} />}</>;
+  return <><button type="button" className={className} {...props} title={props.title ?? props['aria-label']} disabled={busy || props.disabled} onClick={() => { setBusy(true); setError(null); void run().catch((error: unknown) => setError(message(error))).finally(() => setBusy(false)); }}>{busy && <LoaderCircle size={14} className="spin" />}{children}</button>{error && <ErrorBox error={error} />}</>;
 }
 export function Detail({ value, depth = 0 }: { value: unknown; depth?: number }) {
   if (value === null || value === undefined) return <span className="muted">{tr("Not available")}</span>;

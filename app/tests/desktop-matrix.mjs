@@ -130,6 +130,7 @@ async function scenario(name, fn) {
     if (page && !page.isClosed()) {
       await page.screenshot({path:join(home,'failure.png')}).catch(()=>{});
       await writeFile(join(home,'failure.txt'),await page.locator('body').innerText().catch(()=>'closed'));
+      await writeFile(join(home,'failure-menus.json'),JSON.stringify(await page.locator('.choice-positioner, .choice-popup, [role="option"]').evaluateAll(nodes=>nodes.map(e=>({html:e.outerHTML,bounds:e.getBoundingClientRect().toJSON(),visibility:getComputedStyle(e).visibility,display:getComputedStyle(e).display}))).catch(()=>[]),null,2));
       await writeFile(join(home,'failure-debug.json'),JSON.stringify(await page.evaluate(async()=>({active:document.activeElement?.outerHTML,panes:[...document.querySelectorAll('.pane')].map(p=>({classes:p.className,terminal:p.querySelector('textarea')?.outerHTML})),snapshot:(await window.luvus.bootstrap()).find(m=>m.type==='snapshot')?.snapshot})).catch(()=>null),null,2));
     }
   } finally {
@@ -149,7 +150,7 @@ const submit = async (p, name) => {await button(dialog(p),name).click();await di
 async function choose(field, value) {
   await field.click();
   const options = field.page().getByRole('option');
-  await (typeof value === 'object' ? options.nth(value.index) : field.page().locator('[role="option"][data-value=' + JSON.stringify(value) + ']')).click();
+  await (typeof value === 'object' ? options.nth(value.index) : options.and(field.page().locator('[data-value=' + JSON.stringify(value) + ']'))).click();
 }
 const active = snap => snap.workspaces.find(w=>w.active);
 const tab = snap => active(snap).tabs.find(t=>t.active);
@@ -779,20 +780,17 @@ await scenario('settings-inventory',async ({page:p,native,home,api,env,ok})=>{
   await writeFile(hooks,JSON.stringify({hooks:{},fixture_unrelated:'keep'}),{flag:'wx'});
   await p.locator('.sidebar-bottom').getByRole('button',{name:'Settings'}).click();
   const config=await p.evaluate(async()=>(await window.luvus.bootstrap()).find(m=>m.type==='snapshot').snapshot.config);
-  const paths=(o,prefix='')=>Object.entries(o).flatMap(([k,v])=>{const name=prefix?prefix+'.'+k:k;return v && typeof v==='object' && !Array.isArray(v) && Object.keys(v).length?paths(v,name):[name];});
-  const rendered=new Set();
-  for (const key of Object.keys(config)) {
-    await p.getByLabel('Find setting').fill(key);
-    for (const path of await p.locator('.settings-content [aria-label]').evaluateAll(nodes=>nodes.map(n=>n.getAttribute('aria-label')))) rendered.add(path);
+  for (const category of ['General','Appearance','Terminal','Workspaces','Files and diffs','Agents','Keybindings','Connections','Integrations','Layout and bars']) {
+    await p.locator('.settings-nav').getByRole('button',{name:category,exact:true}).click();
+    assert.equal(await p.locator('.settings-content input').evaluateAll(nodes=>nodes.some(n=>/^[\[{]/.test(n.value))),false,category+' has no JSON form');
+    assert.equal(await p.locator('.settings-content [aria-label="version"]').count(),0);
   }
-  assert.ok(rendered.delete('Interface language')); assert.ok(rendered.delete('Core language')); rendered.add('language');
-  assert.deepEqual([...rendered].sort(),paths(config).sort());
   await button(p,'General').click();
   for(const lang of ['zh','ja','ko','de','fr','pt','es','id','en']){
     await choose(p.getByRole('combobox',{name:'Core language',exact:true}),lang);
     await eventually('owner language '+lang,async()=>JSON.parse(await readFile(join(home,'config.json'),'utf8')).language===lang);
   }
-  ok('every projected core preference has a control; all nine registered language settings persist');
+  ok('categorized typed preferences, no JSON or migration version fields; all nine core languages persist');
   await button(p,'Integrations').click();
   const codex=p.locator('[data-agent=codex]');await codex.waitFor();
   const publicRows=(await api('integration.status')).integrations;
@@ -812,12 +810,175 @@ await scenario('settings-inventory',async ({page:p,native,home,api,env,ok})=>{
   assert.equal(JSON.parse(await readFile(hooks,'utf8')).fixture_unrelated,'keep');
   const skill=await api('skill.status');
   assert.ok(skill.destinations.length && skill.destinations.every(row=>row.target.startsWith(home+'/')),'never touch nonfixture agent directories');
-  const shared=p.locator('.setting-row').filter({has:p.getByText('shared',{exact:true})});
+  await p.getByRole('tab',{name:'Bundled skill',exact:true}).click();
+  const shared=p.locator('.settings-list-row').filter({has:p.getByText('shared',{exact:true})});
   await allow();await button(p,'Enable skill…').click();
-  await shared.getByText('current',{exact:true}).waitFor();assert.ok((await api('skill.status')).destinations.some(row=>row.state==='current'));
+  await shared.getByText('Installed',{exact:true}).waitFor();assert.ok((await api('skill.status')).destinations.some(row=>row.state==='current'));
   await allow();await button(p,'Disable skill…').click();
-  await shared.getByText('not-installed',{exact:true}).waitFor();assert.ok((await api('skill.status')).destinations.every(row=>row.state!=='current'));
+  await shared.getByText('Not installed',{exact:true}).waitFor();assert.ok((await api('skill.status')).destinations.every(row=>row.state!=='current'));
   ok('local integration inventory, cancel/install/uninstall, unrelated Codex hooks survive; bundled skills enabled and disabled only in marked agent homes');
+});
+
+await scenario('settings-forms',async ({page:p,native,home,api,ok})=>{
+  const persisted=async()=>JSON.parse(await readFile(join(home,'config.json'),'utf8'));
+  const category=async name=>{
+    await p.locator('.settings-nav').getByRole('button',{name,exact:true}).click();
+    if(['Integrations','集成'].includes(name))await p.locator('.addon-row').first().waitFor();
+  };
+  const saveInput=async(label,value)=>{
+    const input=p.getByLabel(label,{exact:true});await input.fill(value);
+    await input.locator('..').getByRole('button',{name:'Save',exact:true}).click();
+  };
+  await p.locator('.sidebar-bottom').getByRole('button',{name:'Settings',exact:true}).click();
+  await category('Files and diffs');
+  await choose(p.getByRole('combobox',{name:'layout.diff_layout',exact:true}),'split');
+  await choose(p.getByRole('combobox',{name:'layout.diff_color_mode',exact:true}),'standard');
+  await saveInput('layout.diff_context_lines','7');
+  await eventually('diff values persist',async()=>{const c=await persisted();return c.layout.diff_context_lines===7 && c.layout.diff_layout==='split' && c.layout.diff_color_mode==='standard';});
+  const context=p.getByLabel('layout.diff_context_lines',{exact:true});await context.fill('21');
+  assert.ok(await context.locator('..').getByRole('button',{name:'Save'}).isDisabled());
+  assert.equal((await persisted()).layout.diff_context_lines,7);
+  await p.screenshot({path:join(home,'settings-files.png')});
+  await category('Agents');
+  await choose(p.getByRole('combobox',{name:'Agent grouping',exact:true}),'date');
+  await eventually('grouping is exclusive',async()=>{const c=await persisted();return c.agents_group_by_date && !c.agents_group_by_workspace;});
+  await p.getByRole('switch',{name:'mission-budget-enabled'}).click();
+  await saveInput('mission_budget','12.5');
+  await p.getByLabel('Model name',{exact:true}).fill('fixture-price');await button(p,'Add pricing').click();
+  await p.getByLabel('fixture-price Input (USD/M tokens)',{exact:true}).fill('1.5');
+  await p.getByLabel('fixture-price Output (USD/M tokens)',{exact:true}).fill('6');
+  await p.getByLabel('fixture-price Cached (USD/M tokens)',{exact:true}).fill('0.25');
+  await p.locator('.price-row').filter({hasText:'fixture-price'}).getByRole('button',{name:'Save',exact:true}).click();
+  await eventually('pricing persists',async()=>{const c=await persisted();return c.mission_budget===12.5 && JSON.stringify(c.mission_pricing['fixture-price'])==='[1.5,6,0.25]';});
+  await button(p,'Remove pricing fixture-price').click();
+  await p.getByRole('switch',{name:'mission-budget-enabled'}).click();
+  await eventually('map deletion persists',async()=>{const c=await persisted();return c.mission_budget===null && !Object.hasOwn(c.mission_pricing,'fixture-price');});
+  await category('Keybindings');
+  await p.getByRole('button',{name:'prefix',exact:true}).click();
+  await p.getByRole('textbox',{name:'prefix',exact:true}).press('Control+a');
+  await eventually('recorded prefix persists',async()=>(await persisted()).prefix==='ctrl+a');
+  const name=await p.evaluate(async()=>(await window.luvus.bootstrap()).find(m=>m.type==='snapshot').snapshot.commands.find(c=>c.id==='new_tab').label);
+  const row=p.locator('.shortcut-table .settings-list-row').filter({has:p.getByText(name,{exact:true})});
+  const recordShortcut=async(suffix,chord)=>{await row.getByRole('button',{name:name+' '+suffix,exact:true}).click();await row.getByRole('textbox').press(chord);};
+  await recordShortcut('Prefix shortcuts','Z');
+  await eventually('recorded suffix',async()=>(await persisted()).keybindings.new_tab==='Z');
+  const leftName=await p.evaluate(async()=>(await window.luvus.bootstrap()).find(m=>m.type==='snapshot').snapshot.commands.find(c=>c.id==='focus_left').label);
+  const left=p.locator('.shortcut-table .settings-list-row').filter({has:p.getByText(leftName,{exact:true})});
+  await left.getByRole('button',{name:leftName+' Prefix shortcuts',exact:true}).click();
+  await left.getByRole('textbox').press('Backspace');await left.getByRole('alert').waitFor();
+  assert.equal((await persisted()).keybindings.focus_left,undefined);
+  const tabsBeforeRecording=await p.locator('.tab-item').count();
+  await left.getByRole('textbox').press('Meta+t');
+  assert.equal(await p.locator('.tab-item').count(),tabsBeforeRecording);
+  assert.ok(await left.getByRole('textbox').isVisible());
+  await left.getByRole('textbox').press('Z');
+  await eventually('conflicting binding cleared',async()=>{const c=await persisted();return c.keybindings.focus_left==='Z' && c.keybindings.new_tab==='';});
+  await left.getByRole('button',{name:'Restore default '+leftName,exact:true}).click();
+  await recordShortcut('Prefix shortcuts','Z');
+  await row.getByRole('button',{name:'Clear shortcut '+name,exact:true}).click();
+  await eventually('shortcut disabled',async()=>(await persisted()).keybindings.new_tab==='');
+  await row.getByRole('button',{name:'Restore default '+name,exact:true}).click();
+  await eventually('default restored',async()=>!Object.hasOwn((await persisted()).keybindings,'new_tab'));
+  await p.getByRole('tab',{name:'Direct shortcuts',exact:true}).click();
+  await recordShortcut('Direct shortcuts','Alt+Shift+n');
+  await eventually('direct shortcut persists',async()=>(await persisted()).direct_keybindings.new_tab==='alt+shift+n');
+  await row.getByRole('button',{name:'Restore default '+name,exact:true}).click();
+  await eventually('direct override removed',async()=>!Object.hasOwn((await persisted()).direct_keybindings,'new_tab'));
+  await category('Layout and bars');
+  await choose(p.getByRole('combobox',{name:'core:runtime-status',exact:true}),'top-right');
+  await eventually('widget moved',async()=>(await api('ui.bar.list')).widgets.find(w=>w.key==='core:runtime-status').region==='top-right');
+  const siblingDocks=(await api('ui.dock.list')).docks.filter(d=>d.id!=='agents');
+  await choose(p.getByRole('combobox',{name:'dock-agents',exact:true}),'off');
+  await eventually('dock hidden',async()=>!(await api('ui.dock.list')).docks.some(d=>d.id==='agents'));
+  assert.deepEqual((await api('ui.dock.list')).docks,siblingDocks);
+  await choose(p.getByRole('combobox',{name:'dock-agents',exact:true}),'right');
+  await eventually('dock restored',async()=>(await api('ui.dock.list')).docks.find(d=>d.id==='agents')?.side==='right');
+  await category('Terminal');
+  await saveInput('layout.scrollback_bytes','32');
+  await eventually('MiB stored as bytes',async()=>(await persisted()).layout.scrollback_bytes===32*1024*1024);
+  const size=p.getByLabel('Terminal font size',{exact:true});
+  await size.fill('');await size.pressSequentially('15');
+  assert.equal(await size.inputValue(),'15');
+  await size.fill('99');await size.blur();assert.equal(await size.inputValue(),'15');
+  await p.getByLabel('Terminal font weight',{exact:true}).fill('450');
+  await p.getByLabel('Terminal bold weight',{exact:true}).fill('760');
+  assert.equal(await p.locator('.font-preview').evaluate(e=>getComputedStyle(e).fontWeight),'450');
+  await category('Connections');
+  await api('config.patch',{patch:{remote_hosts:['settings-fixture-a','settings-fixture-b']}});
+  await button(p,'Remove host settings-fixture-a').waitFor();
+  await p.evaluate(()=>{
+    const buttons=['settings-fixture-a','settings-fixture-b'].map(host=>document.querySelector(`[aria-label="Remove host ${host}"]`));
+    buttons.forEach(button=>button.click());
+  });
+  await eventually('overlapping host edits fenced',async()=>JSON.stringify((await persisted()).remote_hosts)==='["settings-fixture-b"]');
+  await button(p,'Remove host settings-fixture-b').click();
+  await eventually('second removal uses fresh list',async()=>(await persisted()).remote_hosts.length===0);
+  await category('Appearance');await p.getByLabel('Interface font weight',{exact:true}).fill('460');
+  await button(p,'Light').click();
+  await category('General');await choose(p.getByRole('combobox',{name:'Interface language',exact:true}),'zh');
+  for(const name of ['通用','外观','终端','工作区','文件与差异','智能体','快捷键','连接','集成','布局与状态栏']) {
+    await category(name);
+    assert.equal(await p.locator('.settings-content input').evaluateAll(nodes=>nodes.some(n=>/^[\[{]/.test(n.value))),false);
+    if(name==='快捷键')assert.ok(await p.locator('.shortcut-table .settings-list-row > span').evaluateAll(nodes=>nodes.every(n=>/[\u4e00-\u9fff]/.test(n.textContent))),'all built-in shortcut labels localized');
+    await p.screenshot({path:join(home,'settings-'+name+'.png')});
+  }
+  const search=p.getByRole('textbox',{name:'查找设置',exact:true});
+  await search.fill('字重');await p.getByLabel('终端粗体字重',{exact:true}).waitFor();
+  await search.fill('预算');await p.getByRole('switch',{name:'mission-budget-enabled'}).waitFor();
+  await search.fill('no-such-setting');await p.getByText('没有匹配的设置',{exact:true}).waitFor();
+  await search.fill('');
+  await native.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setContentSize(900,650));
+  for(const name of ['通用','外观','终端','智能体','快捷键','连接','集成','布局与状态栏']) {
+    await category(name);
+    assert.ok(await p.locator('.settings-main').evaluate(e=>e.scrollWidth<=e.clientWidth+1),'no overflow: '+name);
+    await p.screenshot({path:join(home,'compact-'+name+'.png')});
+  }
+  await category('外观');await p.getByRole('button',{name:'深色',exact:true}).click();
+  await category('智能体');await p.screenshot({path:join(home,'settings-dark.png')});
+  await p.getByRole('button',{name:'返回终端',exact:true}).click();
+  await p.waitForFunction(()=>getComputedStyle(document.querySelector('[aria-label="Terminal input"]')).fontWeight==='450');
+  await p.reload();await p.waitForFunction(()=>document.querySelector('.connection-dot.online'));
+  const appearance=await p.evaluate(()=>JSON.parse(localStorage.getItem('luvus.desktop.appearance.v1')));
+  assert.equal(appearance.terminalWeight,450);assert.equal(appearance.terminalBoldWeight,760);assert.equal(appearance.uiWeight,460);
+  assert.equal(await p.getByLabel('Terminal input',{exact:true}).first().evaluate(e=>getComputedStyle(e).fontWeight),'450');
+  ok('typed diff, numeric validation, grouping, budgets/pricing, shortcut capture/clear/reset, widget/dock placement persist; font weights live and after reload; Chinese light/dark compact screenshots');
+});
+
+if (process.argv.includes('variable-font')) await scenario('variable-font',async ({page:p,home,ok})=>{
+  const family=process.env.LUVUS_TEST_VARIABLE_FONT;
+  assert.ok(family,'set LUVUS_TEST_VARIABLE_FONT to an installed variable monospace family');
+  const settings=async()=>{
+    await p.locator('.sidebar-bottom').getByRole('button',{name:'Settings',exact:true}).click();
+    await p.locator('.settings-nav').getByRole('button',{name:'Terminal',exact:true}).click();
+  };
+  await settings();
+  await p.getByRole('combobox',{name:'Terminal font',exact:true}).click();
+  await p.getByRole('option',{name:family,exact:true}).click();
+  await p.getByLabel('Terminal font weight',{exact:true}).fill('300');
+  await p.getByLabel('Terminal bold weight',{exact:true}).fill('600');
+  await button(p,'Back to terminals').click();
+  const input=p.getByLabel('Terminal input');
+  await input.fill("printf '\\033[2J\\033[HRegular AaBb 0123456789\\n\\033[1mBold AaBb 0123456789\\033[0m\\n'");
+  await input.press('Enter');
+  await p.waitForFunction(()=>document.querySelector('.terminal-accessible')?.textContent.startsWith('Regular AaBb'));
+  const raster=()=>p.locator('.pane-focused canvas').evaluate(canvas=>{
+    const ctx=canvas.getContext('2d'),size=parseFloat(getComputedStyle(document.querySelector('.terminal-input')).fontSize);
+    const height=Math.ceil(size*1.45)*devicePixelRatio,width=Math.min(canvas.width,400*devicePixelRatio);
+    return [0,1].map(row=>Array.from(ctx.getImageData(0,row*height,width,height).data).reduce((sum,v,i)=>(sum+v*(i%97+1))%2147483647,0));
+  });
+  const before=await raster();await p.screenshot({path:join(home,'weight-300-600.png')});
+  await settings();
+  await p.getByLabel('Terminal font weight',{exact:true}).fill('450');
+  await p.getByLabel('Terminal bold weight',{exact:true}).fill('780');
+  await button(p,'Back to terminals').click();
+  await eventually('normal and bold terminal rasters change with variable weight',async()=>{const after=await raster();return after.every((v,i)=>v!==before[i]);});
+  assert.ok((await input.evaluate(e=>getComputedStyle(e).fontFamily)).includes(family));
+  assert.equal(await input.evaluate(e=>getComputedStyle(e).fontWeight),'450');
+  await p.screenshot({path:join(home,'weight-450-780.png')});
+  await p.reload();await p.locator('.connection-dot.online').waitFor();
+  await p.waitForFunction(()=>getComputedStyle(document.querySelector('.terminal-input')).fontWeight==='450');
+  assert.ok((await input.evaluate(e=>getComputedStyle(e).fontFamily)).includes(family));
+  ok('installed '+family+' selected from font menu; normal/bold weights change actual canvas pixels and survive reload');
 });
 
 await scenario('commander-private',async ({page:p,launch,ok})=>{

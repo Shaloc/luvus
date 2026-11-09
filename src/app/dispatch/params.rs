@@ -544,6 +544,10 @@ pub(in crate::app::dispatch) fn merge_known_fields(
         "config.keybindings" | "config.direct_keybindings" | "config.mission_pricing"
     );
     for (key, value) in patch {
+        if dynamic_map && value.is_null() {
+            target.remove(key);
+            continue;
+        }
         let Some(existing) = target.get_mut(key) else {
             if dynamic_map {
                 target.insert(key.clone(), value.clone());

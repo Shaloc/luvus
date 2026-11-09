@@ -42,6 +42,7 @@ export function useKeyboardShortcuts(snapshot: Snapshot | null, route: string, r
     const keydown = (event: KeyboardEvent) => {
       const {snapshot,route} = latest.current;
       const target = event.target instanceof HTMLElement ? event.target : null;
+      if (target?.closest('[data-key-recorder]')) {cancel();return;}
       if (!snapshot || event.isComposing || event.key === 'Process' || document.querySelector('dialog[open], [data-app-overlay], [role="menu"], [role="listbox"]')) {cancel();mode.current='';return;}
       const digit = tabDigit(event);
       if (digit !== undefined) {
